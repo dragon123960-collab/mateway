@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies
+vendor/
+node_modules/
+
+# Coverage
+coverage.out
+*.cover
+*.out
+
+# Config (contains API keys)
+config/
+*.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Session data
+memory/
+sessions/
