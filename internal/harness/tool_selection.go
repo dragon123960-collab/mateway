@@ -89,6 +89,8 @@ func scoreToolForGoal(goal string, spec tools.Spec) int {
 		spec.RiskLevel,
 	}, spec.Tags...), " "))
 	score := 0
+	executionGoal := goalLooksLikeExecution(goal)
+	envBoundCLIGoal := goalSuggestsEnvironmentBoundCLI(goal)
 	if strings.Contains(searchBlob, "memory") || strings.Contains(searchBlob, "wiki") || strings.Contains(searchBlob, "history") {
 		score += 2
 	}
@@ -114,14 +116,27 @@ func scoreToolForGoal(goal string, spec tools.Spec) int {
 		if strings.Contains(goal, "cli") || strings.Contains(goal, "命令") {
 			score += 3
 		}
+		if envBoundCLIGoal {
+			score += 5
+		}
 	}
 	if strings.Contains(searchBlob, "web_search") || strings.Contains(searchBlob, "browser_fetch") {
 		if containsAny(goal, "调研", "研究", "趋势", "分析", "news", "research", "trend", "market", "fund", "基金") {
 			score += 8
 		}
 	}
-	if strings.Contains(searchBlob, "sandbox_exec") && containsAny(goal, "执行", "验证", "测试", "命令", "run", "test") {
-		score += 8
+	if strings.Contains(searchBlob, "exec") && executionGoal {
+		score += 4
+	}
+	if spec.Name == "exec" && envBoundCLIGoal {
+		score += 10
+	}
+	if strings.Contains(searchBlob, "sandbox_exec") && executionGoal {
+		if envBoundCLIGoal {
+			score += 2
+		} else {
+			score += 8
+		}
 	}
 	if strings.Contains(searchBlob, "create_agent") || strings.Contains(searchBlob, "create_workspace") {
 		if containsAny(goal, "agent", "workspace", "工作区", "创建", "新建", "channel") {
@@ -170,7 +185,7 @@ func semanticGoalGroups(goal string) []string {
 		add("search", "web", "browser", "wiki")
 	case containsAny(goal, "文件", "代码", "项目", "workspace", "repo", "仓库"):
 		add("filesystem", "file", "workspace")
-	case containsAny(goal, "执行", "验证", "测试", "命令", "shell", "cli", "run", "test"):
+	case goalLooksLikeExecution(goal):
 		add("exec", "sandbox", "cli")
 	case containsAny(goal, "定时", "提醒", "每天", "每日", "每周", "cron", "schedule", "timer", "remind", "自动执行", "自动运行"):
 		add("schedule", "cron", "automation", "reminder")
@@ -194,4 +209,39 @@ func containsAny(text string, items ...string) bool {
 		}
 	}
 	return false
+}
+
+func goalLooksLikeExecution(goal string) bool {
+	return containsAny(goal, "执行", "验证", "测试", "命令", "shell", "cli", "run", "test")
+}
+
+func goalSuggestsEnvironmentBoundCLI(goal string) bool {
+	if !containsAny(goal, "cli", "命令", "shell", "终端", "terminal", "zsh", "bash", "opencli", "gh", "obsidian") {
+		return false
+	}
+	return containsAny(goal,
+		"opencli",
+		"gh",
+		"obsidian",
+		"cookie",
+		"cookies",
+		"浏览器",
+		"browser",
+		"登录",
+		"login",
+		"session",
+		"会话",
+		"daemon",
+		"桌面",
+		"desktop",
+		"终端",
+		"terminal",
+		"zsh",
+		"bash",
+		"本地",
+		"本机",
+		"用户目录",
+		"home",
+		"~/.",
+	)
 }

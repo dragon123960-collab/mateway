@@ -3,7 +3,10 @@ package harness
 import (
 	"fmt"
 	"regexp"
+	"runtime"
 	"strings"
+
+	"github.com/dongping/mateway/internal/cmdresolve"
 )
 
 var cliCommandPattern = regexp.MustCompile(`\b[a-z0-9][a-z0-9._-]{1,64}\b`)
@@ -26,15 +29,21 @@ func buildCLIExplorationHint(goal string, visibleToolNames []string) string {
 	if providerTool := matchingCLIProviderTool(command, visibleToolNames); providerTool != "" {
 		lines = append(lines, fmt.Sprintf("A matching CLI provider appears to exist. Prefer `%s` first for discovery if it is visible.", providerTool))
 	}
+	if hasVisibleTool(visibleToolNames, "exec") {
+		lines = append(lines,
+			"Prefer `exec` when the CLI depends on the real user environment such as HOME/TMPDIR, login shell state, browser cookies, desktop apps, or a local daemon.",
+		)
+	}
 	if hasVisibleTool(visibleToolNames, "sandbox_exec") {
 		lines = append(lines,
-			fmt.Sprintf("If `%s` is not already exposed as a provider tool, use `sandbox_exec` to inspect it locally.", command),
-			fmt.Sprintf("Preferred local inspection order for `%s`: `--help`, then `-h`, then `help`, then `version`.", command),
+			fmt.Sprintf("Only use `sandbox_exec` for isolated, stateless verification of `%s` when `exec` is unnecessary.", command),
+			fmt.Sprintf("Preferred local inspection order for `%s`: %s.", command, strings.Join(preferredCLIHelpOrder(), ", then ")),
 		)
 	}
 	if hasVisibleTool(visibleToolNames, "web_search") || hasVisibleTool(visibleToolNames, "browser_fetch") {
 		lines = append(lines, "Only if local inspection cannot resolve the command should you fall back to web_search/browser_fetch for external docs.")
 	}
+	lines = append(lines, currentPlatformCLIHint())
 	lines = append(lines, "If the command is missing or shell-only, explain that clearly and continue with the best fallback instead of stopping early.")
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
@@ -100,4 +109,25 @@ func normalizeCLIProviderToken(value string) string {
 		}
 	}
 	return strings.Trim(b.String(), "_")
+}
+
+func preferredCLIHelpOrder() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"`--help`", "`-h`", "`help`", "`/?`", "`version`"}
+	}
+	return []string{"`--help`", "`-h`", "`help`", "`version`"}
+}
+
+func currentPlatformCLIHint() string {
+	snapshot, _ := cmdresolve.Default().Snapshot()
+	shellPath := strings.TrimSpace(snapshot.ShellPath)
+	switch runtime.GOOS {
+	case "windows":
+		return "Platform strategy: prefer standalone executables; if you need shell-specific help, account for PowerShell/cmd differences such as `/?`."
+	default:
+		if shellPath != "" {
+			return fmt.Sprintf("Platform strategy: current host is `%s`; prefer standalone executables first and avoid assuming shell aliases are portable.", shellPath)
+		}
+		return "Platform strategy: prefer standalone executables first and keep shell assumptions minimal."
+	}
 }

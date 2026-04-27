@@ -36,7 +36,7 @@ These are the capabilities the platform can expose without any third-party CLI i
 
 - Search first checks `wiki_query` / memory when available.
 - External search prefers `web_search`, then `browser_fetch` for page reading.
-- Execution prefers `sandbox_exec` over unconstrained shell behavior.
+- Execution prefers `sandbox_exec` for isolated, stateless verification, but local/user-environment CLIs should prefer provider tools or `exec`.
 - Learning output is visible through Feishu `/trace` and `/learn`.
 - High-value completed chat runs generate a wiki learning proposal under `workspace/memory/wiki/notes/`.
 
@@ -66,7 +66,7 @@ Current first-pass progressive disclosure now has two layers:
 - always keeps memory/history lookup tools available
 - research-like goals expose search + reading + writeback tools
 - file/code/workspace goals expose file tools
-- execution goals expose `sandbox_exec`
+- execution goals expose `exec` and `sandbox_exec`; use `exec` for real user-environment CLIs and `sandbox_exec` for isolated verification
 - multi-agent goals expose `spawn` / `wait_agent`
 - external CLI tools are only exposed when the task or tool name suggests a match
 - dynamic scoring now also considers tool kind, tags, descriptions, CLI allowed commands, and skill metadata tags/keywords
