@@ -20,6 +20,7 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	agentharness "github.com/dongping/mateway/internal/harness"
 	hostruntime "github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/scheduler"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skills"
 	"github.com/dongping/mateway/internal/tools"
@@ -188,7 +189,7 @@ func jsonResp(status int, body string) *http.Response {
 }
 
 func TestServiceIgnoresSelfMessageAndDuplicate(t *testing.T) {
-	svc := &Service{}
+	svc := &Service{Home: t.TempDir()}
 	svc.botOpenID.Store("ou_bot")
 
 	senderType := "app"
@@ -202,9 +203,22 @@ func TestServiceIgnoresSelfMessageAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestServicePersistsDuplicateMessageIDsAcrossInstances(t *testing.T) {
+	home := t.TempDir()
+	first := &Service{Home: home}
+	if first.isDuplicateMessage("persisted-msg") {
+		t.Fatal("expected first delivery to pass")
+	}
+	second := &Service{Home: home}
+	if !second.isDuplicateMessage("persisted-msg") {
+		t.Fatal("expected second instance to treat message id as duplicate")
+	}
+}
+
 func TestServiceHandleMessageReceiveSendsAckReactionAndPlaceholder(t *testing.T) {
 	var callsMu syncBuffer
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
 			_, _ = w.Write([]byte(`{"code":0,"tenant_access_token":"token"}`))
@@ -304,6 +318,144 @@ func TestServiceHandleMessageReceiveSendsAckReactionAndPlaceholder(t *testing.T)
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for async calls: %v", callsMu.All())
+}
+
+func TestServiceQueuesSlashCommandsBehindActiveSession(t *testing.T) {
+	svc := &Service{
+		Config: config.FeishuConfig{
+			AckTextEnabled:     boolRef(false),
+			AckReactionEnabled: boolRef(false),
+		},
+		sessionQueues: map[string][]queuedMessage{},
+		sessionProcessing: map[string]bool{
+			"feishu:p2p:ou_user": true,
+		},
+	}
+	userType := "user"
+	msgType := larkim.MsgTypeText
+	chatType := "p2p"
+	chatID := "oc_test"
+	msgID := "om_queued"
+	content := `{"text":"/summary"}`
+	openID := "ou_user"
+
+	err := svc.handleMessageReceive(context.Background(), &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderType: &userType,
+				SenderId:   &larkim.UserId{OpenId: &openID},
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   &msgID,
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := svc.sessionQueues["feishu:p2p:ou_user"]
+	if len(queued) != 1 || queued[0].content != "/summary" {
+		t.Fatalf("expected slash command to queue behind active session: %#v", svc.sessionQueues)
+	}
+}
+
+func TestServicePrioritizesControlMessagesAheadOfQueuedTasks(t *testing.T) {
+	svc := &Service{
+		Config: config.FeishuConfig{
+			AckTextEnabled:     boolRef(false),
+			AckReactionEnabled: boolRef(false),
+		},
+		sessionQueues: map[string][]queuedMessage{
+			"feishu:p2p:ou_user": {{
+				sessionKey: "feishu:p2p:ou_user",
+				content:    "请帮我整理昨天会议纪要",
+				kind:       queuedMessageNewTask,
+				taskID:     "task-old",
+			}},
+		},
+		sessionProcessing: map[string]bool{
+			"feishu:p2p:ou_user": true,
+		},
+	}
+	if started := svc.enqueueSessionMessage(queuedMessage{
+		sessionKey: "feishu:p2p:ou_user",
+		content:    "/summary",
+		kind:       queuedMessageControl,
+	}); started {
+		t.Fatal("expected session to stay in processing state")
+	}
+	queue := svc.sessionQueues["feishu:p2p:ou_user"]
+	if len(queue) != 2 {
+		t.Fatalf("expected 2 queued items, got %#v", queue)
+	}
+	if queue[0].kind != queuedMessageControl || queue[0].content != "/summary" {
+		t.Fatalf("expected control message to be promoted ahead of queued tasks: %#v", queue)
+	}
+}
+
+func TestServiceDeriveSessionKeySupportsPerUserGroupIsolation(t *testing.T) {
+	svc := &Service{Config: config.FeishuConfig{
+		GroupTrigger: config.GroupTriggerConfig{SessionMode: "per_user"},
+	}}
+	got := svc.deriveSessionKey("feishu", "group", "oc_group", "ou_user")
+	if got != "feishu:group:oc_group:ou_user" {
+		t.Fatalf("unexpected per-user group session key: %s", got)
+	}
+	svc.Config.GroupTrigger.SessionMode = "shared_thread"
+	got = svc.deriveSessionKey("feishu", "group", "oc_group", "ou_user")
+	if got != "feishu:group:oc_group" {
+		t.Fatalf("unexpected shared-thread group session key: %s", got)
+	}
+}
+
+func TestServiceNotifyAsyncResultSendsMessage(t *testing.T) {
+	var callsMu syncBuffer
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			_, _ = w.Write([]byte(`{"code":0,"tenant_access_token":"token"}`))
+		case r.URL.Path == "/open-apis/im/v1/messages" && r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			callsMu.Add(string(body))
+			_, _ = w.Write([]byte(`{"code":0}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_x", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()))
+	svc := &Service{
+		Config: config.FeishuConfig{
+			AppID:     "cli_x",
+			AppSecret: "secret",
+			BotName:   "Mateway",
+		},
+		client: client,
+	}
+
+	err := svc.NotifyAsyncResult(context.Background(), agentharness.AsyncResultEvent{
+		Channel:  "feishu",
+		ThreadID: "oc_test",
+		RunID:    "run_async",
+		Goal:     "整理上一个任务",
+		Status:   "completed",
+		Result:   "最终结果已经生成",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(callsMu.All(), "\n")
+	if !strings.Contains(got, "异步任务已完成") || !strings.Contains(got, "最终结果已经生成") {
+		t.Fatalf("async result message not sent: %s", got)
+	}
 }
 
 type syncBuffer struct {
@@ -416,12 +568,204 @@ func TestHandlerApprovalCommands(t *testing.T) {
 
 	handler := Handler{Harness: runner}
 	reply := handler.handleText(context.Background(), "feishu:p2p:u1", "/approvals")
-	if !bytes.Contains([]byte(reply), []byte("待批准操作")) {
+	if !bytes.Contains([]byte(reply), []byte("待批准操作")) ||
+		!bytes.Contains([]byte(reply), []byte("task=")) ||
+		!bytes.Contains([]byte(reply), []byte("参数：user_text=needs approval")) {
 		t.Fatalf("unexpected approvals reply: %s", reply)
 	}
 	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/deny")
 	if !bytes.Contains([]byte(reply), []byte("已拒绝")) {
 		t.Fatalf("unexpected deny reply: %s", reply)
+	}
+}
+
+func TestHandlerNaturalLanguageApprovalCommands(t *testing.T) {
+	workspace := t.TempDir()
+	store := session.NewStore(workspace)
+	registry := tools.NewRegistry()
+	registry.Register(tools.BuiltinProvider{
+		Workspace: workspace,
+		Sessions:  store,
+		Memory:    agentharness.New(workspace, store, tools.NewRegistry(), 6).Memory,
+	})
+	runner := agentharness.New(workspace, store, registry, 6)
+	runner.ApprovalPolicy = agentharness.ApprovalPolicy{RequireRiskyTools: true}
+	if _, err := runner.Start(context.Background(), agentharness.Request{
+		SessionKey: "feishu:p2p:u1",
+		Mode:       "tool",
+		ToolName:   "schedule_create",
+		Arguments: map[string]any{
+			"name":             "daily-plan",
+			"interval_minutes": 1440,
+			"prompt":           "整理今日任务",
+		},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := Handler{Harness: runner}
+	reply := handler.handleText(context.Background(), "feishu:p2p:u1", "同意，继续执行")
+	if !bytes.Contains([]byte(reply), []byte("daily-plan")) {
+		t.Fatalf("expected approval execution result, got: %s", reply)
+	}
+
+	if _, err := runner.Start(context.Background(), agentharness.Request{
+		SessionKey: "feishu:p2p:u1",
+		Mode:       "tool",
+		ToolName:   "schedule_create",
+		Arguments: map[string]any{
+			"name":             "daily-plan-2",
+			"interval_minutes": 1440,
+			"prompt":           "再次整理今日任务",
+		},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "先不要")
+	if !bytes.Contains([]byte(reply), []byte("已拒绝")) {
+		t.Fatalf("expected denial reply, got: %s", reply)
+	}
+}
+
+func TestHandlerNaturalApprovalRefreshesSessionSummary(t *testing.T) {
+	workspace := t.TempDir()
+	store := session.NewStore(workspace)
+	registry := tools.NewRegistry()
+	registry.Register(tools.BuiltinProvider{
+		Workspace: workspace,
+		Sessions:  store,
+		Memory:    agentharness.New(workspace, store, tools.NewRegistry(), 6).Memory,
+	})
+	runner := agentharness.New(workspace, store, registry, 6)
+	runner.ApprovalPolicy = agentharness.ApprovalPolicy{RequireRiskyTools: true}
+	sessionKey := "feishu:p2p:u1"
+
+	if _, err := runner.Start(context.Background(), agentharness.Request{
+		SessionKey: sessionKey,
+		Mode:       "tool",
+		ToolName:   "schedule_create",
+		Arguments: map[string]any{
+			"name":             "daily-plan",
+			"interval_minutes": 1440,
+			"prompt":           "整理今日任务",
+		},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := Handler{Harness: runner}
+	reply := handler.handleText(context.Background(), sessionKey, "同意")
+	if !bytes.Contains([]byte(reply), []byte("daily-plan")) {
+		t.Fatalf("expected approval execution result, got: %s", reply)
+	}
+	note, ok, err := runner.Memory.ReadSessionSummary(context.Background(), sessionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || strings.Contains(note.Content, "需要批准") || !strings.Contains(note.Content, "daily-plan") {
+		t.Fatalf("expected refreshed summary with approval result, got %#v ok=%t", note, ok)
+	}
+}
+
+func TestServiceBuildReplyHandlesNaturalApprovalBeforeChatDispatch(t *testing.T) {
+	workspace := t.TempDir()
+	store := session.NewStore(workspace)
+	registry := tools.NewRegistry()
+	registry.Register(tools.BuiltinProvider{
+		Workspace: workspace,
+		Sessions:  store,
+		Memory:    agentharness.New(workspace, store, tools.NewRegistry(), 6).Memory,
+	})
+	runner := agentharness.New(workspace, store, registry, 6)
+	runner.ApprovalPolicy = agentharness.ApprovalPolicy{RequireRiskyTools: true}
+	if _, err := runner.Start(context.Background(), agentharness.Request{
+		SessionKey: "feishu:p2p:u1",
+		Mode:       "tool",
+		ToolName:   "schedule_create",
+		Arguments: map[string]any{
+			"name":             "daily-plan",
+			"interval_minutes": 1440,
+			"prompt":           "整理今日任务",
+		},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &Service{
+		Config: config.FeishuConfig{
+			AckTextEnabled:     boolRef(false),
+			AckReactionEnabled: boolRef(false),
+		},
+		Runner: runner,
+	}
+	reply := svc.buildReply(context.Background(), queuedMessage{
+		sessionKey: "feishu:p2p:u1",
+		chatID:     "oc_test",
+		senderID:   "ou_user",
+		content:    "同意",
+		kind:       queuedMessageApproval,
+		taskID:     "task-approval",
+	})
+	if !bytes.Contains([]byte(reply), []byte("daily-plan")) {
+		t.Fatalf("expected approval execution result, got: %s", reply)
+	}
+}
+
+func TestHandlerNewCommandResetsSessionState(t *testing.T) {
+	workspace := t.TempDir()
+	store := session.NewStore(workspace)
+	registry := tools.NewRegistry()
+	registry.Register(approvalProvider{})
+	runner := agentharness.New(workspace, store, registry, 6)
+	runner.ApprovalPolicy = agentharness.ApprovalPolicy{RequireRiskyTools: true}
+	sessionKey := "feishu:p2p:u1"
+
+	if err := store.Append(sessionKey,
+		session.Message{Role: "user", Content: "hello"},
+		session.Message{Role: "assistant", Content: "world"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Start(context.Background(), agentharness.Request{
+		SessionKey: sessionKey,
+		Mode:       "tool",
+		ToolName:   "spawn",
+		Arguments:  map[string]any{"user_text": "needs approval"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePreferences(sessionKey, session.Preferences{AgentName: "writer"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Memory.WriteSessionSummary(context.Background(), sessionKey, "最近结果: hello", map[string]any{"run_id": "run_demo"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.ListPending(sessionKey)) == 0 {
+		t.Fatal("expected pending approval before reset")
+	}
+
+	handler := Handler{Harness: runner}
+	reply := handler.handleText(context.Background(), sessionKey, "/new")
+	if !bytes.Contains([]byte(reply), []byte("已重置当前 session")) {
+		t.Fatalf("unexpected new reply: %s", reply)
+	}
+	if items, err := store.LoadRecent(sessionKey, 10); err != nil {
+		t.Fatal(err)
+	} else if len(items) != 0 {
+		t.Fatalf("expected empty transcript after reset: %#v", items)
+	}
+	if prefs, err := store.LoadPreferences(sessionKey); err != nil {
+		t.Fatal(err)
+	} else if prefs.AgentName != "" {
+		t.Fatalf("expected preferences to be cleared: %#v", prefs)
+	}
+	if note, ok, err := runner.Memory.ReadSessionSummary(context.Background(), sessionKey); err != nil {
+		t.Fatal(err)
+	} else if ok || strings.TrimSpace(note.Content) != "" {
+		t.Fatalf("expected session summary to be cleared: %#v ok=%t", note, ok)
+	}
+	if pending := runner.ListPending(sessionKey); len(pending) != 0 {
+		t.Fatalf("expected approvals to be cleared: %#v", pending)
 	}
 }
 
@@ -457,10 +801,19 @@ func TestHandlerRunAndSummaryCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := runner.Start(context.Background(), agentharness.Request{
+		SessionKey: "feishu:p2p:u1",
+		ThreadID:   "thread-1",
+		AgentName:  "default",
+		UserText:   "second memory task",
+		Mode:       "chat",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	handler := Handler{Harness: runner}
 	reply := handler.handleText(context.Background(), "feishu:p2p:u1", "/runs")
-	if !bytes.Contains([]byte(reply), []byte(run.ID)) {
+	if !bytes.Contains([]byte(reply), []byte(run.ID)) || !bytes.Contains([]byte(reply), []byte("task=")) {
 		t.Fatalf("unexpected runs reply: %s", reply)
 	}
 	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/run_status "+run.ID)
@@ -468,11 +821,11 @@ func TestHandlerRunAndSummaryCommands(t *testing.T) {
 		t.Fatalf("unexpected run status reply: %s", reply)
 	}
 	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/summary")
-	if !bytes.Contains([]byte(reply), []byte("最近结果")) {
+	if !bytes.Contains([]byte(reply), []byte("最新任务")) || !bytes.Contains([]byte(reply), []byte("上一任务")) {
 		t.Fatalf("unexpected summary reply: %s", reply)
 	}
 	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/last")
-	if !bytes.Contains([]byte(reply), []byte("上次进度")) {
+	if !bytes.Contains([]byte(reply), []byte("最近任务")) {
 		t.Fatalf("unexpected last reply: %s", reply)
 	}
 	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/trace "+run.ID)
@@ -560,10 +913,45 @@ func TestHandlerLearnReplyShowsInitialPlan(t *testing.T) {
 
 	handler := Handler{Harness: runner}
 	reply := handler.handleText(context.Background(), "feishu:p2p:u2", "/learn "+run.ID)
-	if !bytes.Contains([]byte(reply), []byte("初始分解:")) {
+	if !bytes.Contains([]byte(reply), []byte("正式复盘报告")) {
 		t.Fatalf("unexpected learn reply: %s", reply)
 	}
-	if !bytes.Contains([]byte(reply), []byte("执行过程:")) {
+	if !bytes.Contains([]byte(reply), []byte("任务分解:")) {
 		t.Fatalf("unexpected learn reply: %s", reply)
+	}
+	if !bytes.Contains([]byte(reply), []byte("执行时间线:")) {
+		t.Fatalf("unexpected learn reply: %s", reply)
+	}
+}
+
+func TestHandlerScheduleSlashCommands(t *testing.T) {
+	workspace := t.TempDir()
+	store := session.NewStore(workspace)
+	registry := tools.NewRegistry()
+	runner := agentharness.New(workspace, store, registry, 6)
+	scheduleStore := scheduler.Store{Workspace: workspace}
+	job, err := scheduler.NewCronJob("daily ping", "schedule:daily-ping", "ping", "30 9 * * *", "Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduleStore.Save(job); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduleStore.AppendRun(job, "completed", "run_1", "task_1", time.Second, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := Handler{Harness: runner}
+	reply := handler.handleText(context.Background(), "feishu:p2p:u1", "/schedule list")
+	if !bytes.Contains([]byte(reply), []byte("daily ping")) {
+		t.Fatalf("unexpected schedule list reply: %s", reply)
+	}
+	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/schedule get daily ping")
+	if !bytes.Contains([]byte(reply), []byte(`"name": "daily ping"`)) {
+		t.Fatalf("unexpected schedule get reply: %s", reply)
+	}
+	reply = handler.handleText(context.Background(), "feishu:p2p:u1", "/schedule runs daily ping")
+	if !bytes.Contains([]byte(reply), []byte(`"job_name":"daily ping"`)) {
+		t.Fatalf("unexpected schedule runs reply: %s", reply)
 	}
 }

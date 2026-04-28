@@ -85,6 +85,12 @@ func (h *Harness) eligibleToolsForAgent(ctx context.Context, req Request, profil
 		if !capabilities.Allows(effective, spec.Name) {
 			continue
 		}
+		if reporter, ok := item.(mwtools.AvailabilityReporter); ok {
+			availability := reporter.Availability(ctx)
+			if !availability.Available {
+				continue
+			}
+		}
 		if spec.Name == "spawn" || spec.Name == "wait_agent" {
 			continue
 		}

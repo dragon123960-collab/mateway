@@ -73,3 +73,39 @@ func TestExternalCLIRunSpecMentionsAllowedCommands(t *testing.T) {
 		t.Fatalf("unexpected description: %s", spec.Description)
 	}
 }
+
+func TestExternalCLIListReturnsRecoverableUnavailableMessage(t *testing.T) {
+	tool := externalCLIListTool{
+		name:       "demo",
+		binaryPath: filepath.Join(t.TempDir(), "missing-demo"),
+		args:       []string{"--help"},
+		shellPath:  "/bin/zsh",
+	}
+	res, err := tool.Invoke(context.Background(), Call{})
+	if err != nil {
+		t.Fatalf("expected recoverable list failure, got error: %v", err)
+	}
+	if !strings.Contains(string(res.Output), "provider unavailable") {
+		t.Fatalf("unexpected output: %s", string(res.Output))
+	}
+}
+
+func TestExternalCLIRunTurnsUnknownHelpSurfaceIntoLearnBeforeRunGuidance(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "demo-cli")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 127\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tool := externalCLIRunTool{
+		name:            "demo",
+		binaryPath:      bin,
+		allowedCommands: []string{"web"},
+		shellPath:       "/bin/zsh",
+	}
+	res, err := tool.Invoke(context.Background(), Call{Arguments: mustJSON(map[string]any{"args": []string{"web", "ai"}})})
+	if err != nil {
+		t.Fatalf("expected recoverable run failure, got error: %v", err)
+	}
+	if !strings.Contains(string(res.Output), "learn-before-run") {
+		t.Fatalf("unexpected output: %s", string(res.Output))
+	}
+}

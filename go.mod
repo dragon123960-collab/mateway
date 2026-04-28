@@ -8,6 +8,7 @@ require (
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
+	golang.org/x/time v0.14.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

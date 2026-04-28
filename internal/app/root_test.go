@@ -159,6 +159,7 @@ demo
 		t.Fatal(err)
 	}
 	if !bytes.Contains(out.Bytes(), []byte("Local interactive session")) ||
+		!bytes.Contains(out.Bytes(), []byte("/new")) ||
 		!bytes.Contains(out.Bytes(), []byte("/tools")) ||
 		!bytes.Contains(out.Bytes(), []byte("demo-skill [doc]")) ||
 		!bytes.Contains(out.Bytes(), []byte("read_file [builtin]")) {
@@ -329,6 +330,41 @@ func TestRunScheduleCommands(t *testing.T) {
 	}
 	if !bytes.Contains(out.Bytes(), []byte("removed")) {
 		t.Fatalf("unexpected remove output: %s", out.String())
+	}
+}
+
+func TestRunMemoryRebuildCommand(t *testing.T) {
+	home := filepath.Join(t.TempDir(), ".mateway")
+	t.Setenv(config.EnvHome, home)
+
+	var out bytes.Buffer
+	if err := Run(context.Background(), []string{"init"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(home, "workspace", "memory", "sessions", "legacy.jsonl")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"memory", "rebuild", "--force", "--drop-all"}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy memory to be removed, got err=%v", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(home, "workspace", "memory", "tasks"),
+		filepath.Join(home, "workspace", "memory", "task_outcomes"),
+		filepath.Join(home, "workspace", "memory", "artifacts"),
+		filepath.Join(home, "workspace", "memory", "lessons"),
+	} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Fatalf("expected rebuilt dir %s: %v", dir, err)
+		}
 	}
 }
 

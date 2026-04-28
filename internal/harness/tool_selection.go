@@ -17,6 +17,7 @@ func progressiveToolDisclosure(goal string, list []tools.Tool) map[string]bool {
 		return nil
 	}
 	query := normalizeToolSelectionText(goal)
+	envBoundCLIGoal := goalSuggestsEnvironmentBoundCLI(query)
 	allowed := map[string]bool{}
 	alwaysAllowTools(allowed)
 	scored := make([]scoredTool, 0, len(list))
@@ -31,9 +32,24 @@ func progressiveToolDisclosure(goal string, list []tools.Tool) map[string]bool {
 		}
 		return scored[i].score > scored[j].score
 	})
+	hasPreferredEnvCLIPath := false
+	if envBoundCLIGoal {
+		for _, entry := range scored {
+			if entry.score <= 0 {
+				continue
+			}
+			if entry.spec.Name == "exec" || entry.spec.Kind == tools.KindCLI {
+				hasPreferredEnvCLIPath = true
+				break
+			}
+		}
+	}
 	kindCount := map[tools.Kind]int{}
 	for _, entry := range scored {
 		if entry.score <= 0 {
+			continue
+		}
+		if envBoundCLIGoal && hasPreferredEnvCLIPath && entry.spec.Name == "sandbox_exec" {
 			continue
 		}
 		if shouldSkipByKindQuota(entry.spec, kindCount) {
@@ -93,6 +109,17 @@ func scoreToolForGoal(goal string, spec tools.Spec) int {
 	envBoundCLIGoal := goalSuggestsEnvironmentBoundCLI(goal)
 	if strings.Contains(searchBlob, "memory") || strings.Contains(searchBlob, "wiki") || strings.Contains(searchBlob, "history") {
 		score += 2
+	}
+	if goalSuggestsScheduleInspection(goal) {
+		switch spec.Name {
+		case "schedule_list":
+			score += 24
+		case "schedule_get", "schedule_runs":
+			score += 20
+		}
+		if strings.Contains(searchBlob, "memory") || strings.Contains(searchBlob, "wiki") || strings.Contains(searchBlob, "history") {
+			score -= 4
+		}
 	}
 	for _, token := range extractToolSelectionTokens(goal) {
 		switch {
@@ -243,5 +270,32 @@ func goalSuggestsEnvironmentBoundCLI(goal string) bool {
 		"用户目录",
 		"home",
 		"~/.",
+	)
+}
+
+func goalSuggestsScheduleInspection(goal string) bool {
+	if strings.HasPrefix(strings.TrimSpace(goal), "/schedule") {
+		return true
+	}
+	if !containsAny(goal, "定时", "提醒", "schedule", "cron", "自动执行", "自动运行") {
+		return false
+	}
+	return containsAny(goal,
+		"执行了吗",
+		"执行情况",
+		"状态",
+		"结果",
+		"成果",
+		"输出",
+		"日志",
+		"历史",
+		"列出来",
+		"查看",
+		"list",
+		"status",
+		"result",
+		"output",
+		"history",
+		"runs",
 	)
 }

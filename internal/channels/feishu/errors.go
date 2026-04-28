@@ -7,6 +7,7 @@ import (
 
 	agentharness "github.com/dongping/mateway/internal/harness"
 	"github.com/dongping/mateway/internal/llm"
+	"github.com/dongping/mateway/internal/textutil"
 )
 
 func formatRuntimeError(err error) string {
@@ -16,10 +17,12 @@ func formatRuntimeError(err error) string {
 	if errors.Is(err, agentharness.ErrSessionBusy) {
 		return "上一条消息还在处理中，等我先收尾这一轮。"
 	}
-	msg := strings.TrimSpace(err.Error())
+	raw := strings.TrimSpace(err.Error())
+	msg := strings.TrimSpace(textutil.HumanizeRunError(raw))
 	lowered := strings.ToLower(msg)
+	loweredRaw := strings.ToLower(raw)
 	switch {
-	case looksLikeToolFailure(lowered):
+	case looksLikeToolFailure(lowered) || looksLikeToolFailure(loweredRaw):
 		return fmt.Sprintf("工具当前不可用：%s\n\n你仍然可以使用：\n- /skills\n- /run <skill-name>\n- /trace", msg)
 	case llm.LooksLikeQuotaExceeded(err):
 		return fmt.Sprintf("模型供应侧额度已用尽：%s\n\n建议稍后重试，或切到备用模型链。\n\n你仍然可以使用：\n- /skills\n- /run <skill-name>\n- /trace", msg)
@@ -39,6 +42,7 @@ func looksLikeToolFailure(msg string) bool {
 		"web search",
 		"browser fetch",
 		"tool ",
+		"工具运行失败",
 		"sandbox_exec",
 		"external cli",
 		"dangerous command",

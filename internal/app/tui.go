@@ -92,11 +92,13 @@ func handleLocalSlashCommand(ctx context.Context, stdout io.Writer, runner *agen
 		_, _ = fmt.Fprintln(stdout, "可用命令:")
 		printAnnotatedSlashCommands(stdout, []slashCommandHelp{
 			{Command: "/help", Summary: "查看本地命令说明"},
+			{Command: "/new", Summary: "重置当前本地 session 的历史与偏好"},
 			{Command: "/skills", Summary: "列出 skills 目录里的技能清单"},
 			{Command: "/tools", Summary: "列出当前 session 可见的工具与能力"},
 			{Command: "/runs", Summary: "查看最近 run"},
 			{Command: "/trace [run_id]", Summary: "查看执行轨迹"},
 			{Command: "/learn [run_id]", Summary: "查看学习摘要"},
+			{Command: "/learn_apply <run_id> [proposal_id]", Summary: "批准并落盘学习建议"},
 			{Command: "/agent <name>", Summary: "切换当前 session 的 agent"},
 			{Command: "/run <tool-or-skill> [json]", Summary: "执行可调用 tool 或 executable skill"},
 			{Command: "/exit", Summary: "退出本地会话"},
@@ -104,6 +106,16 @@ func handleLocalSlashCommand(ctx context.Context, stdout io.Writer, runner *agen
 		return true, nil
 	case text == "/exit" || text == "/quit":
 		_, _ = fmt.Fprintln(stdout, "退出本地会话。")
+		return true, nil
+	case text == "/new":
+		if runner.SessionBusy(sessionKey) {
+			_, _ = fmt.Fprintln(stdout, "当前 session 正在处理中，请稍后再试 /new。")
+			return true, nil
+		}
+		if err := runner.ResetSession(ctx, sessionKey); err != nil {
+			return true, err
+		}
+		_, _ = fmt.Fprintln(stdout, "已重置当前本地 session。")
 		return true, nil
 	case text == "/skills":
 		return true, printLocalSkills(stdout, catalog)
@@ -122,6 +134,24 @@ func handleLocalSlashCommand(ctx context.Context, stdout io.Writer, runner *agen
 		return true, nil
 	case strings.HasPrefix(text, "/learn "):
 		_, _ = fmt.Fprintln(stdout, localLearnReply(ctx, runner, sessionKey, strings.TrimSpace(strings.TrimPrefix(text, "/learn "))))
+		return true, nil
+	case strings.HasPrefix(text, "/learn_apply"):
+		parts := strings.Fields(text)
+		if len(parts) < 2 {
+			_, _ = fmt.Fprintln(stdout, "用法: /learn_apply <run-id> [proposal-id]")
+			return true, nil
+		}
+		proposalID := ""
+		if len(parts) > 2 {
+			proposalID = parts[2]
+		}
+		applied, err := runner.ApplyLearningProposal(ctx, parts[1], proposalID, sessionKey)
+		if err != nil {
+			return true, err
+		}
+		for _, proposal := range applied {
+			_, _ = fmt.Fprintf(stdout, "已应用 %s [%s] -> %s\n", proposal.ID, proposal.Kind, appFirstNonEmpty(proposal.TargetPath, "-"))
+		}
 		return true, nil
 	case strings.HasPrefix(text, "/agent "):
 		name := strings.TrimSpace(strings.TrimPrefix(text, "/agent "))
@@ -196,7 +226,7 @@ func printLocalVisibleTools(ctx context.Context, stdout io.Writer, runner *agent
 }
 
 func printLocalRuns(ctx context.Context, stdout io.Writer, runner *agentharness.Harness, sessionKey string) error {
-	runs, err := runner.ListRuns(ctx, sessionKey, 10)
+	runs, err := runner.ListTaskRuns(ctx, sessionKey, 10)
 	if err != nil {
 		return err
 	}
@@ -205,7 +235,7 @@ func printLocalRuns(ctx context.Context, stdout io.Writer, runner *agentharness.
 		return nil
 	}
 	for _, run := range runs {
-		_, _ = fmt.Fprintf(stdout, "- %s  %s  %s\n", run.ID, run.Status, appFirstNonEmpty(run.Route, run.Mode, "-"))
+		_, _ = fmt.Fprintf(stdout, "- %s  task=%s  %s\n", run.ID, appFirstNonEmpty(strings.TrimSpace(run.TaskID), "-"), agentharness.FormatTaskDigest(run))
 	}
 	return nil
 }
@@ -317,35 +347,7 @@ func localLearnReply(ctx context.Context, runner *agentharness.Harness, sessionK
 	if !ok {
 		return errMsg
 	}
-	lines := []string{
-		fmt.Sprintf("run `%s` 学习摘要", run.ID),
-		fmt.Sprintf("status: %s", appFirstNonEmpty(run.Status, "-")),
-		fmt.Sprintf("route: %s", appFirstNonEmpty(run.Route, "-")),
-	}
-	if run.ModelName != "" {
-		lines = append(lines, fmt.Sprintf("model: %s", run.ModelName))
-	}
-	if run.Goal != "" {
-		lines = append(lines, "任务目标: "+localTrimBlock(run.Goal))
-	}
-	if len(run.VisibleTools) > 0 {
-		lines = append(lines, "当前可见能力: "+strings.Join(run.VisibleTools, ", "))
-	}
-	if plan := localFirstStepByKinds(run.Steps, "dev_plan", "plan"); plan != nil {
-		lines = append(lines, "", "初始分解:", localTrimBlock(plan.Output))
-	}
-	if execution := localCollectExecutionNarrative(run.Steps); len(execution) > 0 {
-		lines = append(lines, "", "执行过程:")
-		lines = append(lines, execution...)
-	}
-	if fallbacks := localCollectFallbackNarrative(run.Steps, run.Error); len(fallbacks) > 0 {
-		lines = append(lines, "", "失败与切换:")
-		lines = append(lines, fallbacks...)
-	}
-	if run.Result != "" {
-		lines = append(lines, "", "最终输出:", localTrimBlock(run.Result))
-	}
-	return strings.Join(lines, "\n")
+	return agentharness.FormatLearnReport(run)
 }
 
 func loadLocalTraceRun(ctx context.Context, runner *agentharness.Harness, sessionKey, runID string) (agentharness.Run, bool, string) {
@@ -356,7 +358,7 @@ func loadLocalTraceRun(ctx context.Context, runner *agentharness.Harness, sessio
 		}
 		return run, true, ""
 	}
-	runs, err := runner.ListRuns(ctx, sessionKey, 1)
+	runs, err := runner.ListTaskRuns(ctx, sessionKey, 1)
 	if err != nil {
 		return agentharness.Run{}, false, fmt.Sprintf("读取 trace 失败：%v", err)
 	}

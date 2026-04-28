@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/memory"
@@ -84,7 +85,55 @@ func TestBuiltinProviderReadWriteAndProvision(t *testing.T) {
 	if !strings.Contains(content, "daily-report") || !strings.Contains(content, `cron="0 10 * * *"`) {
 		t.Fatalf("unexpected schedule list output: %q", content)
 	}
-	if _, err := index["schedule_remove"].Invoke(context.Background(), Call{Arguments: mustJSON(map[string]any{"name": "daily-report"})}); err != nil {
+	scheduleHistoryStore := scheduler.Store{Workspace: root}
+	dailyReportJob, ok, err := scheduleHistoryStore.Get("daily-report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected daily-report schedule to exist")
+	}
+	if err := scheduleHistoryStore.AppendRun(dailyReportJob, "completed", "run_1", "task_1", time.Second, nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err = index["schedule_runs"].Invoke(context.Background(), Call{Arguments: mustJSON(map[string]any{"name": "daily-report"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(res.Output, &content); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, `"job_name":"daily-report"`) {
+		t.Fatalf("unexpected schedule runs output: %q", content)
+	}
+
+	if _, err := index["schedule_update"].Invoke(context.Background(), Call{Arguments: mustJSON(map[string]any{
+		"name":     "daily-report",
+		"new_name": "daily-plan",
+		"expr":     "30 9 * * *",
+		"tz":       "Asia/Shanghai",
+		"prompt":   "plan today",
+	})}); err != nil {
+		t.Fatal(err)
+	}
+	scheduleStore := scheduler.Store{Workspace: root}
+	job, ok, err := scheduleStore.Get("daily-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected updated schedule to exist")
+	}
+	if job.Schedule.Expr != "30 9 * * *" || job.Prompt != "plan today" {
+		t.Fatalf("unexpected updated schedule: %#v", job)
+	}
+	if _, ok, err := scheduleStore.Get("daily-report"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("expected old schedule name to be replaced")
+	}
+
+	if _, err := index["schedule_remove"].Invoke(context.Background(), Call{Arguments: mustJSON(map[string]any{"name": "daily-plan"})}); err != nil {
 		t.Fatal(err)
 	}
 	res, err = index["schedule_list"].Invoke(context.Background(), Call{Arguments: mustJSON(map[string]any{})})
@@ -94,7 +143,7 @@ func TestBuiltinProviderReadWriteAndProvision(t *testing.T) {
 	if err := json.Unmarshal(res.Output, &content); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(content, "daily-report") {
+	if strings.Contains(content, "daily-plan") {
 		t.Fatalf("expected schedule to be removed, got %q", content)
 	}
 
@@ -108,8 +157,7 @@ func TestBuiltinProviderReadWriteAndProvision(t *testing.T) {
 	})}); err != nil {
 		t.Fatal(err)
 	}
-	scheduleStore := scheduler.Store{Workspace: root}
-	job, ok, err := scheduleStore.Get("follow-up")
+	job, ok, err = scheduleStore.Get("follow-up")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +166,14 @@ func TestBuiltinProviderReadWriteAndProvision(t *testing.T) {
 	}
 	if job.SessionKey != "feishu:p2p:u1" || job.AgentName != "writer" {
 		t.Fatalf("unexpected target resolution: %#v", job)
+	}
+}
+
+func TestCommandNameVariantsSuggestHyphenatedCLI(t *testing.T) {
+	variants := commandNameVariants("larkcli")
+	joined := strings.Join(variants, ",")
+	if !strings.Contains(joined, "lark-cli") {
+		t.Fatalf("expected lark-cli variant, got %q", joined)
 	}
 }
 

@@ -47,6 +47,7 @@ type JobState struct {
 	LastDurationMs    int64     `json:"last_duration_ms,omitempty"`
 	ConsecutiveErrors int       `json:"consecutive_errors,omitempty"`
 	LastRunID         string    `json:"last_run_id,omitempty"`
+	LastTaskID        string    `json:"last_task_id,omitempty"`
 }
 
 type Job struct {
@@ -73,6 +74,7 @@ type runRecord struct {
 	Error       string `json:"error,omitempty"`
 	DurationMs  int64  `json:"duration_ms,omitempty"`
 	RunID       string `json:"run_id,omitempty"`
+	TaskID      string `json:"task_id,omitempty"`
 	NextRunAtMs int64  `json:"next_run_at_ms,omitempty"`
 }
 
@@ -100,6 +102,26 @@ type legacyJob struct {
 func (s Store) Save(job Job) error {
 	_, _, err := s.Upsert(job)
 	return err
+}
+
+func (s Store) SaveRuntimeState(job Job) error {
+	now := time.Now()
+	if err := job.Normalize(now); err != nil {
+		return err
+	}
+	jobs, err := s.List()
+	if err != nil {
+		return err
+	}
+	for i := range jobs {
+		if sameJob(jobs[i], job) {
+			job.ID = jobs[i].ID
+			job.CreatedAt = jobs[i].CreatedAt
+			jobs[i] = job
+			return s.writeAll(jobs)
+		}
+	}
+	return fmt.Errorf("schedule %q not found", firstNonEmpty(job.Name, job.ID))
 }
 
 func (s Store) Upsert(job Job) (Job, string, error) {
@@ -274,7 +296,7 @@ func (s Store) Remove(name string) error {
 	return nil
 }
 
-func (s Store) AppendRun(job Job, status, runID string, duration time.Duration, runErr error) error {
+func (s Store) AppendRun(job Job, status, runID, taskID string, duration time.Duration, runErr error) error {
 	if strings.TrimSpace(job.Name) == "" {
 		return nil
 	}
@@ -288,6 +310,7 @@ func (s Store) AppendRun(job Job, status, runID string, duration time.Duration, 
 		Error:       trimInline(firstNonEmpty(errorString(runErr), job.State.LastError), 600),
 		DurationMs:  duration.Milliseconds(),
 		RunID:       strings.TrimSpace(runID),
+		TaskID:      strings.TrimSpace(taskID),
 		NextRunAtMs: job.State.NextRunAt.UnixMilli(),
 	}
 	data, err := json.Marshal(record)

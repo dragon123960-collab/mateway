@@ -10,8 +10,9 @@ import (
 )
 
 type Preferences struct {
-	AgentName string    `json:"agent_name,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	AgentName   string    `json:"agent_name,omitempty"`
+	LastResetAt time.Time `json:"last_reset_at,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 func (s *Store) SavePreferences(sessionKey string, prefs Preferences) error {
@@ -26,6 +27,11 @@ func (s *Store) SavePreferences(sessionKey string, prefs Preferences) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create session prefs dir: %w", err)
 	}
+	if existing, err := s.loadPreferencesUnlocked(sessionKey); err == nil {
+		if prefs.LastResetAt.IsZero() {
+			prefs.LastResetAt = existing.LastResetAt
+		}
+	}
 	if prefs.UpdatedAt.IsZero() {
 		prefs.UpdatedAt = time.Now()
 	}
@@ -33,7 +39,7 @@ func (s *Store) SavePreferences(sessionKey string, prefs Preferences) error {
 	if err != nil {
 		return fmt.Errorf("encode session prefs: %w", err)
 	}
-	path := filepath.Join(dir, sanitize(sessionKey)+".json")
+	path := s.preferencesFilePath(sessionKey)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write session prefs: %w", err)
 	}
@@ -45,7 +51,13 @@ func (s *Store) LoadPreferences(sessionKey string) (Preferences, error) {
 	if sessionKey == "" {
 		return Preferences{}, nil
 	}
-	path := filepath.Join(filepath.Dir(s.root), "agents", sanitize(sessionKey)+".json")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadPreferencesUnlocked(sessionKey)
+}
+
+func (s *Store) loadPreferencesUnlocked(sessionKey string) (Preferences, error) {
+	path := s.preferencesFilePath(sessionKey)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

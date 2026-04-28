@@ -67,7 +67,7 @@ Use this skill for SQL and schema tasks.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsString(effective.VisibleSkills, "frontend-design") || !containsString(effective.VisibleSkills, "db-manager") {
+	if !testContainsString(effective.VisibleSkills, "frontend-design") || !testContainsString(effective.VisibleSkills, "db-manager") {
 		t.Fatalf("expected catalog skills to be visible, got %#v", effective.VisibleSkills)
 	}
 
@@ -90,7 +90,7 @@ Use this skill for SQL and schema tasks.
 	}
 }
 
-func containsString(list []string, target string) bool {
+func testContainsString(list []string, target string) bool {
 	for _, item := range list {
 		if item == target {
 			return true

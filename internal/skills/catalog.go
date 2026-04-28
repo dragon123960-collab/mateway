@@ -252,7 +252,7 @@ func validateRuntimeMetadata(meta RuntimeMetadata) error {
 func parseSkillMarkdown(data []byte, fallbackName string) (Manifest, string, error) {
 	text := strings.TrimSpace(string(data))
 	manifest := Manifest{
-		Name:     strings.TrimSpace(fallbackName),
+		Name:     inferSkillNameFromMarkdown(text, fallbackName),
 		Metadata: map[string]any{},
 	}
 	if strings.HasPrefix(text, "---\n") {
@@ -267,8 +267,12 @@ func parseSkillMarkdown(data []byte, fallbackName string) (Manifest, string, err
 				License       string         `yaml:"license"`
 				Compatibility string         `yaml:"compatibility"`
 				AllowedTools  []string       `yaml:"allowed-tools"`
+				AllowedTools2 []string       `yaml:"allowed_tools"`
+				Tools         []string       `yaml:"tools"`
 				ResourceDirs  []string       `yaml:"resource_dirs"`
 				ResourceDirs2 []string       `yaml:"resource-dirs"`
+				Tags          []string       `yaml:"tags"`
+				Keywords      []string       `yaml:"keywords"`
 				Context       string         `yaml:"context"`
 				Agent         string         `yaml:"agent"`
 				Model         string         `yaml:"model"`
@@ -285,13 +289,19 @@ func parseSkillMarkdown(data []byte, fallbackName string) (Manifest, string, err
 			manifest.Homepage = strings.TrimSpace(fm.Homepage)
 			manifest.License = strings.TrimSpace(fm.License)
 			manifest.Compatibility = strings.TrimSpace(fm.Compatibility)
-			manifest.AllowedTools = append([]string(nil), fm.AllowedTools...)
+			manifest.AllowedTools = append(append(append([]string(nil), fm.AllowedTools...), fm.AllowedTools2...), fm.Tools...)
 			manifest.ResourceDirs = append(append([]string(nil), fm.ResourceDirs...), fm.ResourceDirs2...)
 			manifest.Context = strings.TrimSpace(fm.Context)
 			manifest.Agent = strings.TrimSpace(fm.Agent)
 			manifest.Model = strings.TrimSpace(fm.Model)
 			if len(fm.Metadata) > 0 {
 				manifest.Metadata = fm.Metadata
+			}
+			if len(fm.Tags) > 0 {
+				manifest.Tags = append(manifest.Tags, fm.Tags...)
+			}
+			if len(fm.Keywords) > 0 {
+				manifest.Tags = append(manifest.Tags, fm.Keywords...)
 			}
 			text = strings.TrimSpace(parts[1])
 		}
@@ -321,6 +331,12 @@ func loadRuntimeMetadata(path string) (RuntimeMetadata, bool, error) {
 }
 
 func inferSkillDescription(markdown string) string {
+	if desc := extractSkillSectionText(markdown, "use this when", "use when", "trigger", "when to use"); desc != "" {
+		return truncateSkillInline(desc, 180)
+	}
+	if desc := extractSkillSectionText(markdown, "description", "overview", "purpose"); desc != "" {
+		return truncateSkillInline(desc, 180)
+	}
 	for _, line := range strings.Split(markdown, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -335,6 +351,67 @@ func inferSkillDescription(markdown string) string {
 		return line
 	}
 	return "Workspace skill"
+}
+
+func inferSkillNameFromMarkdown(markdown, fallbackName string) string {
+	name := strings.TrimSpace(fallbackName)
+	for _, line := range strings.Split(markdown, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") {
+			title := strings.TrimSpace(strings.TrimPrefix(line, "# "))
+			if title != "" {
+				return title
+			}
+		}
+	}
+	return name
+}
+
+func extractSkillSectionText(markdown string, headings ...string) string {
+	lines := strings.Split(markdown, "\n")
+	lookup := map[string]bool{}
+	for _, heading := range headings {
+		lookup[strings.ToLower(strings.TrimSpace(heading))] = true
+	}
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "#") {
+			continue
+		}
+		heading := strings.ToLower(strings.TrimSpace(strings.TrimLeft(line, "#")))
+		if !lookup[heading] {
+			continue
+		}
+		chunk := make([]string, 0, 4)
+		for j := i + 1; j < len(lines); j++ {
+			next := strings.TrimSpace(lines[j])
+			if strings.HasPrefix(next, "#") {
+				break
+			}
+			if next == "" {
+				if len(chunk) > 0 {
+					break
+				}
+				continue
+			}
+			chunk = append(chunk, strings.TrimLeft(next, "-* "))
+			if len(strings.Join(chunk, " ")) >= 180 {
+				break
+			}
+		}
+		if len(chunk) > 0 {
+			return strings.Join(chunk, " ")
+		}
+	}
+	return ""
+}
+
+func truncateSkillInline(value string, limit int) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	if limit > 0 && len(value) > limit {
+		return value[:limit]
+	}
+	return value
 }
 
 func (c *Catalog) Snapshot() []Skill {

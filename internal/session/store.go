@@ -3,6 +3,7 @@ package session
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,7 +39,7 @@ func (s *Store) Append(sessionKey string, messages ...Message) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return fmt.Errorf("create session dir: %w", err)
 	}
-	path := filepath.Join(s.root, sanitize(sessionKey)+".jsonl")
+	path := s.sessionFilePath(sessionKey)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open session file: %w", err)
@@ -65,7 +66,7 @@ func (s *Store) LoadRecent(sessionKey string, limit int) ([]Message, error) {
 	if sessionKey == "" || limit <= 0 {
 		return nil, nil
 	}
-	path := filepath.Join(s.root, sanitize(sessionKey)+".jsonl")
+	path := s.sessionFilePath(sessionKey)
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -98,6 +99,46 @@ func (s *Store) LoadRecent(sessionKey string, limit int) ([]Message, error) {
 		return items, nil
 	}
 	return append([]Message(nil), items[len(items)-limit:]...), nil
+}
+
+func (s *Store) Reset(sessionKey string) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var errs []error
+	if err := os.Remove(s.sessionFilePath(sessionKey)); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(s.preferencesFilePath(sessionKey)), 0o755); err != nil {
+		errs = append(errs, err)
+	} else {
+		state := Preferences{
+			LastResetAt: time.Now(),
+			UpdatedAt:   time.Now(),
+		}
+		data, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := os.WriteFile(s.preferencesFilePath(sessionKey), data, 0o644); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Store) sessionFilePath(sessionKey string) string {
+	return filepath.Join(s.root, sanitize(sessionKey)+".jsonl")
+}
+
+func (s *Store) preferencesFilePath(sessionKey string) string {
+	return filepath.Join(filepath.Dir(s.root), "agents", sanitize(sessionKey)+".json")
 }
 
 var unsafeSessionChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)

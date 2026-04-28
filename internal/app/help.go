@@ -20,6 +20,8 @@ var topLevelHelpEntries = []helpEntry{
 	{Command: "gateway restart", Summary: "Restart the managed gateway on macOS"},
 	{Command: "logs show", Summary: "Show recent gateway log lines"},
 	{Command: "logs follow", Summary: "Follow gateway logs in real time"},
+	{Command: "logs structured [--run id] [--session key] [--channel name] [--json]", Summary: "Show structured runtime JSONL events"},
+	{Command: "logs diagnostics", Summary: "Show structured log diagnostics"},
 	{Command: "logs path", Summary: "Print the gateway log file paths"},
 	{Command: "doctor", Summary: "Check config, models, channels, and skill catalog health"},
 	{Command: "workspace create <name>", Summary: "Create a named workspace under ~/.mateway/workspaces"},
@@ -43,6 +45,7 @@ var topLevelHelpEntries = []helpEntry{
 	{Command: "schedule remove <name>", Summary: "Remove a scheduler job"},
 	{Command: "schedule run <name>", Summary: "Run a scheduler job immediately"},
 	{Command: "schedule runs <name>", Summary: "Show scheduler run history"},
+	{Command: "memory rebuild --force --drop-all", Summary: "Clear and rebuild workspace memory layout"},
 	{Command: "run list [session-key]", Summary: "List recent runs"},
 	{Command: "run get <run-id>", Summary: "Dump a run as JSON"},
 	{Command: "version", Summary: "Show build version"},
@@ -81,6 +84,8 @@ func printCommandHelp(w io.Writer, topic string) bool {
 			[]string{
 				"mateway logs show",
 				"mateway logs follow",
+				"mateway logs structured --run <run-id> --json",
+				"mateway logs diagnostics",
 				"mateway logs path",
 			},
 		)
@@ -111,10 +116,18 @@ func printCommandHelp(w io.Writer, topic string) bool {
 				"mateway schedule runs <name>",
 			},
 		)
+	case "memory":
+		printFocusedHelp(w,
+			"memory",
+			"Rebuild the workspace memory layout. This is destructive when used with --drop-all.",
+			[]string{
+				"mateway memory rebuild --force --drop-all",
+			},
+		)
 	case "tui":
 		printFocusedHelp(w,
 			"tui",
-			"Open the local terminal session with slash commands such as /skills, /tools, /trace, and /learn.",
+			"Open the local terminal session with slash commands such as /new, /skills, /tools, /trace, and /learn.",
 			[]string{
 				"mateway tui",
 			},

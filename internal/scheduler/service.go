@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
 type RunResult struct {
 	RunID  string
+	TaskID string
 	Status string
 	Error  string
 }
@@ -20,9 +22,12 @@ type JobRunner interface {
 type Service struct {
 	Store  Store
 	Runner JobRunner
+
+	mu       sync.Mutex
+	inFlight map[string]struct{}
 }
 
-func (s Service) Start(ctx context.Context) error {
+func (s *Service) Start(ctx context.Context) error {
 	if s.Runner == nil {
 		return nil
 	}
@@ -41,7 +46,7 @@ func (s Service) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s Service) RunNow(ctx context.Context, name string) (Job, error) {
+func (s *Service) RunNow(ctx context.Context, name string) (Job, error) {
 	job, ok, err := s.Store.Get(name)
 	if err != nil {
 		return Job{}, err
@@ -49,20 +54,30 @@ func (s Service) RunNow(ctx context.Context, name string) (Job, error) {
 	if !ok {
 		return Job{}, fmt.Errorf("schedule %q not found", name)
 	}
+	if !s.markRunning(job) {
+		return Job{}, fmt.Errorf("schedule %q is already running", name)
+	}
+	defer s.markFinished(job)
 	return s.runJob(ctx, job, time.Now(), true)
 }
 
-func (s Service) runDue(ctx context.Context, now time.Time) {
+func (s *Service) runDue(ctx context.Context, now time.Time) {
 	jobs, err := s.Store.Due(now)
 	if err != nil {
 		return
 	}
 	for _, job := range jobs {
-		_, _ = s.runJob(ctx, job, now, false)
+		if !s.markRunning(job) {
+			continue
+		}
+		go func(job Job) {
+			defer s.markFinished(job)
+			_, _ = s.runJob(ctx, job, now, false)
+		}(job)
 	}
 }
 
-func (s Service) runJob(ctx context.Context, job Job, now time.Time, force bool) (Job, error) {
+func (s *Service) runJob(ctx context.Context, job Job, now time.Time, force bool) (Job, error) {
 	if s.Runner == nil {
 		return job, nil
 	}
@@ -77,6 +92,7 @@ func (s Service) runJob(ctx context.Context, job Job, now time.Time, force bool)
 	job.State.LastRunAt = startedAt
 	job.State.LastDurationMs = finishedAt.Sub(startedAt).Milliseconds()
 	job.State.LastRunID = stringsOr(result.RunID, "")
+	job.State.LastTaskID = stringsOr(result.TaskID, "")
 
 	status := stringsOr(result.Status, "ok")
 	if err != nil {
@@ -102,8 +118,8 @@ func (s Service) runJob(ctx context.Context, job Job, now time.Time, force bool)
 	}
 	job.UpdatedAt = finishedAt
 
-	saveErr := s.Store.Save(job)
-	appendErr := s.Store.AppendRun(job, status, result.RunID, finishedAt.Sub(startedAt), err)
+	saveErr := s.Store.SaveRuntimeState(job)
+	appendErr := s.Store.AppendRun(job, status, result.RunID, result.TaskID, finishedAt.Sub(startedAt), err)
 	if err != nil {
 		if saveErr != nil {
 			return job, saveErr
@@ -120,6 +136,33 @@ func (s Service) runJob(ctx context.Context, job Job, now time.Time, force bool)
 		return job, appendErr
 	}
 	return job, nil
+}
+
+func (s *Service) markRunning(job Job) bool {
+	key := strings.TrimSpace(stringsOr(job.ID, job.Name))
+	if key == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inFlight == nil {
+		s.inFlight = make(map[string]struct{})
+	}
+	if _, ok := s.inFlight[key]; ok {
+		return false
+	}
+	s.inFlight[key] = struct{}{}
+	return true
+}
+
+func (s *Service) markFinished(job Job) {
+	key := strings.TrimSpace(stringsOr(job.ID, job.Name))
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlight, key)
 }
 
 func stringsOr(values ...string) string {

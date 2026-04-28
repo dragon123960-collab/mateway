@@ -13,7 +13,9 @@ import (
 
 	"github.com/dongping/mateway/internal/config"
 	agentharness "github.com/dongping/mateway/internal/harness"
+	"github.com/dongping/mateway/internal/memory"
 	hostruntime "github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/scheduler"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skills"
 	"github.com/dongping/mateway/internal/textutil"
@@ -34,6 +36,10 @@ type Handler struct {
 	Invoker    SkillInvoker
 	Harness    *agentharness.Harness
 	HTTPClient *http.Client
+	ThreadID   string
+	UserID     string
+	TaskID     string
+	TaskKind   string
 }
 
 type webhookEnvelope struct {
@@ -139,7 +145,21 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 	if text == "" {
 		return ""
 	}
+	if handled, reply := h.handleNaturalApproval(ctx, sessionKey, text); handled {
+		return reply
+	}
 	switch {
+	case text == "/new":
+		if h.Harness == nil {
+			return "当前 runtime 还没有启用 session reset。"
+		}
+		if h.Harness.SessionBusy(sessionKey) {
+			return "当前 session 正在处理中，请稍后再试 `/new`。"
+		}
+		if err := h.Harness.ResetSession(ctx, sessionKey); err != nil {
+			return fmt.Sprintf("重置 session 失败：%v", err)
+		}
+		return "已重置当前 session：对话历史、summary、agent 偏好和待审批项已清空。"
 	case text == "/trace" || text == "/learn":
 		if text == "/learn" {
 			return h.learnReply(ctx, sessionKey, "")
@@ -149,6 +169,29 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		return h.traceReply(ctx, sessionKey, strings.TrimSpace(strings.TrimPrefix(text, "/trace ")))
 	case strings.HasPrefix(text, "/learn "):
 		return h.learnReply(ctx, sessionKey, strings.TrimSpace(strings.TrimPrefix(text, "/learn ")))
+	case strings.HasPrefix(text, "/learn_apply"):
+		if h.Harness == nil {
+			return "当前 runtime 没有启用 learning loop。"
+		}
+		parts := strings.Fields(text)
+		if len(parts) < 2 {
+			return "用法: /learn_apply <run-id> [proposal-id]"
+		}
+		proposalID := ""
+		if len(parts) > 2 {
+			proposalID = parts[2]
+		}
+		applied, err := h.Harness.ApplyLearningProposal(ctx, parts[1], proposalID, sessionKey)
+		if err != nil {
+			return fmt.Sprintf("应用学习建议失败：%v", err)
+		}
+		lines := make([]string, 0, len(applied))
+		for _, proposal := range applied {
+			lines = append(lines, fmt.Sprintf("- %s [%s] -> %s", proposal.ID, proposal.Kind, firstNonEmpty(proposal.TargetPath, "-")))
+		}
+		return "已应用学习建议:\n" + strings.Join(lines, "\n")
+	case text == "/schedule" || strings.HasPrefix(text, "/schedule "):
+		return h.scheduleReply(ctx, text)
 	case strings.HasPrefix(text, "/memory "):
 		if h.Harness == nil {
 			return "当前 runtime 没有启用 memory 检索。"
@@ -185,7 +228,7 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		if h.Harness == nil {
 			return "当前 runtime 没有启用 run 查询。"
 		}
-		runs, err := h.Harness.ListRuns(ctx, sessionKey, 8)
+		runs, err := h.Harness.ListTaskRuns(ctx, sessionKey, 8)
 		if err != nil {
 			return fmt.Sprintf("读取 runs 失败：%v", err)
 		}
@@ -194,7 +237,7 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		}
 		lines := make([]string, 0, len(runs))
 		for _, run := range runs {
-			lines = append(lines, fmt.Sprintf("- %s [%s] %s", run.ID, run.Status, trimBlock(firstNonEmpty(run.ToolName, run.Mode))))
+			lines = append(lines, fmt.Sprintf("- %s task=%s %s", run.ID, firstNonEmpty(strings.TrimSpace(run.TaskID), "-"), agentharness.FormatTaskDigest(run)))
 		}
 		return "最近 runs:\n" + strings.Join(lines, "\n")
 	case strings.HasPrefix(text, "/run_status "):
@@ -221,7 +264,7 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		if !ok || strings.TrimSpace(note.Content) == "" {
 			return "当前 session 还没有 summary。"
 		}
-		return note.Content
+		return trimBlock(note.Content)
 	case text == "/last":
 		if h.Harness == nil {
 			return "当前 runtime 没有启用记忆召回。"
@@ -230,10 +273,28 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		if err != nil {
 			return fmt.Sprintf("读取记忆失败：%v", err)
 		}
-		if !ok || strings.TrimSpace(note.Content) == "" {
-			return "我这里还没有这条 session 的近期记录。"
+		if ok {
+			if digest := metadataString(note.Metadata, "latest_task_digest"); strings.TrimSpace(digest) != "" {
+				return "最近任务:\n" + trimBlock(digest)
+			}
 		}
-		return "上次进度:\n" + note.Content
+		if tasks, taskErr := h.Harness.Memory.RecentTaskRecordsBySession(ctx, sessionKey, 1); taskErr == nil && len(tasks) > 0 {
+			return "最近任务:\n" + trimBlock(agentharness.FormatTaskDigest(agentharness.Run{
+				TaskID:   tasks[0].TaskID,
+				Goal:     tasks[0].Goal,
+				Status:   tasks[0].Status,
+				Result:   tasks[0].Completion.Summary,
+				TaskType: tasks[0].TaskType,
+			}))
+		}
+		runs, runsErr := h.Harness.ListTaskRuns(ctx, sessionKey, 1)
+		if runsErr == nil && len(runs) > 0 {
+			return "最近任务:\n" + agentharness.FormatTaskDigest(runs[0])
+		}
+		if !ok || strings.TrimSpace(note.Content) == "" {
+			return "我这里还没有这条 session 的近期任务记录。"
+		}
+		return "最近任务:\n" + trimBlock(note.Content)
 	case text == "/approvals":
 		if h.Harness == nil {
 			return "当前 runtime 没有启用 approval。"
@@ -244,7 +305,11 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		}
 		lines := make([]string, 0, len(items))
 		for _, item := range items {
-			lines = append(lines, fmt.Sprintf("- %s `%s` (%s)", item.ID, item.ToolName, item.AgentName))
+			lines = append(lines, fmt.Sprintf("- %s tool=%s task=%s agent=%s", item.ID, item.ToolName, firstNonEmpty(strings.TrimSpace(item.TaskID), firstNonEmpty(strings.TrimSpace(item.RunID), "-")), item.AgentName))
+			lines = append(lines, "  危险点："+agentharness.ApprovalRiskSummary(item))
+			if args := agentharness.ApprovalArgumentSummary(item); strings.TrimSpace(args) != "" {
+				lines = append(lines, "  参数："+args)
+			}
 		}
 		return "待批准操作:\n" + strings.Join(lines, "\n")
 	case text == "/approve":
@@ -379,11 +444,21 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		return fmt.Sprintf("`%s` 运行完成。\n%s", name, out)
 	default:
 		if h.Harness != nil {
+			args := map[string]any{}
+			if strings.TrimSpace(h.TaskID) != "" {
+				args["task_id"] = strings.TrimSpace(h.TaskID)
+			}
+			if strings.TrimSpace(h.TaskKind) != "" {
+				args["task_kind"] = strings.TrimSpace(h.TaskKind)
+			}
 			run, err := h.Harness.Start(ctx, agentharness.Request{
 				SessionKey: sessionKey,
+				ThreadID:   strings.TrimSpace(firstNonEmpty(h.ThreadID, sessionKey)),
+				UserID:     strings.TrimSpace(h.UserID),
 				Channel:    "feishu",
 				UserText:   text,
 				Mode:       "chat",
+				Arguments:  args,
 			}, nil)
 			if err == nil {
 				return run.Result
@@ -392,6 +467,169 @@ func (h Handler) handleText(ctx context.Context, sessionKey, text string) string
 		}
 		return fmt.Sprintf("%s 已收到：%s\n\n当前基础版支持：\n- /skills 查看技能目录\n- /tools 查看当前能力\n- /run <skill-name> 执行技能", h.Config.BotName, text)
 	}
+}
+
+func (h Handler) scheduleReply(_ context.Context, text string) string {
+	if h.Harness == nil {
+		return "当前 runtime 没有启用 schedule 查询。"
+	}
+	if strings.TrimSpace(h.Harness.Workspace) == "" {
+		return "当前 runtime 没有可用的 workspace，无法读取定时任务。"
+	}
+	store := scheduler.Store{Workspace: h.Harness.Workspace}
+	switch {
+	case text == "/schedule" || text == "/schedule help":
+		return "用法:\n- /schedule list\n- /schedule get <name>\n- /schedule runs <name>"
+	case text == "/schedule list":
+		items, err := store.List()
+		if err != nil {
+			return fmt.Sprintf("读取定时任务失败：%v", err)
+		}
+		if len(items) == 0 {
+			return "当前没有定时任务。"
+		}
+		lines := make([]string, 0, len(items))
+		for _, item := range items {
+			line := fmt.Sprintf("%s enabled=%t schedule=%s next=%s status=%s",
+				item.Name, item.Enabled, item.Description(), item.State.NextRunAt.Format(time.RFC3339), item.LastStatus())
+			if snippet := h.scheduleTaskSnippet(item); snippet != "" {
+				line += " " + snippet
+			}
+			lines = append(lines, line)
+		}
+		return "当前定时任务:\n" + strings.Join(lines, "\n")
+	case strings.HasPrefix(text, "/schedule get "):
+		name := strings.TrimSpace(strings.TrimPrefix(text, "/schedule get "))
+		if name == "" {
+			return "用法: /schedule get <name>"
+		}
+		job, ok, err := store.Get(name)
+		if err != nil {
+			return fmt.Sprintf("读取定时任务失败：%v", err)
+		}
+		if !ok {
+			return fmt.Sprintf("没有找到定时任务 `%s`。", name)
+		}
+		payload := map[string]any{"job": job}
+		if task := h.loadScheduleTaskRecord(job); task != nil {
+			payload["last_task"] = map[string]any{
+				"task_id":          task.TaskID,
+				"status":           task.Status,
+				"task_type":        task.TaskType,
+				"summary":          task.Completion.Summary,
+				"primary_artifact": taskPrimaryArtifact(task),
+				"delivery_status":  firstNonEmpty(task.DeliveryStatus, task.Completion.DeliveryStatus),
+			}
+		}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return fmt.Sprintf("序列化定时任务失败：%v", err)
+		}
+		return trimBlock(string(data))
+	case strings.HasPrefix(text, "/schedule runs "):
+		name := strings.TrimSpace(strings.TrimPrefix(text, "/schedule runs "))
+		if name == "" {
+			return "用法: /schedule runs <name>"
+		}
+		lines, err := store.ReadRuns(name, 20)
+		if err != nil {
+			return fmt.Sprintf("读取定时任务运行历史失败：%v", err)
+		}
+		if len(lines) == 0 {
+			return fmt.Sprintf("定时任务 `%s` 还没有运行历史。", name)
+		}
+		reply := "最近运行记录:\n" + strings.Join(lines, "\n")
+		job, ok, err := store.Get(name)
+		if err == nil && ok {
+			if task := h.loadScheduleTaskRecord(job); task != nil {
+				reply += "\n\n最近任务结果:\n"
+				reply += fmt.Sprintf("- task_id: %s\n- status: %s\n- summary: %s", task.TaskID, task.Status, trimBlock(firstNonEmpty(task.Completion.Summary, "(empty)")))
+				if artifact := taskPrimaryArtifact(task); artifact != "" {
+					reply += "\n- primary_artifact: " + artifact
+				}
+			}
+		}
+		return reply
+	default:
+		return "用法:\n- /schedule list\n- /schedule get <name>\n- /schedule runs <name>"
+	}
+}
+
+func (h Handler) loadScheduleTaskRecord(job scheduler.Job) *memory.TaskRecord {
+	if h.Harness == nil || strings.TrimSpace(job.State.LastTaskID) == "" {
+		return nil
+	}
+	record, ok, err := h.Harness.Memory.GetTaskRecord(context.Background(), job.State.LastTaskID)
+	if err != nil || !ok {
+		return nil
+	}
+	return &record
+}
+
+func (h Handler) scheduleTaskSnippet(job scheduler.Job) string {
+	task := h.loadScheduleTaskRecord(job)
+	if task == nil {
+		return ""
+	}
+	parts := []string{"task_id=" + task.TaskID}
+	if artifact := taskPrimaryArtifact(task); artifact != "" {
+		parts = append(parts, "artifact="+artifact)
+	}
+	return strings.Join(parts, " ")
+}
+
+func taskPrimaryArtifact(record *memory.TaskRecord) string {
+	if record == nil || record.Completion.PrimaryArtifact == nil {
+		return ""
+	}
+	return strings.TrimSpace(record.Completion.PrimaryArtifact.PathOrRef)
+}
+
+func (h Handler) handleNaturalApproval(ctx context.Context, sessionKey, text string) (bool, string) {
+	if h.Harness == nil || isSlashCommand(text) {
+		return false, ""
+	}
+	items := h.Harness.ListPending(sessionKey)
+	if len(items) == 0 {
+		return false, ""
+	}
+	decision, ok := detectApprovalIntent(text)
+	if !ok {
+		return false, ""
+	}
+	reply, err := h.Harness.ReviewPending(ctx, sessionKey, "", decision, nil)
+	if err != nil {
+		if decision {
+			return true, fmt.Sprintf("批准失败：%v", err)
+		}
+		return true, fmt.Sprintf("拒绝失败：%v", err)
+	}
+	if h.Harness.Sessions != nil {
+		_ = h.Harness.Sessions.Append(sessionKey,
+			session.Message{Role: "user", Content: text},
+			session.Message{Role: "assistant", Content: reply},
+		)
+		_ = h.Harness.RefreshSessionSummaryForSession(ctx, sessionKey)
+	}
+	return true, reply
+}
+
+func detectApprovalIntent(text string) (bool, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return false, false
+	}
+	for _, token := range []string{"不同意", "不可以", "不批准", "不执行", "先不要", "先别", "取消", "拒绝", "deny", "no", "stop"} {
+		if strings.Contains(normalized, token) {
+			return false, true
+		}
+	}
+	for _, token := range []string{"同意", "可以", "批准", "执行吧", "继续执行", "继续", "确认", "好的执行", "go ahead", "approve", "yes", "ok"} {
+		if strings.Contains(normalized, token) {
+			return true, true
+		}
+	}
+	return false, false
 }
 
 func findSkill(snapshot []skills.Skill, name string) (skills.Skill, bool) {
@@ -459,11 +697,41 @@ func (h Handler) traceReply(ctx context.Context, sessionKey, runID string) strin
 		fmt.Sprintf("agent: %s", firstNonEmpty(run.AgentName, "-")),
 		fmt.Sprintf("mode: %s", firstNonEmpty(run.Mode, "-")),
 	}
+	if run.TaskType != "" {
+		lines = append(lines, fmt.Sprintf("task_type: %s", run.TaskType))
+	}
 	if run.Route != "" {
 		lines = append(lines, fmt.Sprintf("route: %s", run.Route))
 	}
+	if strings.TrimSpace(run.TaskID) != "" && h.Harness != nil {
+		if record, ok, err := h.Harness.Memory.GetTaskRecord(ctx, run.TaskID); err == nil && ok {
+			lines = append(lines, fmt.Sprintf("task_record_status: %s", firstNonEmpty(record.Status, "-")))
+			if artifact := taskPrimaryArtifact(&record); artifact != "" {
+				lines = append(lines, fmt.Sprintf("primary_artifact: %s", artifact))
+			}
+			if summary := strings.TrimSpace(record.Completion.Summary); summary != "" {
+				lines = append(lines, "task_summary: "+trimBlock(summary))
+			}
+		}
+	}
 	if run.ModelName != "" {
 		lines = append(lines, fmt.Sprintf("model: %s", run.ModelName))
+	}
+	if run.ModelAttempts > 0 || run.Model429Count > 0 {
+		lines = append(lines, fmt.Sprintf("model_attempts: %d", run.ModelAttempts))
+		lines = append(lines, fmt.Sprintf("model_429_count: %d", run.Model429Count))
+	}
+	if run.PromptTokens > 0 || run.CompletionTokens > 0 || run.TotalTokens > 0 {
+		lines = append(lines, fmt.Sprintf("tokens: prompt=%d completion=%d total=%d", run.PromptTokens, run.CompletionTokens, run.TotalTokens))
+	}
+	if run.ModelDurationMs > 0 {
+		lines = append(lines, fmt.Sprintf("model_duration_ms: %d", run.ModelDurationMs))
+	}
+	if run.EstimatedCostUSD > 0 {
+		lines = append(lines, fmt.Sprintf("estimated_cost_usd: %.6f", run.EstimatedCostUSD))
+	}
+	if run.ContextCompactions > 0 {
+		lines = append(lines, fmt.Sprintf("context_compactions: %d", run.ContextCompactions))
 	}
 	if run.Goal != "" {
 		lines = append(lines, "goal: "+trimBlock(run.Goal))
@@ -494,6 +762,9 @@ func (h Handler) traceReply(ctx context.Context, sessionKey, runID string) strin
 	}
 	lines = append(lines, "steps:")
 	for _, step := range run.Steps {
+		if shouldSkipTraceStep(step) {
+			continue
+		}
 		head := fmt.Sprintf("%d. %s %s", step.Index, step.Kind, step.Status)
 		if step.AgentName != "" {
 			head += " [" + step.AgentName + "]"
@@ -503,10 +774,10 @@ func (h Handler) traceReply(ctx context.Context, sessionKey, runID string) strin
 		}
 		lines = append(lines, head)
 		if step.Input != "" {
-			lines = append(lines, "in: "+trimBlock(step.Input))
+			lines = append(lines, "in: "+trimBlock(summarizeTraceStepValue(step.Kind, step.Input, 180)))
 		}
 		if step.Output != "" {
-			lines = append(lines, "out: "+trimBlock(step.Output))
+			lines = append(lines, "out: "+trimBlock(summarizeTraceStepValue(step.Kind, step.Output, 220)))
 		}
 	}
 	if run.Result != "" {
@@ -515,51 +786,49 @@ func (h Handler) traceReply(ctx context.Context, sessionKey, runID string) strin
 	return strings.Join(lines, "\n")
 }
 
+func shouldSkipTraceStep(step agentharness.RunStep) bool {
+	switch step.Kind {
+	case "llm":
+		return true
+	default:
+		return false
+	}
+}
+
+func summarizeTraceStepValue(kind, value string, limit int) string {
+	switch strings.TrimSpace(kind) {
+	case "callback_model_end", "respond", "agent_message":
+		clean := strings.TrimSpace(textutil.CleanBlock(value, 0))
+		if clean == "" {
+			return ""
+		}
+		return fmt.Sprintf("生成最终答复（chars=%d）", len([]rune(clean)))
+	case "tool_result":
+		return summarizeTraceBlock(value, limit)
+	case "callback_model_start", "callback_tool_start":
+		return textutil.CleanInline(value, min(120, limit))
+	default:
+		return value
+	}
+}
+
+func summarizeTraceBlock(value string, limit int) string {
+	clean := textutil.CleanBlock(value, 0)
+	for _, line := range strings.Split(clean, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "|---") {
+			return textutil.CleanInline(line, limit)
+		}
+	}
+	return textutil.CleanInline(clean, limit)
+}
+
 func (h Handler) learnReply(ctx context.Context, sessionKey, runID string) string {
 	run, ok, errMsg := h.loadTraceRun(ctx, sessionKey, runID)
 	if !ok {
 		return errMsg
 	}
-	lines := []string{
-		fmt.Sprintf("run `%s` 学习摘要", run.ID),
-		fmt.Sprintf("status: %s", firstNonEmpty(run.Status, "-")),
-		fmt.Sprintf("route: %s", firstNonEmpty(run.Route, "-")),
-	}
-	if run.ModelName != "" {
-		lines = append(lines, fmt.Sprintf("model: %s", run.ModelName))
-	}
-	if run.Goal != "" {
-		lines = append(lines, "任务目标: "+trimBlock(run.Goal))
-	}
-	if len(run.VisibleTools) > 0 {
-		lines = append(lines, "当前可见能力: "+strings.Join(run.VisibleTools, ", "))
-	}
-	if len(run.SelectedSkills) > 0 {
-		lines = append(lines, "当前激活技能: "+strings.Join(run.SelectedSkills, ", "))
-	}
-	if plan := firstStepByKinds(run.Steps, "dev_plan", "plan"); plan != nil {
-		lines = append(lines, "", "初始分解:")
-		lines = append(lines, trimBlock(plan.Output))
-	}
-	execution := collectExecutionNarrative(run.Steps)
-	if len(execution) > 0 {
-		lines = append(lines, "", "执行过程:")
-		lines = append(lines, execution...)
-	}
-	fallbacks := collectFallbackNarrative(run.Steps, run.Error)
-	if len(fallbacks) > 0 {
-		lines = append(lines, "", "失败与切换:")
-		lines = append(lines, fallbacks...)
-	}
-	if run.Result != "" {
-		lines = append(lines, "", "最终输出:")
-		lines = append(lines, trimBlock(run.Result))
-	}
-	if run.Error != "" && run.Result == "" {
-		lines = append(lines, "", "最终错误:")
-		lines = append(lines, trimBlock(run.Error))
-	}
-	return strings.Join(lines, "\n")
+	return agentharness.FormatLearnReport(run)
 }
 
 func (h Handler) loadTraceRun(ctx context.Context, sessionKey, runID string) (agentharness.Run, bool, string) {
@@ -578,7 +847,7 @@ func (h Handler) loadTraceRun(ctx context.Context, sessionKey, runID string) (ag
 		}
 	} else {
 		var runs []agentharness.Run
-		runs, err = h.Harness.ListRuns(ctx, sessionKey, 1)
+		runs, err = h.Harness.ListTaskRuns(ctx, sessionKey, 1)
 		if err != nil {
 			return agentharness.Run{}, false, fmt.Sprintf("读取 trace 失败：%v", err)
 		}
@@ -751,4 +1020,18 @@ func (h Handler) client() *http.Client {
 		return h.HTTPClient
 	}
 	return &http.Client{Timeout: 10 * time.Second}
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(metadata[key]))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

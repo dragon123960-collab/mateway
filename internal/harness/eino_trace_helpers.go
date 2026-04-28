@@ -20,16 +20,19 @@ type toolSearchSelection struct {
 }
 
 type runTraceStats struct {
-	ModelCalls       int
-	ToolCalls        int
-	ModelErrors      int
-	ToolErrors       int
-	ToolChoices      int
-	ToolSearches     int
-	Summarizations   int
-	ReductionPasses  int
-	OffloadedResults int
-	Transfers        int
+	ModelAttempts      int
+	ModelCalls         int
+	ToolCalls          int
+	ModelErrors        int
+	ToolErrors         int
+	Model429s          int
+	ToolChoices        int
+	ToolSearches       int
+	Summarizations     int
+	ReductionPasses    int
+	OffloadedResults   int
+	Transfers          int
+	ContextCompactions int
 }
 
 var persistedOutputPathPattern = regexp.MustCompile(`(?im)(?:saved to|保存到|保存至):\s*(.+)$`)
@@ -189,6 +192,11 @@ func buildRunTraceStats(steps []RunStep) runTraceStats {
 	var stats runTraceStats
 	for _, step := range steps {
 		switch step.Kind {
+		case "model_attempt":
+			stats.ModelAttempts++
+			if step.Status == "rate_limited" {
+				stats.Model429s++
+			}
 		case "callback_model_end":
 			stats.ModelCalls++
 		case "callback_tool_end":
@@ -209,6 +217,8 @@ func buildRunTraceStats(steps []RunStep) runTraceStats {
 			stats.OffloadedResults++
 		case "transfer":
 			stats.Transfers++
+		case "context_compaction":
+			stats.ContextCompactions++
 		}
 	}
 	return stats

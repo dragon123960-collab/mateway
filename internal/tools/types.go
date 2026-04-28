@@ -49,9 +49,18 @@ type Result struct {
 	Meta   map[string]any  `json:"meta,omitempty"`
 }
 
+type Availability struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 type Tool interface {
 	Spec() Spec
 	Invoke(ctx context.Context, call Call) (Result, error)
+}
+
+type AvailabilityReporter interface {
+	Availability(ctx context.Context) Availability
 }
 
 type Provider interface {

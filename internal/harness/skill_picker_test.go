@@ -30,7 +30,7 @@ func TestParseSkillPickerContentFiltersUnknownNames(t *testing.T) {
 	}
 }
 
-func TestHarnessSelectsSkillsWithModelPicker(t *testing.T) {
+func TestHarnessPrefersHeuristicSkillPickerByDefault(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "ws")
 	skillRoot := filepath.Join(root, "skills")
@@ -68,16 +68,6 @@ Use this skill for SQL and schema tasks.
 	}
 
 	server := newOpenAICompatTestServer(t, func(messages []map[string]any) map[string]any {
-		if hasMessageContaining(messages, "You are the skill-picker for the Mateway agent runtime.") {
-			return map[string]any{
-				"choices": []map[string]any{{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": `{"skills":["frontend-design"],"reason":"landing page task"}`,
-					},
-				}},
-			}
-		}
 		return map[string]any{
 			"choices": []map[string]any{{
 				"message": map[string]any{
@@ -101,8 +91,8 @@ Use this skill for SQL and schema tasks.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.SkillPickerSource != "model" {
-		t.Fatalf("expected model skill picker source, got %#v", run)
+	if run.SkillPickerSource != "heuristic" {
+		t.Fatalf("expected heuristic skill picker source, got %#v", run)
 	}
 	if len(run.SelectedSkills) != 1 || run.SelectedSkills[0] != "frontend-design" {
 		t.Fatalf("unexpected selected skills: %#v", run.SelectedSkills)
@@ -110,6 +100,81 @@ Use this skill for SQL and schema tasks.
 	step := findRunStep(run.Steps, "skill_picker")
 	if step == nil || !strings.Contains(step.Output, "frontend-design") {
 		t.Fatalf("expected skill_picker trace step, got %#v", run.Steps)
+	}
+}
+
+func TestHarnessUsesModelSkillPickerWhenUserExplicitlyAsksForSkillChoice(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "ws")
+	skillRoot := filepath.Join(root, "skills")
+	if err := os.MkdirAll(filepath.Join(skillRoot, "frontend-design"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillRoot, "db-manager"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillRoot, "frontend-design", "SKILL.md"), []byte(`---
+name: frontend-design
+description: Create distinctive landing pages.
+---
+
+# Frontend Design
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillRoot, "db-manager", "SKILL.md"), []byte(`---
+name: db-manager
+description: Manage database schema.
+---
+
+# DB Manager
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog := skills.NewCatalog([]string{skillRoot})
+	if err := catalog.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := newOpenAICompatTestServer(t, func(messages []map[string]any) map[string]any {
+		if hasMessageContaining(messages, "You are the skill-picker for the Mateway agent runtime.") {
+			return map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": `{"skills":["db-manager"],"reason":"user asked which skill should be used"}`,
+					},
+				}},
+			}
+		}
+		return map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "done",
+				},
+			}},
+		}
+	})
+	defer server.Close()
+
+	h := New(workspace, session.NewStore(workspace), tools.NewRegistry(), 6)
+	h.SkillCatalog = catalog
+	h.UseEinoRuntime(testEinoConfig(server.URL))
+
+	run, err := h.Start(context.Background(), Request{
+		SessionKey: "test:skill-picker-model",
+		UserText:   "帮我判断这件事应该使用哪个 skill 来处理数据库 schema",
+		Mode:       "chat",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SkillPickerSource != "model" {
+		t.Fatalf("expected model skill picker source, got %#v", run)
+	}
+	if len(run.SelectedSkills) != 1 || run.SelectedSkills[0] != "db-manager" {
+		t.Fatalf("unexpected selected skills: %#v", run.SelectedSkills)
 	}
 }
 

@@ -32,6 +32,10 @@ func TestInitCreatesWorkspaceAndConfig(t *testing.T) {
 		filepath.Join(cfg.App.Workspace, "agents", "default.md"),
 		filepath.Join(cfg.App.Workspace, "memory", "runs"),
 		filepath.Join(cfg.App.Workspace, "memory", "knowledge"),
+		filepath.Join(cfg.App.Workspace, "memory", "tasks"),
+		filepath.Join(cfg.App.Workspace, "memory", "task_outcomes"),
+		filepath.Join(cfg.App.Workspace, "memory", "artifacts"),
+		filepath.Join(cfg.App.Workspace, "memory", "lessons"),
 	} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected %s to exist: %v", path, err)

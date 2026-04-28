@@ -24,6 +24,12 @@ func (h *Harness) selectSkillsForRun(ctx context.Context, run Run) ([]string, st
 		return nil, "", ""
 	}
 
+	heuristic := skillNames(skills.ProgressiveDisclosure(run.Goal, visible, defaultSkillPickerLimit))
+	if len(heuristic) > 0 && !shouldUseModelSkillPicker(run.Goal, visible, heuristic) {
+		note := fmt.Sprintf("source=heuristic selected=%s", formatSelectedSkills(heuristic))
+		return heuristic, "heuristic", note
+	}
+
 	modelNames, reason, err := h.pickSkillsWithModel(ctx, run.ID, run.Goal, visible, defaultSkillPickerLimit)
 	if err == nil {
 		note := fmt.Sprintf("source=model selected=%s", formatSelectedSkills(modelNames))
@@ -33,19 +39,18 @@ func (h *Harness) selectSkillsForRun(ctx context.Context, run Run) ([]string, st
 		return modelNames, "model", note
 	}
 
-	fallback := skillNames(skills.ProgressiveDisclosure(run.Goal, visible, defaultSkillPickerLimit))
-	if len(fallback) == 0 {
+	if len(heuristic) == 0 {
 		note := "source=none"
 		if err != nil {
 			note += " error=" + trimInline(err.Error(), 180)
 		}
 		return nil, "fallback_none", note
 	}
-	note := fmt.Sprintf("source=heuristic selected=%s", formatSelectedSkills(fallback))
+	note := fmt.Sprintf("source=heuristic selected=%s", formatSelectedSkills(heuristic))
 	if err != nil {
 		note += " fallback_reason=" + trimInline(err.Error(), 180)
 	}
-	return fallback, "heuristic", note
+	return heuristic, "heuristic", note
 }
 
 func (h *Harness) pickSkillsWithModel(ctx context.Context, runID, goal string, visible []skills.Skill, limit int) ([]string, string, error) {
@@ -61,7 +66,7 @@ func (h *Harness) pickSkillsWithModel(ctx context.Context, runID, goal string, v
 		schema.SystemMessage(buildSkillPickerSystemPrompt(limit)),
 		schema.UserMessage(buildSkillPickerUserPrompt(goal, visible, limit)),
 	}
-	msg, err := model.Generate(ctx, messages, modelOpts...)
+	msg, err := model.Generate(withModelPurpose(ctx, "skill_picker"), messages, modelOpts...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -203,4 +208,29 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func shouldUseModelSkillPicker(goal string, visible []skills.Skill, heuristic []string) bool {
+	goal = strings.ToLower(strings.TrimSpace(goal))
+	if goal == "" {
+		return false
+	}
+	if skillPickerContainsAny(goal,
+		"skill", "skills", "技能", "选择技能", "挑选技能", "which skill", "what skill",
+	) {
+		return true
+	}
+	if len(heuristic) == 0 && len(visible) >= 6 {
+		return true
+	}
+	return false
+}
+
+func skillPickerContainsAny(text string, items ...string) bool {
+	for _, item := range items {
+		if strings.Contains(text, strings.ToLower(strings.TrimSpace(item))) {
+			return true
+		}
+	}
+	return false
 }

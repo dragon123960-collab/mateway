@@ -3,16 +3,19 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/observability"
 )
 
 type gatewayLogTarget struct {
@@ -38,14 +41,93 @@ func runLogsCommand(ctx context.Context, args []string, stdout io.Writer) error 
 		return showGatewayLogs(stdout, targets, 80)
 	case "follow":
 		return followGatewayLogs(ctx, stdout, targets, 40, 700*time.Millisecond)
+	case "structured":
+		return showStructuredLogs(ctx, stdout, cfg, args[1:])
+	case "diagnostics":
+		return showStructuredDiagnostics(ctx, stdout, cfg)
 	case "path":
 		for _, target := range targets {
 			_, _ = fmt.Fprintf(stdout, "%s: %s\n", target.Label, target.Path)
 		}
+		_, _ = fmt.Fprintf(stdout, "structured: %s\n", observability.StructuredLogPath(cfg.App.Workspace))
 		return nil
 	default:
-		return errors.New("usage: mateway logs [show|follow|path]")
+		return errors.New("usage: mateway logs [show|follow|structured|diagnostics|path]")
 	}
+}
+
+func showStructuredLogs(ctx context.Context, stdout io.Writer, cfg config.Config, args []string) error {
+	filter := observability.LogFilter{Limit: 80}
+	asJSON := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			asJSON = true
+		case "--run":
+			if i+1 >= len(args) {
+				return errors.New("--run requires a value")
+			}
+			i++
+			filter.RunID = args[i]
+		case "--session":
+			if i+1 >= len(args) {
+				return errors.New("--session requires a value")
+			}
+			i++
+			filter.SessionKey = args[i]
+		case "--channel":
+			if i+1 >= len(args) {
+				return errors.New("--channel requires a value")
+			}
+			i++
+			filter.Channel = args[i]
+		case "--type":
+			if i+1 >= len(args) {
+				return errors.New("--type requires a value")
+			}
+			i++
+			filter.Type = args[i]
+		case "--limit":
+			if i+1 >= len(args) {
+				return errors.New("--limit requires a value")
+			}
+			i++
+			if n, err := strconv.Atoi(args[i]); err == nil && n > 0 {
+				filter.Limit = n
+			}
+		}
+	}
+	events, err := observability.Query(ctx, cfg.App.Workspace, filter)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		data, err := json.MarshalIndent(events, "", "  ")
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(stdout, string(data))
+		return nil
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		_, _ = fmt.Fprintf(stdout, "%s %-5s %-22s run=%s session=%s channel=%s %s\n",
+			event.CreatedAt, event.Level, event.Type, appFirstNonEmpty(event.RunID, "-"), appFirstNonEmpty(event.SessionKey, "-"), appFirstNonEmpty(event.Channel, "-"), event.Message)
+	}
+	return nil
+}
+
+func showStructuredDiagnostics(ctx context.Context, stdout io.Writer, cfg config.Config) error {
+	report, err := observability.Diagnostics(ctx, cfg.App.Workspace)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, string(data))
+	return nil
 }
 
 func gatewayLogTargets(cfg config.Config) ([]gatewayLogTarget, error) {

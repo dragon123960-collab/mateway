@@ -26,6 +26,19 @@ func TestFormatRuntimeErrorClassifiesProviderQuota(t *testing.T) {
 	}
 }
 
+func TestFormatRuntimeErrorHumanizesNodeRunError(t *testing.T) {
+	got := formatRuntimeError(assertErr("[NodeRunError] failed to invoke tool[name:sandbox_exec id:call_x]: sandbox_exec failed: exec: \"opencli\": executable file not found in $PATH\n------------------------\nnode path: [node_1, ToolNode]"))
+	if !strings.HasPrefix(got, "工具当前不可用") {
+		t.Fatalf("unexpected runtime error prefix: %s", got)
+	}
+	if strings.Contains(got, "NodeRunError") || strings.Contains(got, "node path") {
+		t.Fatalf("expected runtime error to be humanized: %s", got)
+	}
+	if !strings.Contains(got, "opencli") || !strings.Contains(got, "PATH") {
+		t.Fatalf("expected actionable tool guidance: %s", got)
+	}
+}
+
 type runtimeErr string
 
 func (e runtimeErr) Error() string { return string(e) }

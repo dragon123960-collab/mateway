@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,6 +18,29 @@ type stubJobRunner struct {
 
 func (s stubJobRunner) RunScheduledJob(context.Context, Job) (RunResult, error) {
 	return s.result, s.err
+}
+
+type blockingJobRunner struct {
+	mu      sync.Mutex
+	started chan string
+	block   map[string]chan struct{}
+	counts  map[string]int
+}
+
+func (r *blockingJobRunner) RunScheduledJob(_ context.Context, job Job) (RunResult, error) {
+	r.mu.Lock()
+	if r.counts == nil {
+		r.counts = map[string]int{}
+	}
+	r.counts[job.Name]++
+	r.mu.Unlock()
+	if r.started != nil {
+		r.started <- job.Name
+	}
+	if ch := r.block[job.Name]; ch != nil {
+		<-ch
+	}
+	return RunResult{RunID: "run_" + sanitizeScheduleName(job.Name), Status: "completed"}, nil
 }
 
 func TestStoreSaveAndDueInterval(t *testing.T) {
@@ -166,13 +190,32 @@ func TestServiceRunNowUpdatesStateAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := Service{Store: store, Runner: stubJobRunner{result: RunResult{RunID: "run_1", Status: "completed"}}}
+	svc := Service{Store: store, Runner: stubJobRunner{result: RunResult{RunID: "run_1", TaskID: "task_1", Status: "completed"}}}
 	updated, err := svc.RunNow(context.Background(), "manual")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.State.LastRunStatus != "completed" && updated.State.LastRunStatus != "ok" {
 		t.Fatalf("unexpected last run status: %#v", updated.State)
+	}
+	persisted, ok, err := store.Get("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected persisted schedule")
+	}
+	if persisted.State.LastRunAt.IsZero() {
+		t.Fatalf("expected last run timestamp to persist: %#v", persisted.State)
+	}
+	if persisted.State.LastRunStatus != updated.State.LastRunStatus {
+		t.Fatalf("expected persisted last run status %q, got %#v", updated.State.LastRunStatus, persisted.State)
+	}
+	if persisted.State.LastTaskID != "task_1" {
+		t.Fatalf("expected last task id to persist, got %#v", persisted.State)
+	}
+	if !persisted.State.NextRunAt.After(persisted.State.LastRunAt) {
+		t.Fatalf("expected persisted next run after last run: %#v", persisted.State)
 	}
 	lines, err := store.ReadRuns("manual", 10)
 	if err != nil {
@@ -181,7 +224,86 @@ func TestServiceRunNowUpdatesStateAndHistory(t *testing.T) {
 	if len(lines) == 0 {
 		t.Fatal("expected schedule run history")
 	}
-	if !strings.Contains(lines[0], `"job_name":"manual"`) {
+	if !strings.Contains(lines[0], `"job_name":"manual"`) || !strings.Contains(lines[0], `"task_id":"task_1"`) {
 		t.Fatalf("unexpected run history: %s", lines[0])
 	}
+}
+
+func TestServiceRunDueDoesNotBlockLaterJobs(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Workspace: root}
+	longJob, err := NewIntervalJob("long", "schedule:long", "long task", 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortJob, err := NewIntervalJob("short", "schedule:short", "short task", 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	longJob.State.NextRunAt = time.Now().Add(-2 * time.Minute)
+	shortJob.State.NextRunAt = time.Now().Add(-time.Minute)
+	if err := store.Save(longJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(shortJob); err != nil {
+		t.Fatal(err)
+	}
+
+	releaseLong := make(chan struct{})
+	runner := &blockingJobRunner{
+		started: make(chan string, 4),
+		block: map[string]chan struct{}{
+			"long": releaseLong,
+		},
+	}
+	svc := Service{Store: store, Runner: runner}
+	svc.runDue(context.Background(), time.Now())
+
+	started := map[string]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(started) < 2 {
+		select {
+		case name := <-runner.started:
+			started[name] = true
+		case <-deadline:
+			t.Fatalf("expected both due jobs to start even when one blocks, got %#v", started)
+		}
+	}
+	close(releaseLong)
+}
+
+func TestServiceRunDueSkipsInflightJob(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Workspace: root}
+	job, err := NewIntervalJob("long", "schedule:long", "long task", 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.State.NextRunAt = time.Now().Add(-time.Minute)
+	if err := store.Save(job); err != nil {
+		t.Fatal(err)
+	}
+
+	releaseLong := make(chan struct{})
+	runner := &blockingJobRunner{
+		started: make(chan string, 4),
+		block: map[string]chan struct{}{
+			"long": releaseLong,
+		},
+	}
+	svc := Service{Store: store, Runner: runner}
+	now := time.Now()
+	svc.runDue(context.Background(), now)
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("expected long job to start")
+	}
+	svc.runDue(context.Background(), now.Add(30*time.Second))
+	select {
+	case dup := <-runner.started:
+		t.Fatalf("expected inflight job to be skipped, but started duplicate run for %s", dup)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseLong)
 }

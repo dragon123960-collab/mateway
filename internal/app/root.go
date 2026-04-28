@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runChannelCommand(ctx, args[1:], stdout)
 	case "schedule":
 		return runScheduleCommand(ctx, args[1:], stdout)
+	case "memory":
+		return runMemoryCommand(ctx, args[1:], stdout)
 	case "run":
 		return runRunCommand(ctx, args[1:], stdout)
 	case "tui":
@@ -380,6 +383,40 @@ func runScheduleCommand(ctx context.Context, args []string, stdout io.Writer) er
 	}
 }
 
+func runMemoryCommand(ctx context.Context, args []string, stdout io.Writer) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := memory.Store{Workspace: cfg.App.Workspace}
+	if len(args) == 0 {
+		return errors.New("usage: mateway memory rebuild --force --drop-all")
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "rebuild":
+		hasForce := false
+		hasDropAll := false
+		for _, arg := range args[1:] {
+			switch strings.ToLower(strings.TrimSpace(arg)) {
+			case "--force":
+				hasForce = true
+			case "--drop-all":
+				hasDropAll = true
+			}
+		}
+		if !hasForce || !hasDropAll {
+			return errors.New("usage: mateway memory rebuild --force --drop-all")
+		}
+		if err := store.Rebuild(ctx, true); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(stdout, "rebuilt memory under %s\n", filepath.Join(cfg.App.Workspace, "memory"))
+		return nil
+	default:
+		return fmt.Errorf("unknown memory subcommand: %s", args[0])
+	}
+}
+
 func runRunCommand(ctx context.Context, args []string, stdout io.Writer) error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -489,10 +526,11 @@ func newGatewayService(ctx context.Context, cfg config.Config, catalog *skills.C
 		watcher = skills.NewWatcher(catalog, cfg.Skills.Roots)
 		_ = watcher.Start(ctx)
 	}
-	_ = scheduler.Service{
+	scheduleSvc := &scheduler.Service{
 		Store:  scheduler.Store{Workspace: cfg.App.Workspace},
 		Runner: harnessScheduleRunner{runner: runner},
-	}.Start(ctx)
+	}
+	_ = scheduleSvc.Start(ctx)
 	return gateway.Service{
 		Config:  cfg,
 		Catalog: catalog,
@@ -511,23 +549,34 @@ func (h harnessScheduleRunner) RunScheduledJob(ctx context.Context, job schedule
 	if h.runner == nil {
 		return scheduler.RunResult{}, nil
 	}
+	args := appMergeArguments(job.Arguments, map[string]any{
+		"task_kind":       "schedule",
+		"task_type":       "schedule_task",
+		"schedule_name":   job.Name,
+		"schedule_job_id": appFirstNonEmpty(job.ID, job.Name),
+		"triggered_at":    time.Now().Format(time.RFC3339),
+	})
 	run, err := h.runner.Start(ctx, agentharness.Request{
 		SessionKey: job.SessionKey,
 		AgentName:  job.AgentName,
+		Channel:    "schedule",
+		TaskType:   "schedule_task",
 		Mode:       job.Mode,
 		UserText:   job.Prompt,
 		ToolName:   job.ToolName,
-		Arguments:  job.Arguments,
+		Arguments:  args,
 	}, nil)
 	if err != nil {
 		return scheduler.RunResult{
 			RunID:  run.ID,
+			TaskID: run.TaskID,
 			Status: appFirstNonEmpty(run.Status, "error"),
 			Error:  appFirstNonEmpty(run.Error, err.Error()),
 		}, err
 	}
 	return scheduler.RunResult{
 		RunID:  run.ID,
+		TaskID: run.TaskID,
 		Status: appFirstNonEmpty(run.Status, "completed"),
 		Error:  run.Error,
 	}, nil
@@ -540,4 +589,18 @@ func appFirstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func appMergeArguments(base map[string]any, extra map[string]any) map[string]any {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(base)+len(extra))
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range extra {
+		out[key] = value
+	}
+	return out
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -54,8 +55,10 @@ func (p BuiltinProvider) Tools(_ context.Context, _ Scope) ([]Tool, error) {
 		createWorkspaceTool{provisioner: p.Provisioner},
 		createAgentTool{provisioner: p.Provisioner},
 		scheduleCreateTool{workspace: p.Workspace},
+		scheduleUpdateTool{workspace: p.Workspace},
 		scheduleListTool{workspace: p.Workspace},
 		scheduleGetTool{workspace: p.Workspace},
+		scheduleRunsTool{workspace: p.Workspace},
 		scheduleToggleTool{workspace: p.Workspace, enabled: true},
 		scheduleToggleTool{workspace: p.Workspace, enabled: false},
 		scheduleRemoveTool{workspace: p.Workspace},
@@ -358,15 +361,27 @@ func (t readSessionSummaryTool) Invoke(ctx context.Context, call Call) (Result, 
 type recallLastTaskTool struct{ memory memory.Store }
 
 func (t recallLastTaskTool) Spec() Spec {
-	return Spec{Name: "recall_last_task", Description: "Recall what the session was doing most recently.", Kind: KindBuiltin, ReadOnly: true, Tags: []string{"memory", "summary"}, InputSchema: schemaObject()}
+	return Spec{Name: "recall_last_task", Description: "Recall the latest top-level task digest for the current session.", Kind: KindBuiltin, ReadOnly: true, Tags: []string{"memory", "summary", "task"}, InputSchema: schemaObject()}
 }
 func (t recallLastTaskTool) Invoke(ctx context.Context, call Call) (Result, error) {
 	note, ok, err := t.memory.ReadSessionSummary(ctx, call.SessionKey)
 	if err != nil {
 		return Result{}, err
 	}
+	if !ok {
+		return rawResult(""), nil
+	}
+	if digest := strings.TrimSpace(fmt.Sprint(note.Metadata["latest_task_digest"])); digest != "" {
+		return rawResult(digest), nil
+	}
 	if !ok || strings.TrimSpace(note.Content) == "" {
 		return rawResult(""), nil
+	}
+	for _, line := range strings.Split(note.Content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "最新任务:") {
+			return rawResult(strings.TrimSpace(strings.TrimPrefix(line, "最新任务:"))), nil
+		}
 	}
 	return rawResult(note.Content), nil
 }
@@ -616,6 +631,7 @@ func (t sandboxExecTool) Invoke(ctx context.Context, call Call) (Result, error) 
 	resolution, err := cmdresolve.Default().Resolve(command)
 	if err != nil {
 		if resolveErr, ok := err.(*cmdresolve.ResolveError); ok {
+			similar := sandboxSimilarCommands(command, resolveErr)
 			payload, _ := json.Marshal(map[string]any{
 				"sandbox_dir":       sandboxRoot,
 				"working_dir":       workDir,
@@ -625,8 +641,9 @@ func (t sandboxExecTool) Invoke(ctx context.Context, call Call) (Result, error) 
 				"status":            "command_not_found",
 				"resolved_command":  "",
 				"resolution_source": "",
-				"message":           sandboxResolutionMessage(command, resolveErr),
-				"suggestions":       sandboxResolutionSuggestions(command, resolveErr),
+				"message":           sandboxResolutionMessage(command, resolveErr, similar),
+				"suggestions":       sandboxResolutionSuggestions(command, resolveErr, similar),
+				"similar_commands":  similar,
 				"search_paths":      resolveErr.SearchPaths,
 				"shell_path":        resolveErr.ShellPath,
 				"timed_out":         false,
@@ -799,6 +816,135 @@ func (t scheduleCreateTool) Invoke(_ context.Context, call Call) (Result, error)
 	return rawResult(fmt.Sprintf("%s schedule %s (%s)", action, job.Name, job.Description())), nil
 }
 
+type scheduleUpdateTool struct{ workspace string }
+
+func (t scheduleUpdateTool) Spec() Spec {
+	return Spec{
+		Name:        "schedule_update",
+		Description: "Update an existing recurring schedule job. Supports changing the name, schedule, prompt, mode, and target.",
+		Kind:        KindBuiltin,
+		RiskLevel:   "medium",
+		Tags:        []string{"schedule", "cron", "automation"},
+		InputSchema: schemaObject(
+			prop("name", "string", "Existing schedule name or ID"),
+			prop("new_name", "string", "New schedule name"),
+			prop("prompt", "string", "Prompt for chat schedules"),
+			prop("mode", "string", "chat or tool"),
+			prop("tool_name", "string", "Tool name for tool-mode schedules"),
+			prop("arguments", "object", "Tool arguments for tool-mode schedules"),
+			prop("kind", "string", "interval or cron"),
+			prop("interval_minutes", "integer", "Interval minutes for interval schedules"),
+			prop("expr", "string", "Cron expression for cron schedules"),
+			prop("tz", "string", "IANA timezone such as Asia/Shanghai"),
+			prop("enabled", "boolean", "Whether the schedule is enabled"),
+			prop("target_session_mode", "string", "current, explicit, or isolated"),
+			prop("target_session_key", "string", "Session key when target_session_mode=explicit"),
+			prop("target_agent_mode", "string", "current, explicit, or default"),
+			prop("target_agent_name", "string", "Agent name when target_agent_mode=explicit"),
+		),
+	}
+}
+
+func (t scheduleUpdateTool) Invoke(_ context.Context, call Call) (Result, error) {
+	var args struct {
+		Name              string         `json:"name"`
+		NewName           *string        `json:"new_name"`
+		Prompt            *string        `json:"prompt"`
+		Mode              *string        `json:"mode"`
+		ToolName          *string        `json:"tool_name"`
+		Arguments         map[string]any `json:"arguments"`
+		Kind              *string        `json:"kind"`
+		IntervalMinutes   *int           `json:"interval_minutes"`
+		Expr              *string        `json:"expr"`
+		TZ                *string        `json:"tz"`
+		Enabled           *bool          `json:"enabled"`
+		TargetSessionMode *string        `json:"target_session_mode"`
+		TargetSessionKey  *string        `json:"target_session_key"`
+		TargetAgentMode   *string        `json:"target_agent_mode"`
+		TargetAgentName   *string        `json:"target_agent_name"`
+	}
+	if err := json.Unmarshal(call.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	store := scheduler.Store{Workspace: t.workspace}
+	job, ok, err := store.Get(args.Name)
+	if err != nil {
+		return Result{}, err
+	}
+	if !ok {
+		return Result{}, fmt.Errorf("schedule %q not found", args.Name)
+	}
+
+	if args.NewName != nil && strings.TrimSpace(*args.NewName) != "" {
+		job.Name = strings.TrimSpace(*args.NewName)
+	}
+	if args.Prompt != nil {
+		job.Prompt = strings.TrimSpace(*args.Prompt)
+	}
+	if args.Mode != nil && strings.TrimSpace(*args.Mode) != "" {
+		job.Mode = strings.TrimSpace(*args.Mode)
+	}
+	if args.ToolName != nil {
+		job.ToolName = strings.TrimSpace(*args.ToolName)
+	}
+	if args.Arguments != nil {
+		job.Arguments = args.Arguments
+	}
+	if args.Enabled != nil {
+		job.Enabled = *args.Enabled
+	}
+	if args.Kind != nil && strings.TrimSpace(*args.Kind) != "" {
+		job.Schedule.Kind = strings.TrimSpace(*args.Kind)
+	}
+	if args.IntervalMinutes != nil {
+		job.Schedule.IntervalMinutes = *args.IntervalMinutes
+	}
+	if args.Expr != nil {
+		job.Schedule.Expr = strings.TrimSpace(*args.Expr)
+	}
+	if args.TZ != nil {
+		job.Schedule.TZ = strings.TrimSpace(*args.TZ)
+	}
+
+	target := job.Target
+	if args.TargetSessionMode != nil && strings.TrimSpace(*args.TargetSessionMode) != "" {
+		target.SessionMode = strings.TrimSpace(*args.TargetSessionMode)
+	}
+	if args.TargetSessionKey != nil && strings.TrimSpace(*args.TargetSessionKey) != "" {
+		target.SessionKey = strings.TrimSpace(*args.TargetSessionKey)
+	}
+	if args.TargetAgentMode != nil && strings.TrimSpace(*args.TargetAgentMode) != "" {
+		target.AgentMode = strings.TrimSpace(*args.TargetAgentMode)
+	}
+	if args.TargetAgentName != nil && strings.TrimSpace(*args.TargetAgentName) != "" {
+		target.AgentName = strings.TrimSpace(*args.TargetAgentName)
+	}
+	resolvedSession, resolvedAgent, resolvedTarget, err := scheduler.ResolveTarget(job.Name, job.SessionKey, job.AgentName, target)
+	if err != nil {
+		return Result{}, err
+	}
+	job.Target = resolvedTarget
+	job.SessionKey = resolvedSession
+	job.AgentName = resolvedAgent
+
+	if strings.EqualFold(job.Mode, "tool") {
+		if strings.TrimSpace(job.ToolName) == "" {
+			return Result{}, fmt.Errorf("tool_name is required when mode=tool")
+		}
+		job.Prompt = ""
+	} else {
+		job.Mode = "chat"
+		job.ToolName = ""
+		job.Arguments = nil
+	}
+
+	job, action, err := store.Upsert(job)
+	if err != nil {
+		return Result{}, err
+	}
+	return rawResult(fmt.Sprintf("%s schedule %s (%s)", action, job.Name, job.Description())), nil
+}
+
 type scheduleListTool struct{ workspace string }
 
 func (t scheduleListTool) Spec() Spec {
@@ -859,6 +1005,38 @@ func (t scheduleGetTool) Invoke(_ context.Context, call Call) (Result, error) {
 		return Result{}, err
 	}
 	return rawResult(string(data)), nil
+}
+
+type scheduleRunsTool struct{ workspace string }
+
+func (t scheduleRunsTool) Spec() Spec {
+	return Spec{
+		Name:        "schedule_runs",
+		Description: "Read recent run history for one recurring schedule job.",
+		Kind:        KindBuiltin,
+		ReadOnly:    true,
+		Tags:        []string{"schedule", "cron", "automation", "history"},
+		InputSchema: schemaObject(
+			prop("name", "string", "Schedule name"),
+			prop("limit", "integer", "Optional max number of history lines"),
+		),
+	}
+}
+
+func (t scheduleRunsTool) Invoke(_ context.Context, call Call) (Result, error) {
+	var args struct {
+		Name  string `json:"name"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(call.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	store := scheduler.Store{Workspace: t.workspace}
+	lines, err := store.ReadRuns(args.Name, args.Limit)
+	if err != nil {
+		return Result{}, err
+	}
+	return rawResult(strings.Join(lines, "\n")), nil
 }
 
 type scheduleToggleTool struct {
@@ -1160,9 +1338,12 @@ func sandboxEnv(root string, searchPaths []string) []string {
 	}
 }
 
-func sandboxResolutionMessage(command string, resolveErr *cmdresolve.ResolveError) string {
+func sandboxResolutionMessage(command string, resolveErr *cmdresolve.ResolveError, similar []string) string {
 	if resolveErr == nil {
 		return fmt.Sprintf("executable %q could not be resolved", command)
+	}
+	if len(similar) > 0 {
+		return fmt.Sprintf("executable %q not found in the current runtime environment; found similarly named executable(s): %s", command, strings.Join(similar, ", "))
 	}
 	switch resolveErr.Kind {
 	case "shell_only":
@@ -1172,11 +1353,16 @@ func sandboxResolutionMessage(command string, resolveErr *cmdresolve.ResolveErro
 	}
 }
 
-func sandboxResolutionSuggestions(command string, resolveErr *cmdresolve.ResolveError) []string {
+func sandboxResolutionSuggestions(command string, resolveErr *cmdresolve.ResolveError, similar []string) []string {
 	suggestions := []string{
 		"try an absolute path such as /opt/homebrew/bin/" + command,
 		"check whether the gateway process PATH includes the CLI install directory",
 		"register this CLI as an external provider or skill if it should be a stable capability",
+	}
+	for i := len(similar) - 1; i >= 0; i-- {
+		suggestions = append([]string{
+			fmt.Sprintf("try the similarly named executable %q", similar[i]),
+		}, suggestions...)
 	}
 	if resolveErr != nil && resolveErr.Kind == "shell_only" {
 		suggestions = append([]string{
@@ -1184,4 +1370,69 @@ func sandboxResolutionSuggestions(command string, resolveErr *cmdresolve.Resolve
 		}, suggestions...)
 	}
 	return suggestions
+}
+
+func sandboxSimilarCommands(command string, resolveErr *cmdresolve.ResolveError) []string {
+	if resolveErr == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, 4)
+	for _, variant := range commandNameVariants(command) {
+		if variant == command || variant == "" || seen[variant] {
+			continue
+		}
+		if !commandExistsInSearchPaths(variant, resolveErr.SearchPaths) {
+			continue
+		}
+		seen[variant] = true
+		out = append(out, variant)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func commandNameVariants(command string) []string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+	variants := []string{
+		strings.ReplaceAll(command, "_", "-"),
+		strings.ReplaceAll(command, "-", "_"),
+		strings.ReplaceAll(strings.ReplaceAll(command, "-", ""), "_", ""),
+	}
+	if !strings.ContainsAny(command, "-_") {
+		for _, suffix := range []string{"cli", "ctl", "cmd"} {
+			if strings.HasSuffix(command, suffix) && len(command) > len(suffix) {
+				prefix := command[:len(command)-len(suffix)]
+				variants = append(variants, prefix+"-"+suffix, prefix+"_"+suffix)
+			}
+		}
+	}
+	out := make([]string, 0, len(variants))
+	seen := map[string]bool{}
+	for _, variant := range variants {
+		variant = strings.TrimSpace(variant)
+		if variant == "" || variant == command || seen[variant] {
+			continue
+		}
+		seen[variant] = true
+		out = append(out, variant)
+	}
+	return out
+}
+
+func commandExistsInSearchPaths(command string, searchPaths []string) bool {
+	for _, dir := range searchPaths {
+		path := filepath.Join(strings.TrimSpace(dir), command)
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+			return true
+		}
+	}
+	return false
 }

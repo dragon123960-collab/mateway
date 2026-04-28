@@ -24,6 +24,7 @@ func buildCLIExplorationHint(goal string, visibleToolNames []string) string {
 		"## CLI_INSPECTION_POLICY",
 		fmt.Sprintf("The user is asking you to learn or inspect the CLI command `%s`.", command),
 		"Do not ask the user for docs or links before you try local inspection.",
+		"If the exact command is missing, try obvious name variants such as hyphen/underscore forms before concluding it is unavailable; if a likely match exists, ask whether the user meant that command.",
 	}
 
 	if providerTool := matchingCLIProviderTool(command, visibleToolNames); providerTool != "" {

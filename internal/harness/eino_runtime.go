@@ -42,6 +42,9 @@ type tracePlan struct {
 	Steps []string `json:"steps"`
 }
 
+type modelPurposeContextKey struct{}
+type modelCallbackStartContextKey struct{}
+
 func (p *tracePlan) FirstStep() string {
 	if len(p.Steps) == 0 {
 		return ""
@@ -134,7 +137,11 @@ func (t *einoToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON stri
 			pending := PendingApproval{
 				ID:         fmt.Sprintf("approval_%d", time.Now().UnixNano()),
 				RunID:      t.run.ID,
+				TaskID:     t.run.TaskID,
 				SessionKey: t.req.SessionKey,
+				ThreadID:   t.req.ThreadID,
+				UserID:     t.req.UserID,
+				Channel:    t.req.Channel,
 				AgentName:  t.run.AgentName,
 				ToolName:   t.spec.Name,
 				Arguments:  arguments,
@@ -232,7 +239,7 @@ func buildToolChoiceReason(run Run, req Request, spec tools.Spec, argumentsInJSO
 		parts = append(parts, "需要用受控实验验证命令、脚本或最小执行假设。")
 	case "spawn", "wait_agent":
 		parts = append(parts, "任务需要子 agent 协作或等待并行结果。")
-	case "schedule_create", "schedule_enable", "schedule_disable", "schedule_remove":
+	case "schedule_create", "schedule_update", "schedule_enable", "schedule_disable", "schedule_remove":
 		parts = append(parts, "当前目标涉及后续自动执行或任务编排，因此需要调整定时任务状态。")
 	case "schedule_list", "schedule_get":
 		parts = append(parts, "需要先查看现有定时任务，避免重复创建或错误修改。")
@@ -538,26 +545,47 @@ func (h *Harness) einoTraceHandler(run Run) einocallbacks.Handler {
 		}).
 		ChatModel(&cbtemplate.ModelCallbackHandler{
 			OnStart: func(ctx context.Context, info *einocallbacks.RunInfo, input *einomodelcallback.CallbackInput) context.Context {
+				startedAt := time.Now()
 				h.appendRunStep(run.ID, RunStep{
 					Kind:       "callback_model_start",
 					Status:     "started",
 					AgentName:  currentCallbackAgentName(ctx, firstNonEmpty(info.Name, run.AgentName)),
 					Input:      trim(callbackModelInputSummary(input), 240),
 					Output:     trim(callbackModelConfigSummary(input), 240),
-					StartedAt:  time.Now(),
-					FinishedAt: time.Now(),
+					StartedAt:  startedAt,
+					FinishedAt: startedAt,
 				})
-				return ctx
+				return context.WithValue(ctx, modelCallbackStartContextKey{}, startedAt)
 			},
 			OnEnd: func(ctx context.Context, info *einocallbacks.RunInfo, output *einomodelcallback.CallbackOutput) context.Context {
+				startedAt, _ := ctx.Value(modelCallbackStartContextKey{}).(time.Time)
+				if startedAt.IsZero() {
+					startedAt = time.Now()
+				}
+				finishedAt := time.Now()
 				h.appendRunStep(run.ID, RunStep{
 					Kind:       "callback_model_end",
 					Status:     "completed",
 					AgentName:  currentCallbackAgentName(ctx, firstNonEmpty(info.Name, run.AgentName)),
 					Output:     trim(callbackModelOutputSummary(output), 320),
-					StartedAt:  time.Now(),
-					FinishedAt: time.Now(),
+					StartedAt:  startedAt,
+					FinishedAt: finishedAt,
 				})
+				if output != nil && output.TokenUsage != nil {
+					modelName := ""
+					if output.Config != nil {
+						modelName = strings.TrimSpace(output.Config.Model)
+					}
+					h.updateRunModelUsage(
+						run.ID,
+						modelName,
+						output.TokenUsage.PromptTokens,
+						output.TokenUsage.CompletionTokens,
+						output.TokenUsage.TotalTokens,
+						estimateModelCostUSD(modelName, output.TokenUsage.PromptTokens, output.TokenUsage.CompletionTokens),
+						finishedAt.Sub(startedAt),
+					)
+				}
 				return ctx
 			},
 			OnError: func(ctx context.Context, info *einocallbacks.RunInfo, err error) context.Context {
@@ -679,6 +707,29 @@ func callbackModelOutputSummary(output *einomodelcallback.CallbackOutput) string
 	return strings.Join(parts, " ")
 }
 
+func estimateModelCostUSD(modelName string, promptTokens, completionTokens int) float64 {
+	modelName = strings.ToLower(strings.TrimSpace(modelName))
+	if modelName == "" {
+		return 0
+	}
+	type pricing struct {
+		promptPer1K     float64
+		completionPer1K float64
+	}
+	pricebook := map[string]pricing{
+		"qwen3.6-plus": {promptPer1K: 0.0008, completionPer1K: 0.0032},
+		"qwen3.5-plus": {promptPer1K: 0.0008, completionPer1K: 0.0032},
+		"glm-5":        {promptPer1K: 0.0010, completionPer1K: 0.0040},
+		"kimi-k2.5":    {promptPer1K: 0.0010, completionPer1K: 0.0040},
+	}
+	rates, ok := pricebook[modelName]
+	if !ok {
+		return 0
+	}
+	return (float64(maxInt(promptTokens, 0))/1000.0)*rates.promptPer1K +
+		(float64(maxInt(completionTokens, 0))/1000.0)*rates.completionPer1K
+}
+
 func callbackToolOutputSummary(output *einotoolcallback.CallbackOutput) string {
 	if output == nil {
 		return ""
@@ -703,6 +754,13 @@ func stringifyToolResult(result string) string {
 	}
 	data, _ := json.Marshal(trimmed)
 	return string(data)
+}
+
+func limiterState(limiter *llm.ModelLimiter) string {
+	if limiter == nil {
+		return ""
+	}
+	return limiter.DescribeState()
 }
 
 func (h *Harness) attachInterruptIDs(info *adk.InterruptInfo) {
@@ -756,7 +814,7 @@ func (h *Harness) pendingApprovalByID(approvalID string) (PendingApproval, bool)
 }
 
 func approvalMessage(p PendingApproval) string {
-	return fmt.Sprintf("工具 `%s` 需要批准，approval id: `%s`。发送 `/approve %s` 执行，`/deny %s` 拒绝，或 `/approvals` 查看全部待批。", p.ToolName, p.ID, p.ID, p.ID)
+	return FormatPendingApproval(p)
 }
 
 func (h *Harness) newEinoRunner(ctx context.Context, req Request, run Run) (*adk.Runner, []einomodel.Option, error) {
@@ -1024,6 +1082,26 @@ func (h *Harness) buildAgentInstruction(profile agents.Profile, goal string, vis
 			systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + cliHint)
 		}
 	}
+	if failureHint := h.buildFailureAvoidanceHint(goal, selectedSkillNames, visibleToolNames); strings.TrimSpace(failureHint) != "" {
+		if strings.TrimSpace(systemPrompt) == "" {
+			systemPrompt = failureHint
+		} else {
+			systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + failureHint)
+		}
+	}
+	fallbackPolicy := strings.TrimSpace(`
+## TOOL_FALLBACK_POLICY
+If a tool returns provider unavailable, provider policy deny, command not found, shell-only, or learn-before-run guidance:
+- do not stop the task with the raw tool failure
+- switch to the next best route automatically
+- for CLI/provider failures, prefer: provider list/help -> local exec in the real user environment -> local sandbox inspection -> web_search/browser_fetch -> other available tools
+- only report the raw failure to the user after you have already tried the best fallback path
+`)
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = fallbackPolicy
+	} else {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + fallbackPolicy)
+	}
 	base := prompt.Assembler{
 		Workspace:          h.Workspace,
 		SystemPrompt:       systemPrompt,
@@ -1220,9 +1298,10 @@ func (h *Harness) newEinoModelFromCandidates(ctx context.Context, runID string, 
 			opts = append(opts, openaiext.WithExtraHeader(modelCfg.Headers))
 		}
 		out = append(out, fallbackEinoCandidate{
-			name:  modelCfg.Name,
-			model: chatModel,
-			opts:  opts,
+			name:     modelCfg.Name,
+			provider: strings.TrimSpace(modelCfg.Provider),
+			model:    chatModel,
+			opts:     opts,
 		})
 	}
 	if len(out) == 0 {
@@ -1237,32 +1316,60 @@ func (h *Harness) newEinoModelFromCandidates(ctx context.Context, runID string, 
 	return &fallbackEinoModel{
 		candidates: out,
 		onSuccess:  onSuccess,
+		limiterHub: h.limiterHub,
+		runID:      strings.TrimSpace(runID),
+		recorder: func(runID, purpose, provider, modelName, status, detail, limiterState string, startedAt, finishedAt time.Time) {
+			h.recordModelAttempt(runID, purpose, provider, modelName, status, detail, limiterState, startedAt, finishedAt)
+		},
 	}, nil, nil
 }
 
 type fallbackEinoCandidate struct {
-	name  string
-	model *openaiext.ChatModel
-	opts  []einomodel.Option
+	name     string
+	provider string
+	model    *openaiext.ChatModel
+	opts     []einomodel.Option
 }
 
 type fallbackEinoModel struct {
 	candidates []fallbackEinoCandidate
 	boundTools []*schema.ToolInfo
 	onSuccess  func(string)
+	limiterHub *llm.LimiterHub
+	runID      string
+	recorder   func(runID, purpose, provider, modelName, status, detail, limiterState string, startedAt, finishedAt time.Time)
 }
 
 func (m *fallbackEinoModel) Generate(ctx context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.Message, error) {
 	var lastErr error
 	attempted := make([]string, 0, len(m.candidates))
+	purpose := modelPurposeFromContext(ctx)
 	for _, candidate := range m.candidates {
+		limiter := m.limiterFor(candidate)
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				m.recordAttempt(purpose, candidate, "blocked", err.Error(), limiter.DescribeState(), time.Now(), time.Now())
+				return nil, err
+			}
+		}
+		startedAt := time.Now()
 		attempted = append(attempted, candidate.name)
 		msg, err := candidate.model.Generate(ctx, input, m.mergeOptions(candidate.opts, opts...)...)
 		if err == nil {
+			if limiter != nil {
+				limiter.Success()
+			}
+			m.recordAttempt(purpose, candidate, "completed", "generate", limiterState(limiter), startedAt, time.Now())
 			if m.onSuccess != nil {
 				m.onSuccess(candidate.name)
 			}
 			return msg, nil
+		}
+		if llm.LooksLikeProviderRateLimited(err) && limiter != nil {
+			limiter.MarkRateLimited()
+			m.recordAttempt(purpose, candidate, "rate_limited", err.Error(), limiter.DescribeState(), startedAt, time.Now())
+		} else {
+			m.recordAttempt(purpose, candidate, "failed", err.Error(), limiterState(limiter), startedAt, time.Now())
 		}
 		lastErr = err
 		if !llm.ShouldFallbackModel(err) {
@@ -1278,14 +1385,33 @@ func (m *fallbackEinoModel) Generate(ctx context.Context, input []*schema.Messag
 func (m *fallbackEinoModel) Stream(ctx context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.StreamReader[*schema.Message], error) {
 	var lastErr error
 	attempted := make([]string, 0, len(m.candidates))
+	purpose := modelPurposeFromContext(ctx)
 	for _, candidate := range m.candidates {
+		limiter := m.limiterFor(candidate)
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				m.recordAttempt(purpose, candidate, "blocked", err.Error(), limiter.DescribeState(), time.Now(), time.Now())
+				return nil, err
+			}
+		}
+		startedAt := time.Now()
 		attempted = append(attempted, candidate.name)
 		stream, err := candidate.model.Stream(ctx, input, m.mergeOptions(candidate.opts, opts...)...)
 		if err == nil {
+			if limiter != nil {
+				limiter.Success()
+			}
+			m.recordAttempt(purpose, candidate, "completed", "stream", limiterState(limiter), startedAt, time.Now())
 			if m.onSuccess != nil {
 				m.onSuccess(candidate.name)
 			}
 			return stream, nil
+		}
+		if llm.LooksLikeProviderRateLimited(err) && limiter != nil {
+			limiter.MarkRateLimited()
+			m.recordAttempt(purpose, candidate, "rate_limited", err.Error(), limiter.DescribeState(), startedAt, time.Now())
+		} else {
+			m.recordAttempt(purpose, candidate, "failed", err.Error(), limiterState(limiter), startedAt, time.Now())
 		}
 		lastErr = err
 		if !llm.ShouldFallbackModel(err) {
@@ -1303,8 +1429,37 @@ func (m *fallbackEinoModel) WithTools(tools []*schema.ToolInfo) (einomodel.ToolC
 		candidates: append([]fallbackEinoCandidate(nil), m.candidates...),
 		boundTools: append([]*schema.ToolInfo(nil), tools...),
 		onSuccess:  m.onSuccess,
+		limiterHub: m.limiterHub,
+		runID:      m.runID,
+		recorder:   m.recorder,
 	}
 	return cloned, nil
+}
+
+func (m *fallbackEinoModel) recordAttempt(purpose string, candidate fallbackEinoCandidate, status, detail, limiterState string, startedAt, finishedAt time.Time) {
+	if m.recorder == nil || strings.TrimSpace(m.runID) == "" {
+		return
+	}
+	m.recorder(m.runID, purpose, candidate.provider, candidate.name, status, detail, limiterState, startedAt, finishedAt)
+}
+
+func (m *fallbackEinoModel) limiterFor(candidate fallbackEinoCandidate) *llm.ModelLimiter {
+	if m == nil || m.limiterHub == nil {
+		return nil
+	}
+	return m.limiterHub.For(candidate.provider, candidate.name)
+}
+
+func withModelPurpose(ctx context.Context, purpose string) context.Context {
+	return context.WithValue(ctx, modelPurposeContextKey{}, strings.TrimSpace(purpose))
+}
+
+func modelPurposeFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return "chat_runtime"
+	}
+	value, _ := ctx.Value(modelPurposeContextKey{}).(string)
+	return firstNonEmpty(strings.TrimSpace(value), "chat_runtime")
 }
 
 func (m *fallbackEinoModel) mergeOptions(base []einomodel.Option, opts ...einomodel.Option) []einomodel.Option {

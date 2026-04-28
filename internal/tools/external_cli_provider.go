@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dongping/mateway/internal/cmdresolve"
 )
@@ -54,15 +56,19 @@ func (p ExternalCLIProvider) Tools(_ context.Context, _ Scope) ([]Tool, error) {
 			binaryPath:  resolution.Path,
 			args:        listArgs,
 			env:         cloneEnv(p.Env),
+			source:      resolution.Source,
+			shellPath:   resolution.ShellPath,
 		},
 		externalCLIRunTool{
 			name:            name,
 			description:     firstNonEmpty(strings.TrimSpace(p.Description), fmt.Sprintf("Run selected commands from the %s external CLI provider.", name)),
 			binaryPath:      resolution.Path,
+			discoveryArgs:   listArgs,
 			allowedCommands: compactArgs(p.AllowedCommands),
 			blockedCommands: compactArgs(p.BlockedCommands),
 			env:             cloneEnv(p.Env),
 			riskLevel:       riskLevel,
+			shellPath:       resolution.ShellPath,
 		},
 	}, nil
 }
@@ -73,6 +79,8 @@ type externalCLIListTool struct {
 	binaryPath  string
 	args        []string
 	env         map[string]string
+	source      string
+	shellPath   string
 }
 
 func (t externalCLIListTool) Spec() Spec {
@@ -86,22 +94,51 @@ func (t externalCLIListTool) Spec() Spec {
 	}
 }
 
+func (t externalCLIListTool) Availability(ctx context.Context) Availability {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, err := runCLI(probeCtx, t.binaryPath, t.args, t.env)
+	if err != nil {
+		return Availability{
+			Available: false,
+			Reason:    cliProviderUnavailableMessage(t.name, "list", t.args, nil, t.shellPath, err.Error()),
+		}
+	}
+	if strings.TrimSpace(out) == "" {
+		return Availability{
+			Available: false,
+			Reason:    fmt.Sprintf("provider %q resolved locally but its discovery command returned no output", t.name),
+		}
+	}
+	return Availability{Available: true}
+}
+
 func (t externalCLIListTool) Invoke(ctx context.Context, _ Call) (Result, error) {
 	out, err := runCLI(ctx, t.binaryPath, t.args, t.env)
 	if err != nil {
-		return Result{}, fmt.Errorf("%s list failed: %s", t.name, err.Error())
+		return rawResult(cliProviderUnavailableMessage(t.name, "list", t.args, nil, t.shellPath, err.Error())), nil
 	}
-	return rawResult(trimCLIOutput(out)), nil
+	payload, _ := json.Marshal(map[string]any{
+		"provider":            t.name,
+		"binary_path":         t.binaryPath,
+		"resolution_source":   t.source,
+		"shell_path":          t.shellPath,
+		"help_probe_strategy": defaultCLIHelpProbeOrder(),
+		"output":              trimCLIOutput(out),
+	})
+	return Result{Output: payload}, nil
 }
 
 type externalCLIRunTool struct {
 	name            string
 	description     string
 	binaryPath      string
+	discoveryArgs   []string
 	allowedCommands []string
 	blockedCommands []string
 	env             map[string]string
 	riskLevel       string
+	shellPath       string
 }
 
 func (t externalCLIRunTool) Spec() Spec {
@@ -125,6 +162,20 @@ func (t externalCLIRunTool) Spec() Spec {
 	}
 }
 
+func (t externalCLIRunTool) Availability(ctx context.Context) Availability {
+	listTool := externalCLIListTool{
+		name:       t.name,
+		binaryPath: t.binaryPath,
+		args:       compactArgs(t.discoveryArgs),
+		env:        t.env,
+		shellPath:  t.shellPath,
+	}
+	if len(listTool.args) == 0 {
+		listTool.args = []string{"--help"}
+	}
+	return listTool.Availability(ctx)
+}
+
 func (t externalCLIRunTool) Invoke(ctx context.Context, call Call) (Result, error) {
 	var args struct {
 		Args []string `json:"args"`
@@ -143,11 +194,45 @@ func (t externalCLIRunTool) Invoke(ctx context.Context, call Call) (Result, erro
 	if len(t.allowedCommands) > 0 && !commandAllowed(root, t.allowedCommands) {
 		return rawResult(cliPolicyDeniedMessage(t.name, root, "not_allowed", t.allowedCommands, t.blockedCommands)), nil
 	}
+	if preflight := t.preflight(ctx, root); preflight != "" {
+		return rawResult(preflight), nil
+	}
 	out, err := runCLI(ctx, t.binaryPath, clean, t.env)
 	if err != nil {
+		if recoverable, ok := t.recoverableFailure(root, clean, err); ok {
+			return rawResult(recoverable), nil
+		}
 		return Result{}, fmt.Errorf("%s run failed: %s", t.name, err.Error())
 	}
 	return rawResult(trimCLIOutput(out)), nil
+}
+
+func (t externalCLIRunTool) preflight(ctx context.Context, root string) string {
+	if strings.TrimSpace(root) == "" {
+		return ""
+	}
+	// Learn-before-run: verify the root command has a discoverable help surface first.
+	for _, probe := range helpProbeCandidates(root) {
+		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		out, err := runCLI(probeCtx, t.binaryPath, probe, t.env)
+		cancel()
+		if err == nil && strings.TrimSpace(out) != "" {
+			return ""
+		}
+	}
+	return cliLearnBeforeRunMessage(t.name, root, t.allowedCommands, t.shellPath)
+}
+
+func (t externalCLIRunTool) recoverableFailure(root string, args []string, err error) (string, bool) {
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "executable file not found"), strings.Contains(msg, "not found"), strings.Contains(msg, "exit status 127"):
+		return cliProviderUnavailableMessage(t.name, root, args, t.allowedCommands, t.shellPath, err.Error()), true
+	case strings.Contains(msg, "unknown command"), strings.Contains(msg, "invalid choice"), strings.Contains(msg, "no such command"):
+		return cliLearnBeforeRunMessage(t.name, root, t.allowedCommands, t.shellPath), true
+	default:
+		return "", false
+	}
 }
 
 func cliPolicyDeniedMessage(providerName, command, reason string, allowed, blocked []string) string {
@@ -160,7 +245,38 @@ func cliPolicyDeniedMessage(providerName, command, reason string, allowed, block
 	if len(blocked) > 0 {
 		parts = append(parts, "blocked root commands: "+strings.Join(blocked, ", "))
 	}
-	parts = append(parts, "try another allowed command or switch to web_search/browser_fetch instead")
+	parts = append(parts, "learn-before-run: call the provider list/help command first, then try another allowed command or switch to web_search/browser_fetch")
+	return strings.Join(parts, "; ")
+}
+
+func cliLearnBeforeRunMessage(providerName, command string, allowed []string, shellPath string) string {
+	parts := []string{
+		fmt.Sprintf("learn-before-run: provider %q could not verify a help surface for root command %q", providerName, command),
+		"first inspect the provider with its *_list tool or local help probes before trying to execute a task command",
+		"if local inspection still fails, fall back to web_search/browser_fetch for external docs and then retry with a known supported command",
+	}
+	if len(allowed) > 0 {
+		parts = append(parts, "allowed root commands: "+strings.Join(allowed, ", "))
+	}
+	if strategy := platformShellStrategy(shellPath); strategy != "" {
+		parts = append(parts, strategy)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func cliProviderUnavailableMessage(providerName, command string, args []string, allowed []string, shellPath, errText string) string {
+	parts := []string{
+		fmt.Sprintf("provider unavailable: %q failed while running %q with args %v", providerName, command, args),
+		"do not stop here; switch to another completion route such as web_search/browser_fetch or a different local tool",
+		"if this provider is important, inspect availability and docs first instead of repeating the same failing command",
+		"error=" + strings.TrimSpace(errText),
+	}
+	if len(allowed) > 0 {
+		parts = append(parts, "allowed root commands: "+strings.Join(allowed, ", "))
+	}
+	if strategy := platformShellStrategy(shellPath); strategy != "" {
+		parts = append(parts, strategy)
+	}
 	return strings.Join(parts, "; ")
 }
 
@@ -179,6 +295,49 @@ func runCLI(ctx context.Context, binary string, args []string, env map[string]st
 		return strings.TrimSpace(string(out)), err
 	}
 	return string(out), nil
+}
+
+func helpProbeCandidates(root string) [][]string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return [][]string{
+			{root, "--help"},
+			{root, "-h"},
+			{"help", root},
+			{root, "/?"},
+		}
+	default:
+		return [][]string{
+			{root, "--help"},
+			{root, "-h"},
+			{"help", root},
+			{root, "help"},
+		}
+	}
+}
+
+func defaultCLIHelpProbeOrder() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"<root> --help", "<root> -h", "help <root>", "<root> /?"}
+	}
+	return []string{"<root> --help", "<root> -h", "help <root>", "<root> help"}
+}
+
+func platformShellStrategy(shellPath string) string {
+	base := strings.ToLower(strings.TrimSpace(shellPath))
+	switch runtime.GOOS {
+	case "windows":
+		return "platform-shell-strategy: prefer standalone executables first; if you must inspect shell-specific usage, try PowerShell/cmd help styles such as --help, -h, and /?"
+	default:
+		if strings.Contains(base, "zsh") || strings.Contains(base, "bash") || strings.Contains(base, "sh") {
+			return "platform-shell-strategy: prefer standalone executables first; only use shell-specific inspection when the command is shell-bound, and try --help, -h, then help"
+		}
+		return "platform-shell-strategy: prefer standalone executables first and keep shell assumptions minimal"
+	}
 }
 
 func compactArgs(values []string) []string {
