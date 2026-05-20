@@ -19,6 +19,38 @@
 - `shell.run`
 - `user.ask`
 
+## 二进制快速开始
+
+用户只需要下载一个 `mateway` 二进制即可初始化本机运行目录：
+
+```bash
+mateway init
+```
+
+初始化会在 `~/.mateway/config` 生成真实配置、sample 配置和说明文档：
+
+- `config.yaml`
+- `config.sample.yaml`
+- `mateway.env.sample`
+- `models/minimax.yaml`
+- `models/minimax.sample.yaml`
+- `models/local-mlx.yaml`
+- `models/local-mlx.sample.yaml`
+- `channels/feishu.yaml`
+- `channels/feishu.sample.yaml`
+- `README.md`
+
+然后按需填写：
+
+```bash
+cp ~/.mateway/config/mateway.env.sample ~/.mateway/config/mateway.env
+vim ~/.mateway/config/mateway.env
+vim ~/.mateway/config/config.yaml
+mateway doctor
+```
+
+`mateway init` 是幂等的：已有真实配置不会被覆盖，只会补齐缺失文件。
+
 ## 配置
 
 Mateway 从 `MATEWAY_HOME` 读取运行时配置，默认目录是 `~/.mateway`。
@@ -35,15 +67,15 @@ Mateway 从 `MATEWAY_HOME` 读取运行时配置，默认目录是 `~/.mateway`�
 ## 命令
 
 ```bash
-go run ./cmd/mateway init
-go run ./cmd/mateway doctor
-go run ./cmd/mateway ask "现在几点？"
-go run ./cmd/mateway ask "运行 pwd，然后读取 README.md 总结"
-go run ./cmd/mateway gateway serve
-go run ./cmd/mateway gateway status
-go run ./cmd/mateway gateway restart
-go run ./cmd/mateway trace tail
-go run ./cmd/mateway trace show <trace_id>
+mateway init
+mateway doctor
+mateway ask "现在几点？"
+mateway ask "运行 pwd，然后读取 README.md 总结"
+mateway gateway serve
+mateway gateway status
+mateway gateway restart
+mateway trace tail
+mateway trace show <trace_id>
 scripts/restart-plist.sh --env-file ~/.mateway/config/mateway.env
 ```
 

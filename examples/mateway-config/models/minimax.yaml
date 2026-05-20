@@ -1,0 +1,9 @@
+name: minimax
+provider: minimax
+api: anthropic
+model: MiniMax-M2.7
+api_base: https://api.minimaxi.com/anthropic
+api_key_env: MINIMAX_API_KEY
+strip_reasoning: true
+enabled: true
+description: Default remote model for planning, repair, synthesis, and high-reliability tasks.

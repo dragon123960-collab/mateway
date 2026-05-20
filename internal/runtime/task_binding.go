@@ -49,6 +49,9 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 	if decision, ok := l.resolveSlotFill(); ok {
 		return decision
 	}
+	if decision, ok := l.resolvePendingConfirmNewTask(); ok {
+		return decision
+	}
 	if decision, ok := l.resolveRuleFollowup(); ok {
 		return decision
 	}
@@ -259,6 +262,24 @@ func (l *AgentLoop) resolveSlotFill() (taskBindingDecision, bool) {
 	}, true
 }
 
+func (l *AgentLoop) resolvePendingConfirmNewTask() (taskBindingDecision, bool) {
+	task := session.ActiveTask(l.state.session)
+	if task == nil || task.PendingApproval == nil || task.Status != session.TaskAwaitConfirm {
+		return taskBindingDecision{}, false
+	}
+	text := strings.TrimSpace(l.state.message.Text)
+	if !looksLikeIndependentRequestDuringConfirm(text) {
+		return taskBindingDecision{}, false
+	}
+	return taskBindingDecision{
+		Kind:          bindingNewTask,
+		TargetTaskID:  l.state.traceID,
+		ResolvedQuery: text,
+		Reason:        "待确认状态下识别到明显独立新请求，优先开启新任务",
+		Confidence:    0.88,
+	}, true
+}
+
 func (l *AgentLoop) resolveRuleFollowup() (taskBindingDecision, bool) {
 	task := session.ActiveTask(l.state.session)
 	if task == nil {
@@ -278,10 +299,38 @@ func (l *AgentLoop) resolveRuleFollowup() (taskBindingDecision, bool) {
 	return taskBindingDecision{
 		Kind:          bindingActiveFollowup,
 		TargetTaskID:  task.ID,
-		ResolvedQuery: firstNonEmpty(decision.ResolvedQuery, task.ResolvedQuery, task.UserText, l.state.message.Text),
+		ResolvedQuery: strengthenFollowupInstruction(firstNonEmpty(decision.ResolvedQuery, task.ResolvedQuery, task.UserText, l.state.message.Text), l.state.message.Text),
 		Reason:        firstNonEmpty(decision.Reason, "规则解析为继续当前活动任务"),
 		Confidence:    decision.Confidence,
 	}, true
+}
+
+func strengthenFollowupInstruction(resolved, current string) string {
+	resolved = strings.TrimSpace(resolved)
+	current = strings.TrimSpace(current)
+	if current == "" {
+		return resolved
+	}
+	if resolved == "" {
+		return current
+	}
+	if !containsStructuralFollowupIntent(current) {
+		return resolved
+	}
+	return resolved + "\n\n重要：本轮补充要求优先级最高，必须明确执行，不要只复述上一轮主题。\n本轮补充要求：" + current
+}
+
+func containsStructuralFollowupIntent(text string) bool {
+	normalized := normalizeFollowupText(text)
+	cues := []string{
+		"拆成", "拆分", "三条", "3条", "三个", "3个", "步骤", "检查项", "清单", "列表", "可执行", "验收标准", "压缩成", "改成",
+	}
+	for _, cue := range cues {
+		if strings.Contains(normalized, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldDeferFollowupToModel(text string) bool {
@@ -294,6 +343,43 @@ func shouldDeferFollowupToModel(text string) bool {
 		strings.Contains(normalized, "上次") ||
 		strings.Contains(normalized, "之前") ||
 		strings.Contains(normalized, "历史")
+}
+
+func looksLikeIndependentRequestDuringConfirm(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if len([]rune(trimmed)) < 8 {
+		return false
+	}
+	normalized := normalizeFollowupText(trimmed)
+	if normalized == "" {
+		return false
+	}
+	if _, ok := parseApprovalDecision(normalized, &session.PendingApproval{ApprovalType: "boolean_confirm"}); ok {
+		return false
+	}
+	cancelOnly := []string{"先不", "暂时不", "先算了", "不用了", "不要执行", "别执行", "先别执行"}
+	for _, cue := range cancelOnly {
+		if normalized == cue {
+			return false
+		}
+	}
+	newTopicCues := []string{
+		"新问题", "另一个问题", "另外", "换个话题", "先不管", "先别管", "先跳过", "回到",
+	}
+	for _, cue := range newTopicCues {
+		if strings.Contains(normalized, cue) {
+			return true
+		}
+	}
+	requestCues := []string{
+		"请", "帮我", "帮忙", "麻烦", "总结", "搜索", "查一下", "查看", "阅读", "解释", "分析", "列出", "生成", "写一份", "整理", "评估", "对比", "修复", "处理",
+	}
+	for _, cue := range requestCues {
+		if strings.Contains(normalized, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecision, bool) {

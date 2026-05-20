@@ -1,0 +1,95 @@
+app:
+  name: mateway
+  home: ""
+  workspace: ""
+
+model:
+  default: minimax
+  fallbacks:
+    - local-mlx
+  roles:
+    planning: minimax
+    repair: minimax
+    synthesis: minimax
+    followup: local-mlx
+
+agents:
+  default: main
+  profiles:
+    - id: main
+      name: 主助理
+      default: true
+      session_namespace: main
+      model:
+        default: minimax
+        fallbacks:
+          - local-mlx
+        roles:
+          planning: minimax
+          repair: minimax
+          synthesis: minimax
+          followup: local-mlx
+      heartbeat:
+        enabled: false
+        interval: 30m
+        quiet_hours:
+          start: "23:00"
+          end: "08:00"
+      skills:
+        allow: []
+        deny: []
+      tools:
+        allow: []
+        deny: []
+
+    - id: local
+      name: 本地助理
+      session_namespace: local
+      model:
+        default: local-mlx
+        fallbacks:
+          - minimax
+        roles:
+          planning: local-mlx
+          repair: minimax
+          synthesis: local-mlx
+          followup: local-mlx
+      heartbeat:
+        enabled: false
+        interval: 30m
+        quiet_hours:
+          start: "23:00"
+          end: "08:00"
+      skills:
+        allow: []
+        deny: []
+      tools:
+        allow: []
+        deny: []
+
+  bindings:
+    - channel: cli
+      agent_id: main
+    - channel: feishu
+      agent_id: main
+
+security:
+  enforce_workspace_paths: true
+  require_approval_for_risky_tools: true
+  accessible_paths: []
+
+search:
+  default_tool: tavily
+  providers:
+    tavily:
+      enabled: false
+      api_key_env: TAVILY_API_KEY
+      timeout_seconds: 20
+      max_results: 5
+      search_depth: basic
+      topic: general
+    duckduckgo:
+      enabled: true
+      timeout_seconds: 10
+      max_results: 5
+      region: cn-zh

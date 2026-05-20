@@ -11,6 +11,9 @@ import (
 const defaultReplyLimit = 4000
 
 var multiBlankLines = regexp.MustCompile(`\n{3,}`)
+var toolCallBlock = regexp.MustCompile(`(?is)\[TOOL_CALL\].*?(?:\[/TOOL_CALL\]|$)`)
+var minimaxToolCallBlock = regexp.MustCompile(`(?is)<minimax:tool_call\b[^>]*>.*?(?:</minimax:tool_call>|$)`)
+var jsonToolPlanBlock = regexp.MustCompile(`(?is)^\s*\[\s*\{.*"(?:tool|args|risk|requires_confirm|expected_evidence)".*\}\s*\]\s*$`)
 
 type ResponseSanitizer interface {
 	Sanitize(reply channel.OutboundMessage) channel.OutboundMessage
@@ -27,6 +30,8 @@ func (s DefaultSanitizer) Sanitize(reply channel.OutboundMessage) channel.Outbou
 
 func sanitizeReplyText(style, text string, limit int) string {
 	text = strings.TrimSpace(text)
+	text = stripToolCallEcho(text)
+	text = stripJSONToolPlanEcho(text)
 	text = stripPromptEcho(text)
 	text = multiBlankLines.ReplaceAllString(text, "\n\n")
 	text = strings.TrimSpace(text)
@@ -37,6 +42,37 @@ func sanitizeReplyText(style, text string, limit int) string {
 		limit = defaultReplyLimit
 	}
 	return tool.Truncate(text, limit)
+}
+
+func stripJSONToolPlanEcho(text string) string {
+	if !jsonToolPlanBlock.MatchString(text) {
+		return text
+	}
+	return ""
+}
+
+func stripToolCallEcho(text string) string {
+	text = toolCallBlock.ReplaceAllString(text, "")
+	text = minimaxToolCallBlock.ReplaceAllString(text, "")
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	skipJSONish := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.Contains(lower, "[tool_call]"):
+			skipJSONish = true
+			continue
+		case skipJSONish && (strings.Contains(lower, `"tool"`) || strings.Contains(lower, `"args"`) || strings.Contains(lower, `"name"`) || strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "}")):
+			continue
+		case skipJSONish && trimmed == "":
+			skipJSONish = false
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
 }
 
 func stripPromptEcho(text string) string {

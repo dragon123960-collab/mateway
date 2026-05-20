@@ -18,7 +18,23 @@ Mateway 目前是一个小型工具型 Agent，而不是重型框架化 runtime�
 
 ## Workspace 初始化
 
-运行 `mateway init` 会创建 `~/.mateway`，并把默认 skills 释放到：
+运行 `mateway init` 会创建 `~/.mateway`，并释放配置、sample、说明文档和默认 skills。
+
+配置文件会生成到：
+
+- `~/.mateway/config/config.yaml`
+- `~/.mateway/config/config.sample.yaml`
+- `~/.mateway/config/mateway.env.sample`
+- `~/.mateway/config/models/minimax.yaml`
+- `~/.mateway/config/models/minimax.sample.yaml`
+- `~/.mateway/config/models/local-mlx.yaml`
+- `~/.mateway/config/models/local-mlx.sample.yaml`
+- `~/.mateway/config/channels/feishu.yaml`
+- `~/.mateway/config/channels/feishu.sample.yaml`
+
+这些模板随二进制内置，不依赖用户下载源码仓库。`mateway init` 不覆盖已有真实配置。
+
+默认 skills 释放到：
 
 - `~/.mateway/workspace/skills`
 - `~/.mateway/workspace/agents/main/skills`

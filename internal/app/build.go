@@ -29,7 +29,11 @@ func Build(home string, quiet bool) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	modelCfg, err := selectModel(cfg.Models)
+	defaultAgent, err := cfg.DefaultAgentStrict()
+	if err != nil {
+		return nil, err
+	}
+	modelCfg, err := selectModel(cfg.Models, defaultAgent.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -45,6 +49,9 @@ func Init(home string) (string, error) {
 	if err := ensureLayout(loader.Home); err != nil {
 		return "", err
 	}
+	if err := config.EnsureDefaultConfigFiles(loader.Home); err != nil {
+		return "", err
+	}
 	return loader.Home, nil
 }
 
@@ -52,7 +59,14 @@ func ensureLayout(home string) error {
 	return skill.EnsureWorkspaceLayout(home, filepath.Join(home, "workspace"))
 }
 
-func selectModel(models []config.ModelConfig) (config.ModelConfig, error) {
+func selectModel(models []config.ModelConfig, selection config.ModelSelection) (config.ModelConfig, error) {
+	if name := strings.TrimSpace(selection.Default); name != "" {
+		item, ok := modelByName(models, name)
+		if !ok {
+			return config.ModelConfig{}, fmt.Errorf("configured default model %q is not enabled or not found under ~/.mateway/config/models", name)
+		}
+		return item, nil
+	}
 	for _, item := range models {
 		if strings.EqualFold(item.Name, "minimax") && item.Enabled {
 			return item, nil
@@ -64,6 +78,18 @@ func selectModel(models []config.ModelConfig) (config.ModelConfig, error) {
 		}
 	}
 	return config.ModelConfig{}, fmt.Errorf("no enabled model found under ~/.mateway/config/models")
+}
+
+func modelByName(models []config.ModelConfig, name string) (config.ModelConfig, bool) {
+	for _, item := range models {
+		if !item.Enabled {
+			continue
+		}
+		if strings.EqualFold(item.Name, name) {
+			return item, true
+		}
+	}
+	return config.ModelConfig{}, false
 }
 
 func Doctor(home string) (string, error) {

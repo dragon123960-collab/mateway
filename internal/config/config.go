@@ -16,6 +16,8 @@ type Root struct {
 	App      AppConfig      `yaml:"app"`
 	Security SecurityConfig `yaml:"security"`
 	Search   SearchConfig   `yaml:"search"`
+	Model    ModelSelection `yaml:"model"`
+	Agents   AgentsConfig   `yaml:"agents"`
 	Models   []ModelConfig  `yaml:"-"`
 	Channels ChannelsConfig `yaml:"-"`
 }
@@ -56,6 +58,12 @@ type SearchProviderConfig struct {
 	Region         string   `yaml:"region"`
 }
 
+type ModelSelection struct {
+	Default   string            `yaml:"default"`
+	Fallbacks []string          `yaml:"fallbacks"`
+	Roles     map[string]string `yaml:"roles"`
+}
+
 type ModelConfig struct {
 	Name           string `yaml:"name"`
 	Provider       string `yaml:"provider"`
@@ -67,6 +75,49 @@ type ModelConfig struct {
 	StripReasoning bool   `yaml:"strip_reasoning"`
 	Enabled        bool   `yaml:"enabled"`
 	Description    string `yaml:"description"`
+}
+
+type AgentsConfig struct {
+	Default  string               `yaml:"default"`
+	Profiles []AgentProfileConfig `yaml:"profiles"`
+	Bindings []AgentBindingConfig `yaml:"bindings"`
+}
+
+type AgentProfileConfig struct {
+	ID               string            `yaml:"id"`
+	Name             string            `yaml:"name"`
+	Default          bool              `yaml:"default"`
+	WorkspaceRoot    string            `yaml:"workspace_root"`
+	AgentDir         string            `yaml:"agent_dir"`
+	SessionNamespace string            `yaml:"session_namespace"`
+	Model            ModelSelection    `yaml:"model"`
+	Heartbeat        HeartbeatConfig   `yaml:"heartbeat"`
+	Skills           AccessListConfig  `yaml:"skills"`
+	Tools            AccessListConfig  `yaml:"tools"`
+	Metadata         map[string]string `yaml:"metadata"`
+}
+
+type HeartbeatConfig struct {
+	Enabled    bool                `yaml:"enabled"`
+	Interval   string              `yaml:"interval"`
+	QuietHours HeartbeatQuietHours `yaml:"quiet_hours"`
+}
+
+type HeartbeatQuietHours struct {
+	Start string `yaml:"start"`
+	End   string `yaml:"end"`
+}
+
+type AccessListConfig struct {
+	Allow []string `yaml:"allow"`
+	Deny  []string `yaml:"deny"`
+}
+
+type AgentBindingConfig struct {
+	Channel   string `yaml:"channel"`
+	AccountID string `yaml:"account_id"`
+	PeerID    string `yaml:"peer_id"`
+	AgentID   string `yaml:"agent_id"`
 }
 
 type ChannelsConfig struct {
@@ -161,12 +212,79 @@ func (l Loader) Load() (*Root, error) {
 		return nil, err
 	}
 	root.Models = models
+	root.normalizeAgents()
 	channels, err := l.loadChannels()
 	if err != nil {
 		return nil, err
 	}
 	root.Channels = channels
 	return root, nil
+}
+
+func (r *Root) DefaultAgent() AgentProfileConfig {
+	r.normalizeAgents()
+	for _, profile := range r.Agents.Profiles {
+		if strings.EqualFold(profile.ID, r.Agents.Default) {
+			return profile
+		}
+	}
+	return r.Agents.Profiles[0]
+}
+
+func (r *Root) DefaultAgentStrict() (AgentProfileConfig, error) {
+	r.normalizeAgents()
+	for _, profile := range r.Agents.Profiles {
+		if strings.EqualFold(profile.ID, r.Agents.Default) {
+			return profile, nil
+		}
+	}
+	return AgentProfileConfig{}, fmt.Errorf("configured default agent %q is not defined", r.Agents.Default)
+}
+
+func (r *Root) normalizeAgents() {
+	if strings.TrimSpace(r.Agents.Default) == "" {
+		for _, profile := range r.Agents.Profiles {
+			if profile.Default && strings.TrimSpace(profile.ID) != "" {
+				r.Agents.Default = strings.TrimSpace(profile.ID)
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(r.Agents.Default) == "" {
+		r.Agents.Default = "main"
+	}
+	if len(r.Agents.Profiles) == 0 {
+		r.Agents.Profiles = []AgentProfileConfig{{
+			ID:               r.Agents.Default,
+			Name:             "主助理",
+			Default:          true,
+			SessionNamespace: r.Agents.Default,
+			Model:            r.Model,
+		}}
+	}
+	for i := range r.Agents.Profiles {
+		profile := &r.Agents.Profiles[i]
+		if strings.TrimSpace(profile.ID) == "" {
+			profile.ID = fmt.Sprintf("agent-%d", i+1)
+		}
+		profile.ID = strings.TrimSpace(profile.ID)
+		if strings.TrimSpace(profile.Name) == "" {
+			profile.Name = profile.ID
+		}
+		if strings.TrimSpace(profile.SessionNamespace) == "" {
+			profile.SessionNamespace = profile.ID
+		}
+		if profile.Model.Empty() {
+			profile.Model = r.Model
+		}
+		if strings.EqualFold(profile.ID, r.Agents.Default) {
+			profile.Default = true
+		}
+	}
+}
+
+func (m ModelSelection) Empty() bool {
+	return strings.TrimSpace(m.Default) == "" && len(m.Fallbacks) == 0 && len(m.Roles) == 0
 }
 
 func (l Loader) loadEnvFile() error {
@@ -218,23 +336,47 @@ func (l Loader) loadModels() ([]ModelConfig, error) {
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".yaml") || strings.HasPrefix(name, "_") || strings.Contains(name, ".example.") {
+		if shouldSkipConfigFile(entry, name) {
 			continue
 		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	models := make([]ModelConfig, 0, len(names))
+	seen := map[string]string{}
 	for _, name := range names {
 		var model ModelConfig
 		if err := readYAML(filepath.Join(dir, name), &model); err != nil {
 			return nil, err
 		}
 		if model.Enabled {
+			key := strings.ToLower(strings.TrimSpace(model.Name))
+			if key == "" {
+				return nil, fmt.Errorf("model config %s has empty name", filepath.Join(dir, name))
+			}
+			if previous := seen[key]; previous != "" {
+				return nil, fmt.Errorf("duplicate enabled model name %q in %s and %s", model.Name, previous, filepath.Join(dir, name))
+			}
+			seen[key] = filepath.Join(dir, name)
 			models = append(models, model)
 		}
 	}
 	return models, nil
+}
+
+func shouldSkipConfigFile(entry os.DirEntry, name string) bool {
+	if entry.IsDir() {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" || strings.HasPrefix(lower, "_") {
+		return true
+	}
+	if !strings.HasSuffix(lower, ".yaml") {
+		return true
+	}
+	base := strings.TrimSuffix(lower, ".yaml")
+	return strings.HasSuffix(base, ".sample") || strings.HasSuffix(base, ".example")
 }
 
 func (l Loader) loadChannels() (ChannelsConfig, error) {

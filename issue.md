@@ -1,145 +1,116 @@
-# Mateway 测试问题清单
+# Mateway 当前问题清单
 
 更新时间：2026-05-20
 
-这份文档只记录本轮真实模型批测中暴露出来的问题、证据和影响，不展开修复实现。
+历史完整记录已归档到：
 
-## 1. followup 续接对“继续上一轮”不稳定
+- [`docs/archive/issue-20260520-141704.md`](/Users/dongping/project/mateway/docs/archive/issue-20260520-141704.md)
 
-状态：已处理（2026-05-20）
+## 当前未闭环
 
-处理记录：
+### 1. 最新信息来源质量仍只是软约束
 
-- 已在 runtime task binding 中接入 `internal/followup.Resolver`，并放在模型 followup 前作为强规则兜底。
-- “继续上一轮 / 继续刚才 / 接着刚才 / 展开 / 按刚才”等明确依赖当前活动任务的输入会优先绑定 active task，不再因为模型低置信直接进入 ambiguous。
-- “昨天 / 上次 / 之前 / 历史”等可能指向非当前任务的输入仍交给模型结合历史候选判断，避免把历史续接误绑到 active task。
-- 已新增回归测试 `TestRuntimeRuleFollowupBeatsLowConfidenceModelAmbiguity`。
+状态：已部分处理，待继续增强
 
-### 现象
+现象：
 
-在连续会话批测里，用户已经明确说了“继续上一轮”，系统仍然经常返回“我还不能确定你是在继续哪个任务”，把任务打成待补充信息。
+- “2026 最新 AI 课程 / 趋势”类任务能跑完，但仍可能混入二手榜单、转载页、时间戳不明页面。
 
-### 证据
+后续方向：
 
-- [`/Users/dongping/project/mateway/docs/测试文档.md`](/Users/dongping/project/mateway/docs/测试文档.md)
-- [`/Users/dongping/.mateway/testdata/2026-05-20/125800-1.md`](/Users/dongping/.mateway/testdata/2026-05-20/125800-1.md)
-- [`/Users/dongping/.mateway/testdata/2026-05-20/125836-2.md`](/Users/dongping/.mateway/testdata/2026-05-20/125836-2.md)
-- [`/Users/dongping/project/mateway/internal/runtime/task_binding.go`](/Users/dongping/project/mateway/internal/runtime/task_binding.go#L258)
-- [`/Users/dongping/project/mateway/internal/model/planner.go`](/Users/dongping/project/mateway/internal/model/planner.go#L206)
+- 在工具层返回结构化来源分类与排序。
+- 或新增 source gate：二手/时间不明来源不能单独支撑“最新/官方/最热”结论。
 
-### 影响
+### 2. 测试报告质量判断仍是轻量提示
 
-- 连续会话体验断裂
-- 用户明明是在接着上一轮说，系统却反复要求补一句上下文
-- `followup` 的核心价值被削弱，尤其是在批量测试和真实对话里很明显
+状态：已部分处理，非阻塞
 
-### 可能原因
+现象：
 
-- `resolveModelFollowup()` 完全依赖模型置信度阈值，低于阈值就直接转成 `ambiguous`
-- 提示词里虽然给了 open/history 候选，但对“上一轮任务”没有足够强的确定性兜底
-- `continue` 这类明确意图在模型侧仍然可能被判成不明确
+- `mateway test` 能提示“机制完成但质量需复核”，但还不是独立自动评分系统。
 
-## 2. 现有 `internal/followup` 规则没有真正进入主链
+后续方向：
 
-状态：已处理（2026-05-20）
+- 如需要自动回归质量，可新增独立 quality evaluator。
+- 当前阶段先人工复核报告即可。
 
-处理记录：
+### 3. 飞书模型服务瞬断需要更稳的重试策略
 
-- `AgentLoop.resolveTaskBinding()` 当前顺序为：approval reply -> slot fill -> rule followup -> model followup -> new task。
-- `internal/followup/resolver.go` 不再只是孤立测试能力，已成为主链 task binding 的本地规则入口。
-- 模型 followup 仍保留用于历史任务选择、open task 选择和复杂澄清。
+状态：已包装用户提示，待后续增强
 
-### 现象
+现象：
 
-仓库里存在一个较完整的 `internal/followup/resolver.go`，里面已经能识别“继续”“重试”“展开”“按刚才这个文件”等 followup 意图，但运行时主链实际走的是 `resolveModelFollowup()`，没有直接消费这个规则化 resolver。
+- 飞书里出现过 `unexpected EOF`，说明 MiniMax/网络偶发失败会中断本轮请求。
 
-### 证据
+已处理：
 
-- [`/Users/dongping/project/mateway/internal/followup/resolver.go`](/Users/dongping/project/mateway/internal/followup/resolver.go)
-- [`/Users/dongping/project/mateway/internal/runtime/task_binding.go`](/Users/dongping/project/mateway/internal/runtime/task_binding.go#L258)
-- [`/Users/dongping/project/mateway/internal/runtime/agent_loop.go`](/Users/dongping/project/mateway/internal/runtime/agent_loop.go)
+- 底层 URL / HTTP / `unexpected EOF` 不再直接暴露给用户。
+- trace 里会保留 `error_detail` 方便排障。
 
-### 影响
+后续方向：
 
-- 规则化 followup 逻辑和真实运行路径分裂
-- 测试里能看到 heuristics 已存在，但线上行为仍然主要受模型输出和置信度影响
-- 这会让“为什么明明是继续上一轮却还是 ambiguous”更难排查
+- 在 model client 层增加有限重试和退避。
+- 区分可重试错误与不可重试错误。
 
-### 可能原因
+### 4. 飞书 MiniMax tool_call 标签回显
 
-- followup 包被保留成了独立能力，但还没真正接到 `AgentLoop` 的任务绑定入口
-- 当前 runtime 更信任模型 followup，而不是本地规则兜底
+状态：已处理，待飞书实机回归
 
-## 3. 测试报告里的 trace_id 和真实 runtime trace 不完全对齐
+现象：
 
-状态：已处理（2026-05-20）
+- 飞书最终回复曾直接出现 `<minimax:tool_call>`。
+- 内容包含 `file.read args / risk / requires_confirm` 等内部工具调用字段。
 
-处理记录：
+已处理：
 
-- `runtime.Response` 已新增 `TraceID` 字段，由 `AgentLoop` 的真实请求级 trace id 填充。
-- `mateway test` 报告不再使用 session key 派生 trace id，改为优先使用 runtime 返回的真实 `TraceID`。
-- Trace Events 现在按真实请求级 trace id 读取，报告和 `~/.mateway/trace/events-YYYY-MM-DD.jsonl` 可以对齐排查。
+- runtime sanitizer 已清理 `<minimax:tool_call>...</minimax:tool_call>` 形态。
+- 飞书出站渲染增加二次兜底，会过滤 MiniMax tool_call 标签和工具调用详情行。
+- 已补单测覆盖连续两个 `file.read` 工具调用标签泄漏的截图场景。
 
-### 现象
+下一步验收：
 
-`mateway test` 生成的报告里，`trace_id` 使用的是测试命令自己拼出来的值，看起来更像 session key，而不是 runtime 实际写入 trace 的那个请求级 trace id。这会让报告里的 trace 片段和真实事件对不上，排障时容易误判。
+- 飞书实机再发“总结测试目标”类任务。
+- 通过标准：不出现 `<minimax:tool_call>`、`file.read args`、`risk`、`requires_confirm` 等内部字段。
 
-### 证据
+### 5. 项目/测试总结可能缺少真实文档证据
 
-- [`/Users/dongping/project/mateway/cmd/mateway/main.go`](/Users/dongping/project/mateway/cmd/mateway/main.go)
-- [`/Users/dongping/project/mateway/internal/runtime/runtime.go`](/Users/dongping/project/mateway/internal/runtime/runtime.go#L414)
-- [`/Users/dongping/project/mateway/internal/observer/logger.go`](/Users/dongping/project/mateway/internal/observer/logger.go)
-- [`/Users/dongping/project/mateway/testdata/2026-05-20/125929-1.md`](/Users/dongping/project/mateway/testdata/2026-05-20/125929-1.md)
-- [`/Users/dongping/project/mateway/testdata/2026-05-20/130009-2.md`](/Users/dongping/project/mateway/testdata/2026-05-20/130009-2.md)
+状态：已处理，待飞书实机回归
 
-### 影响
+现象：
 
-- 报告里的 trace 可能找不到对应事件，或者把不同请求混到一起
-- 用户看报告时会觉得“流程看起来完整，但 trace 对不上”
-- 不利于把测试结果直接拿去做修复定位
+- 用户要求“总结当前 Mateway 的测试目标”时，系统会说“让我查看测试文档获取具体目标”。
+- 但如果没有真实 `file.read / file.summary / project.index` 结果支撑，最终容易变成泛化回答，像是在敷衍。
 
-### 可能原因
+已处理：
 
-- 测试命令里为了方便按 session 汇总报告，自己生成了一个独立的 `trace_id`
-- 这个 `trace_id` 没有和 runtime 实际的 message-level trace id 做统一
+- runtime 增加 grounded evidence gate：当前项目、仓库、测试目标等总结类请求必须有文件或项目索引证据。
+- 第一版 plan 没拿到证据时，会触发 plan repair，要求补足 `file.read / file.summary / project.index`。
+- repair 后仍无证据时，会停止生成泛化结论，返回用户可读失败提示。
+- 已补单测覆盖“先只查时间，repair 后读测试文档”和“repair 后仍无文档证据则阻断泛化回答”。
 
-## 4. 批测任务的“通过”不等于答案质量真的足够
+下一步验收：
 
-状态：已部分处理（2026-05-20）
+- 飞书实机再发“请总结当前 Mateway 的测试目标，控制在两句话”。
+- 通过标准：回答应基于真实文档/项目证据；如果没读到证据，应明确失败，不应口头承诺“我去看文档”后泛化回答。
 
-处理记录：
+### 6. 多步 web.search 计划 JSON 缺少 step 闭合括号
 
-- `mateway test` 报告新增“质量提示”段。
-- 当任务机制完成但回复过短、缺少工具证据、分析型问题证据过少或回复偏工具痕迹时，结论会标为“任务机制已完成，但答案质量需要人工复核”。
-- 这不是完整自动评分系统，只是先避免把“跑完”误读为“质量通过”。后续若需要可继续做独立质量评估器。
+状态：已处理，待飞书实机回归
 
-### 现象
+现象：
 
-部分测试任务虽然成功落了 Markdown 报告，但内容更像是“工具调用痕迹 + 形式化总结”，不一定真的完成了用户想要的分析深度。例如有些任务只做了文档重述、shell echo 或浅层总结，还是会被记录成已完成。
+- 飞书趋势分析任务在 plan 阶段失败，工具没有开始执行。
+- trace 显示 MiniMax 返回的计划 JSON 中，多个 `web.search` step 少了外层 `}`，形如 `args:{...},{id:"step-2"...}`。
 
-### 证据
+已处理：
 
-- [`/Users/dongping/project/mateway/testdata/2026-05-20/125922-task.md`](/Users/dongping/project/mateway/testdata/2026-05-20/125922-task.md)
-- [`/Users/dongping/project/mateway/testdata/2026-05-20/125940-task.md`](/Users/dongping/project/mateway/testdata/2026-05-20/125940-task.md)
-- [`/Users/dongping/project/mateway/testdata/2026-05-20/125913-task.md`](/Users/dongping/project/mateway/testdata/2026-05-20/125913-task.md)
+- `parsePlan()` 增加 step 对象闭合括号修复兜底。
+- 修复器会按 `steps` 数组里的 step 边界切分，并根据花括号平衡度补齐缺失的 `}`。
+- 已补单测覆盖截图中的 AI 趋势多步搜索计划。
+- 已抽出 `PlanChecker / PlanNormalizer` 第一版，统一负责 raw plan JSON 的提取、修复、schema 校验和默认字段补齐。
+- runtime trace 会记录 `checker_fixed / checker_warns`，后续能直接看到计划是否被自动修过。
 
-### 影响
+下一步验收：
 
-- `mateway test` 能验证“机制通不通”，但还不能自动判断“答案够不够好”
-- 批量回归容易出现“看上去跑完了，其实质量偏浅”的情况
-- 如果后面要把测试结果交给人看，需要额外的质量检查标准
-
-### 可能原因
-
-- 目前测试命令只负责执行和落盘，没有独立的质量评分或失败判定
-- 任务模板还没有强制区分“真正分析”与“只是调用工具后做形式总结”
-
-## 结论
-
-这轮批测里，最值得优先处理的是：
-
-1. followup 续接稳定性
-2. followup 规则和 runtime 主链的接线
-3. 测试报告 trace 对齐
-
-`HOME` 作为默认目录本身没有问题，这次主要问题不在默认根，而在 followup 绑定和测试报告可读性上。
+- 飞书实机重发“搜集现在的 ai 趋势...”任务。
+- 通过标准：不再在 plan 阶段因 JSON 少括号失败，应进入 `web.search` 工具执行。

@@ -315,7 +315,7 @@ func tavilySearch(ctx context.Context, cfg SearchConfig, query string) Result {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return ErrorResult(err.Error())
 	}
-	lines := []string{"Search results for: " + query}
+	lines := []string{"Search results for: " + query, sourceQualityHint(query)}
 	for i, item := range parsed.Results {
 		lines = append(lines, fmt.Sprintf("%d. %s\n%s\n%s", i+1, item.Title, item.URL, item.Content))
 	}
@@ -354,7 +354,7 @@ func duckDuckGoSearch(ctx context.Context, cfg SearchConfig, query string) Resul
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return ErrorResult(err.Error())
 	}
-	lines := []string{"Search results for: " + query}
+	lines := []string{"Search results for: " + query, sourceQualityHint(query)}
 	if parsed.AbstractText != "" {
 		lines = append(lines, parsed.AbstractText+"\n"+parsed.AbstractURL)
 	}
@@ -366,7 +366,33 @@ func duckDuckGoSearch(ctx context.Context, cfg SearchConfig, query string) Resul
 			lines = append(lines, item.Text+"\n"+item.FirstURL)
 		}
 	}
-	return Result{OK: true, Output: Truncate(strings.Join(lines, "\n\n"), DefaultOutputLimit), Evidence: map[string]any{"kind": "web_search", "provider": "duckduckgo", "query": query, "result_count": len(lines) - 1}}
+	return Result{OK: true, Output: Truncate(strings.Join(lines, "\n\n"), DefaultOutputLimit), Evidence: map[string]any{"kind": "web_search", "provider": "duckduckgo", "query": query, "result_count": len(lines) - 2}}
+}
+
+func sourceQualityHint(query string) string {
+	if !looksTimeSensitiveSearch(query) {
+		return "Source quality hint: classify sources as official/primary, authoritative media, secondary roundup, or unclear-date before using them."
+	}
+	return strings.Join([]string{
+		"Source quality hint for fresh/current query:",
+		"- Prefer official docs/blogs, official GitHub, release notes, changelogs, academic or standards sources.",
+		"- Treat secondary roundups, SEO listicles, reposts, and unclear-date pages as weak evidence.",
+		"- Do not present a claim as latest/current unless the source date or release context supports it.",
+	}, "\n")
+}
+
+func looksTimeSensitiveSearch(query string) bool {
+	q := strings.ToLower(strings.TrimSpace(query))
+	cues := []string{
+		"latest", "current", "recent", "official", "release", "changelog", "2026", "trend", "trends", "course", "courses",
+		"最新", "当前", "最近", "官方", "发布", "版本", "趋势", "走向", "课程", "最热", "权威",
+	}
+	for _, cue := range cues {
+		if strings.Contains(q, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func simpleDiff(oldText, newText string) string {

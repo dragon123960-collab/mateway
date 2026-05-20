@@ -161,9 +161,9 @@ func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Pla
 		args := copyArgs(step.Args)
 		delete(args, "confirmed")
 		delete(args, "confirm")
-		needsConfirm := step.RequiresConfirm || tool.RequireConfirmForTool(step.Tool, args)
+		needsConfirm := tool.RequireConfirmForTool(step.Tool, args)
 		if needsConfirm && !approvalGranted {
-			tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "await_confirm", Output: "Step requires confirmation before execution.", Evidence: map[string]any{"kind": "step_confirm", "goal": step.Goal}}
+			tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "await_confirm", Output: confirmPromptForStep(step, args), Evidence: map[string]any{"kind": "step_confirm", "goal": step.Goal, "tool": step.Tool}}
 			results = append(results, tr)
 			r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm"})
 			if r.Observer != nil {
@@ -206,10 +206,51 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 		p = *plan
 	}
 	return Response{
-		Reply:   r.sanitizeReply(channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: err.Error(), Style: "error"}),
+		Reply:   r.sanitizeReply(channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: userFacingError(err), Style: "error"}),
 		TraceID: traceIDForMessage(msg),
 		Plan:    p, Results: results, Failed: true,
 	}
+}
+
+func userFacingError(err error) string {
+	if err == nil {
+		return "这次处理失败了，但我已经停在安全位置。"
+	}
+	text := err.Error()
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "insufficient tool evidence") {
+		return "这次我没有拿到足够的工具证据来回答，已停止生成泛化结论。请重试；我会优先读取相关项目文档后再总结。"
+	}
+	if strings.Contains(lower, "unexpected eof") ||
+		strings.Contains(lower, "model request") ||
+		strings.Contains(lower, "api.minimaxi.com") ||
+		strings.Contains(lower, "/anthropic/") ||
+		strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "context deadline exceeded") {
+		return "这次请求模型服务时临时失败了，任务没有继续执行。请稍后重试；如果连续出现，我会建议查看 trace 日志定位。"
+	}
+	return "这次处理失败了，但我已经停在安全位置。请查看报告或 trace 里的错误详情。"
+}
+
+func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
+	switch step.Tool {
+	case "shell.run":
+		command := strings.TrimSpace(args["command"])
+		if command != "" {
+			return "这个命令可能会修改或删除本地内容，需要你确认后我才会执行。\n\n命令：`" + command + "`\n\n如果确认执行，请回复“同意”或“确认”；如果不执行，请回复“取消”。"
+		}
+	case "file.write", "file.patch":
+		path := strings.TrimSpace(args["path"])
+		if path != "" {
+			return "这个文件操作会修改本地文件，需要你确认后我才会执行。\n\n文件：" + path + "\n\n如果确认执行，请回复“同意”或“确认”；如果不执行，请回复“取消”。"
+		}
+	}
+	goal := strings.TrimSpace(step.Goal)
+	if goal == "" {
+		goal = step.Tool
+	}
+	return "这一步需要你确认后才能继续。\n\n操作：" + goal + "\n\n如果确认执行，请回复“同意”或“确认”；如果不执行，请回复“取消”。"
 }
 
 func (r Runtime) sanitizeReply(reply channel.OutboundMessage) channel.OutboundMessage {
@@ -226,6 +267,55 @@ func hasRepairableFailure(results []model.ToolResult) bool {
 		}
 	}
 	return false
+}
+
+func needsGroundedProjectEvidence(user string, results []model.ToolResult) bool {
+	if !requiresProjectEvidence(user) {
+		return false
+	}
+	return !hasGroundingEvidence(results)
+}
+
+func requiresProjectEvidence(user string) bool {
+	normalized := normalizeIntentText(user)
+	if normalized == "" {
+		return false
+	}
+	hasLocalSubject := strings.Contains(normalized, "当前") ||
+		strings.Contains(normalized, "mateway") ||
+		strings.Contains(normalized, "项目") ||
+		strings.Contains(normalized, "仓库") ||
+		strings.Contains(normalized, "测试")
+	hasKnowledgeAction := strings.Contains(normalized, "总结") ||
+		strings.Contains(normalized, "概览") ||
+		strings.Contains(normalized, "梳理") ||
+		strings.Contains(normalized, "说明") ||
+		strings.Contains(normalized, "分析") ||
+		strings.Contains(normalized, "列出") ||
+		strings.Contains(normalized, "检查项") ||
+		strings.Contains(normalized, "目标")
+	return hasLocalSubject && hasKnowledgeAction
+}
+
+func hasGroundingEvidence(results []model.ToolResult) bool {
+	for _, result := range results {
+		if !result.OK {
+			continue
+		}
+		switch strings.TrimSpace(result.Tool) {
+		case "file.read", "file.summary", "project.index":
+			return true
+		}
+		if kind, _ := result.Evidence["kind"].(string); kind == "file_read" || kind == "file_summary" || kind == "project_index" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeIntentText(text string) string {
+	replacer := strings.NewReplacer("，", "", "。", "", "？", "", "！", "", "：", "", "\n", "")
+	return strings.ToLower(strings.TrimSpace(replacer.Replace(text)))
 }
 
 func anyFailed(results []model.ToolResult) bool {

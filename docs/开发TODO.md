@@ -326,7 +326,7 @@ TODO 定执行；
 
 ### T1.4 AgentProfile / AgentRegistry / GatewayBinding
 
-状态：未开始
+状态：进行中（配置契约已落地，Gateway 路由未开始）
 
 - 目标：支持多个长期共存 agent，但暂不进入 supervisor / spawn。
 - 建议位置：
@@ -334,13 +334,31 @@ TODO 定执行；
   - `internal/config`
   - 可新增 `internal/agent`
 - 交付物：
-  - AgentProfile
+  - AgentProfile 配置结构
+  - ModelSelection 配置结构
+  - Heartbeat 配置结构
   - AgentRegistry
   - channel/account/peer 到 agentId 的绑定
 - 验收标准：
+  - 默认模型只能由 `model.default` 或默认 agent 的 `model.default` 显式指定
+  - 启用 OpenAI-compatible 本地模型不会因为 `api: openai` 自动抢占默认模型
+  - agent 可声明模型 fallback、角色模型、heartbeat、skill/tool allow/deny
   - Gateway 可按绑定选择 agent
   - 每个 agent 有独立上下文目录和 session 命名空间
   - 不引入复杂 router
+
+已完成：
+
+- `internal/config` 已支持顶层 `model` 与 `agents` 配置结构。
+- 无 agents 配置时会合成 `main` 默认 agent，兼容当前单 agent 主链。
+- app 启动模型选择已改为显式默认优先，未配置时保留 `minimax` 兼容默认。
+
+未完成：
+
+- AgentRegistry 运行时对象。
+- GatewayBinding 路由接入。
+- 多模型 fallback 的真实运行时重试。
+- role model 在 planning / repair / synthesis / followup 阶段的实际分流。
 
 ---
 

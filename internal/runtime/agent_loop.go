@@ -10,6 +10,7 @@ import (
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
+	"github.com/dongping/mateway/internal/tool"
 )
 
 type AgentLoop struct {
@@ -68,11 +69,14 @@ func (l *AgentLoop) Run(ctx context.Context) (Response, error) {
 	if l.state.control != "" {
 		return l.controlReply(), nil
 	}
-	if l.shouldRepair() {
+	if l.shouldRepairBeforeSynthesis() {
 		l.repair(ctx)
 		if l.state.control != "" {
 			return l.controlReply(), nil
 		}
+	}
+	if l.shouldBlockUnsupportedSynthesis() {
+		return l.fail(fmt.Errorf("insufficient tool evidence for grounded answer")), nil
 	}
 	l.synthesize(ctx)
 	return l.finalReply(), nil
@@ -135,21 +139,35 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 	})
 	l.recordSelectedSkills(planSkills)
 	contextPrompt := buildModelContextPrompt(l.state.resolvedRequest(), skill.StagePlanning, planMatches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx)
-	plan, err := l.runtime.Model.PlanJSON(ctx, l.state.resolvedRequest(), l.runtime.Tools.Definitions(), strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)))
+	plan, check, err := l.planJSON(ctx, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)))
 	if err != nil {
 		return err
 	}
 	l.state.plan = plan
 	l.runtime.Logger.Event("runtime.plan", map[string]any{
-		"trace_id":   l.state.traceID,
-		"summary":    plan.Summary,
-		"steps":      len(plan.Steps),
-		"tool_names": planToolNames(plan),
+		"trace_id":       l.state.traceID,
+		"summary":        plan.Summary,
+		"steps":          len(plan.Steps),
+		"tool_names":     planToolNames(plan),
+		"checker_fixed":  check.Fixed,
+		"checker_warns":  check.Warnings,
+		"checker_raw_ok": check.Raw != "",
 	})
 	if l.runtime.Observer != nil {
 		l.runtime.Observer.Plan(l.state.traceID, plan)
 	}
 	return nil
+}
+
+func (l *AgentLoop) planJSON(ctx context.Context, skillPrompt string) (model.Plan, model.PlanCheckResult, error) {
+	if checker, ok := l.runtime.Model.(interface {
+		PlanCheckedJSON(context.Context, string, []tool.Definition, string) (model.PlanCheckResult, error)
+	}); ok {
+		result, err := checker.PlanCheckedJSON(ctx, l.state.resolvedRequest(), l.runtime.Tools.Definitions(), skillPrompt)
+		return result.Plan, result, err
+	}
+	plan, err := l.runtime.Model.PlanJSON(ctx, l.state.resolvedRequest(), l.runtime.Tools.Definitions(), skillPrompt)
+	return plan, model.PlanCheckResult{Plan: plan}, err
 }
 
 func (l *AgentLoop) act(ctx context.Context, plan model.Plan) {
@@ -159,8 +177,18 @@ func (l *AgentLoop) act(ctx context.Context, plan model.Plan) {
 	l.state.control = control
 }
 
-func (l *AgentLoop) shouldRepair() bool {
-	return l.state.control == "" && hasRepairableFailure(l.state.results)
+func (l *AgentLoop) shouldRepairBeforeSynthesis() bool {
+	if l.state.control != "" {
+		return false
+	}
+	return hasRepairableFailure(l.state.results) || needsGroundedProjectEvidence(l.state.resolvedRequest(), l.state.results)
+}
+
+func (l *AgentLoop) shouldBlockUnsupportedSynthesis() bool {
+	if l.state.control != "" {
+		return false
+	}
+	return needsGroundedProjectEvidence(l.state.resolvedRequest(), l.state.results)
 }
 
 func (l *AgentLoop) repair(ctx context.Context) {
@@ -176,7 +204,7 @@ func (l *AgentLoop) repair(ctx context.Context) {
 	})
 	l.recordSelectedSkills(planSkills)
 	contextPrompt := buildModelContextPrompt(l.state.resolvedRequest(), "planning_repair", planMatches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx)
-	repaired, err := l.runtime.Model.RepairPlanJSON(ctx, l.state.resolvedRequest(), l.state.plan, l.state.results, l.runtime.Tools.Definitions(), strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)))
+	repaired, check, err := l.repairPlanJSON(ctx, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)))
 	if err != nil {
 		l.runtime.Logger.Event("runtime.plan_repair_failed", map[string]any{
 			"trace_id": l.state.traceID,
@@ -185,15 +213,29 @@ func (l *AgentLoop) repair(ctx context.Context) {
 		return
 	}
 	l.runtime.Logger.Event("runtime.plan_repair", map[string]any{
-		"trace_id":   l.state.traceID,
-		"summary":    repaired.Summary,
-		"steps":      len(repaired.Steps),
-		"tool_names": planToolNames(repaired),
+		"trace_id":       l.state.traceID,
+		"summary":        repaired.Summary,
+		"steps":          len(repaired.Steps),
+		"tool_names":     planToolNames(repaired),
+		"checker_fixed":  check.Fixed,
+		"checker_warns":  check.Warnings,
+		"checker_raw_ok": check.Raw != "",
 	})
 	if l.runtime.Observer != nil {
 		l.runtime.Observer.Plan(l.state.traceID, repaired)
 	}
 	l.act(ctx, repaired)
+}
+
+func (l *AgentLoop) repairPlanJSON(ctx context.Context, skillPrompt string) (model.Plan, model.PlanCheckResult, error) {
+	if checker, ok := l.runtime.Model.(interface {
+		RepairPlanCheckedJSON(context.Context, string, model.Plan, []model.ToolResult, []tool.Definition, string) (model.PlanCheckResult, error)
+	}); ok {
+		result, err := checker.RepairPlanCheckedJSON(ctx, l.state.resolvedRequest(), l.state.plan, l.state.results, l.runtime.Tools.Definitions(), skillPrompt)
+		return result.Plan, result, err
+	}
+	plan, err := l.runtime.Model.RepairPlanJSON(ctx, l.state.resolvedRequest(), l.state.plan, l.state.results, l.runtime.Tools.Definitions(), skillPrompt)
+	return plan, model.PlanCheckResult{Plan: plan}, err
 }
 
 func (l *AgentLoop) synthesize(ctx context.Context) {
@@ -311,8 +353,9 @@ func (l *AgentLoop) finalReply() Response {
 func (l *AgentLoop) fail(err error) Response {
 	resp := l.runtime.failure(l.state.message, nil, nil, err)
 	l.runtime.Logger.Event("runtime.failed", map[string]any{
-		"trace_id": l.state.traceID,
-		"reason":   resp.Reply.Text,
+		"trace_id":     l.state.traceID,
+		"reason":       resp.Reply.Text,
+		"error_detail": err.Error(),
 	})
 	if l.runtime.Observer != nil {
 		l.runtime.Observer.Failed(l.state.traceID, resp.Reply.Text)

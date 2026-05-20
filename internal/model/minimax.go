@@ -32,11 +32,22 @@ type Message struct {
 }
 
 func (c Client) Generate(ctx context.Context, system string, messages []Message) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(c.Config.API)) {
+	case "", "anthropic":
+		return c.generateAnthropic(ctx, system, messages)
+	case "openai":
+		return c.generateOpenAI(ctx, system, messages)
+	default:
+		return "", fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
+	}
+}
+
+func (c Client) generateAnthropic(ctx context.Context, system string, messages []Message) (string, error) {
 	key := c.Config.ResolvedAPIKey()
 	if key == "" {
 		return "", fmt.Errorf("model api key is empty for %s", c.Config.Name)
 	}
-	endpoint, err := messagesEndpoint(c.Config.APIBase)
+	endpoint, err := endpointWithSuffix(c.Config.APIBase, "/v1/messages")
 	if err != nil {
 		return "", err
 	}
@@ -60,6 +71,40 @@ func (c Client) Generate(ctx context.Context, system string, messages []Message)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("authorization", "Bearer "+key)
+	return c.doGenerate(req)
+}
+
+func (c Client) generateOpenAI(ctx context.Context, system string, messages []Message) (string, error) {
+	endpoint, err := endpointWithSuffix(c.Config.APIBase, "/chat/completions")
+	if err != nil {
+		return "", err
+	}
+	wireMessages := make([]Message, 0, len(messages)+1)
+	if strings.TrimSpace(system) != "" {
+		wireMessages = append(wireMessages, Message{Role: "system", Content: system})
+	}
+	wireMessages = append(wireMessages, messages...)
+	body := map[string]any{
+		"model":      c.Config.Model,
+		"messages":   wireMessages,
+		"max_tokens": 4096,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("content-type", "application/json")
+	if key := strings.TrimSpace(c.Config.ResolvedAPIKey()); key != "" {
+		req.Header.Set("authorization", "Bearer "+key)
+	}
+	return c.doGenerate(req)
+}
+
+func (c Client) doGenerate(req *http.Request) (string, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return "", err
@@ -69,11 +114,23 @@ func (c Client) Generate(ctx context.Context, system string, messages []Message)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("model request failed: status=%d body=%s", resp.StatusCode, truncateForError(string(data)))
 	}
-	text, err := parseAnthropicText(data)
+	switch strings.ToLower(strings.TrimSpace(c.Config.API)) {
+	case "", "anthropic":
+		text, err := parseAnthropicText(data)
+		return finishGenerate(c.Config, text, err)
+	case "openai":
+		text, err := parseOpenAIText(data)
+		return finishGenerate(c.Config, text, err)
+	default:
+		return "", fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
+	}
+}
+
+func finishGenerate(cfg config.ModelConfig, text string, err error) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if c.Config.StripReasoning {
+	if cfg.StripReasoning {
 		text = stripReasoning(text)
 	}
 	if strings.TrimSpace(text) == "" {
@@ -82,7 +139,7 @@ func (c Client) Generate(ctx context.Context, system string, messages []Message)
 	return strings.TrimSpace(text), nil
 }
 
-func messagesEndpoint(apiBase string) (string, error) {
+func endpointWithSuffix(apiBase, suffix string) (string, error) {
 	apiBase = strings.TrimRight(strings.TrimSpace(apiBase), "/")
 	if apiBase == "" {
 		return "", fmt.Errorf("model api_base is required")
@@ -91,10 +148,10 @@ func messagesEndpoint(apiBase string) (string, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", fmt.Errorf("invalid model api_base %q", apiBase)
 	}
-	if strings.HasSuffix(parsed.Path, "/v1/messages") {
+	if strings.HasSuffix(parsed.Path, suffix) {
 		return apiBase, nil
 	}
-	return apiBase + "/v1/messages", nil
+	return apiBase + suffix, nil
 }
 
 func parseAnthropicText(data []byte) (string, error) {
@@ -118,6 +175,50 @@ func parseAnthropicText(data []byte) (string, error) {
 	for _, item := range payload.Content {
 		if item.Text != "" {
 			parts = append(parts, item.Text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n")), nil
+}
+
+func parseOpenAIText(data []byte) (string, error) {
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"message"`
+			Text string `json:"text"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", fmt.Errorf("parse model response: %w", err)
+	}
+	if payload.Error != nil {
+		return "", fmt.Errorf("model error %s: %s", payload.Error.Type, payload.Error.Message)
+	}
+	var parts []string
+	for _, choice := range payload.Choices {
+		if choice.Text != "" {
+			parts = append(parts, choice.Text)
+			continue
+		}
+		switch content := choice.Message.Content.(type) {
+		case string:
+			if strings.TrimSpace(content) != "" {
+				parts = append(parts, content)
+			}
+		case []any:
+			for _, item := range content {
+				if m, ok := item.(map[string]any); ok {
+					if text, ok := m["text"].(string); ok && strings.TrimSpace(text) != "" {
+						parts = append(parts, text)
+					}
+				}
+			}
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n")), nil

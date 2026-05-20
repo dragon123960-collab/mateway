@@ -60,6 +60,13 @@ func TestFileSummaryRejectsDirectory(t *testing.T) {
 	}
 }
 
+func TestSourceQualityHintForFreshSearch(t *testing.T) {
+	hint := sourceQualityHint("2026 latest AI courses official")
+	if !strings.Contains(hint, "official") || !strings.Contains(hint, "weak evidence") {
+		t.Fatalf("expected fresh source quality hint, got %q", hint)
+	}
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

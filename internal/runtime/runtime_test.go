@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 type fakePlanner struct {
 	plan                      model.Plan
+	repairPlan                model.Plan
 	planCalls                 int
 	repairCalls               int
 	lastPlanSkillPrompt       string
@@ -24,6 +26,7 @@ type fakePlanner struct {
 	lastPlanUser              string
 	followupDecision          model.FollowupDecision
 	followupErr               error
+	followupCalls             int
 }
 
 func (f *fakePlanner) PlanJSON(ctx context.Context, user string, tools []tool.Definition, skillPrompt string) (model.Plan, error) {
@@ -36,6 +39,9 @@ func (f *fakePlanner) PlanJSON(ctx context.Context, user string, tools []tool.De
 func (f *fakePlanner) RepairPlanJSON(ctx context.Context, user string, plan model.Plan, results []model.ToolResult, tools []tool.Definition, skillPrompt string) (model.Plan, error) {
 	f.repairCalls++
 	f.lastPlanSkillPrompt = skillPrompt
+	if strings.TrimSpace(f.repairPlan.Summary) != "" || len(f.repairPlan.Steps) > 0 {
+		return f.repairPlan, nil
+	}
 	return model.Plan{Summary: "repaired", Steps: []model.PlanStep{{ID: "r1", Tool: "time.now", Args: map[string]string{}}}}, nil
 }
 
@@ -45,6 +51,7 @@ func (f *fakePlanner) Synthesize(ctx context.Context, user string, plan model.Pl
 }
 
 func (f *fakePlanner) ResolveFollowupJSON(ctx context.Context, prompt string) (model.FollowupDecision, error) {
+	f.followupCalls++
 	if f.followupErr != nil {
 		return model.FollowupDecision{}, f.followupErr
 	}
@@ -69,6 +76,60 @@ func TestRuntimeRepairsOnce(t *testing.T) {
 	}
 	if resp.Failed {
 		t.Fatalf("expected repaired response")
+	}
+}
+
+func TestRuntimeRepairsUngroundedProjectSummaryBeforeSynthesis(t *testing.T) {
+	root := t.TempDir()
+	doc := filepath.Join(root, "docs", "测试文档.md")
+	if err := os.MkdirAll(filepath.Dir(doc), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(doc, []byte("# 测试文档\n\n目标：验证上下文、工具证据和安全确认。"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "generic", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+		repairPlan: model.Plan{Summary: "read tests", Steps: []model.PlanStep{{
+			ID: "r1", Tool: "file.summary", Args: map[string]string{"path": doc},
+		}}},
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root, AllowedRoots: []string{root}}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请总结当前 Mateway 的测试目标，控制在两句话"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected repaired grounded response, got %#v", resp)
+	}
+	if fp.repairCalls != 1 {
+		t.Fatalf("expected repair for missing project evidence, got %d", fp.repairCalls)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Tool != "file.summary" {
+		t.Fatalf("expected repaired plan to read document evidence, got %#v", resp.Results)
+	}
+}
+
+func TestRuntimeBlocksUngroundedProjectSummaryAfterRepair(t *testing.T) {
+	fp := &fakePlanner{
+		plan:       model.Plan{Summary: "generic", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+		repairPlan: model.Plan{Summary: "still generic", Steps: []model.PlanStep{{ID: "r1", Tool: "time.now", Args: map[string]string{}}}},
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请总结当前 Mateway 的测试目标，控制在两句话"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed {
+		t.Fatalf("expected ungrounded project summary to fail instead of generic synthesis, got %#v", resp)
+	}
+	if fp.repairCalls != 1 {
+		t.Fatalf("expected one repair attempt, got %d", fp.repairCalls)
+	}
+	if strings.Contains(resp.Reply.Text, "done") {
+		t.Fatalf("expected generic synthesis to be blocked, got %q", resp.Reply.Text)
 	}
 }
 
@@ -124,6 +185,21 @@ func TestRuntimeIgnoresModelConfirmedArgForDangerousCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("expected command not to write before user approval, stat err=%v", err)
+	}
+}
+
+func TestRuntimeIgnoresModelRequiresConfirmForSafeCommand(t *testing.T) {
+	fp := &fakePlanner{plan: model.Plan{Summary: "pwd", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "shell.run", Args: map[string]string{"command": "pwd"}, RequiresConfirm: true,
+	}}}}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "run pwd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm {
+		t.Fatalf("expected safe command not to await confirm, got %#v", resp)
 	}
 }
 
@@ -445,6 +521,44 @@ func TestRuntimeRuleFollowupBeatsLowConfidenceModelAmbiguity(t *testing.T) {
 	}
 }
 
+func TestRuntimeRuleFollowupStrengthensStructuralInstruction(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "followup", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-next",
+		TaskOrder:    []string{"task-next"},
+		Tasks: map[string]session.TaskState{
+			"task-next": {
+				ID:            "task-next",
+				UserText:      "总结当前下一步最值得做的一项工作",
+				ResolvedQuery: "总结当前下一步最值得做的一项工作",
+				Topic:         "下一步工作",
+				Status:        session.TaskOpen,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:cli",
+		Text:       "继续上一轮，把刚才那项工作拆成三个可执行小步骤。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fp.lastPlanUser, "本轮补充要求优先级最高") || !strings.Contains(fp.lastPlanUser, "三个可执行小步骤") {
+		t.Fatalf("expected strengthened followup instruction, got %q", fp.lastPlanUser)
+	}
+}
+
 func TestRuntimeSlotFillKeepsTaskWaitingWhenFieldsRemain(t *testing.T) {
 	fp := &fakePlanner{}
 	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
@@ -563,6 +677,67 @@ func TestRuntimeApprovalRejectionCancelsCurrentTask(t *testing.T) {
 	}
 	if st.Tasks["task-install"].Status != session.TaskAbandoned {
 		t.Fatalf("expected task abandoned, got %#v", st.Tasks["task-install"])
+	}
+}
+
+func TestRuntimePendingConfirmAllowsClearIndependentNewTask(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "summary", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+		followupDecision: model.FollowupDecision{
+			Kind:       "ambiguous",
+			Reason:     "would otherwise be ambiguous",
+			Confidence: 0.94,
+		},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-delete",
+		TaskOrder:    []string{"task-delete"},
+		Tasks: map[string]session.TaskState{
+			"task-delete": {
+				ID:            "task-delete",
+				Status:        session.TaskAwaitConfirm,
+				UserText:      "删除临时目录",
+				ResolvedQuery: "删除临时目录",
+				PendingApproval: &session.PendingApproval{
+					ApprovalType:    "boolean_confirm",
+					Prompt:          "是否删除临时目录？",
+					RequestedAction: "删除临时目录",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	msg := "请总结当前 Mateway 的测试目标，控制在两句话"
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: msg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput {
+		t.Fatalf("expected clear new request not to ask for clarification, got %#v", resp)
+	}
+	if fp.followupCalls != 0 {
+		t.Fatalf("expected pending-confirm new task rule to avoid model followup, got %d calls", fp.followupCalls)
+	}
+	if fp.planCalls != 1 {
+		t.Fatalf("expected new task to enter planning, got %d calls", fp.planCalls)
+	}
+	if fp.lastPlanUser != msg {
+		t.Fatalf("expected planner to receive independent request, got %q", fp.lastPlanUser)
+	}
+	st, err := store.Load("cli:cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ActiveTaskID == "task-delete" {
+		t.Fatalf("expected active task to switch away from pending confirmation")
+	}
+	if st.Tasks["task-delete"].Status != session.TaskAwaitConfirm {
+		t.Fatalf("expected original pending task to remain pending but inactive, got %#v", st.Tasks["task-delete"])
 	}
 }
 
@@ -928,5 +1103,73 @@ func TestDefaultSanitizerProvidesFallbackText(t *testing.T) {
 	reply := s.Sanitize(channel.OutboundMessage{Style: "approval_pending", Text: "   "})
 	if reply.Text != "需要确认后才能继续。" {
 		t.Fatalf("unexpected fallback reply %q", reply.Text)
+	}
+}
+
+func TestDefaultSanitizerStripsToolCallEcho(t *testing.T) {
+	s := DefaultSanitizer{}
+	reply := s.Sanitize(channel.OutboundMessage{
+		Style: "reply",
+		Text:  "[TOOL_CALL]\n{\"tool\":\"file.read\",\"args\":{\"path\":\"README.md\"}}\n[/TOOL_CALL]\n\n这是最终结论。",
+	})
+	if strings.Contains(reply.Text, "TOOL_CALL") || strings.Contains(reply.Text, "file.read") {
+		t.Fatalf("expected tool call echo stripped, got %q", reply.Text)
+	}
+	if reply.Text != "这是最终结论。" {
+		t.Fatalf("unexpected reply %q", reply.Text)
+	}
+}
+
+func TestDefaultSanitizerStripsMiniMaxToolCallEcho(t *testing.T) {
+	s := DefaultSanitizer{}
+	reply := s.Sanitize(channel.OutboundMessage{
+		Style: "reply",
+		Text: `<minimax:tool_call>
+file.read args: {"path": "/Users/dongping/project/mateway/docs/测试文档.md"} risk: "safe_read" requires_confirm: false
+<minimax:tool_call>
+file.read args: {"path": "/Users/dongping/project/mateway/docs/进度.md"} risk: "safe_read" requires_confirm: false
+</minimax:tool_call>
+
+当前 Mateway 的测试目标是验证 Agent 在复杂对话中保持上下文。`,
+	})
+	if strings.Contains(reply.Text, "minimax:tool_call") || strings.Contains(reply.Text, "file.read") || strings.Contains(reply.Text, "requires_confirm") {
+		t.Fatalf("expected minimax tool call echo stripped, got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "当前 Mateway 的测试目标") {
+		t.Fatalf("expected final answer preserved, got %q", reply.Text)
+	}
+}
+
+func TestDefaultSanitizerStripsBareJSONToolPlan(t *testing.T) {
+	s := DefaultSanitizer{}
+	reply := s.Sanitize(channel.OutboundMessage{
+		Style: "reply",
+		Text: `[
+  {
+    "id": "step-2",
+    "goal": "查看测试文档内容",
+    "tool": "file.read",
+    "args": {"path": "/tmp/测试文档.md"},
+    "risk": "safe_read",
+    "requires_confirm": false
+  }
+]`,
+	})
+	if strings.Contains(reply.Text, `"tool"`) || strings.Contains(reply.Text, "file.read") {
+		t.Fatalf("expected bare json tool plan stripped, got %q", reply.Text)
+	}
+	if reply.Text != "已处理完成。" {
+		t.Fatalf("unexpected fallback %q", reply.Text)
+	}
+}
+
+func TestRuntimeFailureHidesModelTransportError(t *testing.T) {
+	rt := Runtime{}
+	resp := rt.failure(channel.InboundMessage{Channel: "cli", ID: "x"}, nil, nil, fmt.Errorf(`plan failed: Post "https://api.minimaxi.com/anthropic/v1/messages": unexpected EOF`))
+	if strings.Contains(resp.Reply.Text, "api.minimaxi.com") || strings.Contains(resp.Reply.Text, "unexpected EOF") {
+		t.Fatalf("expected transport detail hidden, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "模型服务") {
+		t.Fatalf("expected user-facing model service error, got %q", resp.Reply.Text)
 	}
 }

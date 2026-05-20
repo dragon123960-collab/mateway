@@ -133,9 +133,26 @@ type taskReport struct {
 	ProjectRoot    string
 	GeneratedAt    time.Time
 	QualityNotes   []string
+	Skills         []skillEvent
 	Events         []map[string]any
 	Plan           any
 	ToolResults    []any
+}
+
+type skillEvent struct {
+	Stage  string
+	Skills []map[string]any
+}
+
+func uniqueTaskSuffix(title string) string {
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return time.Now().Format("20060102-150405")
+	}
+	if name := slugify(trimmed); name != "" && name != "task" {
+		return name
+	}
+	return trimmed
 }
 
 func runTest(args []string) error {
@@ -154,11 +171,11 @@ func runTest(args []string) error {
 		return err
 	}
 	msg := channel.InboundMessage{
-		ID:         "test-" + slugify(opts.Title),
+		ID:         "test-" + uniqueTaskSuffix(opts.Title),
 		Channel:    firstNonEmptyLocal(opts.Channel, "cli"),
-		SessionKey: firstNonEmptyLocal(opts.SessionKey, "test:"+slugify(opts.Title)),
+		SessionKey: firstNonEmptyLocal(opts.SessionKey, "test:"+uniqueTaskSuffix(opts.Title)),
 		UserID:     firstNonEmptyLocal(opts.UserID, "local"),
-		ThreadID:   firstNonEmptyLocal(opts.ThreadID, "test:"+slugify(opts.Title)),
+		ThreadID:   firstNonEmptyLocal(opts.ThreadID, "test:"+uniqueTaskSuffix(opts.Title)),
 		Text:       opts.Message,
 	}
 	resp, err := a.Runtime.Handle(context.Background(), msg)
@@ -269,6 +286,7 @@ func buildTaskReport(a *app.App, opts testCommandOptions, msg channel.InboundMes
 		ProjectRoot:    firstNonEmptyLocal(opts.ProjectRoot, a.Runtime.ToolCtx.ProjectRoot),
 		GeneratedAt:    time.Now(),
 		QualityNotes:   qualityNotesForReport(opts.Message, resp),
+		Skills:         collectSkillsForReport(traceID, a.Config.App.Home),
 		Plan:           resp.Plan,
 		ToolResults:    make([]any, 0, len(resp.Results)),
 	}
@@ -289,7 +307,7 @@ func writeTaskReport(report taskReport, outDir string) (string, error) {
 	if err := os.MkdirAll(dateDir, 0o755); err != nil {
 		return "", err
 	}
-	name := slugify(report.Title)
+	name := uniqueTaskSuffix(report.Title)
 	if name == "" {
 		name = "task"
 	}
@@ -327,6 +345,25 @@ func writeTaskReportMarkdown(b *strings.Builder, report taskReport) {
 		fmt.Fprintln(b, "## 质量提示")
 		for _, note := range report.QualityNotes {
 			fmt.Fprintf(b, "- %s\n", note)
+		}
+	}
+	if len(report.Skills) > 0 {
+		fmt.Fprintln(b)
+		fmt.Fprintln(b, "## Skills")
+		for _, item := range report.Skills {
+			fmt.Fprintf(b, "- stage: %s\n", item.Stage)
+			for _, skillItem := range item.Skills {
+				name := firstNonEmptyLocal(fmt.Sprint(skillItem["name"]))
+				reason := firstNonEmptyLocal(fmt.Sprint(skillItem["reason"]))
+				dir := firstNonEmptyLocal(fmt.Sprint(skillItem["dir"]))
+				fmt.Fprintf(b, "  - %s\n", name)
+				if reason != "" {
+					fmt.Fprintf(b, "    - reason: %s\n", reason)
+				}
+				if dir != "" {
+					fmt.Fprintf(b, "    - dir: %s\n", dir)
+				}
+			}
 		}
 	}
 	fmt.Fprintln(b)
@@ -413,6 +450,48 @@ func loadTraceEvents(traceDir, traceID string) []map[string]any {
 				out = append(out, ev)
 			}
 		}
+	}
+	return out
+}
+
+func collectSkillsForReport(traceID, home string) []skillEvent {
+	traceFile := traceFileForTime(home, time.Now())
+	data, err := os.ReadFile(traceFile)
+	if err != nil {
+		return nil
+	}
+	var out []skillEvent
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if fmt.Sprint(ev["trace_id"]) != traceID {
+			continue
+		}
+		if fmt.Sprint(ev["event"]) != "runtime.skills_selected" {
+			continue
+		}
+		stage := fmt.Sprint(ev["stage"])
+		key := stage + "|" + line
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		group := skillEvent{Stage: stage}
+		if raw, ok := ev["skills"].([]any); ok {
+			for _, item := range raw {
+				if m, ok := item.(map[string]any); ok {
+					group.Skills = append(group.Skills, m)
+				}
+			}
+		}
+		out = append(out, group)
 	}
 	return out
 }
@@ -619,7 +698,7 @@ func printHelp() {
 	fmt.Print(`mateway
 
 Commands:
-  init                   initialize ~/.mateway and default skills
+  init                   initialize ~/.mateway config, samples, docs, and default skills
   doctor                 validate config and list tools
   ask <message>          run one CLI task
   gateway serve          run the configured gateway in foreground
@@ -629,5 +708,10 @@ Commands:
   gateway status         show service and instance-lock status
   trace tail             follow today's structured trace
   trace show <trace_id>  show events for one trace id
+
+Typical binary setup:
+  mateway init
+  edit ~/.mateway/config/mateway.env and ~/.mateway/config/*.yaml
+  mateway doctor
 `)
 }

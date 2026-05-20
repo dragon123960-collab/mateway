@@ -30,6 +30,12 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 		OnP2MessageReceiveV1(func(eventCtx context.Context, event *larkim.P2MessageReceiveV1) error {
 			msg := NormalizeMessageReceive(event)
 			return receiver(eventCtx, msg)
+		}).
+		OnP2MessageReadV1(func(eventCtx context.Context, event *larkim.P2MessageReadV1) error {
+			return nil
+		}).
+		OnP2ChatAccessEventBotP2pChatEnteredV1(func(eventCtx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
+			return nil
 		})
 	client := ws.NewClient(cfg.AppID, cfg.AppSecret, ws.WithEventHandler(d))
 	return client.Start(ctx)
