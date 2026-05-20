@@ -1,0 +1,3 @@
+display_name: Fresh Search
+short_description: Prefer fresh and authoritative sources for time-sensitive searches.
+default_prompt: 搜索最新信息并优先使用官方来源

@@ -1,0 +1,10 @@
+.DS_Store
+.gocache/
+.tmp_codex/
+.claude/
+.env
+*.log
+/dist/
+/bin/
+/build/
+coverage.out
