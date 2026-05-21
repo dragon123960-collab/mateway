@@ -69,6 +69,13 @@ func TestSourceQualityHintForFreshSearch(t *testing.T) {
 	}
 }
 
+func TestSoftwareSearchQueriesPreferOfficialLarkCLI(t *testing.T) {
+	got := softwareSearchQueries("飞书的cli")
+	if len(got) == 0 || got[0] != "larksuite cli" {
+		t.Fatalf("expected larksuite cli first, got %#v", got)
+	}
+}
+
 func TestMemoryToolsSearchAndIndex(t *testing.T) {
 	workspace := t.TempDir()
 	store := memory.NewStore(workspace)

@@ -23,6 +23,7 @@ import (
 	"github.com/dongping/mateway/internal/observer"
 	runtimepkg "github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/skill"
 )
 
 func main() {
@@ -102,6 +103,8 @@ func run() error {
 		return runTrace(args[1:], os.Stdout)
 	case "memory":
 		return runMemory(args[1:], os.Stdout)
+	case "skill":
+		return runSkill(args[1:], os.Stdout)
 	case "heartbeat":
 		return runHeartbeat(args[1:], os.Stdout)
 	case "schedule":
@@ -1089,6 +1092,69 @@ func uniqueTaskSuffix(title string) string {
 	return trimmed
 }
 
+func runSkill(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway skill <search|install|list>")
+	}
+	a, err := app.Build("", true)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "search":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mateway skill search <query>")
+		}
+		query := strings.Join(args[1:], " ")
+		items, err := skill.SearchCatalog(context.Background(), a.Config.App.Workspace, query, skill.CatalogSearchOptions{Limit: 8})
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			fmt.Fprintf(out, "No matching skills found for: %s\n", query)
+			return nil
+		}
+		for _, item := range items {
+			status := "not-installed"
+			if item.Installed {
+				status = "installed"
+			}
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.Name, item.Source, status, item.URL)
+		}
+		return nil
+	case "install":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mateway skill install <name-or-url>")
+		}
+		ref := strings.Join(args[1:], " ")
+		result, err := skill.InstallCatalogSkill(context.Background(), a.Config.App.Workspace, ref, skill.CatalogSearchOptions{Limit: 1})
+		if err != nil {
+			return err
+		}
+		if result.AlreadyDone {
+			fmt.Fprintf(out, "Skill already installed: %s\n%s\n", result.Item.Name, result.TargetPath)
+			return nil
+		}
+		fmt.Fprintf(out, "Skill installed: %s\n%s\n", result.Item.Name, result.TargetPath)
+		return nil
+	case "list":
+		defs, err := skill.ListInstalled(a.Config.App.Workspace)
+		if err != nil {
+			return err
+		}
+		if len(defs) == 0 {
+			fmt.Fprintln(out, "No installed skills found.")
+			return nil
+		}
+		for _, def := range defs {
+			fmt.Fprintf(out, "%s\t%s\t%s\n", def.Name, def.Stage, def.Dir)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway skill <search|install|list>")
+	}
+}
+
 func runTest(args []string) error {
 	for _, arg := range args {
 		if arg == "--help" || arg == "-h" {
@@ -1651,6 +1717,9 @@ Commands:
   schedule show <id>     print one user scheduled task
   schedule due           list user scheduled tasks due now
   schedule run-due       run due user scheduled tasks through runtime
+  skill search <query>   search installable skills from priority catalogs
+  skill install <ref>    install a skill into ~/.mateway/workspace/skills
+  skill list             list installed Mateway workspace skills
   memory lint            check Markdown memory wiki health without modifying files
   memory index           rebuild JSON memory index from Markdown
   memory list            list inbox or long memory items

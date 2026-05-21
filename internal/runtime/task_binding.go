@@ -17,6 +17,7 @@ import (
 const (
 	bindingApprovalReply          = "approval_reply"
 	bindingPendingApprovalBlocked = "pending_approval_blocked"
+	bindingReplacePendingApproval = "replace_pending_approval"
 	bindingSlotFill               = "slot_fill"
 	bindingActiveFollowup         = "active_followup"
 	bindingOpenTaskFollowup       = "open_task_followup"
@@ -87,6 +88,25 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 		l.runtime.Logger.Event("runtime.followup_resolved", l.bindingTraceFields(decision))
 		l.saveConversationOnly(resp)
 		return &resp
+	case bindingReplacePendingApproval:
+		if active != nil {
+			active.Status = session.TaskAbandoned
+			active.PendingApproval = nil
+			active.PendingQuestions = nil
+			active.PendingFields = nil
+			active.UpdatedAt = l.state.startedAt
+			l.state.session.Tasks[active.ID] = *active
+		}
+		task := session.TaskState{
+			ID:            decision.TargetTaskID,
+			TraceID:       l.state.traceID,
+			Status:        session.TaskOpen,
+			UserText:      l.state.message.Text,
+			ResolvedQuery: l.state.resolvedQuery,
+			StartedAt:     l.state.startedAt,
+			UpdatedAt:     l.state.startedAt,
+		}
+		l.state.currentTask = &task
 	case bindingAmbiguous:
 		text := firstNonEmpty(decision.ClarifyPrompt, "I am not sure which task you want to continue. Please add a bit more context.")
 		reply := l.runtime.sanitizeReply(channel.OutboundMessage{
@@ -258,6 +278,16 @@ func (l *AgentLoop) resolvePendingApprovalBlock() (taskBindingDecision, bool) {
 	task := session.ActiveTask(l.state.session)
 	if task == nil || task.PendingApproval == nil || task.Status != session.TaskAwaitConfirm {
 		return taskBindingDecision{}, false
+	}
+	if isPendingApprovalReplacementRequest(l.state.message.Text) {
+		return taskBindingDecision{
+			Kind:          bindingReplacePendingApproval,
+			TargetTaskID:  l.state.traceID,
+			SourceTaskID:  task.ID,
+			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
+			Reason:        "user asked to replace the pending approval with a different approach",
+			Confidence:    0.94,
+		}, true
 	}
 	prompt := strings.TrimSpace(task.PendingApproval.Prompt)
 	if prompt == "" {
@@ -607,6 +637,36 @@ func parseApprovalDecision(text string, approval *session.PendingApproval) (bool
 		}
 	}
 	return false, false
+}
+
+func isPendingApprovalReplacementRequest(text string) bool {
+	normalized := normalizeFollowupText(text)
+	if normalized == "" {
+		return false
+	}
+	replacementCues := []string{
+		"换", "改用", "换成", "换为", "不要这个", "别用这个", "重新", "另一种", "其他方式", "别装这个",
+		"use instead", "switch", "change to", "replace", "different way", "another way", "not this",
+	}
+	methodCues := []string{
+		"homebrew", "brew", "go install", "npm", "pnpm", "pip", "uv", "docker", "源码", "source", "binary", "release",
+	}
+	hasReplacementCue := false
+	for _, cue := range replacementCues {
+		if strings.Contains(normalized, cue) {
+			hasReplacementCue = true
+			break
+		}
+	}
+	if !hasReplacementCue {
+		return false
+	}
+	for _, cue := range methodCues {
+		if strings.Contains(normalized, cue) {
+			return true
+		}
+	}
+	return strings.Contains(normalized, "安装") || strings.Contains(normalized, "install")
 }
 
 func parseChoiceIndex(text string) (int, error) {

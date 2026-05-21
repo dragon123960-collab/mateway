@@ -1130,6 +1130,55 @@ func TestRuntimePendingConfirmBlocksIndependentNewTask(t *testing.T) {
 	}
 }
 
+func TestRuntimePendingConfirmCanBeReplacedByNewInstallMethod(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "install with brew", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-install-go",
+		TaskOrder:    []string{"task-install-go"},
+		Tasks: map[string]session.TaskState{
+			"task-install-go": {
+				ID:            "task-install-go",
+				Status:        session.TaskAwaitConfirm,
+				UserText:      "安装 larkcli",
+				ResolvedQuery: "安装 larkcli",
+				PendingApproval: &session.PendingApproval{
+					ApprovalType:    "boolean_confirm",
+					Prompt:          "go install github.com/larksuite/cli/cmd/lark@latest",
+					RequestedAction: "go install github.com/larksuite/cli/cmd/lark@latest",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: "换homebrew安"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput {
+		t.Fatalf("expected replacement request to replan, got %#v", resp)
+	}
+	if fp.planCalls != 1 || !strings.Contains(fp.lastPlanUser, "homebrew") {
+		t.Fatalf("expected replanning with homebrew request, calls=%d user=%q", fp.planCalls, fp.lastPlanUser)
+	}
+	st, err := store.Load("cli:cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Tasks["task-install-go"].Status != session.TaskAbandoned {
+		t.Fatalf("expected old pending task abandoned, got %#v", st.Tasks["task-install-go"])
+	}
+	if st.ActiveTaskID == "task-install-go" {
+		t.Fatalf("expected active task to move to replacement task")
+	}
+}
+
 func TestRuntimeHistoricalContinuationCreatesNewTask(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "history", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},

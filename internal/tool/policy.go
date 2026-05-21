@@ -24,7 +24,7 @@ func IsDangerousCommand(cmd string) bool {
 
 func RequireConfirmForTool(name string, args map[string]string) bool {
 	switch name {
-	case "file.write", "file.patch":
+	case "file.write", "file.patch", "skill.install":
 		return true
 	case "shell.run":
 		return IsDangerousCommand(args["command"])
