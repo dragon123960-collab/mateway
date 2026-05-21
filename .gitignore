@@ -4,6 +4,8 @@
 .claude/
 .env
 *.log
+/docs/archive/
+/testdata/
 /dist/
 /bin/
 /build/
