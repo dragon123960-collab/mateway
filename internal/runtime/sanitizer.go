@@ -108,12 +108,12 @@ func stripPromptEcho(text string) string {
 func defaultReplyText(style string) string {
 	switch strings.TrimSpace(style) {
 	case "approval_pending":
-		return "需要确认后才能继续。"
+		return "Confirmation is required before continuing."
 	case "input_required":
-		return "还需要你补充一点信息，我才能继续。"
+		return "I need one more detail before I can continue."
 	case "error":
-		return "这次处理失败了，但我已经停在安全位置。"
+		return "The task failed, and I stopped at a safe point."
 	default:
-		return "已处理完成。"
+		return "Done."
 	}
 }

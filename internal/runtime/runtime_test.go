@@ -13,6 +13,7 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
 	"github.com/dongping/mateway/internal/tool"
@@ -124,6 +125,161 @@ func TestRuntimeCreatesSkillCandidateAfterSuccessfulPatternThreshold(t *testing.
 	}
 	if len(matches) != 1 {
 		t.Fatalf("expected one skill candidate, got %v", matches)
+	}
+}
+
+func TestRuntimeCreatesMemoryProposalAfterGroundedSuccessfulTask(t *testing.T) {
+	workspace := t.TempDir()
+	doc := filepath.Join(workspace, "project.md")
+	if err := os.WriteFile(doc, []byte("# Project\n\nMateway uses reviewed Markdown memory proposals."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "read project memory", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.summary", Args: map[string]string{"path": doc},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{
+				Default:  "main",
+				Profiles: []config.AgentProfileConfig{{ID: "main"}},
+			},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:memory-proposal", Text: "Summarize project memory direction"}); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "memory-proposal-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one memory proposal, got %v", matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "status: proposed") || !strings.Contains(text, "trace:") || !strings.Contains(text, "file:"+doc) {
+		t.Fatalf("unexpected memory proposal:\n%s", text)
+	}
+	if !strings.Contains(text, "file:"+doc+":1-") {
+		t.Fatalf("expected file line evidence in memory proposal:\n%s", text)
+	}
+}
+
+func TestRuntimeSkipsMemoryProposalWithoutEvidence(t *testing.T) {
+	workspace := t.TempDir()
+	fp := &fakePlanner{plan: model.Plan{Summary: "time only", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:no-memory-proposal", Text: "What time is it?"}); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "memory-proposal-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no memory proposal, got %v", matches)
+	}
+}
+
+func TestRuntimeAppendsInboxReminderForPendingItems(t *testing.T) {
+	workspace := t.TempDir()
+	mem := memory.NewStore(workspace)
+	if _, err := mem.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Title:   "Pending Memory",
+		Body:    "This proposal is waiting for review.",
+		Sources: []string{"manual"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "simple grounded task", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "config.summary", Args: map[string]string{},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   mem,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:inbox-reminder", Text: "Show config summary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "Inbox reminder:") || !strings.Contains(resp.Reply.Text, "memory proposal") {
+		t.Fatalf("expected inbox reminder, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDoesNotAppendInboxReminderToControlReply(t *testing.T) {
+	workspace := t.TempDir()
+	mem := memory.NewStore(workspace)
+	if _, err := mem.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Title:   "Pending Memory",
+		Body:    "This proposal is waiting for review.",
+		Sources: []string{"manual"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "write file", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.write", Args: map[string]string{"path": filepath.Join(workspace, "out.txt"), "content": "x"},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   mem,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:inbox-control", Text: "Write file"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm {
+		t.Fatalf("expected confirmation")
+	}
+	if strings.Contains(resp.Reply.Text, "Inbox reminder:") {
+		t.Fatalf("expected no inbox reminder on control reply, got %q", resp.Reply.Text)
 	}
 }
 
@@ -386,6 +542,119 @@ func TestBuildModelContextPromptIncludesUserButNotHeartbeat(t *testing.T) {
 	}
 }
 
+func TestRuntimeInjectsShortMemoryIntoModelContext(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "continue task", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	now := time.Now()
+	if err := store.Save(session.State{
+		SessionKey:   "cli:memory",
+		Channel:      "cli",
+		UserID:       "local",
+		ThreadID:     "cli",
+		ActiveTaskID: "task-1",
+		TaskOrder:    []string{"task-1"},
+		Tasks: map[string]session.TaskState{
+			"task-1": {
+				ID:            "task-1",
+				Status:        session.TaskOpen,
+				Topic:         "项目复盘",
+				UserText:      "总结当前项目",
+				ResolvedQuery: "总结当前项目并列出下一步",
+				PlanSummary:   "read project docs",
+				Artifacts: []session.Artifact{{
+					Kind:  "file",
+					Path:  "/tmp/report.md",
+					Label: "项目复盘文档",
+				}},
+				UpdatedAt: now,
+			},
+		},
+		RecentTurns: []session.Turn{
+			{Role: "user", Text: "上一轮问题", At: now.Add(-time.Minute)},
+			{Role: "assistant", Text: "上一轮回答", At: now},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:memory",
+		Text:       "继续",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := fp.lastPlanSkillPrompt
+	if !strings.Contains(prompt, "Short memory:") {
+		t.Fatalf("expected short memory section, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "Recent turns:") || !strings.Contains(prompt, "上一轮问题") {
+		t.Fatalf("expected recent turns in short memory, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "Active task:") || !strings.Contains(prompt, "task-1") || !strings.Contains(prompt, "项目复盘") {
+		t.Fatalf("expected active task in short memory, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "Known artifacts:") || !strings.Contains(prompt, "/tmp/report.md") {
+		t.Fatalf("expected artifact summary in short memory, got %q", prompt)
+	}
+}
+
+func TestRuntimeInjectsRelevantLongMemoryIntoModelContext(t *testing.T) {
+	workspace := t.TempDir()
+	mem := memory.NewStore(workspace)
+	proposal, err := mem.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Title:   "Mateway Memory Direction",
+		Body:    "Mateway keeps durable memory in Markdown files and only commits reviewed proposals.",
+		Sources: []string{"manual"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mem.Commit(memory.CommitInput{AgentID: "main", Proposal: proposal.ID}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "answer memory question", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   mem,
+	}
+	rt.Logger.Quiet = true
+	_, err = rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:long-memory",
+		Text:       "How does Mateway store memory?",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "Relevant long memory:") {
+		t.Fatalf("expected long memory section, got %q", fp.lastPlanSkillPrompt)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "durable memory in Markdown files") {
+		t.Fatalf("expected long memory snippet, got %q", fp.lastPlanSkillPrompt)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "lines:") {
+		t.Fatalf("expected long memory line evidence, got %q", fp.lastPlanSkillPrompt)
+	}
+}
+
 func TestRuntimeInputRequiredDoesNotDumpToolProcess(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "ask more", Steps: []model.PlanStep{
@@ -602,7 +871,7 @@ func TestRuntimeRuleFollowupStrengthensStructuralInstruction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(fp.lastPlanUser, "本轮补充要求优先级最高") || !strings.Contains(fp.lastPlanUser, "三个可执行小步骤") {
+	if !strings.Contains(fp.lastPlanUser, "current additional request has the highest priority") || !strings.Contains(fp.lastPlanUser, "三个可执行小步骤") {
 		t.Fatalf("expected strengthened followup instruction, got %q", fp.lastPlanUser)
 	}
 }
@@ -716,7 +985,7 @@ func TestRuntimeApprovalRejectionCancelsCurrentTask(t *testing.T) {
 	if fp.planCalls != 0 {
 		t.Fatalf("expected rejection not to plan, got %d", fp.planCalls)
 	}
-	if !strings.Contains(resp.Reply.Text, "取消") {
+	if !strings.Contains(resp.Reply.Text, "Canceled") {
 		t.Fatalf("expected cancellation reply, got %q", resp.Reply.Text)
 	}
 	st, err := store.Load("cli:cli")
@@ -859,7 +1128,7 @@ func TestRuntimeHistoricalContinuationClarifiesMissingSourceTask(t *testing.T) {
 	if fp.planCalls != 0 {
 		t.Fatalf("expected missing source task to clarify before planning, got %d", fp.planCalls)
 	}
-	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
+	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "could not find") {
 		t.Fatalf("expected clarification for missing source task, got %#v", resp)
 	}
 }
@@ -888,7 +1157,7 @@ func TestRuntimeOpenFollowupClarifiesMissingTargetTask(t *testing.T) {
 	if fp.planCalls != 0 {
 		t.Fatalf("expected missing target task to clarify before planning, got %d", fp.planCalls)
 	}
-	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
+	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "could not find") {
 		t.Fatalf("expected clarification for missing target task, got %#v", resp)
 	}
 }
@@ -907,7 +1176,7 @@ func TestRuntimeAmbiguousFollowupClarifies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "不能确定") {
+	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "not sure") {
 		t.Fatalf("expected clarification reply, got %#v", resp)
 	}
 }
@@ -1091,6 +1360,386 @@ func TestRuntimeArtifactLookupDoesNotInterceptGenericDocumentRequest(t *testing.
 	}
 }
 
+func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
+	home := t.TempDir()
+	fp := &fakePlanner{}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule", Text: "每天帮我收集 AI 最新趋势文章"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitUserInput || resp.Reply.Style != "input_required" {
+		t.Fatalf("expected input_required, got %#v", resp)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected schedule request handled before planning, got %d calls", fp.planCalls)
+	}
+	st, err := rt.Sessions.Load("cli:schedule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := session.ActiveTask(st)
+	if task == nil || task.Status != session.TaskAwaitUserInput {
+		t.Fatalf("expected awaiting schedule task, got %#v", st)
+	}
+	if _, ok := task.PendingFields["daily_at"]; !ok {
+		t.Fatalf("expected daily_at pending, got %#v", task.PendingFields)
+	}
+}
+
+func TestRuntimeScheduleRequestCreatesProposal(t *testing.T) {
+	home := t.TempDir()
+	fp := &fakePlanner{}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-ready", Text: "每天 9点 帮我收集 AI 最新趋势文章"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "Schedule proposal written") {
+		t.Fatalf("expected schedule proposal reply, got %#v", resp)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected schedule request handled before planning, got %d calls", fp.planCalls)
+	}
+	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusProposed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Schedule != "daily@09:00" {
+		t.Fatalf("expected one 09:00 proposal, got %#v", items)
+	}
+}
+
+func TestRuntimeScheduleProposalApprovalEnablesTask(t *testing.T) {
+	home := t.TempDir()
+	fp := &fakePlanner{}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-confirm", Text: "每天 9点 帮我收集 AI 最新趋势文章"}
+	resp, err := rt.Handle(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected approval pending, got %#v", resp)
+	}
+	confirm := msg
+	confirm.ID = "confirm"
+	confirm.Text = "好"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "Schedule enabled") {
+		t.Fatalf("expected enabled reply, got %q", resp.Reply.Text)
+	}
+	tasks, err := schedule.NewStore(home).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != schedule.StatusActive {
+		t.Fatalf("expected active schedule task, got %#v", tasks)
+	}
+}
+
+func TestRuntimeScheduleProposalRejectionRejectsProposal(t *testing.T) {
+	home := t.TempDir()
+	fp := &fakePlanner{}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-reject", Text: "每天 9点 帮我收集 AI 最新趋势文章"}
+	if _, err := rt.Handle(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	reject := msg
+	reject.ID = "reject"
+	reject.Text = "不要"
+	resp, err := rt.Handle(context.Background(), reject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "rejected") {
+		t.Fatalf("expected rejected reply, got %q", resp.Reply.Text)
+	}
+	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusRejected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected rejected proposal, got %#v", items)
+	}
+	tasks, err := schedule.NewStore(home).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected no active task, got %#v", tasks)
+	}
+}
+
+func TestRuntimeScheduleRequestCreatesWeeklyAndIntervalProposals(t *testing.T) {
+	home := t.TempDir()
+	fp := &fakePlanner{}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-weekly", Text: "每周五 9点 帮我汇总 open issues"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-interval", Text: "每隔2小时 帮我检查接口状态"}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusProposed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected two proposals, got %#v", items)
+	}
+	foundWeekly := false
+	foundInterval := false
+	for _, item := range items {
+		if item.Schedule == "weekly:friday@09:00" {
+			foundWeekly = true
+		}
+		if item.Schedule == "interval:2h" {
+			foundInterval = true
+		}
+	}
+	if !foundWeekly || !foundInterval {
+		t.Fatalf("expected weekly and interval proposals, got %#v", items)
+	}
+}
+
+func TestRuntimeScheduleRequestCreatesWorkdayAndMonthlyProposals(t *testing.T) {
+	home := t.TempDir()
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-workday", Text: "工作日 9点 帮我检查 AI 趋势"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-monthly", Text: "每月15号 9点 帮我整理账单"}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusProposed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundWorkday := false
+	foundMonthly := false
+	for _, item := range items {
+		if item.Schedule == "weekly:monday,tuesday,wednesday,thursday,friday@09:00" {
+			foundWorkday = true
+		}
+		if item.Schedule == "monthly:15@09:00" {
+			foundMonthly = true
+		}
+	}
+	if !foundWorkday || !foundMonthly {
+		t.Fatalf("expected workday and monthly proposals, got %#v", items)
+	}
+}
+
+func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
+	home := t.TempDir()
+	store := schedule.NewStore(home)
+	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-delete", Text: "删除 ai-trends 定时任务"}
+	resp, err := rt.Handle(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected approval pending, got %#v", resp)
+	}
+	if tasks, err := store.List(); err != nil || len(tasks) != 1 {
+		t.Fatalf("expected task still present before confirmation, tasks=%#v err=%v", tasks, err)
+	}
+	confirm := msg
+	confirm.ID = "confirm-delete"
+	confirm.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "deleted") {
+		t.Fatalf("expected deleted reply, got %q", resp.Reply.Text)
+	}
+	tasks, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected task deleted, got %#v", tasks)
+	}
+}
+
+func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
+	home := t.TempDir()
+	store := schedule.NewStore(home)
+	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-pause", Text: "暂停 ai-trends 定时任务"}
+	if _, err := rt.Handle(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	confirm := msg
+	confirm.ID = "confirm-pause"
+	confirm.Text = "好"
+	if _, err := rt.Handle(context.Background(), confirm); err != nil {
+		t.Fatal(err)
+	}
+	task, _, err := store.Show("ai-trends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != schedule.StatusPaused {
+		t.Fatalf("expected paused, got %#v", task)
+	}
+	resume := msg
+	resume.SessionKey = "cli:schedule-resume"
+	resume.ID = "resume"
+	resume.Text = "恢复 ai-trends 定时任务"
+	if _, err := rt.Handle(context.Background(), resume); err != nil {
+		t.Fatal(err)
+	}
+	confirmResume := resume
+	confirmResume.ID = "confirm-resume"
+	confirmResume.Text = "好"
+	if _, err := rt.Handle(context.Background(), confirmResume); err != nil {
+		t.Fatal(err)
+	}
+	task, _, err = store.Show("ai-trends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != schedule.StatusActive {
+		t.Fatalf("expected active, got %#v", task)
+	}
+}
+
+func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
+	home := t.TempDir()
+	store := schedule.NewStore(home)
+	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-update", Text: "把 ai-trends 定时任务改成 10点"}
+	resp, err := rt.Handle(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || !strings.Contains(resp.Reply.Text, "daily@10:00") {
+		t.Fatalf("expected update confirmation, got %#v", resp)
+	}
+	task, _, err := store.Show("ai-trends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.Summary(task.Schedule) != "daily@09:00" {
+		t.Fatalf("expected unchanged before confirmation, got %#v", task)
+	}
+	confirm := msg
+	confirm.ID = "confirm-update"
+	confirm.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "updated") {
+		t.Fatalf("expected updated reply, got %q", resp.Reply.Text)
+	}
+	task, _, err = store.Show("ai-trends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.Summary(task.Schedule) != "daily@10:00" {
+		t.Fatalf("expected updated schedule, got %#v", task)
+	}
+}
+
 func TestCollectArtifactsExtractsSearchLinksAndQuery(t *testing.T) {
 	results := []model.ToolResult{{
 		Tool:   "web.search",
@@ -1149,7 +1798,7 @@ func TestDefaultSanitizerRemovesPromptEchoAndNormalizes(t *testing.T) {
 func TestDefaultSanitizerProvidesFallbackText(t *testing.T) {
 	s := DefaultSanitizer{}
 	reply := s.Sanitize(channel.OutboundMessage{Style: "approval_pending", Text: "   "})
-	if reply.Text != "需要确认后才能继续。" {
+	if reply.Text != "Confirmation is required before continuing." {
 		t.Fatalf("unexpected fallback reply %q", reply.Text)
 	}
 }
@@ -1206,7 +1855,7 @@ func TestDefaultSanitizerStripsBareJSONToolPlan(t *testing.T) {
 	if strings.Contains(reply.Text, `"tool"`) || strings.Contains(reply.Text, "file.read") {
 		t.Fatalf("expected bare json tool plan stripped, got %q", reply.Text)
 	}
-	if reply.Text != "已处理完成。" {
+	if reply.Text != "Done." {
 		t.Fatalf("unexpected fallback %q", reply.Text)
 	}
 }
@@ -1217,7 +1866,7 @@ func TestRuntimeFailureHidesModelTransportError(t *testing.T) {
 	if strings.Contains(resp.Reply.Text, "api.minimaxi.com") || strings.Contains(resp.Reply.Text, "unexpected EOF") {
 		t.Fatalf("expected transport detail hidden, got %q", resp.Reply.Text)
 	}
-	if !strings.Contains(resp.Reply.Text, "模型服务") {
+	if !strings.Contains(resp.Reply.Text, "model service") {
 		t.Fatalf("expected user-facing model service error, got %q", resp.Reply.Text)
 	}
 }

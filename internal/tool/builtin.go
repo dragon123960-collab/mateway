@@ -14,11 +14,16 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/textmatch"
 )
 
 func RegisterBuiltins(r *Registry) {
 	r.Register(TimeNow())
 	r.Register(ConfigSummary())
+	r.Register(MemorySearch())
+	r.Register(MemoryIndex())
 	r.Register(WebSearch())
 	r.Register(FileRead())
 	r.Register(ProjectIndex())
@@ -60,6 +65,103 @@ func ConfigSummary() Definition {
 		ArgsSchema:  map[string]string{},
 		Run: func(ctx context.Context, call Call) Result {
 			return Result{OK: true, Output: call.Context.ConfigSummary, Evidence: map[string]any{"kind": "config_summary"}}
+		},
+	}
+}
+
+func MemorySearch() Definition {
+	return Definition{
+		Name:        "memory.search",
+		Description: "Search reviewed long memory and return snippets with path and line evidence.",
+		Risk:        RiskSafeRead,
+		ArgsSchema: map[string]string{
+			"query":   "search query",
+			"agent":   "optional agent id, defaults to main",
+			"limit":   "optional result limit",
+			"rebuild": "optional true to rebuild index before searching",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			query := strings.TrimSpace(firstNonEmpty(call.Args["query"], call.Args["q"]))
+			if query == "" {
+				return ErrorResult("query is required")
+			}
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			if parseBoolArg(call.Args["rebuild"]) {
+				if _, err := store.RebuildIndex(time.Now()); err != nil {
+					return ErrorResult(err.Error())
+				}
+			}
+			limit := parsePositiveArg(call.Args["limit"], 4)
+			results, err := store.SearchLong(memory.SearchOptions{
+				AgentID:      firstNonEmpty(call.Args["agent"], "main"),
+				Query:        query,
+				Limit:        limit,
+				SnippetLimit: 600,
+			})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{
+				OK:       true,
+				Output:   renderMemorySearchOutput(query, results),
+				Evidence: memorySearchEvidence(query, results),
+			}
+		},
+	}
+}
+
+func memorySearchEvidence(query string, results []memory.SearchResult) map[string]any {
+	evidence := map[string]any{
+		"kind":         "memory_search",
+		"query":        query,
+		"result_count": len(results),
+	}
+	if len(results) > 0 {
+		evidence["path"] = results[0].Path
+		evidence["start_line"] = results[0].StartLine
+		evidence["end_line"] = results[0].EndLine
+	}
+	return evidence
+}
+
+func MemoryIndex() Definition {
+	return Definition{
+		Name:        "memory.index",
+		Description: "Return a concise summary of the rebuildable memory index.",
+		Risk:        RiskSafeRead,
+		ArgsSchema: map[string]string{
+			"rebuild": "optional true to rebuild index before reading",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			var result memory.RebuildIndexResult
+			if parseBoolArg(call.Args["rebuild"]) {
+				result, err = store.RebuildIndex(time.Now())
+				if err != nil {
+					return ErrorResult(err.Error())
+				}
+			} else {
+				result, err = store.ReadIndex()
+				if err != nil {
+					return ErrorResult(err.Error())
+				}
+			}
+			return Result{
+				OK:     true,
+				Output: renderMemoryIndexOutput(result),
+				Evidence: map[string]any{
+					"kind":        "memory_index",
+					"path":        result.Path,
+					"entry_count": len(result.Index.Entries),
+					"issue_count": result.Index.IssueCount,
+				},
+			}
 		},
 	}
 }
@@ -107,9 +209,11 @@ func FileRead() Definition {
 				return ErrorResult(err.Error())
 			}
 			return Result{OK: true, Output: Truncate(string(data), DefaultOutputLimit), Evidence: map[string]any{
-				"kind":  "file_read",
-				"path":  path,
-				"bytes": len(data),
+				"kind":       "file_read",
+				"path":       path,
+				"bytes":      len(data),
+				"start_line": 1,
+				"end_line":   countTextLines(string(data)),
 			}}
 		},
 	}
@@ -385,14 +489,86 @@ func looksTimeSensitiveSearch(query string) bool {
 	q := strings.ToLower(strings.TrimSpace(query))
 	cues := []string{
 		"latest", "current", "recent", "official", "release", "changelog", "2026", "trend", "trends", "course", "courses",
-		"最新", "当前", "最近", "官方", "发布", "版本", "趋势", "走向", "课程", "最热", "权威",
 	}
+	cues = append(cues, textmatch.Terms("fresh_search_cues")...)
 	for _, cue := range cues {
 		if strings.Contains(q, cue) {
 			return true
 		}
 	}
 	return false
+}
+
+func memoryStoreFromToolContext(ctx Context) (memory.Store, error) {
+	workspace := strings.TrimSpace(ctx.Workspace)
+	if workspace == "" {
+		return memory.Store{}, fmt.Errorf("workspace is required")
+	}
+	return memory.NewStore(workspace), nil
+}
+
+func renderMemorySearchOutput(query string, results []memory.SearchResult) string {
+	lines := []string{"Memory search results for: " + query}
+	if len(results) == 0 {
+		lines = append(lines, "No matching long memory found.")
+		return strings.Join(lines, "\n")
+	}
+	for i, result := range results {
+		lines = append(lines, fmt.Sprintf("%d. %s\npath: %s\nlines: %d-%d\nscore: %d\n%s", i+1, firstNonEmpty(result.Title, result.ID), result.Path, result.StartLine, result.EndLine, result.Score, result.Snippet))
+	}
+	return Truncate(strings.Join(lines, "\n\n"), DefaultOutputLimit)
+}
+
+func renderMemoryIndexOutput(result memory.RebuildIndexResult) string {
+	counts := map[string]int{}
+	sourceCount := 0
+	for _, entry := range result.Index.Entries {
+		counts[firstNonEmpty(entry.Area, "unknown")]++
+		sourceCount += len(entry.ParsedSources)
+	}
+	areas := sortedIntKeys(counts)
+	lines := []string{
+		"Memory index: " + result.Path,
+		fmt.Sprintf("entries=%d issues=%d parsed_sources=%d built_at=%s", len(result.Index.Entries), result.Index.IssueCount, sourceCount, result.Index.BuiltAt.Format(time.RFC3339)),
+	}
+	for _, area := range areas {
+		lines = append(lines, fmt.Sprintf("- %s: %d", area, counts[area]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func countTextLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	return len(strings.Split(text, "\n"))
+}
+
+func parseBoolArg(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func parsePositiveArg(value string, fallback int) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	n := 0
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return fallback
+		}
+		n = n*10 + int(ch-'0')
+	}
+	if n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 func simpleDiff(oldText, newText string) string {
@@ -418,6 +594,15 @@ func errorString(err error) string {
 }
 
 func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedIntKeys(m map[string]int) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
 		keys = append(keys, key)

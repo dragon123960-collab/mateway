@@ -37,6 +37,9 @@ type loopState struct {
 	selectedSkills  []string
 	binding         taskBindingDecision
 	currentTask     *session.TaskState
+	shortMemory     shortMemorySummary
+	longMemory      longMemorySummary
+	inboxReminder   inboxReminder
 }
 
 func NewAgentLoop(rt Runtime, msg channel.InboundMessage) AgentLoop {
@@ -55,6 +58,12 @@ func NewAgentLoop(rt Runtime, msg channel.InboundMessage) AgentLoop {
 
 func (l *AgentLoop) Run(ctx context.Context) (Response, error) {
 	l.loadSession()
+	if resp := l.handleScheduleProposalApproval(); resp != nil {
+		return *resp, nil
+	}
+	if resp := l.handleScheduleMutationApproval(); resp != nil {
+		return *resp, nil
+	}
 	if resp := l.resolveArtifactDirectAnswer(); resp != nil {
 		return *resp, nil
 	}
@@ -62,7 +71,15 @@ func (l *AgentLoop) Run(ctx context.Context) (Response, error) {
 	if resp := l.applyTaskBinding(binding); resp != nil {
 		return *resp, nil
 	}
+	if resp := l.handleScheduleMutationRequest(); resp != nil {
+		return *resp, nil
+	}
+	if resp := l.handleScheduleRequest(); resp != nil {
+		return *resp, nil
+	}
 	l.receive()
+	l.loadLongMemory()
+	l.state.inboxReminder = l.loadInboxReminder()
 	if err := l.plan(ctx); err != nil {
 		return l.fail(fmt.Errorf("plan failed: %w", err)), nil
 	}
@@ -97,6 +114,38 @@ func (l *AgentLoop) receive() {
 	})
 }
 
+func (l *AgentLoop) loadLongMemory() {
+	if strings.TrimSpace(l.state.resolvedRequest()) == "" || strings.TrimSpace(l.runtime.Memory.Root) == "" {
+		return
+	}
+	agentID := "main"
+	if l.runtime.Config != nil {
+		agentID = firstNonEmpty(l.runtime.Config.Agents.Default, agentID)
+	}
+	results, err := l.runtime.Memory.SearchLong(memory.SearchOptions{
+		AgentID:      agentID,
+		Query:        l.state.resolvedRequest(),
+		Limit:        4,
+		SnippetLimit: 500,
+	})
+	if err != nil {
+		l.runtime.Logger.Event("runtime.long_memory_failed", map[string]any{
+			"trace_id": l.state.traceID,
+			"error":    err.Error(),
+		})
+		return
+	}
+	l.state.longMemory = buildLongMemorySummary(results)
+	if len(results) > 0 {
+		l.runtime.Logger.Event("runtime.long_memory_loaded", map[string]any{
+			"trace_id": l.state.traceID,
+			"count":    len(results),
+			"items":    longMemoryTraceFields(results),
+			"chars":    len(l.state.longMemory.Text),
+		})
+	}
+}
+
 func (l *AgentLoop) loadSession() {
 	if l.runtime.Sessions == nil {
 		return
@@ -111,6 +160,7 @@ func (l *AgentLoop) loadSession() {
 		return
 	}
 	l.state.session = state
+	l.state.shortMemory = buildShortMemorySummary(state)
 	lastTaskID := ""
 	lastStatus := ""
 	if state.LastTask != nil {
@@ -125,6 +175,17 @@ func (l *AgentLoop) loadSession() {
 		"last_task_id": lastTaskID,
 		"last_status":  lastStatus,
 	})
+	if l.state.shortMemory.SessionPresent && l.state.shortMemory.Text != "" {
+		l.runtime.Logger.Event("runtime.short_memory_loaded", map[string]any{
+			"trace_id":       l.state.traceID,
+			"session_key":    l.state.message.SessionKey,
+			"recent_turns":   l.state.shortMemory.RecentTurns,
+			"open_tasks":     l.state.shortMemory.OpenTasks,
+			"artifacts":      l.state.shortMemory.Artifacts,
+			"active_task_id": l.state.shortMemory.ActiveTaskID,
+			"chars":          len(l.state.shortMemory.Text),
+		})
+	}
 }
 
 func (l *AgentLoop) plan(ctx context.Context) error {
@@ -139,7 +200,7 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 		"skills":   selectedSkillsTraceFields(planMatches),
 	})
 	l.recordSelectedSkills(planSkills)
-	contextPrompt := buildModelContextPrompt(l.state.resolvedRequest(), skill.StagePlanning, planMatches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx)
+	contextPrompt := l.buildContextPrompt(skill.StagePlanning, planMatches)
 	plan, check, err := l.planJSON(ctx, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)))
 	if err != nil {
 		return err
@@ -204,7 +265,7 @@ func (l *AgentLoop) repair(ctx context.Context) {
 		"skills":   selectedSkillsTraceFields(planMatches),
 	})
 	l.recordSelectedSkills(planSkills)
-	contextPrompt := buildModelContextPrompt(l.state.resolvedRequest(), "planning_repair", planMatches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx)
+	contextPrompt := l.buildContextPrompt("planning_repair", planMatches)
 	repaired, check, err := l.repairPlanJSON(ctx, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)))
 	if err != nil {
 		l.runtime.Logger.Event("runtime.plan_repair_failed", map[string]any{
@@ -251,7 +312,7 @@ func (l *AgentLoop) synthesize(ctx context.Context) {
 		"skills":   selectedSkillsTraceFields(synthMatches),
 	})
 	l.recordSelectedSkills(synthSkills)
-	contextPrompt := buildModelContextPrompt(l.state.resolvedRequest(), skill.StageSynthesis, synthMatches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx)
+	contextPrompt := l.buildContextPrompt(skill.StageSynthesis, synthMatches)
 	text, err := l.runtime.Model.Synthesize(ctx, l.state.resolvedRequest(), l.state.plan, l.state.results, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(synthSkills)))
 	if err != nil {
 		l.state.synthesisFailed = true
@@ -284,6 +345,13 @@ func (l *AgentLoop) skillDefinitions() []skill.Definition {
 	return l.runtime.Skills.Definitions()
 }
 
+func (l *AgentLoop) buildContextPrompt(stage string, matches []skill.Match) string {
+	return buildModelContextPrompt(l.state.resolvedRequest(), stage, matches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx, promptContextOptions{
+		ShortMemory: l.state.shortMemory.Text,
+		LongMemory:  l.state.longMemory.Text,
+	})
+}
+
 func (l *AgentLoop) controlReply() Response {
 	style := "approval_pending"
 	awaitInput := false
@@ -304,7 +372,7 @@ func (l *AgentLoop) controlReply() Response {
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    style,
-			Title:    "Mateway 待确认",
+			Title:    "Mateway pending confirmation",
 		}),
 		TraceID:        l.state.traceID,
 		Plan:           l.state.plan,
@@ -350,6 +418,9 @@ func (l *AgentLoop) finalReply() Response {
 	learning := l.saveSession(resp)
 	if learning.CandidateGenerated {
 		resp.Reply.Text = strings.TrimSpace(resp.Reply.Text + "\n\n" + skillCandidatePrompt(learning))
+	}
+	if !resp.Failed && !resp.AwaitConfirm && !resp.AwaitUserInput && !learning.CandidateGenerated {
+		resp.Reply.Text = appendInboxReminder(resp.Reply.Text, l.state.inboxReminder)
 	}
 	return resp
 }
@@ -450,6 +521,7 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 		"task_status":  task.Status,
 		"result_count": task.ResultCount,
 	})
+	l.proposeMemoryFromTask(resp.Reply, task)
 	return l.recordLearningPattern(resp, task)
 }
 

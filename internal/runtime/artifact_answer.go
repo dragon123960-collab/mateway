@@ -9,6 +9,7 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/textmatch"
 )
 
 const artifactAnswerThreshold = 7
@@ -39,7 +40,7 @@ func (l *AgentLoop) resolveArtifactDirectAnswer() *Response {
 		ThreadID: l.state.message.ThreadID,
 		Text:     text,
 		Style:    "reply",
-		Title:    "Mateway 找到历史产物",
+		Title:    "Mateway found a historical artifact",
 	})
 	resp := Response{Reply: reply, TraceID: l.state.traceID}
 	l.runtime.Logger.Event("runtime.artifact_lookup", map[string]any{
@@ -73,21 +74,15 @@ func isArtifactLookupIntent(text string) bool {
 		return false
 	}
 	hasArtifactWord := containsAny(normalized,
-		"artifact", "产物", "文件", "文档", "资料", "材料", "链接", "网址", "url", "地址", "路径", "网页", "来源", "报告", "记录",
+		append([]string{"artifact", "url"}, textmatch.Terms("artifact_words")...)...,
 	)
-	hasHistoricalReference := containsAny(normalized,
-		"那个", "这个", "上次", "之前", "刚才", "刚刚", "昨天",
-	)
-	hasLocationRequest := containsAny(normalized,
-		"在哪", "哪里", "哪儿", "放哪", "放在", "路径", "地址",
-	)
-	hasDeliveryRequest := containsAny(normalized,
-		"发我", "给我", "贴", "打开", "看一下",
-	)
-	if hasArtifactWord && (hasHistoricalReference || hasLocationRequest || hasDeliveryRequest && containsAny(normalized, "链接", "网址", "url", "网页")) {
+	hasHistoricalReference := textmatch.ContainsGroup(normalized, "artifact_historical")
+	hasLocationRequest := textmatch.ContainsGroup(normalized, "artifact_location")
+	hasDeliveryRequest := textmatch.ContainsGroup(normalized, "artifact_delivery")
+	if hasArtifactWord && (hasHistoricalReference || hasLocationRequest || hasDeliveryRequest && containsAny(normalized, append([]string{"url"}, textmatch.Terms("artifact_link_words")...)...)) {
 		return true
 	}
-	return containsAny(normalized, "昨天那个文档", "刚才那个文件", "上次那个链接", "之前那个链接")
+	return textmatch.ContainsGroup(normalized, "artifact_exact_lookup")
 }
 
 func findArtifactMatches(query string, st session.State, limit int) []artifactMatch {
@@ -128,13 +123,13 @@ func scoreArtifactMatch(query string, task session.TaskState, artifact session.A
 	if asksForDocArtifact(normalized) && artifactLooksDocument(artifact) {
 		score += 3
 	}
-	if containsAny(normalized, "哪里", "哪儿", "在哪", "放哪", "放在", "路径", "地址") {
+	if textmatch.ContainsGroup(normalized, "artifact_location") {
 		score += 2
 	}
-	if containsAny(normalized, "昨天", "上次", "之前", "刚才", "刚刚", "那个") {
+	if textmatch.ContainsGroup(normalized, "artifact_historical") {
 		score += 2
 	}
-	if containsAny(normalized, "发我", "给我", "贴", "打开", "看一下") {
+	if textmatch.ContainsGroup(normalized, "artifact_delivery") {
 		score += 1
 	}
 	score += artifactKeywordScore(normalized, task, artifact)
@@ -177,10 +172,8 @@ func artifactKeywordScore(query string, task session.TaskState, artifact session
 }
 
 func artifactQueryTokens(query string) []string {
-	stop := map[string]struct{}{
-		"那个": {}, "这个": {}, "昨天": {}, "上次": {}, "之前": {}, "刚才": {}, "刚刚": {}, "哪里": {}, "哪儿": {}, "在哪": {}, "放哪": {}, "放在": {},
-		"文件": {}, "文档": {}, "资料": {}, "材料": {}, "链接": {}, "网址": {}, "url": {}, "地址": {}, "路径": {}, "网页": {}, "发我": {}, "给我": {},
-	}
+	stop := textmatch.StopSet("artifact_stop")
+	stop["url"] = struct{}{}
 	seen := map[string]struct{}{}
 	var out []string
 	for _, token := range tokenizeForMatch(query) {
@@ -194,7 +187,9 @@ func artifactQueryTokens(query string) []string {
 		seen[token] = struct{}{}
 		out = append(out, token)
 	}
-	for _, marker := range []string{"ai", "docker", "nginx", "mateway", "minimax", "飞书"} {
+	markers := []string{"ai", "docker", "nginx", "mateway", "minimax"}
+	markers = append(markers, textmatch.Terms("artifact_markers")...)
+	for _, marker := range markers {
 		if strings.Contains(strings.ToLower(query), strings.ToLower(marker)) {
 			if _, ok := seen[marker]; !ok {
 				seen[marker] = struct{}{}
@@ -210,13 +205,13 @@ func artifactRecencyScore(query string, updatedAt time.Time) int {
 		return 0
 	}
 	now := time.Now()
-	if strings.Contains(query, "昨天") && sameDate(updatedAt, now.AddDate(0, 0, -1)) {
+	if textmatch.ContainsGroup(query, "artifact_yesterday") && sameDate(updatedAt, now.AddDate(0, 0, -1)) {
 		return 4
 	}
-	if containsAny(query, "刚才", "刚刚") && now.Sub(updatedAt) <= 2*time.Hour {
+	if textmatch.ContainsGroup(query, "artifact_recent") && now.Sub(updatedAt) <= 2*time.Hour {
 		return 3
 	}
-	if containsAny(query, "上次", "之前", "那个") && now.Sub(updatedAt) <= 72*time.Hour {
+	if textmatch.ContainsGroup(query, "artifact_previous") && now.Sub(updatedAt) <= 72*time.Hour {
 		return 2
 	}
 	return 0
@@ -227,10 +222,10 @@ func artifactDirectAnswerText(matches []artifactMatch) string {
 		return ""
 	}
 	if len(matches) == 1 {
-		return "找到了，应该是这个：\n" + formatArtifactMatch(matches[0])
+		return "I found the most likely artifact:\n" + formatArtifactMatch(matches[0])
 	}
 	var b strings.Builder
-	b.WriteString("找到了，最可能是这些历史产物：")
+	b.WriteString("I found these likely historical artifacts:")
 	for i, match := range matches {
 		fmt.Fprintf(&b, "\n%d. %s", i+1, formatArtifactMatch(match))
 	}
@@ -242,12 +237,12 @@ func formatArtifactMatch(match artifactMatch) string {
 	target := firstNonEmpty(artifact.Path, artifact.SourceURL, artifact.Label)
 	label := firstNonEmpty(artifact.Label, artifact.Kind, "artifact")
 	summary := firstNonEmpty(artifact.Summary, match.Task.Topic, match.Task.PlanSummary)
-	parts := []string{fmt.Sprintf("%s：%s", label, target)}
+	parts := []string{fmt.Sprintf("%s: %s", label, target)}
 	if summary != "" && summary != target {
-		parts = append(parts, "线索："+shortenReply(summary, 120))
+		parts = append(parts, "Hint: "+shortenReply(summary, 120))
 	}
 	if match.Task.Topic != "" {
-		parts = append(parts, "来自任务："+match.Task.Topic)
+		parts = append(parts, "From task: "+match.Task.Topic)
 	}
 	return strings.Join(parts, "\n   ")
 }
@@ -264,20 +259,20 @@ func tasksNewestFirst(st session.State) []session.TaskState {
 }
 
 func asksForFileArtifact(text string) bool {
-	return containsAny(text, "文件", "文档", "资料", "材料", "报告", "路径", "放哪")
+	return textmatch.ContainsGroup(text, "artifact_doc_words")
 }
 
 func asksForDocArtifact(text string) bool {
-	return containsAny(text, "文档", "报告", "资料", "材料", "doc", "pdf", "md")
+	return containsAny(text, append([]string{"doc", "pdf", "md"}, textmatch.Terms("artifact_document_words")...)...)
 }
 
 func asksForLinkArtifact(text string) bool {
-	return containsAny(text, "链接", "网址", "url", "网页", "来源", "地址")
+	return containsAny(text, append([]string{"url"}, textmatch.Terms("artifact_link_words")...)...)
 }
 
 func artifactLooksDocument(artifact session.Artifact) bool {
 	text := strings.ToLower(strings.Join([]string{artifact.Kind, artifact.Path, artifact.Label, artifact.Summary}, " "))
-	if containsAny(text, "document", "doc", "文档", "报告", "资料") {
+	if containsAny(text, append([]string{"document", "doc"}, textmatch.Terms("artifact_document_kind")...)...) {
 		return true
 	}
 	ext := strings.ToLower(filepath.Ext(artifact.Path))

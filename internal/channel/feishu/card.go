@@ -10,7 +10,7 @@ import (
 func renderReplyMessage(reply channel.OutboundMessage) (string, string, error) {
 	text := sanitizeFeishuText(reply)
 	if text == "" {
-		text = "暂无内容。"
+		text = "No content."
 	}
 	content, err := json.Marshal(map[string]string{"text": text})
 	return "text", string(content), err
@@ -77,13 +77,13 @@ func looksLikeToolCallDetailLine(lower, trimmed string) bool {
 func fallbackFeishuText(style string) string {
 	switch strings.TrimSpace(style) {
 	case "approval_pending":
-		return "需要你确认后我才能继续。请回复“同意”或“取消”。"
+		return "I need your confirmation before continuing. Reply yes to continue or no to cancel."
 	case "input_required":
-		return "还需要你补充一点信息，我才能继续。"
+		return "I need one more detail before I can continue."
 	case "error":
-		return "这次处理失败了，但我已经停在安全位置。"
+		return "The task failed, and I stopped at a safe point."
 	default:
-		return "已处理完成。"
+		return "Done."
 	}
 }
 

@@ -26,7 +26,11 @@ TODO 定执行；
 2. SessionState / TaskState
 3. FollowupResolver
 4. `project.index` / `file.summary` tools
-5. AgentProfile / AgentRegistry / GatewayBinding
+5. Memory：Short Memory / Long Memory / Self-Learning
+6. Connector 扫描注册机制
+7. AgentProfile / AgentRegistry / GatewayBinding
+
+当前下一阶段是 Memory。多 Agent 配置契约可以保留，但暂不推进 Gateway 多 Agent 路由、supervisor、spawn/subagent 或 DAG 编排。
 
 ---
 
@@ -326,7 +330,7 @@ TODO 定执行；
 
 ### T1.4 AgentProfile / AgentRegistry / GatewayBinding
 
-状态：进行中（配置契约已落地，Gateway 路由未开始）
+状态：延后（配置契约已落地，Gateway 路由暂不开始）
 
 - 目标：支持多个长期共存 agent，但暂不进入 supervisor / spawn。
 - 建议位置：
@@ -359,6 +363,43 @@ TODO 定执行；
 - GatewayBinding 路由接入。
 - 多模型 fallback 的真实运行时重试。
 - role model 在 planning / repair / synthesis / followup 阶段的实际分流。
+
+延后原因：
+
+- 当前单 Agent 的记忆、沉淀和复盘能力还未稳定。
+- 下一阶段优先完成 Memory，不提前引入多 Agent 路由复杂度。
+
+---
+
+## P1.5：Connector 扫描注册机制
+
+状态：待开始
+
+目标：让 `larkcli`、企业 API、传统 CLI 或脚本等外部系统通过配置声明暴露为工具，而不是内置进 runtime。
+
+设计原则：
+
+- 不把 `larkcli` 做成默认内置能力。
+- runtime 只负责扫描 connector 配置、校验声明、注册工具。
+- 具体业务系统能力由用户选择启用。
+- connector 必须声明 tool name、risk、arguments、evidence、auth requirements、confirmation boundary。
+
+建议目录：
+
+```text
+connectors/
+  larkcli/
+    connector.yaml
+    SKILL.md
+    examples.md
+```
+
+验收标准：
+
+- 未启用 connector 时，runtime 不注册相关工具。
+- 启用 connector 后，工具出现在 ToolRegistry。
+- 高风险动作进入确认边界。
+- trace 记录 connector/tool 名称、参数摘要和 evidence，但不记录 secrets。
 
 ---
 
@@ -407,7 +448,7 @@ TODO 定执行；
 
 ### T2.2 Short Memory
 
-状态：待开始
+状态：已完成第一版
 
 - 目标：把当前 session/task 状态整理成稳定短记忆。
 - 交付物：
@@ -419,9 +460,27 @@ TODO 定执行；
   - task 切换仍可解释
   - trace 能看到注入了哪些短记忆
 
+当前结果：
+
+- 已新增 `internal/runtime/short_memory.go`
+- 已从 `SessionState / TaskState` 压缩：
+  - recent turns
+  - active task
+  - open tasks
+  - artifacts
+- `planning / planning_repair / synthesis` 三个阶段都会注入 `Short memory`
+- 已新增 `runtime.short_memory_loaded` trace 事件
+- 已补单测覆盖短记忆进入模型上下文
+
+后续仍需：
+
+- 更强的任务相关性排序
+- 控制不同阶段的短记忆预算
+- 与 long memory 检索结果合并排序
+
 ### T2.3 Long Memory
 
-状态：待开始
+状态：已完成第一版基础写入闭环，待增强
 
 - 目标：沉淀用户偏好、项目事实、企业流程、常用系统调用方式。
 - 当前标准 Markdown 结构：
@@ -451,6 +510,55 @@ TODO 定执行；
   - 支持人工删除或修正
   - 支持 `memory.propose` 和 `memory.commit` 两段式写入
 
+当前结果：
+
+- 已新增 `internal/memory/proposal.go`
+- 已支持 `Store.Propose()`：
+  - 写入 `workspace/memory/agents/<agent_id>/inbox/memory-proposal-*.md`
+  - 使用 YAML frontmatter 标记 `status: proposed`
+  - 写入 sources / confidence / tags / created_at / updated_at
+  - 拒绝明显 secret/token/password/API key 类内容
+- 已支持 `Store.Commit()`：
+  - 从 inbox proposal 提交到 `workspace/memory/agents/<agent_id>/long/*.md`
+  - proposal 状态更新为 `committed`
+  - long memory 状态更新为 `active`
+  - 更新 agent `index.md`
+  - 追加 `memory/log.md`
+- 已新增 CLI：
+  - `mateway memory propose --title <title> --body <text> [--source <source>]`
+  - `mateway memory commit --proposal <proposal-id-or-path>`
+- 已补单测覆盖 propose / commit / secret-like 拒绝
+
+后续仍需：
+
+- user/org scope 的提交路径细化
+- 更严格的 frontmatter parser 与 schema 校验
+
+补充结果：
+
+- 已支持 `Store.List()` / `Store.Show()` / `Store.Reject()`
+- 已新增 CLI：
+  - `mateway memory list [--area inbox|long] [--status proposed|active|rejected]`
+  - `mateway memory show <id-or-path>`
+  - `mateway memory reject --proposal <proposal-id-or-path> [--reason <text>]`
+- 已补单测覆盖 list / show / reject
+- 已支持 planning 前按请求相关性读取 long memory：
+  - 新增 `internal/memory/search.go`
+  - 新增 `internal/runtime/long_memory.go`
+  - runtime 会读取 `workspace/memory/agents/<agent_id>/long/*.md`
+  - 仅注入 `status: active` 的相关片段
+  - `planning / planning_repair / synthesis` 会获得 `Relevant long memory`
+  - 已新增 `runtime.long_memory_loaded` trace 事件
+  - 已补单测覆盖 memory 搜索和 runtime prompt 注入
+- 已支持任务结束后自动生成 memory proposal：
+  - 新增 `internal/runtime/memory_proposal.go`
+  - 成功完成、未等待确认/输入、未失败的 task 才会触发
+  - 必须有工具 evidence/artifacts，避免把纯闲聊写进记忆
+  - 只写入 inbox proposal，不自动 commit
+  - proposal 包含 task id、trace id、user request、plan summary、tools、reply preview 和 evidence
+  - 已新增 `runtime.memory_proposal_created / runtime.memory_proposal_failed` trace 事件
+  - 已补单测覆盖有证据时生成 proposal、无证据时跳过
+
 ### T2.4 Self-Learning Policy
 
 状态：已完成第一版基础设施
@@ -467,7 +575,7 @@ TODO 定执行；
 
 ### T2.5 Skill Crystallization
 
-状态：已完成第一版基础设施
+状态：已完成第一版基础设施，pending 提醒已接入
 
 - 目标：同类任务成功达到阈值后，生成待确认 skill candidate。
 - 当前实现：
@@ -477,9 +585,19 @@ TODO 定执行；
   - 当前任务刚生成 candidate 时会在回复中提示用户
   - 默认不自动启用 skill
 - 后续仍需：
-  - 下一次交互时继续提醒未处理 candidate
   - `memory.commit` / skill promotion 命令
   - 更强的 pattern 归类
+
+补充结果：
+
+- 已新增 `internal/runtime/inbox_reminder.go`
+- runtime 会在普通任务最终回复后提醒未处理 inbox 项：
+  - memory proposals
+  - skill candidates
+- 待确认、待补问、错误回复不会追加提醒，避免干扰主流程
+- 本轮刚生成 skill candidate 时保留原专用提示，不重复追加 inbox 总提醒
+- 已新增 `runtime.inbox_reminder_loaded / runtime.inbox_reminder_failed` trace 事件
+- 已补单测覆盖普通回复追加提醒、控制回复不追加提醒
 
 ### T2.6 LLM Wiki / RAG 取舍
 
@@ -609,7 +727,7 @@ connectors/
 
 ### T4.2 Best-Effort Scheduler
 
-状态：待开始
+状态：已完成第一版
 
 - 目标：`gateway serve` 中启动 best-effort scheduler。
 - 验收标准：
@@ -618,6 +736,161 @@ connectors/
   - missed heartbeat 可补跑
   - 不保证强 cron
   - 不主动夜间询问用户
+
+当前结果：
+
+- 已新增 `internal/heartbeat`
+- 已支持状态文件：
+  - 默认位置：`~/.mateway/run/scheduler/state.json`
+  - 可通过 `scheduler.state_dir` 覆盖目录
+- 已新增 CLI：
+  - `mateway heartbeat status`
+  - `mateway heartbeat run --agent main --job memory_lint`
+- 已支持 job：
+  - `memory_lint`
+  - `memory_daily_review`
+  - `memory_recent_compact`
+  - `memory_index_rebuild`
+- `memory_lint` 会复用 `memory.Lint()`，记录 last_run_at / status / summary / last_error
+- `memory_daily_review` 会扫描当天 session/task，写入 `workspace/memory/agents/<agent_id>/recent/YYYY-MM-DD.md`，并追加 `memory/log.md`
+- `memory_daily_review` 当前定位为非模型事实索引，不做知识判断，不自动生成长期记忆
+- `memory_recent_compact` 会按 `memory.recent_days` 归档过旧 recent 文件到 `recent/archive/`，不做摘要和长期记忆 proposal
+- 已补单测覆盖 memory_lint 状态写入和 unsupported job failure
+- 已补单测覆盖 memory_daily_review recent 文件和 log 写入
+- 已补单测覆盖 memory_recent_compact 归档旧 recent 文件
+- 已新增 `internal/heartbeat/scheduler.go`
+- `gateway serve` 会在 `scheduler.enabled=true` 且 agent `heartbeat.enabled=true` 时启动 best-effort scheduler
+- scheduler 启动时立即检查一次 due jobs，之后低频检查
+- 自动 scheduler 只允许运行低风险 job：
+  - `memory_lint`
+  - `memory_daily_review`
+  - `memory_recent_compact`
+- scheduler 会按 `schedule.daily_at` 补跑当天未成功记录过的 job
+- scheduler 会尊重 `quiet_hours`，静默时段不自动运行
+- scheduler 不主动发送消息，`auto_send_summary` 暂不启用
+- 已补单测覆盖：
+  - scheduler disabled 不运行
+  - due job 选择
+  - 当天已运行不重复
+  - quiet hours 跳过
+  - `RunDue` 写入状态
+
+后续仍需：
+
+- LLM-assisted daily review / recent summary proposal，需要单独设计确认边界后再做
+
+### T4.3 Memory Source And Search Hardening
+
+状态：已完成第一版
+
+- 目标：吸收 wiki/source/search 方向的经验，但不提前引入重型存储依赖。
+- 近期规则：
+  - 数字、百分比、具体结论进入长期记忆时必须保留 source/path/line evidence
+  - heartbeat 体检优先检查 missing sources、broken links、stale recent files
+  - 当前搜索先使用 Markdown 文件和轻量关键词检索
+  - SQLite FTS5 仅作为后续可重建索引，不作为 memory 的唯一真相源
+- 暂不做：
+  - 不把 long memory 迁入 SQLite
+  - 不让 heartbeat 自动做无来源知识判断
+  - 不默认启用 LLM review
+
+当前结果：
+
+- `SearchLong` 会返回 snippet 的 `start_line / end_line`
+- 长记忆 prompt 注入会显示 `path` 和 `lines`
+- trace 会记录命中的 line evidence
+- 检索片段优先围绕正文命中行，不只截取文件开头
+- `memory lint` 会对包含数字、百分比或货币符号的长期记忆检查弱 evidence
+- 弱 evidence 作为 lint issue 输出，不阻断 commit
+- memory frontmatter 已从字符串包含判断升级为结构化 YAML 解析
+- `memory lint` 会校验 type / scope / status / confidence / sources schema
+- 已新增可重建 JSON index：
+  - `mateway memory index`
+  - 从 Markdown 扫描 `agents/*/{long,inbox}`、`user/`、`org/`
+  - 写入 `workspace/memory/index.json`
+  - 记录 id/path/area/agent/title/type/scope/status/tags/sources/confidence/updated_at
+- `SearchLong` 会优先读取 `index.json` 作为候选过滤，再回读 Markdown 校验 status 并提取 snippet
+- memory propose / commit / reject 后会 best-effort 重建 `index.json`
+- 已新增 heartbeat job `memory_index_rebuild`，用于低频补漏用户手工编辑 Markdown 后的索引刷新
+- 已新增只读工具：
+  - `memory.search`：搜索 reviewed long memory，返回 path/line evidence
+  - `memory.index`：读取或重建 JSON memory index 摘要
+- 已新增 source evidence parser：
+  - 支持 `file:path:line`、`file:path:start-end`、URL、`trace:`、`task:`、`manual`
+  - `index.json` 保留原始 sources，并新增 `parsed_sources`
+  - `memory lint` 的 weak evidence 检查改用结构化 source evidence
+- 自动 memory proposal 会尽量写入标准 source evidence：
+  - 文件 artifact 带 line 时写为 `file:path:start-end`
+  - URL、trace、task 保持结构化来源
+
+### T4.4 User Scheduled Tasks
+
+状态：已完成第一版骨架
+
+- 目标：支持用户明确发布的业务定时任务，例如“每天帮我收集 AI 最新趋势文章”。
+- 定位：
+  - 与 heartbeat maintenance 分开建模
+  - 可以复用底层 scheduler tick / state store
+  - scheduler 只负责 due detection 和 dispatch
+  - 任务正文必须交给现有 runtime 主链执行
+  - 不能混进 agent heartbeat job 白名单
+- 建议存储：
+  - `~/.mateway/schedules/tasks/*.yaml` 保存用户任务定义
+  - `~/.mateway/run/scheduler/user_tasks_state.json` 保存运行状态
+- 任务定义需要包含：
+  - task id / title
+  - schedule
+  - owner channel / thread / user
+  - agent id
+  - prompt
+  - allowed tools
+  - delivery target
+  - confirmation policy
+  - max runtime / output budget
+- 安全边界：
+  - 创建、修改、删除用户定时任务必须用户确认
+  - 涉及 shell/file write/external posting/payment/admin actions 的任务，每次执行仍需按工具风险走确认
+  - 默认允许低风险 read/search/summarize/report
+  - 默认不在 quiet hours 主动打扰，除非用户明确指定
+  - 失败需要记录 last_error，不无限重试
+- 验收标准：
+  - CLI 可列出、查看、暂停、删除用户 schedule（已完成）
+  - Feishu/CLI 用户可通过自然语言创建待确认 schedule proposal
+  - `gateway serve` 可自动运行 due user tasks（已完成第一版）
+  - due user task 会构造成内部 inbound message / scheduled invocation，并调用 runtime
+  - runtime 继续负责 planning、tool policy、act、observe、synthesize、memory proposal
+  - 运行结果按配置发回原 channel/thread 或写入 workspace（第一版支持 artifact）
+  - state 记录 last_run_at / status / next_run_at / last_error / output artifact（第一版记录 last_run_at / status / last_error / trace / output）
+- 当前结果：
+  - 新增 `internal/schedule`
+  - 支持 YAML task 定义和 JSON run state
+  - 支持 YAML proposal 定义，用户确认后才提交为正式 task
+  - 支持 schedule draft slot check，缺少 title / prompt / daily_at 时会产出补问信息，不写 proposal
+  - 支持 `mateway schedule create/list/show/pause/resume/delete/due`
+  - 支持 `mateway schedule propose/proposals/commit-proposal/reject-proposal`
+  - 支持 `mateway schedule run-due` 手动执行到期任务
+  - `run-due` 会把任务 prompt 构造成 scheduled inbound message 并调用 runtime
+  - `gateway serve` 会在 `scheduler.enabled=true` 时自动检查并运行 due user tasks
+  - runtime 已支持保守的自然语言 schedule proposal 入口：
+    - 仅识别明显 schedule create 请求
+    - 信息不全时使用 `PendingFields / PendingQuestions` 补问
+    - 信息齐全时写 proposal，不直接启用 task
+    - 用户回复 yes/no 可启用或拒绝 proposal
+    - 支持 daily / weekly / interval / monthly schedule spec
+    - 支持 workday 和 multiple weekdays 第一版抽取
+    - 删除 / 暂停 / 恢复 schedule 需要自然语言确认
+    - 修改 schedule spec / prompt 需要自然语言确认
+  - 第一版 delivery 只支持写 artifact，不主动发 Feishu 消息
+  - 已补单测覆盖 create/list/show/status/delete/due、weekly/interval/monthly/multiple-weekday due、draft slot check、proposal commit/reject、runtime natural language entry、runtime proposal approval/rejection、runtime mutation confirmation、runtime runner、gateway scheduler
+- 后续仍需：
+  - 增强自然语言 schedule extraction，例如 date range / timezone / end condition
+- 暂缓：
+  - Feishu 主动 delivery。后续如果有发送飞书消息的 skill/tool，再让 runtime 按工具策略调用
+- 暂不做：
+  - 不把用户业务定时任务塞进 `heartbeat.jobs`
+  - 不默认让业务任务写 long memory
+  - 不做强 cron SLA
+  - 不做跨 agent supervisor
 
 ---
 

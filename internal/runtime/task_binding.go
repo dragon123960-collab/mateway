@@ -11,6 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/followup"
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/textmatch"
 )
 
 const (
@@ -62,7 +63,7 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 		Kind:          bindingNewTask,
 		TargetTaskID:  l.state.traceID,
 		ResolvedQuery: strings.TrimSpace(l.state.message.Text),
-		Reason:        "未命中已有任务，作为新任务处理",
+		Reason:        "no existing task matched; treating input as a new task",
 		Confidence:    0.9,
 	}
 }
@@ -73,13 +74,13 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 	active := session.ActiveTask(l.state.session)
 	switch decision.Kind {
 	case bindingAmbiguous:
-		text := firstNonEmpty(decision.ClarifyPrompt, "我还不能确定你是在继续哪个任务。请再说清楚一点。")
+		text := firstNonEmpty(decision.ClarifyPrompt, "I am not sure which task you want to continue. Please add a bit more context.")
 		reply := l.runtime.sanitizeReply(channel.OutboundMessage{
 			Channel:  l.state.message.Channel,
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    "input_required",
-			Title:    "Mateway 需要确认上下文",
+			Title:    "Mateway needs context",
 		})
 		resp := Response{Reply: reply, TraceID: l.state.traceID, AwaitUserInput: true}
 		l.runtime.Logger.Event("runtime.followup_resolved", l.bindingTraceFields(decision))
@@ -143,7 +144,7 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 					task.PendingQuestions = nil
 				} else {
 					task.Status = session.TaskAwaitUserInput
-					nextQuestion := "还需要补充这些信息："
+					nextQuestion := "I still need these fields: "
 					var missing []string
 					for key, value := range task.PendingFields {
 						if strings.TrimSpace(value) == "" {
@@ -151,7 +152,7 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 						}
 					}
 					if len(missing) > 0 {
-						nextQuestion += strings.Join(missing, "、")
+						nextQuestion += strings.Join(missing, ", ")
 						task.PendingQuestions = []string{nextQuestion}
 					}
 				}
@@ -171,13 +172,13 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 			"task_status": l.state.currentTask.Status,
 		})
 		if decision.Kind == bindingSlotFill && len(l.state.currentTask.PendingFields) > 0 {
-			text := firstNonEmpty(strings.Join(l.state.currentTask.PendingQuestions, "\n"), "还需要你补充一点信息。")
+			text := firstNonEmpty(strings.Join(l.state.currentTask.PendingQuestions, "\n"), "I need one more detail before I can continue.")
 			reply := l.runtime.sanitizeReply(channel.OutboundMessage{
 				Channel:  l.state.message.Channel,
 				ThreadID: l.state.message.ThreadID,
 				Text:     text,
 				Style:    "input_required",
-				Title:    "Mateway 还需要信息",
+				Title:    "Mateway needs more information",
 			})
 			resp := Response{Reply: reply, TraceID: l.state.traceID, AwaitUserInput: true}
 			l.runtime.Logger.Event("runtime.task_pending_input", map[string]any{
@@ -191,13 +192,13 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 		}
 		if decision.Kind == bindingApprovalReply && !decision.ApprovalGranted {
 			l.state.currentTask.Status = session.TaskAbandoned
-			text := "已取消上一轮待确认操作。"
+			text := "Canceled the previous pending operation."
 			reply := l.runtime.sanitizeReply(channel.OutboundMessage{
 				Channel:  l.state.message.Channel,
 				ThreadID: l.state.message.ThreadID,
 				Text:     text,
 				Style:    "reply",
-				Title:    "Mateway 已取消",
+				Title:    "Mateway canceled the operation",
 			})
 			resp := Response{Reply: reply, TraceID: l.state.traceID}
 			l.runtime.Logger.Event("runtime.followup_resolved", l.bindingTraceFields(decision))
@@ -222,16 +223,16 @@ func (l *AgentLoop) resolveApprovalReply() (taskBindingDecision, bool) {
 		return taskBindingDecision{}, false
 	}
 	if approved, ok := parseApprovalDecision(text, task.PendingApproval); ok {
-		action := "继续执行上一轮任务"
+		action := "Continue the previous task"
 		if approved {
-			action = "继续并批准上一轮任务"
+			action = "Continue and approve the previous task"
 		}
-		resolved := action + "：\n" + firstNonEmpty(task.ResolvedQuery, task.UserText)
+		resolved := action + ":\n" + firstNonEmpty(task.ResolvedQuery, task.UserText)
 		return taskBindingDecision{
 			Kind:            bindingApprovalReply,
 			TargetTaskID:    task.ID,
 			ResolvedQuery:   resolved,
-			Reason:          "命中当前活动任务的批准回复",
+			Reason:          "matched approval reply for active task",
 			Confidence:      0.98,
 			ApprovalGranted: approved,
 		}, true
@@ -256,7 +257,7 @@ func (l *AgentLoop) resolveSlotFill() (taskBindingDecision, bool) {
 		Kind:          bindingSlotFill,
 		TargetTaskID:  task.ID,
 		ResolvedQuery: resolved,
-		Reason:        "命中当前活动任务的参数补全",
+		Reason:        "matched slot fill for active task",
 		Confidence:    0.96,
 		FilledFields:  filled,
 	}, true
@@ -275,7 +276,7 @@ func (l *AgentLoop) resolvePendingConfirmNewTask() (taskBindingDecision, bool) {
 		Kind:          bindingNewTask,
 		TargetTaskID:  l.state.traceID,
 		ResolvedQuery: text,
-		Reason:        "待确认状态下识别到明显独立新请求，优先开启新任务",
+		Reason:        "detected an independent request while a confirmation was pending",
 		Confidence:    0.88,
 	}, true
 }
@@ -300,7 +301,7 @@ func (l *AgentLoop) resolveRuleFollowup() (taskBindingDecision, bool) {
 		Kind:          bindingActiveFollowup,
 		TargetTaskID:  task.ID,
 		ResolvedQuery: strengthenFollowupInstruction(firstNonEmpty(decision.ResolvedQuery, task.ResolvedQuery, task.UserText, l.state.message.Text), l.state.message.Text),
-		Reason:        firstNonEmpty(decision.Reason, "规则解析为继续当前活动任务"),
+		Reason:        firstNonEmpty(decision.Reason, "rule-based resolver matched active task followup"),
 		Confidence:    decision.Confidence,
 	}, true
 }
@@ -317,20 +318,12 @@ func strengthenFollowupInstruction(resolved, current string) string {
 	if !containsStructuralFollowupIntent(current) {
 		return resolved
 	}
-	return resolved + "\n\n重要：本轮补充要求优先级最高，必须明确执行，不要只复述上一轮主题。\n本轮补充要求：" + current
+	return resolved + "\n\nImportant: the current additional request has the highest priority. Execute it directly; do not only restate the previous topic.\nCurrent additional request: " + current
 }
 
 func containsStructuralFollowupIntent(text string) bool {
 	normalized := normalizeFollowupText(text)
-	cues := []string{
-		"拆成", "拆分", "三条", "3条", "三个", "3个", "步骤", "检查项", "清单", "列表", "可执行", "验收标准", "压缩成", "改成",
-	}
-	for _, cue := range cues {
-		if strings.Contains(normalized, cue) {
-			return true
-		}
-	}
-	return false
+	return textmatch.ContainsGroup(normalized, "structural_followup")
 }
 
 func shouldDeferFollowupToModel(text string) bool {
@@ -338,11 +331,7 @@ func shouldDeferFollowupToModel(text string) bool {
 	if normalized == "" {
 		return false
 	}
-	return strings.Contains(normalized, "昨天") ||
-		strings.Contains(normalized, "前天") ||
-		strings.Contains(normalized, "上次") ||
-		strings.Contains(normalized, "之前") ||
-		strings.Contains(normalized, "历史")
+	return textmatch.ContainsGroup(normalized, "history_defer")
 }
 
 func looksLikeIndependentRequestDuringConfirm(text string) bool {
@@ -357,29 +346,15 @@ func looksLikeIndependentRequestDuringConfirm(text string) bool {
 	if _, ok := parseApprovalDecision(normalized, &session.PendingApproval{ApprovalType: "boolean_confirm"}); ok {
 		return false
 	}
-	cancelOnly := []string{"先不", "暂时不", "先算了", "不用了", "不要执行", "别执行", "先别执行"}
-	for _, cue := range cancelOnly {
+	for _, cue := range textmatch.Terms("cancel_only") {
 		if normalized == cue {
 			return false
 		}
 	}
-	newTopicCues := []string{
-		"新问题", "另一个问题", "另外", "换个话题", "先不管", "先别管", "先跳过", "回到",
+	if textmatch.ContainsGroup(normalized, "pending_new_topic") {
+		return true
 	}
-	for _, cue := range newTopicCues {
-		if strings.Contains(normalized, cue) {
-			return true
-		}
-	}
-	requestCues := []string{
-		"请", "帮我", "帮忙", "麻烦", "总结", "搜索", "查一下", "查看", "阅读", "解释", "分析", "列出", "生成", "写一份", "整理", "评估", "对比", "修复", "处理",
-	}
-	for _, cue := range requestCues {
-		if strings.Contains(normalized, cue) {
-			return true
-		}
-	}
-	return false
+	return textmatch.ContainsGroup(normalized, "request_cues")
 }
 
 func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecision, bool) {
@@ -392,9 +367,9 @@ func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecisi
 		return taskBindingDecision{
 			Kind:          bindingAmbiguous,
 			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
-			Reason:        firstNonEmpty(decision.Reason, "无法高置信识别要继续的任务"),
+			Reason:        firstNonEmpty(decision.Reason, "could not confidently identify the target task"),
 			Confidence:    decision.Confidence,
-			ClarifyPrompt: "我还不能确定你是在继续哪个任务。请补一句，例如“继续刚才的安装任务”或“接着昨天的 AI 趋势讨论”。",
+			ClarifyPrompt: "I am not sure which task you want to continue. Please mention a clue such as the task topic, document name, or link.",
 		}, true
 	}
 	kind := strings.TrimSpace(decision.Kind)
@@ -407,9 +382,9 @@ func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecisi
 		return taskBindingDecision{
 			Kind:          bindingAmbiguous,
 			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
-			Reason:        firstNonEmpty(decision.Reason, "任务目标不明确"),
+			Reason:        firstNonEmpty(decision.Reason, "task target is ambiguous"),
 			Confidence:    decision.Confidence,
-			ClarifyPrompt: "我还不能确定你要继续哪个任务。请带上“刚才的安装”“昨天的 AI 趋势文档”之类线索。",
+			ClarifyPrompt: "I am not sure which task you want to continue. Please include a clearer clue such as the topic, document, or link.",
 		}, true
 	}
 	if kind == bindingActiveFollowup && strings.TrimSpace(decision.TargetTaskID) == "" && strings.TrimSpace(l.state.session.ActiveTaskID) != "" {
@@ -419,18 +394,18 @@ func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecisi
 		return taskBindingDecision{
 			Kind:          bindingAmbiguous,
 			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
-			Reason:        "模型返回的历史任务不存在",
+			Reason:        "model returned a missing historical task",
 			Confidence:    decision.Confidence,
-			ClarifyPrompt: "我没找到你提到的历史任务。请带上更明确的线索，比如文档名、链接主题或任务内容。",
+			ClarifyPrompt: "I could not find the historical task you mentioned. Please include a clearer clue such as a document name, link topic, or task content.",
 		}, true
 	}
 	if (kind == bindingActiveFollowup || kind == bindingOpenTaskFollowup) && !l.taskExists(decision.TargetTaskID) {
 		return taskBindingDecision{
 			Kind:          bindingAmbiguous,
 			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
-			Reason:        "模型返回的目标任务不存在",
+			Reason:        "model returned a missing target task",
 			Confidence:    decision.Confidence,
-			ClarifyPrompt: "我没找到要继续的那个任务。请补一句更明确的上下文。",
+			ClarifyPrompt: "I could not find the task to continue. Please add clearer context.",
 		}, true
 	}
 	if kind == bindingNewTask {
@@ -618,7 +593,7 @@ func filepathBase(text string) string {
 }
 
 func normalizeFollowupText(text string) string {
-	replacer := strings.NewReplacer("，", "", "。", "", "？", "", "！", "", "：", "", "\n", " ")
+	replacer := strings.NewReplacer("\uFF0C", "", "\u3002", "", "\uFF1F", "", "\uFF01", "", "\uFF1A", "", "\n", " ")
 	return strings.ToLower(strings.TrimSpace(replacer.Replace(text)))
 }
 
@@ -627,11 +602,11 @@ func parseApprovalDecision(text string, approval *session.PendingApproval) (bool
 		return false, false
 	}
 	switch approval.ApprovalType {
-	case "boolean_confirm", "":
-		switch text {
-		case "同意", "可以", "好", "好的", "行", "安装吧", "确认", "yes", "y", "ok":
+	case "boolean_confirm", "schedule_proposal_confirm", "schedule_mutation_confirm", "":
+		switch {
+		case textmatch.ExactGroup(text, "approval_yes") || text == "yes" || text == "y" || text == "ok":
 			return true, true
-		case "拒绝", "不要", "不行", "取消", "no", "n":
+		case textmatch.ExactGroup(text, "approval_no") || text == "no" || text == "n":
 			return false, true
 		}
 	case "single_choice":
@@ -643,16 +618,27 @@ func parseApprovalDecision(text string, approval *session.PendingApproval) (bool
 }
 
 func parseChoiceIndex(text string) (int, error) {
-	text = strings.TrimSpace(strings.TrimPrefix(text, "选"))
+	for _, prefix := range textmatch.Terms("choice_prefix") {
+		text = strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	}
 	switch text {
-	case "第一", "第一个", "1":
+	case "1":
 		return 0, nil
-	case "第二", "第二个", "2":
+	case "2":
 		return 1, nil
-	case "第三", "第三个", "3":
+	case "3":
 		return 2, nil
 	default:
-		return -1, fmt.Errorf("invalid choice")
+		switch {
+		case textmatch.ExactGroup(text, "choice_first"):
+			return 0, nil
+		case textmatch.ExactGroup(text, "choice_second"):
+			return 1, nil
+		case textmatch.ExactGroup(text, "choice_third"):
+			return 2, nil
+		default:
+			return -1, fmt.Errorf("invalid choice")
+		}
 	}
 }
 
@@ -662,7 +648,7 @@ func fillPendingFields(pending map[string]string, input string) map[string]strin
 	}
 	filled := map[string]string{}
 	parts := strings.FieldsFunc(strings.TrimSpace(input), func(r rune) bool {
-		return r == ',' || r == '，' || r == '\n' || r == ';' || r == '；'
+		return r == ',' || r == '\uFF0C' || r == '\n' || r == ';' || r == '\uFF1B'
 	})
 	for _, part := range parts {
 		key, value, ok := strings.Cut(part, "=")
@@ -737,7 +723,7 @@ func buildResolvedQueryWithFields(base string, fields map[string]string) string 
 	if len(parts) == 0 {
 		return base
 	}
-	return base + "\n已补充参数：" + strings.Join(parts, "；")
+	return base + "\nFilled fields: " + strings.Join(parts, "; ")
 }
 
 func pendingFieldNames(fields map[string]string) []string {

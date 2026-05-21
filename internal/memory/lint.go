@@ -44,11 +44,18 @@ func Lint(root string) (LintReport, error) {
 			return nil
 		}
 		text := string(data)
-		if requiresFrontmatter(path) && !strings.HasPrefix(strings.TrimSpace(text), "---") {
-			report.Issues = append(report.Issues, LintIssue{Path: path, Code: "missing_frontmatter", Message: "durable memory page should start with YAML frontmatter"})
+		parsed, parseErr := parseMarkdown(text)
+		if requiresFrontmatter(path) {
+			if !parsed.HasYAML {
+				report.Issues = append(report.Issues, LintIssue{Path: path, Code: "missing_frontmatter", Message: "durable memory page should start with YAML frontmatter"})
+			} else if parseErr != nil {
+				report.Issues = append(report.Issues, LintIssue{Path: path, Code: "invalid_frontmatter", Message: parseErr.Error()})
+			} else {
+				report.Issues = append(report.Issues, validateMemoryFrontmatter(path, parsed.Frontmatter)...)
+			}
 		}
-		if requiresSource(path) && !strings.Contains(text, "sources:") {
-			report.Issues = append(report.Issues, LintIssue{Path: path, Code: "missing_sources", Message: "durable memory page should include sources"})
+		if requiresSource(path) && hasSpecificClaim(parsed.Body) && !hasStrongSourceEvidence(parsed.Frontmatter.Sources) {
+			report.Issues = append(report.Issues, LintIssue{Path: path, Code: "weak_evidence", Message: "specific claims should include source path, URL, or line evidence"})
 		}
 		return nil
 	}); err != nil {
@@ -120,4 +127,13 @@ func requiresFrontmatter(path string) bool {
 func requiresSource(path string) bool {
 	normalized := filepath.ToSlash(path)
 	return strings.Contains(normalized, "/long/")
+}
+
+func hasSpecificClaim(text string) bool {
+	for _, r := range text {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+	}
+	return strings.Contains(text, "%") || strings.Contains(text, "$")
 }

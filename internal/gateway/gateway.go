@@ -10,6 +10,8 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/heartbeat"
+	"github.com/dongping/mateway/internal/schedule"
 )
 
 type Gateway struct {
@@ -27,6 +29,11 @@ func New(a *app.App) Gateway {
 
 func (g Gateway) Serve(ctx context.Context) error {
 	g.workerCtx = ctx
+	heartbeat.NewScheduler(g.App.Config).Start(ctx)
+	schedule.NewScheduler(g.App.Config, func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
+		resp, err := g.App.Runtime.Handle(ctx, msg)
+		return schedule.Response{Reply: resp.Reply, TraceID: resp.TraceID, Failed: resp.Failed}, err
+	}).Start(ctx)
 	return feishu.StartWebSocket(ctx, g.App.Config.Channels.Feishu, g.HandleInbound)
 }
 
@@ -59,7 +66,7 @@ func (g Gateway) processInbound(ctx context.Context, msg channel.InboundMessage)
 	resp, err := rt.Handle(ctx, msg)
 	if err != nil {
 		_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
-		_ = g.Sender.Reply(ctx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
+		_ = g.Sender.Reply(ctx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "Processing failed: " + err.Error(), Style: "error"})
 		return
 	}
 	if err := g.Sender.Reply(ctx, msg, resp.Reply); err != nil {

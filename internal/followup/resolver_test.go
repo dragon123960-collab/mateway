@@ -36,7 +36,7 @@ func TestResolverDetectsReferenceEdit(t *testing.T) {
 	if !decision.IsFollowup {
 		t.Fatalf("expected followup, got %#v", decision)
 	}
-	if !strings.Contains(decision.ResolvedQuery, "原任务：帮我整理 README") {
+	if !strings.Contains(decision.ResolvedQuery, "Original task: 帮我整理 README") {
 		t.Fatalf("unexpected resolved query %q", decision.ResolvedQuery)
 	}
 }

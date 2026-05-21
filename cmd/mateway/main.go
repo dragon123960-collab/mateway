@@ -18,9 +18,11 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
+	"github.com/dongping/mateway/internal/heartbeat"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/observer"
 	runtimepkg "github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/schedule"
 )
 
 func main() {
@@ -100,15 +102,567 @@ func run() error {
 		return runTrace(args[1:], os.Stdout)
 	case "memory":
 		return runMemory(args[1:], os.Stdout)
+	case "heartbeat":
+		return runHeartbeat(args[1:], os.Stdout)
+	case "schedule":
+		return runSchedule(args[1:], os.Stdout)
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
+func runSchedule(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway schedule <create|propose|list|proposals|show|pause|resume|delete|due|run-due|commit-proposal|reject-proposal>")
+	}
+	a, err := app.Build("", true)
+	if err != nil {
+		return err
+	}
+	store := schedule.NewStore(a.Config.App.Home)
+	switch args[0] {
+	case "create":
+		opts, err := parseScheduleCreateOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		task, path, err := store.Create(schedule.CreateInput{
+			ID:           opts.ID,
+			Title:        opts.Title,
+			Prompt:       opts.Prompt,
+			AgentID:      opts.AgentID,
+			DailyAt:      opts.DailyAt,
+			WeeklyAt:     opts.WeeklyAt,
+			Weekday:      opts.Weekday,
+			Weekdays:     opts.Weekdays,
+			MonthlyAt:    opts.MonthlyAt,
+			MonthlyDay:   opts.MonthlyDay,
+			Interval:     opts.Interval,
+			Channel:      opts.Channel,
+			ThreadID:     opts.ThreadID,
+			UserID:       opts.UserID,
+			DeliveryMode: opts.DeliveryMode,
+			DeliveryPath: opts.DeliveryPath,
+			AllowedTools: opts.AllowedTools,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule task written: %s\n", path)
+		fmt.Fprintf(out, "id=%s status=%s schedule=%s\n", task.ID, task.Status, scheduleSummary(task.Schedule))
+		return nil
+	case "propose":
+		opts, err := parseScheduleCreateOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		proposal, path, err := store.Propose(schedule.ProposalInput{CreateInput: schedule.CreateInput{
+			ID:           opts.ID,
+			Title:        opts.Title,
+			Prompt:       opts.Prompt,
+			AgentID:      opts.AgentID,
+			DailyAt:      opts.DailyAt,
+			WeeklyAt:     opts.WeeklyAt,
+			Weekday:      opts.Weekday,
+			Weekdays:     opts.Weekdays,
+			MonthlyAt:    opts.MonthlyAt,
+			MonthlyDay:   opts.MonthlyDay,
+			Interval:     opts.Interval,
+			Channel:      opts.Channel,
+			ThreadID:     opts.ThreadID,
+			UserID:       opts.UserID,
+			DeliveryMode: opts.DeliveryMode,
+			DeliveryPath: opts.DeliveryPath,
+			AllowedTools: opts.AllowedTools,
+		}})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule proposal written: %s\n", path)
+		fmt.Fprintf(out, "id=%s status=%s schedule=%s\n", proposal.Task.ID, proposal.ProposalStatus, scheduleSummary(proposal.Task.Schedule))
+		return nil
+	case "list":
+		tasks, err := store.List()
+		if err != nil {
+			return err
+		}
+		if len(tasks) == 0 {
+			fmt.Fprintln(out, "No schedule tasks found.")
+			return nil
+		}
+		for _, task := range tasks {
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n", task.ID, task.Status, task.AgentID, scheduleSummary(task.Schedule), task.Title)
+		}
+		return nil
+	case "proposals":
+		status := ""
+		if len(args) > 1 {
+			var err error
+			status, err = parseScheduleProposalStatus(args[1:])
+			if err != nil {
+				return err
+			}
+		}
+		items, err := store.ListProposals(status)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			fmt.Fprintln(out, "No schedule proposals found.")
+			return nil
+		}
+		for _, item := range items {
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.ID, item.Status, item.Schedule, item.Title)
+		}
+		return nil
+	case "show":
+		id, err := oneIDArg(args[1:], "usage: mateway schedule show <id>")
+		if err != nil {
+			return err
+		}
+		task, path, err := store.Show(id)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(task.ID) == "" {
+			return fmt.Errorf("invalid schedule task: %s", path)
+		}
+		fmt.Fprint(out, string(data))
+		if len(data) == 0 || data[len(data)-1] != '\n' {
+			fmt.Fprintln(out)
+		}
+		return nil
+	case "pause":
+		id, err := oneIDArg(args[1:], "usage: mateway schedule pause <id>")
+		if err != nil {
+			return err
+		}
+		task, _, err := store.SetStatus(id, schedule.StatusPaused)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule task paused: %s\n", task.ID)
+		return nil
+	case "resume":
+		id, err := oneIDArg(args[1:], "usage: mateway schedule resume <id>")
+		if err != nil {
+			return err
+		}
+		task, _, err := store.SetStatus(id, schedule.StatusActive)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule task resumed: %s\n", task.ID)
+		return nil
+	case "delete":
+		id, err := oneIDArg(args[1:], "usage: mateway schedule delete <id>")
+		if err != nil {
+			return err
+		}
+		path, err := store.Delete(id)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule task deleted: %s\n", path)
+		return nil
+	case "due":
+		tasks, err := store.Due(time.Now())
+		if err != nil {
+			return err
+		}
+		if len(tasks) == 0 {
+			fmt.Fprintln(out, "No schedule tasks are due.")
+			return nil
+		}
+		for _, task := range tasks {
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", task.ID, task.AgentID, scheduleSummary(task.Schedule), task.Title)
+		}
+		return nil
+	case "commit-proposal":
+		id, err := oneIDArg(args[1:], "usage: mateway schedule commit-proposal <id>")
+		if err != nil {
+			return err
+		}
+		task, path, err := store.CommitProposal(id)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule proposal committed: %s\n", path)
+		fmt.Fprintf(out, "id=%s status=%s schedule=%s\n", task.ID, task.Status, scheduleSummary(task.Schedule))
+		return nil
+	case "reject-proposal":
+		id, reason, err := parseScheduleRejectProposalOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		proposal, path, err := store.RejectProposal(id, reason)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Schedule proposal rejected: %s\n", path)
+		fmt.Fprintf(out, "id=%s status=%s\n", proposal.Task.ID, proposal.ProposalStatus)
+		return nil
+	case "run-due":
+		results, err := schedule.Runner{Store: store, Handle: scheduleHandler(a.Runtime.Handle)}.RunDue(context.Background(), time.Now())
+		if err != nil {
+			return err
+		}
+		if len(results) == 0 {
+			fmt.Fprintln(out, "No schedule tasks are due.")
+			return nil
+		}
+		for _, result := range results {
+			status := "ok"
+			if result.Failed {
+				status = "failed"
+			}
+			fmt.Fprintf(out, "%s\t%s\ttrace=%s\toutput=%s\n", result.Task.ID, status, result.TraceID, result.OutputPath)
+			if strings.TrimSpace(result.Error) != "" {
+				fmt.Fprintf(out, "  error=%s\n", result.Error)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway schedule <create|propose|list|proposals|show|pause|resume|delete|due|run-due|commit-proposal|reject-proposal>")
+	}
+}
+
+type scheduleCreateOptions struct {
+	ID           string
+	Title        string
+	Prompt       string
+	AgentID      string
+	DailyAt      string
+	WeeklyAt     string
+	Weekday      string
+	Weekdays     []string
+	MonthlyAt    string
+	MonthlyDay   int
+	Interval     string
+	Channel      string
+	ThreadID     string
+	UserID       string
+	DeliveryMode string
+	DeliveryPath string
+	AllowedTools []string
+}
+
+func parseScheduleCreateOptions(args []string) (scheduleCreateOptions, error) {
+	opts := scheduleCreateOptions{AgentID: "main", DailyAt: "09:00", Channel: "cli", DeliveryMode: "artifact"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--id":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.ID, i = value, next
+		case "--title":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Title, i = value, next
+		case "--prompt":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Prompt, i = value, next
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--daily-at":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.DailyAt, i = value, next
+		case "--weekly-at":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.WeeklyAt, i = value, next
+		case "--weekday":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Weekday, i = value, next
+		case "--weekdays":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Weekdays, i = splitScheduleList(value), next
+		case "--monthly-at":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.MonthlyAt, i = value, next
+		case "--monthly-day":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			day, err := parsePositiveCLIInt(value)
+			if err != nil {
+				return opts, err
+			}
+			opts.MonthlyDay, i = day, next
+		case "--interval":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Interval, i = value, next
+		case "--channel":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Channel, i = value, next
+		case "--thread":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.ThreadID, i = value, next
+		case "--user":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.UserID, i = value, next
+		case "--delivery":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.DeliveryMode, i = value, next
+		case "--delivery-path":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.DeliveryPath, i = value, next
+		case "--tool":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AllowedTools, i = append(opts.AllowedTools, value), next
+		default:
+			return opts, fmt.Errorf("unknown schedule create option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(opts.Title) == "" || strings.TrimSpace(opts.Prompt) == "" {
+		return opts, fmt.Errorf("usage: mateway schedule create --title <title> --prompt <text> [--daily-at HH:MM]")
+	}
+	return opts, nil
+}
+
+func parseScheduleProposalStatus(args []string) (string, error) {
+	status := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--status":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return "", err
+			}
+			status, i = value, next
+		default:
+			return "", fmt.Errorf("unknown schedule proposals option %q", args[i])
+		}
+	}
+	return status, nil
+}
+
+func splitScheduleList(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	var out []string
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func parsePositiveCLIInt(value string) (int, error) {
+	n := 0
+	for _, ch := range strings.TrimSpace(value) {
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("expected positive integer, got %q", value)
+		}
+		n = n*10 + int(ch-'0')
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("expected positive integer, got %q", value)
+	}
+	return n, nil
+}
+
+func parseScheduleRejectProposalOptions(args []string) (string, string, error) {
+	if len(args) == 0 {
+		return "", "", fmt.Errorf("usage: mateway schedule reject-proposal <id> [--reason <text>]")
+	}
+	id := ""
+	reason := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--reason":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return "", "", err
+			}
+			reason, i = value, next
+		default:
+			if id == "" && !strings.HasPrefix(args[i], "-") {
+				id = args[i]
+				continue
+			}
+			return "", "", fmt.Errorf("unknown schedule reject-proposal option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(id) == "" {
+		return "", "", fmt.Errorf("usage: mateway schedule reject-proposal <id> [--reason <text>]")
+	}
+	return id, reason, nil
+}
+
+func oneIDArg(args []string, usage string) (string, error) {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return "", fmt.Errorf("%s", usage)
+	}
+	return strings.TrimSpace(args[0]), nil
+}
+
+func scheduleHandler(handle func(context.Context, channel.InboundMessage) (runtimepkg.Response, error)) schedule.Handler {
+	return func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
+		resp, err := handle(ctx, msg)
+		return schedule.Response{Reply: resp.Reply, TraceID: resp.TraceID, Failed: resp.Failed}, err
+	}
+}
+
+func scheduleSummary(spec schedule.ScheduleSpec) string {
+	return schedule.Summary(spec)
+}
+
+func runHeartbeat(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway heartbeat <status|run>")
+	}
+	a, err := app.Build("", true)
+	if err != nil {
+		return err
+	}
+	runner := heartbeat.NewRunner(a.Config)
+	switch args[0] {
+	case "status":
+		state, path, err := runner.Status()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Heartbeat state: %s\n", path)
+		if len(state.Jobs) == 0 {
+			fmt.Fprintln(out, "No heartbeat jobs have run yet.")
+			return nil
+		}
+		for _, job := range state.Jobs {
+			fmt.Fprintf(out, "- agent=%s job=%s status=%s last_run_at=%s summary=%s\n", job.AgentID, job.Job, job.Status, job.LastRunAt.Format(time.RFC3339), job.Summary)
+			if strings.TrimSpace(job.LastError) != "" {
+				fmt.Fprintf(out, "  error=%s\n", job.LastError)
+			}
+		}
+		return nil
+	case "run":
+		opts, err := parseHeartbeatRunOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		result, err := runner.Run(heartbeat.RunOptions{AgentID: opts.AgentID, Job: opts.Job})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Heartbeat job completed: agent=%s job=%s status=%s\n", result.State.AgentID, result.State.Job, result.State.Status)
+		if result.Report != nil {
+			fmt.Fprintf(out, "Memory lint checked %s\n", result.Report.Root)
+			if len(result.Report.Issues) == 0 {
+				fmt.Fprintln(out, "No issues found.")
+			} else {
+				for _, issue := range result.Report.Issues {
+					fmt.Fprintf(out, "- [%s] %s: %s\n", issue.Code, issue.Path, issue.Message)
+				}
+			}
+		}
+		if result.DailyReview != nil {
+			fmt.Fprintf(out, "Daily review written: %s\n", result.DailyReview.Path)
+			fmt.Fprintf(out, "Tasks: %d, completed: %d, open: %d, artifacts: %d, proposed inbox items: %d\n",
+				result.DailyReview.TaskCount,
+				result.DailyReview.Completed,
+				result.DailyReview.OpenTasks,
+				result.DailyReview.Artifacts,
+				result.DailyReview.InboxProposed,
+			)
+		}
+		if result.Compact != nil {
+			fmt.Fprintf(out, "Recent memory compacted: archived=%d kept=%d archive=%s\n", result.Compact.Archived, result.Compact.Kept, result.Compact.ArchivedDir)
+		}
+		if result.Index != nil {
+			fmt.Fprintf(out, "Memory index rebuilt: %s\n", result.Index.Path)
+			fmt.Fprintf(out, "Entries: %d, issues: %d\n", len(result.Index.Index.Entries), result.Index.Index.IssueCount)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway heartbeat <status|run>")
+	}
+}
+
+type heartbeatRunOptions struct {
+	AgentID string
+	Job     string
+}
+
+func parseHeartbeatRunOptions(args []string) (heartbeatRunOptions, error) {
+	opts := heartbeatRunOptions{AgentID: "main", Job: heartbeat.JobMemoryLint}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--job":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Job, i = value, next
+		default:
+			return opts, fmt.Errorf("unknown heartbeat run option %q", args[i])
+		}
+	}
+	return opts, nil
+}
+
 func runMemory(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory <lint>")
+		return fmt.Errorf("usage: mateway memory <lint|index|list|show|propose|commit|reject>")
 	}
 	switch args[0] {
 	case "lint":
@@ -129,9 +683,356 @@ func runMemory(args []string, out io.Writer) error {
 			fmt.Fprintf(out, "- [%s] %s: %s\n", issue.Code, issue.Path, issue.Message)
 		}
 		return nil
+	case "index":
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		result, err := memory.NewStore(a.Config.App.Workspace).RebuildIndex(time.Now())
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Memory index written: %s\n", result.Path)
+		fmt.Fprintf(out, "entries=%d issues=%d\n", len(result.Index.Entries), result.Index.IssueCount)
+		return nil
+	case "list":
+		opts, err := parseMemoryListOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		items, err := memory.NewStore(a.Config.App.Workspace).List(memory.ListOptions{AgentID: opts.AgentID, Status: opts.Status, Area: opts.Area})
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			fmt.Fprintln(out, "No memory items found.")
+			return nil
+		}
+		for _, item := range items {
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n", item.ID, item.Status, item.Kind, item.Updated, item.Title)
+		}
+		return nil
+	case "show":
+		opts, err := parseMemoryShowOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		result, err := memory.NewStore(a.Config.App.Workspace).Show(opts.AgentID, opts.ID)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(out, result.Text)
+		if !strings.HasSuffix(result.Text, "\n") {
+			fmt.Fprintln(out)
+		}
+		return nil
+	case "propose":
+		opts, err := parseMemoryProposeOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		result, err := memory.NewStore(a.Config.App.Workspace).Propose(memory.ProposalInput{
+			AgentID:    opts.AgentID,
+			Scope:      opts.Scope,
+			Type:       opts.Type,
+			Title:      opts.Title,
+			Body:       opts.Body,
+			Sources:    opts.Sources,
+			Tags:       opts.Tags,
+			Confidence: opts.Confidence,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Memory proposal written: %s\n", result.Path)
+		return nil
+	case "commit":
+		opts, err := parseMemoryCommitOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		result, err := memory.NewStore(a.Config.App.Workspace).Commit(memory.CommitInput{
+			AgentID:  opts.AgentID,
+			Proposal: opts.Proposal,
+			Title:    opts.Title,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Memory committed: %s\n", result.TargetPath)
+		return nil
+	case "reject":
+		opts, err := parseMemoryRejectOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		result, err := memory.NewStore(a.Config.App.Workspace).Reject(memory.RejectInput{
+			AgentID:  opts.AgentID,
+			Proposal: opts.Proposal,
+			Reason:   opts.Reason,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Memory proposal rejected: %s\n", result.Path)
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway memory <lint>")
+		return fmt.Errorf("usage: mateway memory <lint|index|list|show|propose|commit|reject>")
 	}
+}
+
+type memoryListOptions struct {
+	AgentID string
+	Area    string
+	Status  string
+}
+
+type memoryShowOptions struct {
+	AgentID string
+	ID      string
+}
+
+type memoryProposeOptions struct {
+	AgentID    string
+	Scope      string
+	Type       string
+	Title      string
+	Body       string
+	Sources    []string
+	Tags       []string
+	Confidence string
+}
+
+type memoryCommitOptions struct {
+	AgentID  string
+	Proposal string
+	Title    string
+}
+
+type memoryRejectOptions struct {
+	AgentID  string
+	Proposal string
+	Reason   string
+}
+
+func parseMemoryListOptions(args []string) (memoryListOptions, error) {
+	opts := memoryListOptions{AgentID: "main", Area: "inbox"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--area":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Area, i = value, next
+		case "--status":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Status, i = value, next
+		default:
+			return opts, fmt.Errorf("unknown memory list option %q", args[i])
+		}
+	}
+	return opts, nil
+}
+
+func parseMemoryShowOptions(args []string) (memoryShowOptions, error) {
+	opts := memoryShowOptions{AgentID: "main"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--id":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.ID, i = value, next
+		default:
+			if strings.TrimSpace(opts.ID) == "" && !strings.HasPrefix(args[i], "-") {
+				opts.ID = args[i]
+				continue
+			}
+			return opts, fmt.Errorf("unknown memory show option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(opts.ID) == "" {
+		return opts, fmt.Errorf("usage: mateway memory show <id-or-path>")
+	}
+	return opts, nil
+}
+
+func parseMemoryProposeOptions(args []string) (memoryProposeOptions, error) {
+	opts := memoryProposeOptions{AgentID: "main", Scope: "agent", Type: "note", Confidence: "medium"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--scope":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Scope, i = value, next
+		case "--type":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Type, i = value, next
+		case "--title":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Title, i = value, next
+		case "--body":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Body, i = value, next
+		case "--source":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Sources, i = append(opts.Sources, value), next
+		case "--tag":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Tags, i = append(opts.Tags, value), next
+		case "--confidence":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Confidence, i = value, next
+		default:
+			return opts, fmt.Errorf("unknown memory propose option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(opts.Title) == "" || strings.TrimSpace(opts.Body) == "" {
+		return opts, fmt.Errorf("usage: mateway memory propose --title <title> --body <text> [--source <source>] [--scope agent|user|org]")
+	}
+	return opts, nil
+}
+
+func parseMemoryCommitOptions(args []string) (memoryCommitOptions, error) {
+	opts := memoryCommitOptions{AgentID: "main"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--proposal":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Proposal, i = value, next
+		case "--title":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Title, i = value, next
+		default:
+			if strings.TrimSpace(opts.Proposal) == "" && !strings.HasPrefix(args[i], "-") {
+				opts.Proposal = args[i]
+				continue
+			}
+			return opts, fmt.Errorf("unknown memory commit option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(opts.Proposal) == "" {
+		return opts, fmt.Errorf("usage: mateway memory commit --proposal <proposal-id-or-path>")
+	}
+	return opts, nil
+}
+
+func parseMemoryRejectOptions(args []string) (memoryRejectOptions, error) {
+	opts := memoryRejectOptions{AgentID: "main"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--proposal":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Proposal, i = value, next
+		case "--reason":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Reason, i = value, next
+		default:
+			if strings.TrimSpace(opts.Proposal) == "" && !strings.HasPrefix(args[i], "-") {
+				opts.Proposal = args[i]
+				continue
+			}
+			return opts, fmt.Errorf("unknown memory reject option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(opts.Proposal) == "" {
+		return opts, fmt.Errorf("usage: mateway memory reject --proposal <proposal-id-or-path>")
+	}
+	return opts, nil
+}
+
+func optionValue(args []string, i int) (string, int, error) {
+	if i+1 >= len(args) {
+		return "", i, fmt.Errorf("%s requires a value", args[i])
+	}
+	return args[i+1], i + 1, nil
 }
 
 type testCommandOptions struct {
@@ -739,7 +1640,22 @@ Commands:
   gateway restart        restart OS-managed gateway service
   gateway stop           stop OS-managed gateway service
   gateway status         show service and instance-lock status
+  heartbeat status       show heartbeat job state
+  heartbeat run          run one heartbeat job manually
+  schedule create        create one user scheduled task
+  schedule propose       write a pending user scheduled task proposal
+  schedule list          list user scheduled tasks
+  schedule proposals     list pending user scheduled task proposals
+  schedule show <id>     print one user scheduled task
+  schedule due           list user scheduled tasks due now
+  schedule run-due       run due user scheduled tasks through runtime
   memory lint            check Markdown memory wiki health without modifying files
+  memory index           rebuild JSON memory index from Markdown
+  memory list            list inbox or long memory items
+  memory show            print one memory item
+  memory propose         write a reviewed memory proposal into inbox
+  memory commit          commit an inbox proposal into long memory
+  memory reject          mark an inbox proposal as rejected
   trace tail             follow today's structured trace
   trace show <trace_id>  show events for one trace id
 

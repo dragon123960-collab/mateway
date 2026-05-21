@@ -11,10 +11,15 @@ Mateway 目前是一个小型工具型 Agent，而不是重型框架化 runtime�
 - `internal/tool`：工具注册、基础工具、策略保护、输出截断
 - `internal/runtime`：任务绑定、JSON planning loop、一次 repair、证据收集、总结回复
 - `internal/session`：session/task 状态保存、active task、continuation
+- `internal/memory`：Markdown LLM Wiki、proposal、lint、index、source evidence
+- `internal/heartbeat`：系统维护 job 和 best-effort scheduler
+- `internal/schedule`：用户业务定时任务 proposal、store、runner、scheduler
 - `internal/skill`：workspace skill discovery 和默认 skill 释放
 - `internal/channel/feishu`：飞书 WebSocket、回复、reaction
 - `internal/gateway`：channel 编排、session key、runtime 调用
 - `internal/observer`：结构化日志和 trace 读取
+
+当前功能体系总览见：[当前功能体系](./当前功能体系.md)。
 
 ## Workspace 初始化
 

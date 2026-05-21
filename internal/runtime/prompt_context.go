@@ -22,9 +22,18 @@ type agentPromptFiles struct {
 	Tools  string
 }
 
-func buildModelContextPrompt(msg string, stage string, matches []skill.Match, toolDefs []tool.Definition, toolCtx tool.Context) string {
+type promptContextOptions struct {
+	ShortMemory string
+	LongMemory  string
+}
+
+func buildModelContextPrompt(msg string, stage string, matches []skill.Match, toolDefs []tool.Definition, toolCtx tool.Context, opts ...promptContextOptions) string {
 	now := time.Now()
 	files := loadAgentPromptFiles(toolCtx.Workspace, "main")
+	var option promptContextOptions
+	if len(opts) > 0 {
+		option = opts[0]
+	}
 	sections := []string{
 		"You are Mateway, a practical personal work assistant agent.",
 		"",
@@ -46,6 +55,12 @@ func buildModelContextPrompt(msg string, stage string, matches []skill.Match, to
 	}
 	if extra := renderAgentPromptFiles(files); extra != "" {
 		sections = append(sections, "", extra)
+	}
+	if memory := strings.TrimSpace(option.ShortMemory); memory != "" {
+		sections = append(sections, "", "Short memory:", memory)
+	}
+	if memory := strings.TrimSpace(option.LongMemory); memory != "" {
+		sections = append(sections, "", "Relevant long memory:", memory)
 	}
 	if selected := renderSelectedSkills(matches); selected != "" {
 		sections = append(sections, "", "Selected skills:", selected)

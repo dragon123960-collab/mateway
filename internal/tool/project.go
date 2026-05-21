@@ -174,12 +174,14 @@ func buildFileSummary(path string, data []byte, maxLines int) (string, map[strin
 	headings := detectHeadings(lines, 8)
 	preview := previewLines(lines, maxLines)
 	evidence := map[string]any{
-		"kind":      "file_summary",
-		"path":      path,
-		"bytes":     len(data),
-		"lines":     len(lines),
-		"headings":  headings,
-		"extension": strings.ToLower(filepath.Ext(path)),
+		"kind":       "file_summary",
+		"path":       path,
+		"bytes":      len(data),
+		"lines":      len(lines),
+		"start_line": 1,
+		"end_line":   previewEndLine(lines, maxLines),
+		"headings":   headings,
+		"extension":  strings.ToLower(filepath.Ext(path)),
 	}
 	parts := []string{
 		"File summary",
@@ -208,6 +210,16 @@ func intArg(raw string, fallback, min, max int) int {
 		return max
 	}
 	return value
+}
+
+func previewEndLine(lines []string, limit int) int {
+	if len(lines) == 0 {
+		return 0
+	}
+	if limit <= 0 || limit > len(lines) {
+		return len(lines)
+	}
+	return limit
 }
 
 func pathDepth(rel string) int {

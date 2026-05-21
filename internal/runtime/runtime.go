@@ -16,6 +16,7 @@ import (
 	"github.com/dongping/mateway/internal/observer"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
+	"github.com/dongping/mateway/internal/textmatch"
 	"github.com/dongping/mateway/internal/tool"
 )
 
@@ -217,12 +218,12 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 
 func userFacingError(err error) string {
 	if err == nil {
-		return "这次处理失败了，但我已经停在安全位置。"
+		return "The task failed, and I stopped at a safe point."
 	}
 	text := err.Error()
 	lower := strings.ToLower(text)
 	if strings.Contains(lower, "insufficient tool evidence") {
-		return "这次我没有拿到足够的工具证据来回答，已停止生成泛化结论。请重试；我会优先读取相关项目文档后再总结。"
+		return "I did not get enough tool evidence to answer, so I stopped before making an unsupported conclusion. Please retry; I will read the relevant project evidence first."
 	}
 	if strings.Contains(lower, "unexpected eof") ||
 		strings.Contains(lower, "model request") ||
@@ -231,9 +232,9 @@ func userFacingError(err error) string {
 		strings.Contains(lower, "connection reset") ||
 		strings.Contains(lower, "timeout") ||
 		strings.Contains(lower, "context deadline exceeded") {
-		return "这次请求模型服务时临时失败了，任务没有继续执行。请稍后重试；如果连续出现，我会建议查看 trace 日志定位。"
+		return "The model service request failed temporarily, so the task did not continue. Please retry later; if it keeps happening, check the trace logs."
 	}
-	return "这次处理失败了，但我已经停在安全位置。请查看报告或 trace 里的错误详情。"
+	return "The task failed, and I stopped at a safe point. Check the report or trace for details."
 }
 
 func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
@@ -241,19 +242,19 @@ func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
 	case "shell.run":
 		command := strings.TrimSpace(args["command"])
 		if command != "" {
-			return "这个命令可能会修改或删除本地内容，需要你确认后我才会执行。\n\n命令：`" + command + "`\n\n如果确认执行，请回复“同意”或“确认”；如果不执行，请回复“取消”。"
+			return "This command may modify or delete local content, so I need confirmation before running it.\n\nCommand: `" + command + "`\n\nReply yes to run it, or no to cancel."
 		}
 	case "file.write", "file.patch":
 		path := strings.TrimSpace(args["path"])
 		if path != "" {
-			return "这个文件操作会修改本地文件，需要你确认后我才会执行。\n\n文件：" + path + "\n\n如果确认执行，请回复“同意”或“确认”；如果不执行，请回复“取消”。"
+			return "This file operation will modify a local file, so I need confirmation before running it.\n\nFile: " + path + "\n\nReply yes to run it, or no to cancel."
 		}
 	}
 	goal := strings.TrimSpace(step.Goal)
 	if goal == "" {
 		goal = step.Tool
 	}
-	return "这一步需要你确认后才能继续。\n\n操作：" + goal + "\n\n如果确认执行，请回复“同意”或“确认”；如果不执行，请回复“取消”。"
+	return "This step needs confirmation before I can continue.\n\nAction: " + goal + "\n\nReply yes to run it, or no to cancel."
 }
 
 func (r Runtime) sanitizeReply(reply channel.OutboundMessage) channel.OutboundMessage {
@@ -284,19 +285,9 @@ func requiresProjectEvidence(user string) bool {
 	if normalized == "" {
 		return false
 	}
-	hasLocalSubject := strings.Contains(normalized, "当前") ||
-		strings.Contains(normalized, "mateway") ||
-		strings.Contains(normalized, "项目") ||
-		strings.Contains(normalized, "仓库") ||
-		strings.Contains(normalized, "测试")
-	hasKnowledgeAction := strings.Contains(normalized, "总结") ||
-		strings.Contains(normalized, "概览") ||
-		strings.Contains(normalized, "梳理") ||
-		strings.Contains(normalized, "说明") ||
-		strings.Contains(normalized, "分析") ||
-		strings.Contains(normalized, "列出") ||
-		strings.Contains(normalized, "检查项") ||
-		strings.Contains(normalized, "目标")
+	hasLocalSubject := strings.Contains(normalized, "mateway") ||
+		textmatch.ContainsGroup(normalized, "project_subject")
+	hasKnowledgeAction := textmatch.ContainsGroup(normalized, "project_action")
 	return hasLocalSubject && hasKnowledgeAction
 }
 
@@ -373,10 +364,12 @@ func collectArtifacts(results []model.ToolResult) []session.Artifact {
 			if _, ok := seen[key]; !ok {
 				seen[key] = struct{}{}
 				artifacts = append(artifacts, session.Artifact{
-					Kind:    firstNonEmpty(stringValue(evidence["kind"]), "file"),
-					Path:    path,
-					Label:   result.Tool,
-					Summary: shortenReply(result.Output, 180),
+					Kind:      firstNonEmpty(stringValue(evidence["kind"]), "file"),
+					Path:      path,
+					StartLine: intValue(evidence["start_line"]),
+					EndLine:   intValue(evidence["end_line"]),
+					Label:     result.Tool,
+					Summary:   shortenReply(result.Output, 180),
 				})
 			}
 		}
@@ -414,6 +407,22 @@ func collectArtifacts(results []model.ToolResult) []session.Artifact {
 		}
 	}
 	return artifacts
+}
+
+func intValue(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	default:
+		return 0
+	}
 }
 
 var urlPattern = regexp.MustCompile(`https?://[^\s]+`)

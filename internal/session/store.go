@@ -39,6 +39,8 @@ type PendingApproval struct {
 type Artifact struct {
 	Kind      string `json:"kind"`
 	Path      string `json:"path,omitempty"`
+	StartLine int    `json:"start_line,omitempty"`
+	EndLine   int    `json:"end_line,omitempty"`
 	Label     string `json:"label,omitempty"`
 	SourceURL string `json:"source_url,omitempty"`
 	Summary   string `json:"summary,omitempty"`

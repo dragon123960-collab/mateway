@@ -5,6 +5,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/textmatch"
 )
 
 type Input struct {
@@ -40,7 +41,7 @@ func (Resolver) Resolve(in Input) Decision {
 			IsFollowup:    false,
 			ResolvedQuery: current,
 			Topic:         "",
-			Reason:        "用户明确开启新话题",
+			Reason:        "user explicitly started a new topic",
 			Confidence:    0.94,
 		}
 	}
@@ -54,7 +55,7 @@ func (Resolver) Resolve(in Input) Decision {
 			IsFollowup:    true,
 			ResolvedQuery: mergeBaseAndInstruction(base, current),
 			Topic:         topic,
-			Reason:        "当前输入依赖上一轮上下文才能理解",
+			Reason:        "current input depends on previous context",
 			Confidence:    0.73,
 		}
 	}
@@ -63,7 +64,7 @@ func (Resolver) Resolve(in Input) Decision {
 		IsFollowup:    false,
 		ResolvedQuery: current,
 		Topic:         "",
-		Reason:        "当前输入可独立理解",
+		Reason:        "current input is standalone",
 		Confidence:    0.78,
 	}
 }
@@ -75,23 +76,23 @@ func resolveByIntent(current, normalized, base, topic string) (Decision, bool) {
 			IsFollowup:    true,
 			ResolvedQuery: base,
 			Topic:         topic,
-			Reason:        "用户要求继续上一轮任务",
+			Reason:        "user asked to continue the previous task",
 			Confidence:    0.95,
 		}, true
 	case isRetryIntent(normalized):
 		return Decision{
 			IsFollowup:    true,
-			ResolvedQuery: "重新执行刚才的任务：\n" + base,
+			ResolvedQuery: "Retry the previous task:\n" + base,
 			Topic:         topic,
-			Reason:        "用户要求重试上一轮任务",
+			Reason:        "user asked to retry the previous task",
 			Confidence:    0.94,
 		}, true
 	case isExpandIntent(normalized):
 		return Decision{
 			IsFollowup:    true,
-			ResolvedQuery: "继续上一轮任务，并展开说明以下方向：\n原任务：" + base + "\n补充要求：" + current,
+			ResolvedQuery: "Continue the previous task and expand in this direction:\nOriginal task: " + base + "\nAdditional request: " + current,
 			Topic:         topic,
-			Reason:        "用户要求基于上一轮结果继续展开",
+			Reason:        "user asked to expand from the previous result",
 			Confidence:    0.91,
 		}, true
 	case looksReferenceEdit(normalized):
@@ -99,7 +100,7 @@ func resolveByIntent(current, normalized, base, topic string) (Decision, bool) {
 			IsFollowup:    true,
 			ResolvedQuery: mergeBaseAndInstruction(base, current),
 			Topic:         topic,
-			Reason:        "用户在引用上一轮对象追加修改要求",
+			Reason:        "user referenced a previous object and added an edit request",
 			Confidence:    0.88,
 		}, true
 	}
@@ -115,7 +116,7 @@ func mergeBaseAndInstruction(base, current string) string {
 	if current == "" {
 		return base
 	}
-	return "继续处理上一轮任务：\n原任务：" + base + "\n补充要求：" + current
+	return "Continue the previous task:\nOriginal task: " + base + "\nAdditional request: " + current
 }
 
 func baseQuery(last *session.TaskState) string {
@@ -143,62 +144,35 @@ func lastTaskTopic(last *session.TaskState) string {
 }
 
 func normalize(in string) string {
-	replacer := strings.NewReplacer("，", "", "。", "", "？", "", "！", "", "：", "", "；", "", "\n", " ", "\t", " ")
+	replacer := strings.NewReplacer("\uFF0C", "", "\u3002", "", "\uFF1F", "", "\uFF01", "", "\uFF1A", "", "\uFF1B", "", "\n", " ", "\t", " ")
 	return strings.ToLower(strings.TrimSpace(replacer.Replace(in)))
 }
 
 func isExplicitNewTopic(text string) bool {
-	cues := []string{"换个话题", "新问题", "另一个问题", "另外一个问题", "重新问", "顺便问个新问题"}
-	for _, cue := range cues {
-		if strings.Contains(text, cue) {
-			return true
-		}
-	}
-	return false
+	return textmatch.ContainsGroup(text, "explicit_new_topic")
 }
 
 func isContinueIntent(text string) bool {
-	exact := []string{"继续", "继续吧", "接着", "接着做", "继续刚才的", "继续刚才那个", "继续上一个", "继续上一轮", "继续处理"}
-	for _, item := range exact {
-		if text == item {
-			return true
-		}
-	}
-	return strings.Contains(text, "继续刚才") || strings.Contains(text, "继续上一轮") || strings.Contains(text, "接着刚才")
+	return textmatch.ExactGroup(text, "continue_exact") || textmatch.ContainsGroup(text, "continue_contains")
 }
 
 func isRetryIntent(text string) bool {
-	return strings.Contains(text, "再试一次") || strings.Contains(text, "重试") || strings.Contains(text, "重新执行刚才")
+	return textmatch.ContainsGroup(text, "retry_contains")
 }
 
 func isExpandIntent(text string) bool {
-	cues := []string{"展开", "详细", "细说", "具体一点", "展开讲", "再多说", "深入一点"}
-	for _, cue := range cues {
-		if strings.Contains(text, cue) {
-			return true
-		}
-	}
-	return false
+	return textmatch.ContainsGroup(text, "expand_cues")
 }
 
 func looksReferenceEdit(text string) bool {
-	cues := []string{"按刚才", "按上面", "基于刚才", "这个文件", "那个文件", "这个结果", "那个结果", "刚才那个文件", "前面那个"}
-	for _, cue := range cues {
-		if strings.Contains(text, cue) {
-			return true
-		}
-	}
-	return false
+	return textmatch.ContainsGroup(text, "reference_edit_cues")
 }
 
 func looksContextDependent(text string) bool {
 	if utf8.RuneCountInString(text) <= 8 {
-		shortCues := []string{"这个", "那个", "它", "继续", "接着", "展开", "重试", "再来", "按这个", "按那个"}
-		for _, cue := range shortCues {
-			if strings.Contains(text, cue) {
-				return true
-			}
+		if textmatch.ContainsGroup(text, "short_context_cues") {
+			return true
 		}
 	}
-	return strings.Contains(text, "刚才") || strings.Contains(text, "上一个") || strings.Contains(text, "前面")
+	return textmatch.ContainsGroup(text, "context_contains")
 }
