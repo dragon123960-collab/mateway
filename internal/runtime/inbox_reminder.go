@@ -52,12 +52,12 @@ func (r inboxReminder) Text() string {
 	}
 	parts := []string{}
 	if r.MemoryProposals > 0 {
-		parts = append(parts, fmt.Sprintf("%d memory proposal(s)", r.MemoryProposals))
+		parts = append(parts, fmt.Sprintf("%d 条记忆候选", r.MemoryProposals))
 	}
 	if r.SkillCandidates > 0 {
-		parts = append(parts, fmt.Sprintf("%d skill candidate(s)", r.SkillCandidates))
+		parts = append(parts, fmt.Sprintf("%d 个 skill 候选", r.SkillCandidates))
 	}
-	return "Inbox reminder: " + strings.Join(parts, " and ") + " are waiting for review. Use `mateway memory list --area inbox --status proposed` to inspect them."
+	return "Inbox 提醒：" + strings.Join(parts, "，") + "等待 review。可以用 `mateway memory list --area inbox --status proposed` 查看。"
 }
 
 func appendInboxReminder(text string, reminder inboxReminder) string {

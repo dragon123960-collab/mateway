@@ -238,7 +238,7 @@ func TestRuntimeAppendsInboxReminderForPendingItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Reply.Text, "Inbox reminder:") || !strings.Contains(resp.Reply.Text, "memory proposal") {
+	if !strings.Contains(resp.Reply.Text, "Inbox 提醒：") || !strings.Contains(resp.Reply.Text, "记忆候选") {
 		t.Fatalf("expected inbox reminder, got %q", resp.Reply.Text)
 	}
 }
@@ -278,7 +278,7 @@ func TestRuntimeDoesNotAppendInboxReminderToControlReply(t *testing.T) {
 	if !resp.AwaitConfirm {
 		t.Fatalf("expected confirmation")
 	}
-	if strings.Contains(resp.Reply.Text, "Inbox reminder:") {
+	if strings.Contains(resp.Reply.Text, "Inbox 提醒：") {
 		t.Fatalf("expected no inbox reminder on control reply, got %q", resp.Reply.Text)
 	}
 }
@@ -404,6 +404,31 @@ func TestRuntimeIgnoresModelRequiresConfirmForSafeCommand(t *testing.T) {
 	}
 	if resp.AwaitConfirm {
 		t.Fatalf("expected safe command not to await confirm, got %#v", resp)
+	}
+}
+
+func TestRuntimeRewritesProjectOverviewShellPlanToProjectIndex(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# Mateway"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "project overview", Steps: []model.PlanStep{{
+		ID: "s1", Goal: "概览项目目录结构", Tool: "shell.run", Args: map[string]string{"command": "find . -maxdepth 2 -type f"}, RequiresConfirm: true,
+	}}}}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请概览当前项目的目录结构和核心包"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm {
+		t.Fatalf("expected project overview to avoid shell confirmation, got %#v", resp)
+	}
+	if len(resp.Plan.Steps) != 1 || resp.Plan.Steps[0].Tool != "project.index" {
+		t.Fatalf("expected project.index plan, got %#v", resp.Plan)
+	}
+	if len(resp.Results) != 1 || !resp.Results[0].OK || resp.Results[0].Tool != "project.index" {
+		t.Fatalf("expected project.index result, got %#v", resp.Results)
 	}
 }
 
@@ -876,6 +901,56 @@ func TestRuntimeRuleFollowupStrengthensStructuralInstruction(t *testing.T) {
 	}
 }
 
+func TestRuntimeRuleFollowupUsesCompletedActiveTask(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "followup", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+		followupDecision: model.FollowupDecision{
+			Kind:       "ambiguous",
+			Reason:     "模型不确定",
+			Confidence: 0.2,
+		},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-system",
+		TaskOrder:    []string{"task-system"},
+		Tasks: map[string]session.TaskState{
+			"task-system": {
+				ID:            "task-system",
+				UserText:      "总结当前 Mateway 已经形成闭环的三块能力",
+				ResolvedQuery: "总结当前 Mateway 已经形成闭环的三块能力",
+				Topic:         "当前功能体系",
+				Status:        session.TaskCompleted,
+				UpdatedAt:     time.Now().Add(-5 * time.Minute),
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:cli",
+		Text:       "继续上一轮，把它拆成三条验收检查项。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput {
+		t.Fatalf("expected completed active task followup to avoid clarification, got %#v", resp)
+	}
+	if fp.followupCalls != 0 {
+		t.Fatalf("expected rule followup before model followup, got %d calls", fp.followupCalls)
+	}
+	if !strings.Contains(fp.lastPlanUser, "三条验收检查项") || !strings.Contains(fp.lastPlanUser, "当前 Mateway 已经形成闭环") {
+		t.Fatalf("expected completed task context in planning input, got %q", fp.lastPlanUser)
+	}
+}
+
 func TestRuntimeSlotFillKeepsTaskWaitingWhenFieldsRemain(t *testing.T) {
 	fp := &fakePlanner{}
 	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
@@ -997,7 +1072,7 @@ func TestRuntimeApprovalRejectionCancelsCurrentTask(t *testing.T) {
 	}
 }
 
-func TestRuntimePendingConfirmAllowsClearIndependentNewTask(t *testing.T) {
+func TestRuntimePendingConfirmBlocksIndependentNewTask(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "summary", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
 		followupDecision: model.FollowupDecision{
@@ -1034,24 +1109,21 @@ func TestRuntimePendingConfirmAllowsClearIndependentNewTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitUserInput {
-		t.Fatalf("expected clear new request not to ask for clarification, got %#v", resp)
+	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "等待确认") {
+		t.Fatalf("expected pending approval clarification, got %#v", resp)
 	}
 	if fp.followupCalls != 0 {
-		t.Fatalf("expected pending-confirm new task rule to avoid model followup, got %d calls", fp.followupCalls)
+		t.Fatalf("expected pending approval block to avoid model followup, got %d calls", fp.followupCalls)
 	}
-	if fp.planCalls != 1 {
-		t.Fatalf("expected new task to enter planning, got %d calls", fp.planCalls)
-	}
-	if fp.lastPlanUser != msg {
-		t.Fatalf("expected planner to receive independent request, got %q", fp.lastPlanUser)
+	if fp.planCalls != 0 {
+		t.Fatalf("expected pending approval block before planning, got %d calls", fp.planCalls)
 	}
 	st, err := store.Load("cli:cli")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.ActiveTaskID == "task-delete" {
-		t.Fatalf("expected active task to switch away from pending confirmation")
+	if st.ActiveTaskID != "task-delete" {
+		t.Fatalf("expected active task to remain pending confirmation, got %q", st.ActiveTaskID)
 	}
 	if st.Tasks["task-delete"].Status != session.TaskAwaitConfirm {
 		t.Fatalf("expected original pending task to remain pending but inactive, got %#v", st.Tasks["task-delete"])
@@ -1128,7 +1200,7 @@ func TestRuntimeHistoricalContinuationClarifiesMissingSourceTask(t *testing.T) {
 	if fp.planCalls != 0 {
 		t.Fatalf("expected missing source task to clarify before planning, got %d", fp.planCalls)
 	}
-	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "could not find") {
+	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
 		t.Fatalf("expected clarification for missing source task, got %#v", resp)
 	}
 }
@@ -1157,7 +1229,7 @@ func TestRuntimeOpenFollowupClarifiesMissingTargetTask(t *testing.T) {
 	if fp.planCalls != 0 {
 		t.Fatalf("expected missing target task to clarify before planning, got %d", fp.planCalls)
 	}
-	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "could not find") {
+	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
 		t.Fatalf("expected clarification for missing target task, got %#v", resp)
 	}
 }
@@ -1229,6 +1301,46 @@ func TestRuntimeDirectlyAnswersArtifactFileLookup(t *testing.T) {
 	}
 	if st.ActiveTaskID != "task-doc" {
 		t.Fatalf("expected direct answer not to create a new task, got active task %q", st.ActiveTaskID)
+	}
+}
+
+func TestRuntimeDirectlyAnswersGenericRecentArtifactPathLookup(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-doc",
+		TaskOrder:    []string{"task-doc"},
+		Tasks: map[string]session.TaskState{
+			"task-doc": {
+				ID:            "task-doc",
+				Status:        session.TaskCompleted,
+				Topic:         "功能体系",
+				ResolvedQuery: "阅读 docs/当前功能体系.md",
+				Artifacts: []session.Artifact{{
+					Kind:  "file",
+					Path:  "/Users/dongping/project/mateway/docs/当前功能体系.md",
+					Label: "当前功能体系",
+				}},
+				UpdatedAt: time.Now().Add(-20 * time.Minute),
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: "刚才那个功能体系文档路径发我"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected direct artifact answer without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "/Users/dongping/project/mateway/docs/当前功能体系.md") {
+		t.Fatalf("expected artifact path in reply, got %q", resp.Reply.Text)
 	}
 }
 
@@ -1413,8 +1525,11 @@ func TestRuntimeScheduleRequestCreatesProposal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "Schedule proposal written") {
+	if resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "请确认是否启用这个定时任务") {
 		t.Fatalf("expected schedule proposal reply, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "执行内容：每天 9点 帮我收集 AI 最新趋势文章") || !strings.Contains(resp.Reply.Text, "时间：每天 09:00") || !strings.Contains(resp.Reply.Text, "交付：写入任务产物文件") {
+		t.Fatalf("expected user-friendly schedule summary, got %q", resp.Reply.Text)
 	}
 	if fp.planCalls != 0 {
 		t.Fatalf("expected schedule request handled before planning, got %d calls", fp.planCalls)
@@ -1456,7 +1571,7 @@ func TestRuntimeScheduleProposalApprovalEnablesTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Reply.Text, "Schedule enabled") {
+	if !strings.Contains(resp.Reply.Text, "定时任务已启用") {
 		t.Fatalf("expected enabled reply, got %q", resp.Reply.Text)
 	}
 	tasks, err := schedule.NewStore(home).List()
@@ -1492,7 +1607,7 @@ func TestRuntimeScheduleProposalRejectionRejectsProposal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Reply.Text, "rejected") {
+	if !strings.Contains(resp.Reply.Text, "已拒绝") {
 		t.Fatalf("expected rejected reply, got %q", resp.Reply.Text)
 	}
 	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusRejected)
@@ -1623,7 +1738,7 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Reply.Text, "deleted") {
+	if !strings.Contains(resp.Reply.Text, "已删除") {
 		t.Fatalf("expected deleted reply, got %q", resp.Reply.Text)
 	}
 	tasks, err := store.List()
@@ -1728,7 +1843,7 @@ func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Reply.Text, "updated") {
+	if !strings.Contains(resp.Reply.Text, "已更新") {
 		t.Fatalf("expected updated reply, got %q", resp.Reply.Text)
 	}
 	task, _, err = store.Show("ai-trends")
@@ -1798,7 +1913,7 @@ func TestDefaultSanitizerRemovesPromptEchoAndNormalizes(t *testing.T) {
 func TestDefaultSanitizerProvidesFallbackText(t *testing.T) {
 	s := DefaultSanitizer{}
 	reply := s.Sanitize(channel.OutboundMessage{Style: "approval_pending", Text: "   "})
-	if reply.Text != "Confirmation is required before continuing." {
+	if reply.Text != "继续之前需要你确认。" {
 		t.Fatalf("unexpected fallback reply %q", reply.Text)
 	}
 }
@@ -1855,7 +1970,7 @@ func TestDefaultSanitizerStripsBareJSONToolPlan(t *testing.T) {
 	if strings.Contains(reply.Text, `"tool"`) || strings.Contains(reply.Text, "file.read") {
 		t.Fatalf("expected bare json tool plan stripped, got %q", reply.Text)
 	}
-	if reply.Text != "Done." {
+	if reply.Text != "完成。" {
 		t.Fatalf("unexpected fallback %q", reply.Text)
 	}
 }
@@ -1866,7 +1981,7 @@ func TestRuntimeFailureHidesModelTransportError(t *testing.T) {
 	if strings.Contains(resp.Reply.Text, "api.minimaxi.com") || strings.Contains(resp.Reply.Text, "unexpected EOF") {
 		t.Fatalf("expected transport detail hidden, got %q", resp.Reply.Text)
 	}
-	if !strings.Contains(resp.Reply.Text, "model service") {
+	if !strings.Contains(resp.Reply.Text, "模型服务") {
 		t.Fatalf("expected user-facing model service error, got %q", resp.Reply.Text)
 	}
 }

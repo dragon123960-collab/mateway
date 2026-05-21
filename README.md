@@ -1,134 +1,130 @@
 # Mateway
 
-Mateway is a small Go agent runtime for connecting LLMs to real tools, local workspaces, and business systems.
+[English](./README.md) | [中文](./README.zh.md)
 
-The current focus is deliberately practical:
+Mateway is a lightweight Go runtime for building a practical personal or team agent that can use tools, remember useful context, and work from both CLI and Feishu.
 
-- run from a single binary
-- work from CLI and Feishu
-- call safe local tools with confirmation boundaries
-- keep configuration and skills editable under `~/.mateway`
-- let teams add API/CLI capabilities without rebuilding the core runtime
+It is designed for people who want an agent that can actually operate inside a local workspace and business chat, without starting from a heavy workflow platform.
 
-Mateway is not trying to become a heavyweight workflow engine. The core loop stays small:
+## Why Mateway
+
+Most agent demos are easy to start but hard to trust in daily work. Mateway focuses on a smaller, inspectable system:
+
+- **Single binary first**: build one `mateway` binary and run it locally or as a service.
+- **CLI and Feishu**: talk to the same runtime from terminal or Feishu chat.
+- **Tool use with boundaries**: file writes, patches, and dangerous shell commands require confirmation.
+- **Traceable execution**: plans, tool calls, results, and replies are written to trace logs.
+- **Session-aware follow-up**: short memory tracks recent tasks, artifacts, pending confirmations, and follow-up context.
+- **Markdown-first memory**: durable memory is kept as reviewable Markdown, with evidence and an optional rebuildable index.
+- **User scheduled tasks**: create natural-language recurring tasks that run through the same runtime.
+- **Skill-oriented extension**: add capabilities through skills and future connector packages instead of hard-coding business systems.
+
+The core runtime loop stays intentionally small:
 
 ```text
 receive -> plan -> policy -> act -> observe -> synthesize -> reply
 ```
 
-## Status
+## Current Status
 
-Mateway is under active development. The single-agent runtime is usable, and the next major phase is memory plus enterprise capability integration.
+Mateway is early but usable as a first-version single-agent runtime.
 
 Implemented:
 
-- CLI `ask`, `doctor`, `test`, and `trace`
+- CLI commands: `init`, `doctor`, `ask`, `test`, `trace`, `memory`, `heartbeat`, `schedule`, `gateway`
 - Feishu WebSocket receive/reply/reaction
 - Anthropic-compatible and OpenAI-compatible model clients
-- model/agent configuration with explicit defaults and fallback metadata
-- file read/write/patch tools with path guards and confirmation
-- shell command tool with dangerous-command confirmation
-- web search, time, config summary, project index, and file summary tools
-- session/task state, follow-up resolution, trace events, and response sanitization
-- workspace skills loaded from `~/.mateway/workspace`
-- binary-first `mateway init` that creates config, samples, docs, and default skills
+- configurable model and agent profiles
+- built-in tools: time, config summary, web search, file read/write/patch, shell run, project index, file summary, memory search/index, user ask
+- path guards, dangerous command guards, output truncation, and response sanitization
+- persistent session/task state and follow-up resolution
+- Markdown memory proposal, commit, reject, lint, index, and search
+- heartbeat maintenance jobs for memory lint/review/compact/index rebuild
+- natural-language user scheduled tasks with proposal, confirmation, mutation, due detection, and runtime execution
+- workspace skill discovery and default skills
 
-Not yet done:
+Still evolving:
 
-- long/short memory system
-- self-learning and durable knowledge curation
-- multi-agent runtime routing beyond the configuration contract
-- enterprise API/CLI connector packaging
-- optional structured workflow mode
+- higher quality memory review and promotion workflows
+- connector scanning for external APIs and CLIs
+- multi-agent profile routing beyond the current configuration contract
+- optional FTS5 or embedding-backed retrieval
+- packaging, release automation, and more production hardening
 
-## Binary Quick Start
+## Quick Start
 
-Download or build one `mateway` binary, then initialize local runtime files:
-
-```bash
-mateway init
-```
-
-This creates `~/.mateway` and writes configuration, sample files, docs, memory scaffolding, and default skill templates. Existing real config files are not overwritten.
-
-### `mateway init` vs `mateway gateway serve`
-
-- `mateway init` bootstraps local files under `~/.mateway`. Use it on a new machine or when you want to regenerate missing templates.
-- `mateway gateway serve` starts the actual foreground gateway process. It loads config, acquires the single-instance lock, and runs the CLI/Feishu runtime loop.
-- `gateway serve` is the runtime entrypoint; `init` is the filesystem/bootstrap entrypoint.
-- `gateway serve` is what you run under LaunchAgent, systemd, or another service manager.
-- `init` does not connect to Feishu or process user messages.
-- `init` does not require valid model or Feishu secrets to complete, while `gateway serve` does.
-
-Important generated files:
-
-```text
-~/.mateway/config/
-  README.md
-  config.yaml
-  config.sample.yaml
-  mateway.env.sample
-  models/
-    minimax.yaml
-    minimax.sample.yaml
-    local-mlx.yaml
-    local-mlx.sample.yaml
-  channels/
-    feishu.yaml
-    feishu.sample.yaml
-```
-
-Then configure secrets and validate:
-
-```bash
-cp ~/.mateway/config/mateway.env.sample ~/.mateway/config/mateway.env
-vim ~/.mateway/config/mateway.env
-vim ~/.mateway/config/config.yaml
-mateway doctor
-```
-
-## Build From Source
+Build from source:
 
 ```bash
 git clone https://github.com/dragon123960-collab/mateway.git
 cd mateway
 go test ./...
 go build -o build/mateway ./cmd/mateway
+```
+
+Initialize local runtime files:
+
+```bash
 ./build/mateway init
+```
+
+This creates `~/.mateway` with config templates, workspace files, memory scaffolding, and default skills. Existing real config files are not overwritten.
+
+Configure secrets and validate:
+
+```bash
+cp ~/.mateway/config/mateway.env.sample ~/.mateway/config/mateway.env
+vim ~/.mateway/config/mateway.env
+vim ~/.mateway/config/config.yaml
 ./build/mateway doctor
 ```
 
-## Common Commands
+Ask from CLI:
 
 ```bash
-mateway init
-mateway doctor
-mateway ask "What time is it?"
-mateway ask "Run pwd, then read README.md and summarize it."
-mateway gateway serve
-mateway gateway status
-mateway gateway restart
-mateway trace tail
-mateway trace show <trace_id>
+./build/mateway ask "What time is it?"
+./build/mateway ask "Read README.md and summarize this project."
+./build/mateway ask "Run pwd, then explain the current working directory."
 ```
 
-## Configuration Model
+Start the gateway process:
 
-Runtime config lives under `~/.mateway/config`.
+```bash
+./build/mateway gateway serve
+```
 
-- `config.yaml` controls app paths, security, search, model defaults, and agent profiles.
-- `models/*.yaml` declares model endpoints and API compatibility.
-- `channels/feishu.yaml` configures Feishu.
-- `mateway.env` stores local secrets and should not be committed.
-- `*.sample.yaml` files are user templates and are ignored by the runtime loader.
-- `gateway serve` uses the generated config and templates; `init` only creates them.
+`gateway serve` is the foreground runtime process. Run it under LaunchAgent, systemd, or another service manager when you want Mateway to stay online.
 
-Model config currently supports:
+## Configuration
+
+Runtime configuration lives under `~/.mateway/config`.
+
+Important files:
+
+```text
+~/.mateway/config/
+  config.yaml
+  mateway.env
+  models/
+    minimax.yaml
+    local-mlx.yaml
+  channels/
+    feishu.yaml
+```
+
+Configuration responsibilities:
+
+- `config.yaml`: app paths, security, search, scheduler, memory, and agent defaults
+- `models/*.yaml`: model provider, endpoint, API compatibility, and model name
+- `channels/feishu.yaml`: Feishu channel configuration
+- `mateway.env`: local secrets, never commit this file
+
+Supported model API modes:
 
 - `api: anthropic`
 - `api: openai`
 
-Agent model config can declare:
+Example model selection:
 
 ```yaml
 model:
@@ -141,68 +137,171 @@ model:
     followup: minimax
 ```
 
-Today the runtime uses the default model. Role-specific model routing and real fallback retries are planned.
+The current runtime primarily uses the default model. Role-specific routing is part of the configuration contract and will become more important as the runtime grows.
 
-## Security Boundaries
+## CLI Usage
 
-Mateway is designed to make tool use explicit and observable.
+Common commands:
 
-- File tools are restricted to the current project root, Mateway workspace, and configured `accessible_paths`.
-- File write/patch tools require confirmation.
-- Dangerous shell commands require confirmation.
-- Feishu replies are sanitized to avoid leaking raw tool-call traces.
-- Runtime events are written to trace logs for debugging.
+```bash
+mateway init
+mateway doctor
+mateway ask "Summarize the current repository."
+mateway gateway serve
+mateway gateway status
+mateway trace tail
+mateway trace show <trace_id>
+```
 
-This is still early software. Review configuration and confirmation boundaries before using it on sensitive machines.
+Memory commands:
 
-## Skills And Enterprise Connectors
+```bash
+mateway memory list --area inbox --status proposed
+mateway memory show <id-or-path>
+mateway memory commit --proposal <proposal-id>
+mateway memory reject --proposal <proposal-id>
+mateway memory lint
+mateway memory index
+```
 
-Mateway’s extension direction is skill-first:
+Scheduled task commands:
+
+```bash
+mateway schedule propose --title "AI trends" --prompt "Collect recent AI trend articles with sources." --daily-at 09:00
+mateway schedule proposals
+mateway schedule commit-proposal <id>
+mateway schedule list
+mateway schedule due
+mateway schedule run-due
+```
+
+Natural-language schedule creation is also supported through the runtime:
+
+```text
+Every day at 9:00, collect recent AI trend articles and write a short sourced report.
+```
+
+Mateway will write a proposal first and ask for confirmation before enabling the task.
+
+## Feishu
+
+Mateway can run as a Feishu WebSocket bot.
+
+The Feishu channel is intentionally simple:
+
+- receive and normalize messages
+- reply to the user
+- add lightweight reactions
+- ignore app/self messages
+- avoid noisy intermediate progress messages by default
+
+Runtime work is handled outside the Feishu callback so slow model/tool execution does not block event acknowledgement.
+
+Configure Feishu in:
+
+```text
+~/.mateway/config/channels/feishu.yaml
+~/.mateway/config/mateway.env
+```
+
+Then run:
+
+```bash
+mateway gateway serve
+```
+
+## Memory
+
+Mateway uses a Markdown-first memory design.
+
+There are two layers:
+
+- **Short memory**: recent session/task state, artifacts, pending confirmations, and follow-up context
+- **Long memory**: reviewed Markdown notes under the workspace memory tree
+
+Long memory is proposal-based:
+
+```text
+task with evidence -> memory proposal -> user review -> commit/reject -> searchable long memory
+```
+
+This keeps durable knowledge inspectable and editable. The JSON memory index is rebuildable from Markdown, so Markdown remains the source of truth.
+
+## Scheduled Tasks And Heartbeat
+
+Mateway has two separate background concepts:
+
+- **Heartbeat**: system maintenance jobs, such as memory lint, daily review, recent compaction, and memory index rebuild
+- **User scheduled tasks**: user-created recurring business tasks, such as collecting AI trend articles every morning
+
+User scheduled tasks run through the same runtime path as normal user requests, so tool policy, confirmations, traces, memory, and artifacts remain consistent.
+
+The lifecycle is:
+
+```text
+draft -> fill missing info -> proposal -> user confirmation -> active task -> due run -> artifact
+```
+
+## Skills And Connectors
+
+Skills are local capability packages that describe how the agent should work in a domain.
+
+The current direction is:
 
 ```text
 skill = instructions + metadata + optional scripts/assets + allowed tools
+connector = scanned config that exposes API/CLI/software capability as a tool
 ```
 
-The next intended enterprise use case is:
+Mateway does not hard-code business integrations into the core runtime. Future connector support should let teams expose existing APIs, CLIs, and internal systems through configuration, with explicit argument schemas, risk levels, evidence, auth requirements, and confirmation boundaries.
 
-1. A traditional system exposes existing APIs, CLIs, or scripts.
-2. The team describes them in a Mateway skill/connector package.
-3. Mateway validates arguments, risk level, and confirmation boundaries.
-4. The agent calls the API/CLI through tools or fixed mini-workflows.
-5. Results are summarized back to the user through CLI, Feishu, or future channels.
+## Security Model
 
-This keeps legacy integration close to the business system while avoiding a giant central workflow engine.
+Mateway is built for explicit, observable tool use:
 
-## Memory Direction
+- file tools are restricted to the project root, Mateway workspace, and configured accessible paths
+- file write and patch operations require confirmation
+- dangerous shell commands require confirmation
+- model-provided `confirmed=true` is ignored for guarded tools
+- Feishu replies are sanitized to avoid leaking raw tool call JSON
+- all runtime steps can be traced through local event logs
 
-The planned memory system is Markdown-first:
-
-- short memory: recent session/task state
-- long memory: curated Markdown notes under the agent workspace
-- evidence and provenance recorded with each durable note
-- optional SQLite index for metadata/search when Markdown alone is not enough
-
-The project does not need a heavy “LLM wiki” or vector-RAG stack as the first step. A transparent Markdown knowledge base plus a small index is easier to inspect, edit, back up, and trust.
+This is still early software. Review configuration, allowed paths, and confirmation behavior before running it on sensitive machines.
 
 ## Repository Layout
 
 ```text
 cmd/mateway              CLI entrypoint
-internal/config          config loading and init templates
-internal/model           model clients and plan normalization
-internal/runtime         agent loop, task binding, session flow
-internal/tool            built-in tools and safety policy
-internal/skill           skill discovery and default skill templates
-internal/channel/feishu  Feishu channel adapter
+internal/app             application wiring
+internal/channel         channel interfaces
+internal/channel/feishu  Feishu adapter
+internal/config          configuration loading and init templates
 internal/gateway         channel orchestration and service management
+internal/heartbeat       maintenance scheduler
+internal/memory          Markdown memory store, lint, index, search
+internal/model           model clients and planning helpers
 internal/observer        trace and event inspection
-docs/                    development notes and internal planning
+internal/runtime         agent loop, task binding, session flow
+internal/schedule        user scheduled task store and runner
+internal/session         persisted session/task state
+internal/skill           skill discovery and default skills
+internal/tool            built-in tools and safety policy
 ```
 
-Documents under `docs/` are development notes. The root README is the public project entry point.
+## Development
+
+Run tests:
+
+```bash
+go test ./...
+```
+
+Build:
+
+```bash
+go build -o build/mateway ./cmd/mateway
+```
 
 ## License
 
-This project is licensed under the Apache License 2.0.
-
-Apache-2.0 is permissive and includes an explicit patent grant, which makes it a reasonable default for an independent developer who wants open-source adoption and future enterprise use. Commercial support, hosted services, private connectors, or dual-licensed enterprise modules can still be offered separately.
+Apache License 2.0.

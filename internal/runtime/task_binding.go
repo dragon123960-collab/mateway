@@ -16,6 +16,7 @@ import (
 
 const (
 	bindingApprovalReply          = "approval_reply"
+	bindingPendingApprovalBlocked = "pending_approval_blocked"
 	bindingSlotFill               = "slot_fill"
 	bindingActiveFollowup         = "active_followup"
 	bindingOpenTaskFollowup       = "open_task_followup"
@@ -47,10 +48,10 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 	if decision, ok := l.resolveApprovalReply(); ok {
 		return decision
 	}
-	if decision, ok := l.resolveSlotFill(); ok {
+	if decision, ok := l.resolvePendingApprovalBlock(); ok {
 		return decision
 	}
-	if decision, ok := l.resolvePendingConfirmNewTask(); ok {
+	if decision, ok := l.resolveSlotFill(); ok {
 		return decision
 	}
 	if decision, ok := l.resolveRuleFollowup(); ok {
@@ -73,6 +74,19 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 	l.state.resolvedQuery = firstNonEmpty(decision.ResolvedQuery, l.state.message.Text)
 	active := session.ActiveTask(l.state.session)
 	switch decision.Kind {
+	case bindingPendingApprovalBlocked:
+		text := firstNonEmpty(decision.ClarifyPrompt, "当前还有一个操作等待确认。请先回复“确认”或“取消”；如果要开始新任务，请先取消当前待确认操作。")
+		reply := l.runtime.sanitizeReply(channel.OutboundMessage{
+			Channel:  l.state.message.Channel,
+			ThreadID: l.state.message.ThreadID,
+			Text:     text,
+			Style:    "input_required",
+			Title:    "Mateway 等待确认",
+		})
+		resp := Response{Reply: reply, TraceID: l.state.traceID, AwaitUserInput: true}
+		l.runtime.Logger.Event("runtime.followup_resolved", l.bindingTraceFields(decision))
+		l.saveConversationOnly(resp)
+		return &resp
 	case bindingAmbiguous:
 		text := firstNonEmpty(decision.ClarifyPrompt, "I am not sure which task you want to continue. Please add a bit more context.")
 		reply := l.runtime.sanitizeReply(channel.OutboundMessage{
@@ -172,7 +186,7 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 			"task_status": l.state.currentTask.Status,
 		})
 		if decision.Kind == bindingSlotFill && len(l.state.currentTask.PendingFields) > 0 {
-			text := firstNonEmpty(strings.Join(l.state.currentTask.PendingQuestions, "\n"), "I need one more detail before I can continue.")
+			text := firstNonEmpty(strings.Join(l.state.currentTask.PendingQuestions, "\n"), "我还需要你补充一个信息才能继续。")
 			reply := l.runtime.sanitizeReply(channel.OutboundMessage{
 				Channel:  l.state.message.Channel,
 				ThreadID: l.state.message.ThreadID,
@@ -240,6 +254,25 @@ func (l *AgentLoop) resolveApprovalReply() (taskBindingDecision, bool) {
 	return taskBindingDecision{}, false
 }
 
+func (l *AgentLoop) resolvePendingApprovalBlock() (taskBindingDecision, bool) {
+	task := session.ActiveTask(l.state.session)
+	if task == nil || task.PendingApproval == nil || task.Status != session.TaskAwaitConfirm {
+		return taskBindingDecision{}, false
+	}
+	prompt := strings.TrimSpace(task.PendingApproval.Prompt)
+	if prompt == "" {
+		prompt = firstNonEmpty(task.PendingApproval.RequestedAction, task.ResolvedQuery, task.UserText)
+	}
+	return taskBindingDecision{
+		Kind:          bindingPendingApprovalBlocked,
+		TargetTaskID:  task.ID,
+		ResolvedQuery: strings.TrimSpace(l.state.message.Text),
+		Reason:        "blocked non-approval message while a confirmation is pending",
+		Confidence:    0.95,
+		ClarifyPrompt: "当前还有一个操作等待确认：\n\n" + prompt + "\n\n请先回复“确认”继续，或回复“取消”放弃。处理完以后再发送新的任务。",
+	}, true
+}
+
 func (l *AgentLoop) resolveSlotFill() (taskBindingDecision, bool) {
 	task := session.ActiveTask(l.state.session)
 	if task == nil || len(task.PendingFields) == 0 {
@@ -260,24 +293,6 @@ func (l *AgentLoop) resolveSlotFill() (taskBindingDecision, bool) {
 		Reason:        "matched slot fill for active task",
 		Confidence:    0.96,
 		FilledFields:  filled,
-	}, true
-}
-
-func (l *AgentLoop) resolvePendingConfirmNewTask() (taskBindingDecision, bool) {
-	task := session.ActiveTask(l.state.session)
-	if task == nil || task.PendingApproval == nil || task.Status != session.TaskAwaitConfirm {
-		return taskBindingDecision{}, false
-	}
-	text := strings.TrimSpace(l.state.message.Text)
-	if !looksLikeIndependentRequestDuringConfirm(text) {
-		return taskBindingDecision{}, false
-	}
-	return taskBindingDecision{
-		Kind:          bindingNewTask,
-		TargetTaskID:  l.state.traceID,
-		ResolvedQuery: text,
-		Reason:        "detected an independent request while a confirmation was pending",
-		Confidence:    0.88,
 	}, true
 }
 
@@ -334,29 +349,6 @@ func shouldDeferFollowupToModel(text string) bool {
 	return textmatch.ContainsGroup(normalized, "history_defer")
 }
 
-func looksLikeIndependentRequestDuringConfirm(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	if len([]rune(trimmed)) < 8 {
-		return false
-	}
-	normalized := normalizeFollowupText(trimmed)
-	if normalized == "" {
-		return false
-	}
-	if _, ok := parseApprovalDecision(normalized, &session.PendingApproval{ApprovalType: "boolean_confirm"}); ok {
-		return false
-	}
-	for _, cue := range textmatch.Terms("cancel_only") {
-		if normalized == cue {
-			return false
-		}
-	}
-	if textmatch.ContainsGroup(normalized, "pending_new_topic") {
-		return true
-	}
-	return textmatch.ContainsGroup(normalized, "request_cues")
-}
-
 func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecision, bool) {
 	prompt := buildFollowupPrompt(l.state.message.Text, l.state.session)
 	decision, err := l.runtime.Model.ResolveFollowupJSON(ctx, prompt)
@@ -396,7 +388,7 @@ func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecisi
 			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
 			Reason:        "model returned a missing historical task",
 			Confidence:    decision.Confidence,
-			ClarifyPrompt: "I could not find the historical task you mentioned. Please include a clearer clue such as a document name, link topic, or task content.",
+			ClarifyPrompt: "我没找到你提到的历史任务。可以补一个更明确的线索，比如文档名、链接主题或任务内容。",
 		}, true
 	}
 	if (kind == bindingActiveFollowup || kind == bindingOpenTaskFollowup) && !l.taskExists(decision.TargetTaskID) {
@@ -405,7 +397,7 @@ func (l *AgentLoop) resolveModelFollowup(ctx context.Context) (taskBindingDecisi
 			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
 			Reason:        "model returned a missing target task",
 			Confidence:    decision.Confidence,
-			ClarifyPrompt: "I could not find the task to continue. Please add clearer context.",
+			ClarifyPrompt: "我没找到要继续的任务。请补充更明确的上下文。",
 		}, true
 	}
 	if kind == bindingNewTask {

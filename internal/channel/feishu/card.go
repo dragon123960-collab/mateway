@@ -77,13 +77,13 @@ func looksLikeToolCallDetailLine(lower, trimmed string) bool {
 func fallbackFeishuText(style string) string {
 	switch strings.TrimSpace(style) {
 	case "approval_pending":
-		return "I need your confirmation before continuing. Reply yes to continue or no to cancel."
+		return "继续之前需要你确认。回复“确认”继续，或回复“取消”放弃。"
 	case "input_required":
-		return "I need one more detail before I can continue."
+		return "我还需要你补充一个信息才能继续。"
 	case "error":
-		return "The task failed, and I stopped at a safe point."
+		return "任务失败了，我已经停在安全位置。"
 	default:
-		return "Done."
+		return "完成。"
 	}
 }
 

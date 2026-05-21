@@ -60,6 +60,11 @@ func ResolveAllowedPath(raw string, ctx Context) (string, error) {
 			return clean, nil
 		}
 	}
+	if filepath.IsAbs(strings.TrimSpace(raw)) {
+		if remapped, ok := remapAbsolutePathToAllowedRoot(clean, roots); ok {
+			return remapped, nil
+		}
+	}
 	return "", fmt.Errorf("path %s is outside allowed roots", clean)
 }
 
@@ -73,4 +78,70 @@ func allowedRoots(ctx Context) []string {
 	}
 	roots = append(roots, ctx.AllowedRoots...)
 	return roots
+}
+
+func remapAbsolutePathToAllowedRoot(clean string, roots []string) (string, bool) {
+	for _, root := range roots {
+		rootAbs, err := filepath.Abs(filepath.Clean(root))
+		if err != nil || rootAbs == "" {
+			continue
+		}
+		if candidate, ok := remapByKnownProjectSuffix(clean, rootAbs); ok {
+			return candidate, true
+		}
+		if candidate, ok := remapByExistingTail(clean, rootAbs); ok {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func remapByKnownProjectSuffix(clean, rootAbs string) (string, bool) {
+	rootName := filepath.Base(rootAbs)
+	if rootName == "" || rootName == "." || rootName == string(filepath.Separator) {
+		return "", false
+	}
+	parts := splitCleanPath(clean)
+	for i, part := range parts {
+		if part != rootName || i == len(parts)-1 {
+			continue
+		}
+		rel := filepath.Join(parts[i+1:]...)
+		if rel == "" {
+			continue
+		}
+		candidate := filepath.Join(rootAbs, rel)
+		if fileExists(candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func remapByExistingTail(clean, rootAbs string) (string, bool) {
+	parts := splitCleanPath(clean)
+	for i := 0; i < len(parts)-1; i++ {
+		rel := filepath.Join(parts[i:]...)
+		if rel == "" {
+			continue
+		}
+		candidate := filepath.Join(rootAbs, rel)
+		if fileExists(candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func splitCleanPath(path string) []string {
+	trimmed := strings.Trim(path, string(filepath.Separator))
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, string(filepath.Separator))
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

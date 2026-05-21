@@ -92,7 +92,7 @@ func TestRenderReplyMessageStripsBareJSONToolPlan(t *testing.T) {
 	if strings.Contains(content, "file.read") || strings.Contains(content, `"tool"`) {
 		t.Fatalf("expected json tool plan stripped, got %s", content)
 	}
-	if !strings.Contains(content, "Done.") {
+	if !strings.Contains(content, "完成。") {
 		t.Fatalf("expected fallback text, got %s", content)
 	}
 }

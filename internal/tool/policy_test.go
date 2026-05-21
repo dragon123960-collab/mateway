@@ -2,6 +2,8 @@ package tool
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -59,6 +61,25 @@ func TestPathGuardAllowsProjectRelative(t *testing.T) {
 	}
 	if got != "/tmp/project/README.md" {
 		t.Fatalf("unexpected path %q", got)
+	}
+}
+
+func TestPathGuardRemapsStaleProjectAbsolutePath(t *testing.T) {
+	root := t.TempDir()
+	doc := filepath.Join(root, "docs", "current.md")
+	if err := os.MkdirAll(filepath.Dir(doc), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(doc, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join("/Users/yijun/ws", filepath.Base(root), "docs", "current.md")
+	got, err := ResolveAllowedPath(stale, Context{ProjectRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != doc {
+		t.Fatalf("expected remapped path %q, got %q", doc, got)
 	}
 }
 

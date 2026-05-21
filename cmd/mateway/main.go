@@ -868,6 +868,8 @@ func parseMemoryShowOptions(args []string) (memoryShowOptions, error) {
 	opts := memoryShowOptions{AgentID: "main"}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--help", "-h":
+			return opts, fmt.Errorf("usage: mateway memory show <id-or-path> [--agent <agent-id>]")
 		case "--agent":
 			value, next, err := optionValue(args, i)
 			if err != nil {

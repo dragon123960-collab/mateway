@@ -218,12 +218,12 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 
 func userFacingError(err error) string {
 	if err == nil {
-		return "The task failed, and I stopped at a safe point."
+		return "任务失败了，我已经停在安全位置。"
 	}
 	text := err.Error()
 	lower := strings.ToLower(text)
 	if strings.Contains(lower, "insufficient tool evidence") {
-		return "I did not get enough tool evidence to answer, so I stopped before making an unsupported conclusion. Please retry; I will read the relevant project evidence first."
+		return "我没有拿到足够的工具证据，所以先停下，避免给出没有依据的结论。你可以再试一次，我会先读取相关项目证据。"
 	}
 	if strings.Contains(lower, "unexpected eof") ||
 		strings.Contains(lower, "model request") ||
@@ -232,9 +232,9 @@ func userFacingError(err error) string {
 		strings.Contains(lower, "connection reset") ||
 		strings.Contains(lower, "timeout") ||
 		strings.Contains(lower, "context deadline exceeded") {
-		return "The model service request failed temporarily, so the task did not continue. Please retry later; if it keeps happening, check the trace logs."
+		return "模型服务请求临时失败，所以任务没有继续。稍后可以重试；如果一直出现，再看 trace 日志。"
 	}
-	return "The task failed, and I stopped at a safe point. Check the report or trace for details."
+	return "任务失败了，我已经停在安全位置。可以查看报告或 trace 了解细节。"
 }
 
 func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
@@ -242,19 +242,19 @@ func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
 	case "shell.run":
 		command := strings.TrimSpace(args["command"])
 		if command != "" {
-			return "This command may modify or delete local content, so I need confirmation before running it.\n\nCommand: `" + command + "`\n\nReply yes to run it, or no to cancel."
+			return "这个命令可能会修改或删除本地内容，执行前需要你确认。\n\n命令：`" + command + "`\n\n回复“确认”继续执行，或回复“取消”放弃。"
 		}
 	case "file.write", "file.patch":
 		path := strings.TrimSpace(args["path"])
 		if path != "" {
-			return "This file operation will modify a local file, so I need confirmation before running it.\n\nFile: " + path + "\n\nReply yes to run it, or no to cancel."
+			return "这个文件操作会修改本地文件，执行前需要你确认。\n\n文件：" + path + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
 		}
 	}
 	goal := strings.TrimSpace(step.Goal)
 	if goal == "" {
 		goal = step.Tool
 	}
-	return "This step needs confirmation before I can continue.\n\nAction: " + goal + "\n\nReply yes to run it, or no to cancel."
+	return "这一步需要你确认后我才能继续。\n\n操作：" + goal + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
 }
 
 func (r Runtime) sanitizeReply(reply channel.OutboundMessage) channel.OutboundMessage {

@@ -199,7 +199,7 @@ func controlReplyText(results []model.ToolResult, style string) string {
 				}
 			}
 		}
-		return "I need one more detail from you before I can continue."
+		return "我还需要你补充一个信息才能继续。"
 	}
 	if style == "approval_pending" {
 		for i := len(results) - 1; i >= 0; i-- {
@@ -207,7 +207,7 @@ func controlReplyText(results []model.ToolResult, style string) string {
 				return text
 			}
 		}
-		return "I need your confirmation before I can continue."
+		return "继续之前需要你确认。"
 	}
 	return fallbackSynthesis(results)
 }

@@ -216,6 +216,9 @@ func (s Store) Show(id string) (Task, string, error) {
 	path := s.taskPath(id)
 	task, err := readTask(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return Task{}, "", fmt.Errorf("schedule task %q does not exist; create it again before changing it", strings.TrimSpace(id))
+		}
 		return Task{}, "", err
 	}
 	return task, path, nil
@@ -277,6 +280,9 @@ func (s Store) Update(id string, input UpdateInput) (Task, string, error) {
 func (s Store) Delete(id string) (string, error) {
 	path := s.taskPath(id)
 	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("schedule task %q does not exist; it may already be deleted", strings.TrimSpace(id))
+		}
 		return "", err
 	}
 	return path, nil

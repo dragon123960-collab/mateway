@@ -205,6 +205,7 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	plan = l.normalizePlanForRuntime(plan)
 	l.state.plan = plan
 	l.runtime.Logger.Event("runtime.plan", map[string]any{
 		"trace_id":       l.state.traceID,
@@ -219,6 +220,64 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 		l.runtime.Observer.Plan(l.state.traceID, plan)
 	}
 	return nil
+}
+
+func (l *AgentLoop) normalizePlanForRuntime(plan model.Plan) model.Plan {
+	for i := range plan.Steps {
+		step := &plan.Steps[i]
+		if shouldUseProjectIndex(l.state.resolvedRequest(), *step) {
+			step.Tool = "project.index"
+			step.Risk = string(tool.RiskSafeRead)
+			step.RequiresConfirm = false
+			step.Args = projectIndexArgsFromShell(step.Args)
+			if strings.TrimSpace(step.Goal) == "" {
+				step.Goal = "Index project structure"
+			}
+		}
+	}
+	return plan
+}
+
+func shouldUseProjectIndex(userText string, step model.PlanStep) bool {
+	if step.Tool != "shell.run" {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(userText + " " + step.Goal + " " + step.Args["command"]))
+	projectCue := strings.Contains(text, "project") ||
+		strings.Contains(text, "repo") ||
+		strings.Contains(text, "repository") ||
+		strings.Contains(text, "codebase") ||
+		strings.Contains(text, "项目") ||
+		strings.Contains(text, "仓库") ||
+		strings.Contains(text, "代码库") ||
+		strings.Contains(text, "目录结构") ||
+		strings.Contains(text, "核心包")
+	overviewCue := strings.Contains(text, "overview") ||
+		strings.Contains(text, "map") ||
+		strings.Contains(text, "tree") ||
+		strings.Contains(text, "structure") ||
+		strings.Contains(text, "distribution") ||
+		strings.Contains(text, "概览") ||
+		strings.Contains(text, "分布") ||
+		strings.Contains(text, "结构")
+	command := strings.TrimSpace(step.Args["command"])
+	readOnlyInspection := strings.Contains(command, "find") ||
+		strings.Contains(command, "ls") ||
+		strings.Contains(command, "tree") ||
+		strings.Contains(command, "rg") ||
+		strings.Contains(command, "git ls-files")
+	return projectCue && (overviewCue || readOnlyInspection)
+}
+
+func projectIndexArgsFromShell(args map[string]string) map[string]string {
+	out := map[string]string{"max_depth": "3", "max_files": "120"}
+	if args == nil {
+		return out
+	}
+	if workdir := strings.TrimSpace(args["workdir"]); workdir != "" {
+		out["path"] = workdir
+	}
+	return out
 }
 
 func (l *AgentLoop) planJSON(ctx context.Context, skillPrompt string) (model.Plan, model.PlanCheckResult, error) {

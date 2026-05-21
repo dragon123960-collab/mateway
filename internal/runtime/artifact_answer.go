@@ -113,6 +113,14 @@ func scoreArtifactMatch(query string, task session.TaskState, artifact session.A
 	if normalized == "" {
 		return 0
 	}
+	if isGenericRecentArtifactLookup(normalized, artifact) {
+		score := 8
+		score += artifactRecencyScore(normalized, task.UpdatedAt)
+		if !artifactHasAddress(artifact) {
+			score -= 3
+		}
+		return score
+	}
 	score := 0
 	if strings.TrimSpace(artifact.Path) != "" && asksForFileArtifact(normalized) {
 		score += 4
@@ -138,6 +146,22 @@ func scoreArtifactMatch(query string, task session.TaskState, artifact session.A
 		score -= 3
 	}
 	return score
+}
+
+func isGenericRecentArtifactLookup(query string, artifact session.Artifact) bool {
+	if !textmatch.ContainsGroup(query, "artifact_historical") {
+		return false
+	}
+	if !(textmatch.ContainsGroup(query, "artifact_location") || textmatch.ContainsGroup(query, "artifact_delivery")) {
+		return false
+	}
+	if asksForLinkArtifact(query) {
+		return strings.TrimSpace(artifact.SourceURL) != ""
+	}
+	if asksForFileArtifact(query) || asksForDocArtifact(query) {
+		return strings.TrimSpace(artifact.Path) != "" || artifactLooksDocument(artifact)
+	}
+	return artifactHasAddress(artifact)
 }
 
 func artifactKeywordScore(query string, task session.TaskState, artifact session.Artifact) int {
@@ -222,10 +246,10 @@ func artifactDirectAnswerText(matches []artifactMatch) string {
 		return ""
 	}
 	if len(matches) == 1 {
-		return "I found the most likely artifact:\n" + formatArtifactMatch(matches[0])
+		return "我找到了最可能的历史产物：\n" + formatArtifactMatch(matches[0])
 	}
 	var b strings.Builder
-	b.WriteString("I found these likely historical artifacts:")
+	b.WriteString("我找到了这些可能相关的历史产物：")
 	for i, match := range matches {
 		fmt.Fprintf(&b, "\n%d. %s", i+1, formatArtifactMatch(match))
 	}

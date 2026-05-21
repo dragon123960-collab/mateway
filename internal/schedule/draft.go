@@ -17,56 +17,56 @@ func CheckDraft(input CreateInput) DraftCheck {
 	var questions []string
 	if strings.TrimSpace(input.Title) == "" {
 		missing["title"] = ""
-		questions = append(questions, "What should I call this scheduled task?")
+		questions = append(questions, "这个定时任务叫什么名字？")
 	}
 	if strings.TrimSpace(input.Prompt) == "" {
 		missing["prompt"] = ""
-		questions = append(questions, "What should the agent do when this schedule runs?")
+		questions = append(questions, "定时触发时，希望我具体做什么？")
 	}
 	switch draftScheduleKind(input) {
 	case "daily":
 		if strings.TrimSpace(input.DailyAt) == "" {
 			missing["daily_at"] = ""
-			questions = append(questions, "What time should it run each day? Use HH:MM.")
+			questions = append(questions, "每天几点运行？请用 HH:MM 格式。")
 		} else if _, _, ok := parseClock(input.DailyAt); !ok {
 			missing["daily_at"] = strings.TrimSpace(input.DailyAt)
-			questions = append(questions, "The run time must use HH:MM. What daily time should I use?")
+			questions = append(questions, "运行时间需要用 HH:MM 格式。每天几点运行？")
 		}
 	case "weekly":
 		if strings.TrimSpace(input.Weekday) == "" && len(input.Weekdays) == 0 {
 			missing["weekday"] = ""
-			questions = append(questions, "Which weekday or weekdays should it run?")
+			questions = append(questions, "每周哪一天或哪几天运行？")
 		}
 		if strings.TrimSpace(input.WeeklyAt) == "" {
 			missing["weekly_at"] = ""
-			questions = append(questions, "What time should it run on that weekday? Use HH:MM.")
+			questions = append(questions, "这些日期的几点运行？请用 HH:MM 格式。")
 		} else if _, _, ok := parseClock(input.WeeklyAt); !ok {
 			missing["weekly_at"] = strings.TrimSpace(input.WeeklyAt)
-			questions = append(questions, "The weekly run time must use HH:MM. What time should I use?")
+			questions = append(questions, "每周运行时间需要用 HH:MM 格式。几点运行？")
 		}
 	case "monthly":
 		if input.MonthlyDay < 1 || input.MonthlyDay > 31 {
 			missing["monthly_day"] = ""
-			questions = append(questions, "Which day of the month should it run? Use 1-31.")
+			questions = append(questions, "每月几号运行？请填写 1-31。")
 		}
 		if strings.TrimSpace(input.MonthlyAt) == "" {
 			missing["monthly_at"] = ""
-			questions = append(questions, "What time should it run on that day? Use HH:MM.")
+			questions = append(questions, "当天几点运行？请用 HH:MM 格式。")
 		} else if _, _, ok := parseClock(input.MonthlyAt); !ok {
 			missing["monthly_at"] = strings.TrimSpace(input.MonthlyAt)
-			questions = append(questions, "The monthly run time must use HH:MM. What time should I use?")
+			questions = append(questions, "每月运行时间需要用 HH:MM 格式。几点运行？")
 		}
 	case "interval":
 		if strings.TrimSpace(input.Interval) == "" {
 			missing["interval"] = ""
-			questions = append(questions, "How often should it run? Use a duration such as 2h.")
+			questions = append(questions, "每隔多久运行一次？请用类似 2h 的时长格式。")
 		} else if _, err := time.ParseDuration(input.Interval); err != nil {
 			missing["interval"] = strings.TrimSpace(input.Interval)
-			questions = append(questions, "The interval must be a duration such as 2h. How often should it run?")
+			questions = append(questions, "间隔需要是类似 2h 的时长格式。每隔多久运行一次？")
 		}
 	default:
 		missing["daily_at"] = ""
-		questions = append(questions, "When should it run?")
+		questions = append(questions, "这个任务什么时候运行？")
 	}
 	if len(missing) == 0 {
 		return DraftCheck{Ready: true}

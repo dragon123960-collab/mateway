@@ -66,7 +66,7 @@ func (g Gateway) processInbound(ctx context.Context, msg channel.InboundMessage)
 	resp, err := rt.Handle(ctx, msg)
 	if err != nil {
 		_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
-		_ = g.Sender.Reply(ctx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "Processing failed: " + err.Error(), Style: "error"})
+		_ = g.Sender.Reply(ctx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
 		return
 	}
 	if err := g.Sender.Reply(ctx, msg, resp.Reply); err != nil {

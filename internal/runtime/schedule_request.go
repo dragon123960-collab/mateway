@@ -49,14 +49,14 @@ func (l *AgentLoop) handleScheduleRequest() *Response {
 		return l.scheduleFailure(err)
 	}
 	input.ID = proposal.Task.ID
-	text := fmt.Sprintf("Schedule proposal written: %s\n\nid=%s\nschedule=%s\n\nReply yes to enable it, or no to reject it.", path, proposal.Task.ID, schedule.Summary(proposal.Task.Schedule))
+	text := scheduleProposalText(proposal.Task, path)
 	resp := Response{
 		Reply: l.runtime.sanitizeReply(channel.OutboundMessage{
 			Channel:  l.state.message.Channel,
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    "approval_pending",
-			Title:    "Mateway schedule proposal",
+			Title:    "Mateway 定时任务草案",
 		}),
 		TraceID:      l.state.traceID,
 		AwaitConfirm: true,
@@ -91,7 +91,7 @@ func (l *AgentLoop) handleScheduleProposalApproval() *Response {
 		if err != nil {
 			return l.scheduleFailure(err)
 		}
-		text = fmt.Sprintf("Schedule enabled: %s\n\nid=%s\nschedule=%s", path, created.ID, schedule.Summary(created.Schedule))
+		text = scheduleEnabledText(created, path)
 		l.runtime.Logger.Event("runtime.schedule_proposal_committed", map[string]any{
 			"trace_id": l.state.traceID,
 			"id":       created.ID,
@@ -102,7 +102,7 @@ func (l *AgentLoop) handleScheduleProposalApproval() *Response {
 		if err != nil {
 			return l.scheduleFailure(err)
 		}
-		text = "Schedule proposal rejected: " + path
+		text = scheduleRejectedText(proposalID, path)
 		status = session.TaskAbandoned
 		l.runtime.Logger.Event("runtime.schedule_proposal_rejected", map[string]any{
 			"trace_id": l.state.traceID,
@@ -116,7 +116,7 @@ func (l *AgentLoop) handleScheduleProposalApproval() *Response {
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    "reply",
-			Title:    "Mateway schedule confirmation",
+			Title:    "Mateway 定时任务确认",
 		}),
 		TraceID: l.state.traceID,
 	}
@@ -138,7 +138,7 @@ func (l *AgentLoop) handleScheduleMutationApproval() *Response {
 		return l.scheduleFailure(fmt.Errorf("schedule mutation target is missing"))
 	}
 	store := schedule.NewStore(l.runtime.Config.App.Home)
-	text := "Schedule change canceled."
+	text := "定时任务变更已取消。"
 	status := session.TaskAbandoned
 	if approved {
 		switch op {
@@ -147,19 +147,19 @@ func (l *AgentLoop) handleScheduleMutationApproval() *Response {
 			if err != nil {
 				return l.scheduleFailure(err)
 			}
-			text = "Schedule task deleted: " + path
+			text = "定时任务已删除：" + path
 		case "pause":
 			updated, _, err := store.SetStatus(id, schedule.StatusPaused)
 			if err != nil {
 				return l.scheduleFailure(err)
 			}
-			text = "Schedule task paused: " + updated.ID
+			text = "定时任务已暂停：" + updated.ID
 		case "resume":
 			updated, _, err := store.SetStatus(id, schedule.StatusActive)
 			if err != nil {
 				return l.scheduleFailure(err)
 			}
-			text = "Schedule task resumed: " + updated.ID
+			text = "定时任务已恢复：" + updated.ID
 		case "update":
 			fields := fieldsFromResolvedQuery(task.ResolvedQuery)
 			update := scheduleUpdateFromFields(fields)
@@ -167,7 +167,7 @@ func (l *AgentLoop) handleScheduleMutationApproval() *Response {
 			if err != nil {
 				return l.scheduleFailure(err)
 			}
-			text = fmt.Sprintf("Schedule task updated: %s\n\nid=%s\nschedule=%s", path, updated.ID, schedule.Summary(updated.Schedule))
+			text = fmt.Sprintf("定时任务已更新：%s\n\nid=%s\nschedule=%s", path, updated.ID, schedule.Summary(updated.Schedule))
 		default:
 			return l.scheduleFailure(fmt.Errorf("unsupported schedule mutation: %s", op))
 		}
@@ -190,7 +190,7 @@ func (l *AgentLoop) handleScheduleMutationApproval() *Response {
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    "reply",
-			Title:    "Mateway schedule confirmation",
+			Title:    "Mateway 定时任务确认",
 		}),
 		TraceID: l.state.traceID,
 	}
@@ -204,14 +204,14 @@ func (l *AgentLoop) handleScheduleMutationRequest() *Response {
 		return nil
 	}
 	detail := firstNonEmpty(intent.Summary, intent.Task.Title)
-	text := fmt.Sprintf("Confirm schedule %s: %s (%s)? Reply yes to continue, or no to cancel.", intent.Op, intent.Task.ID, detail)
+	text := scheduleMutationConfirmText(intent, detail)
 	resp := Response{
 		Reply: l.runtime.sanitizeReply(channel.OutboundMessage{
 			Channel:  l.state.message.Channel,
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    "approval_pending",
-			Title:    "Mateway schedule confirmation",
+			Title:    "Mateway 定时任务确认",
 		}),
 		TraceID:      l.state.traceID,
 		AwaitConfirm: true,
@@ -228,7 +228,7 @@ func (l *AgentLoop) handleScheduleMutationRequest() *Response {
 func (l *AgentLoop) scheduleNeedsInput(input schedule.CreateInput, check schedule.DraftCheck) *Response {
 	text := check.ClarifyMessage
 	if strings.TrimSpace(text) == "" {
-		text = "I need more information before creating this schedule."
+		text = "创建这个定时任务前，我还需要更多信息。"
 	}
 	resp := Response{
 		Reply: l.runtime.sanitizeReply(channel.OutboundMessage{
@@ -236,7 +236,7 @@ func (l *AgentLoop) scheduleNeedsInput(input schedule.CreateInput, check schedul
 			ThreadID: l.state.message.ThreadID,
 			Text:     text,
 			Style:    "input_required",
-			Title:    "Mateway needs schedule details",
+			Title:    "Mateway 需要定时任务信息",
 		}),
 		TraceID:        l.state.traceID,
 		AwaitUserInput: true,
@@ -257,6 +257,135 @@ func (l *AgentLoop) scheduleFailure(err error) *Response {
 	})
 	l.saveSession(resp)
 	return &resp
+}
+
+func scheduleProposalText(task schedule.Task, path string) string {
+	return "请确认是否启用这个定时任务：\n\n" +
+		scheduleTaskSummaryText(task, path) +
+		"\n\n回复“确认”启用，或回复“取消”放弃。"
+}
+
+func scheduleEnabledText(task schedule.Task, path string) string {
+	return "定时任务已启用：\n\n" + scheduleTaskSummaryText(task, path)
+}
+
+func scheduleRejectedText(id, path string) string {
+	return fmt.Sprintf("定时任务草案已拒绝。\n\n任务 ID：%s\n详情路径：%s", strings.TrimSpace(id), strings.TrimSpace(path))
+}
+
+func scheduleMutationConfirmText(intent scheduleMutationIntent, detail string) string {
+	op := scheduleMutationVerb(intent.Op)
+	var b strings.Builder
+	fmt.Fprintf(&b, "请确认是否%s这个定时任务：\n\n", op)
+	b.WriteString(scheduleTaskSummaryText(intent.Task, ""))
+	if strings.TrimSpace(detail) != "" && strings.TrimSpace(detail) != strings.TrimSpace(intent.Task.Title) {
+		fmt.Fprintf(&b, "\n变更内容：%s", strings.TrimSpace(detail))
+	}
+	b.WriteString("\n\n回复“确认”继续，或回复“取消”放弃。")
+	return b.String()
+}
+
+func scheduleTaskSummaryText(task schedule.Task, path string) string {
+	lines := []string{
+		"任务：" + firstNonEmpty(task.Title, task.ID),
+		"执行内容：" + scheduleUserPrompt(task.Prompt),
+		"时间：" + scheduleHumanSummary(task.Schedule),
+		"交付：" + scheduleDeliverySummary(task.Delivery),
+		"任务 ID：" + task.ID,
+	}
+	if strings.TrimSpace(path) != "" {
+		lines = append(lines, "详情路径："+strings.TrimSpace(path))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func scheduleUserPrompt(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	prompt = strings.TrimPrefix(prompt, "Scheduled task request:")
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "未填写"
+	}
+	if len([]rune(prompt)) > 120 {
+		return string([]rune(prompt)[:120]) + "..."
+	}
+	return prompt
+}
+
+func scheduleHumanSummary(spec schedule.ScheduleSpec) string {
+	switch strings.TrimSpace(spec.Kind) {
+	case "weekly":
+		days := strings.Join(scheduleWeekdayLabels(spec), "、")
+		if days == "" {
+			days = "每周"
+		}
+		return days + " " + firstNonEmpty(spec.WeeklyAt, "09:00")
+	case "monthly":
+		return fmt.Sprintf("每月 %d 日 %s", spec.MonthlyDay, firstNonEmpty(spec.MonthlyAt, "09:00"))
+	case "interval":
+		return "每隔 " + firstNonEmpty(spec.Interval, "未设置")
+	default:
+		return "每天 " + firstNonEmpty(spec.DailyAt, "09:00")
+	}
+}
+
+func scheduleWeekdayLabels(spec schedule.ScheduleSpec) []string {
+	days := spec.Weekdays
+	if len(days) == 0 && strings.TrimSpace(spec.Weekday) != "" {
+		days = []string{spec.Weekday}
+	}
+	labels := make([]string, 0, len(days))
+	for _, day := range days {
+		switch strings.ToLower(strings.TrimSpace(day)) {
+		case "monday", "mon":
+			labels = append(labels, "每周一")
+		case "tuesday", "tue":
+			labels = append(labels, "每周二")
+		case "wednesday", "wed":
+			labels = append(labels, "每周三")
+		case "thursday", "thu":
+			labels = append(labels, "每周四")
+		case "friday", "fri":
+			labels = append(labels, "每周五")
+		case "saturday", "sat":
+			labels = append(labels, "每周六")
+		case "sunday", "sun":
+			labels = append(labels, "每周日")
+		case "workday", "weekday", "weekdays":
+			labels = append(labels, "每个工作日")
+		default:
+			if strings.TrimSpace(day) != "" {
+				labels = append(labels, strings.TrimSpace(day))
+			}
+		}
+	}
+	return labels
+}
+
+func scheduleDeliverySummary(delivery schedule.DeliverySpec) string {
+	mode := strings.TrimSpace(delivery.Mode)
+	if mode == "" || mode == "artifact" {
+		if strings.TrimSpace(delivery.Path) != "" {
+			return "写入文件 " + strings.TrimSpace(delivery.Path)
+		}
+		return "写入任务产物文件"
+	}
+	return mode
+}
+
+func scheduleMutationVerb(op string) string {
+	switch strings.TrimSpace(op) {
+	case "delete":
+		return "删除"
+	case "pause":
+		return "暂停"
+	case "resume":
+		return "恢复"
+	case "update":
+		return "修改"
+	default:
+		return "变更"
+	}
 }
 
 func (l *AgentLoop) saveScheduleSession(resp Response, input schedule.CreateInput, pending map[string]string) {
