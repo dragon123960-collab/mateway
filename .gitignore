@@ -10,3 +10,7 @@
 /bin/
 /build/
 coverage.out
+docs/
+scripts/
+AGENTS.md
+issue.md
