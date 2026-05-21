@@ -11,6 +11,7 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/observer"
 	"github.com/dongping/mateway/internal/session"
@@ -29,6 +30,7 @@ type Runtime struct {
 	MaxSteps  int
 	Observer  Observer
 	Sessions  session.Store
+	Memory    memory.Store
 }
 
 type Observer interface {
@@ -70,6 +72,7 @@ func New(cfg *config.Root, planner model.Planner, registry *tool.Registry, logge
 		ToolCtx:   ctx,
 		MaxSteps:  6,
 		Sessions:  session.NewFileStore(filepath.Join(home, "run", "sessions")),
+		Memory:    memory.NewStore(ctx.Workspace),
 	}
 }
 

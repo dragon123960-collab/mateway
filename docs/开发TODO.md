@@ -362,9 +362,268 @@ TODO 定执行；
 
 ---
 
-## P2：Agent 间通信
+## P2：记忆系统、自学习与沉淀
 
-### T2.1 Agent Message Contract
+详细设计见：
+
+- [记忆系统设计](./记忆系统设计.md)
+- [定时任务与 Heartbeat 设计](./定时任务与Heartbeat设计.md)
+
+### T2.1 Memory Contract
+
+状态：已完成第一版基础设施
+
+- 目标：先定义记忆边界，不直接上重型 RAG / LLM wiki。
+- 设计判断：
+  - 第一阶段采用 Markdown / Obsidian-compatible LLM wiki。
+  - 短记忆继续基于 `SessionState / TaskState`。
+  - 统一记忆根目录为 `~/.mateway/workspace/memory/`。
+  - agent 私有记忆位于 `workspace/memory/agents/<agent_id>/`。
+  - user/org 共享记忆位于 `workspace/memory/user/` 与 `workspace/memory/org/`。
+  - `memory.md` 是 agent prompt 的记忆入口和索引摘要，只放“如何使用记忆”和少量高价值摘要。
+  - `workspace/memory/agents/<agent_id>/recent/*.md` 记录近 2-3 天滚动工作摘要。
+  - `workspace/memory/agents/<agent_id>/long/**/*.md` 记录稳定事实、用户偏好、项目事实、企业系统和 playbooks。
+  - `workspace/memory/agents/<agent_id>/inbox/*.md` 记录待确认的候选记忆与 skill candidate。
+  - 每条长期记忆必须带来源、时间、适用范围和置信度。
+  - SQLite 可作为索引和元数据层，但不是唯一真相来源，且必须能从 Markdown 重建。
+- 建议位置：
+  - `internal/memory`
+  - `internal/session`
+  - `internal/runtime`
+  - `~/.mateway/workspace/memory/`
+- 交付物：
+  - MemoryRecord schema（文档已定义）
+  - MemoryStore 接口（后续继续抽象）
+  - MarkdownMemoryStore 第一版（当前已实现 learning/lint 子集）
+  - Obsidian-compatible 文件结构（init 已生成）
+  - 可选 SQLite index 设计文档
+- 验收标准：
+  - 记忆可人工阅读、编辑、备份
+  - Markdown 文件可直接用 Obsidian 打开
+  - 支持 tags / backlinks / frontmatter
+  - 模型不能直接把任意对话写成长记忆
+  - 长记忆写入需要明确 evidence / source / reason
+  - planning / synthesis 能按需注入小段相关记忆
+
+### T2.2 Short Memory
+
+状态：待开始
+
+- 目标：把当前 session/task 状态整理成稳定短记忆。
+- 交付物：
+  - recent turns 压缩策略
+  - active/open task 摘要策略
+  - artifacts 摘要策略
+- 验收标准：
+  - followup 不需要反复读完整历史
+  - task 切换仍可解释
+  - trace 能看到注入了哪些短记忆
+
+### T2.3 Long Memory
+
+状态：待开始
+
+- 目标：沉淀用户偏好、项目事实、企业流程、常用系统调用方式。
+- 当前标准 Markdown 结构：
+
+```text
+~/.mateway/workspace/memory/
+  README.md
+  schema.md
+  index.md
+  log.md
+  user/
+  org/
+  agents/
+    main/
+      memory.md
+      index.md
+      recent/
+      long/
+      inbox/
+      raw/
+      learning/
+```
+
+- 验收标准：
+  - 记忆按主题分文件，而不是单个无限增长大文件
+  - 每段记忆带 `source` / `updated_at` / `confidence`
+  - 支持人工删除或修正
+  - 支持 `memory.propose` 和 `memory.commit` 两段式写入
+
+### T2.4 Self-Learning Policy
+
+状态：已完成第一版基础设施
+
+- 目标：允许系统从任务中沉淀经验，但必须可控、可解释。
+- 原则：
+  - 默认只 propose，不自动 commit 高影响记忆
+  - 用户确认后才能写入用户偏好、企业流程、系统凭据相关知识
+  - 自动沉淀只允许低风险事实，例如常用项目路径、公开文档链接、用户明确表达的偏好
+- 验收标准：
+  - 每次自学习有 trace（当前已记录 `runtime.learning_pattern_recorded`）
+  - 可查看 pending memories（当前 skill candidate 写入 `inbox/`）
+  - 可撤销最近写入
+
+### T2.5 Skill Crystallization
+
+状态：已完成第一版基础设施
+
+- 目标：同类任务成功达到阈值后，生成待确认 skill candidate。
+- 当前实现：
+  - 任务成功后记录 pattern 到 `patterns.jsonl`
+  - 更新 `counters.json`
+  - 达到 `success_threshold` 后写入 `inbox/skill-candidate-*.md`
+  - 当前任务刚生成 candidate 时会在回复中提示用户
+  - 默认不自动启用 skill
+- 后续仍需：
+  - 下一次交互时继续提醒未处理 candidate
+  - `memory.commit` / skill promotion 命令
+  - 更强的 pattern 归类
+
+### T2.6 LLM Wiki / RAG 取舍
+
+状态：结论先定，先做轻量 Obsidian-compatible wiki
+
+- 当前认可轻量 LLM wiki：Markdown 文件 + Obsidian 兼容链接 + agent 可读写的索引摘要。
+- 当前不优先引入重型 wiki 服务。
+- 当前不优先引入向量数据库。
+- RAG 不是“过时”，但对当前阶段可能过重；问题不在检索算法，而在知识是否可信、是否可维护、是否可追溯。
+- 第一阶段建议：
+  - Markdown 是 source of truth。
+  - SQLite 只做索引、标签、更新时间、来源、embedding id 等元数据。
+  - 后续如知识规模变大，再加全文索引或 embedding。
+- 验收标准：
+  - 不牺牲人工可读性
+  - 不让模型把未经验证的内容沉淀成事实
+  - 不把记忆系统做成黑盒
+
+---
+
+## P3：企业 API / CLI 能力接入
+
+详细设计见：[企业传统软件接入设想](./企业传统软件接入设想.md)。
+
+### T3.1 Connector Package Contract
+
+状态：待开始
+
+- 目标：让传统企业能按固定格式把已有 API、CLI、脚本接入 Mateway。
+- 定位：
+  - connector 是面向企业系统的能力包。
+  - skill 负责告诉 agent 什么时候用、怎么问、怎么解释结果。
+  - tool/adapter 负责真正调用 API / CLI。
+  - fixed workflow 只用于少数确定性业务流程，不替代主 AgentLoop。
+- 建议目录：
+
+```text
+connectors/
+  crm/
+    connector.yaml
+    SKILL.md
+    tools/
+    workflows/
+    examples/
+```
+
+- `connector.yaml` 应声明：
+  - name / version / owner
+  - tools
+  - risk
+  - args schema
+  - auth requirements
+  - confirmation boundary
+  - output evidence schema
+- 验收标准：
+  - 企业只需描述已有 API/CLI，不需要改 runtime 主链
+  - 每个动作有风险等级和确认边界
+  - 每次调用有 evidence
+  - 默认不能读取或打印 secrets
+
+### T3.2 API Tool Adapter
+
+状态：待开始
+
+- 目标：支持把 HTTP API 声明成 tool。
+- 建议能力：
+  - method / url / headers / body template
+  - env secret 引用
+  - timeout / retry
+  - response extraction
+  - risk / confirm
+- 验收标准：
+  - 可接入一个示例 REST API
+  - 参数校验失败时不调用
+  - trace 中记录 endpoint 摘要但不记录 secret
+
+### T3.3 CLI Tool Adapter
+
+状态：待开始
+
+- 目标：支持把企业已有 CLI 或脚本声明成 tool。
+- 建议能力：
+  - command template
+  - working directory
+  - env allowlist
+  - stdout/stderr budget
+  - dangerous command boundary
+- 验收标准：
+  - 可接入一个示例本地 CLI
+  - shell 注入风险有测试覆盖
+  - 高风险命令进入确认
+
+### T3.4 Fixed Workflow
+
+状态：待开始
+
+- 目标：为传统企业常见流程提供“固定步骤 + agent 解释”的轻量工作流。
+- 适用场景：
+  - 查客户 -> 查订单 -> 查物流 -> 汇总
+  - 生成报表 -> 校验 -> 通知
+  - 创建工单 -> 添加附件 -> 更新状态
+- 不做：
+  - 不做全局复杂 DAG 引擎
+  - 不把所有 agent 行为 workflow 化
+- 验收标准：
+  - workflow 可被 agent 调用
+  - 每步可观测
+  - 失败可解释并可恢复
+
+---
+
+## P4：Scheduler / Heartbeat
+
+详细设计见：[定时任务与 Heartbeat 设计](./定时任务与Heartbeat设计.md)。
+
+### T4.1 Memory Lint
+
+状态：已完成第一版
+
+- 目标：提供手动记忆库体检。
+- 当前实现：
+  - `mateway memory lint`
+  - 检查 missing frontmatter
+  - 检查 missing sources
+  - 检查 broken wikilinks
+  - 默认只报告，不修改
+
+### T4.2 Best-Effort Scheduler
+
+状态：待开始
+
+- 目标：`gateway serve` 中启动 best-effort scheduler。
+- 验收标准：
+  - 有单实例锁保护
+  - 记录 last_run_at
+  - missed heartbeat 可补跑
+  - 不保证强 cron
+  - 不主动夜间询问用户
+
+---
+
+## P5：Agent 间通信
+
+### T5.1 Agent Message Contract
 
 - 目标：先定义 agent 间消息和权限边界，再考虑是否真正执行跨 agent 协作。
 - 建议位置：
@@ -377,9 +636,9 @@ TODO 定执行；
 
 ---
 
-## P3：planning-mode / 局部 DAG
+## P6：planning-mode / 局部 DAG
 
-### T3.1 Planning Mode
+### T6.1 Planning Mode
 
 - 目标：仅在复杂任务中提供显式 planning mode，而不是默认主流程。
 - 建议位置：
@@ -390,7 +649,7 @@ TODO 定执行；
   - planning mode 为可选能力
   - 不要求全局 workflow engine
 
-### T3.2 局部 DAG
+### T6.2 局部 DAG
 
 - 目标：只支持局部可验证的依赖图，不做大而全编排系统。
 - 建议位置：
@@ -402,9 +661,9 @@ TODO 定执行；
 
 ---
 
-## P4：spawn / subagent
+## P7：spawn / subagent
 
-### T4.1 Spawn Boundary
+### T7.1 Spawn Boundary
 
 - 目标：先定义 subagent 的触发条件、资源边界、上下文裁剪，再决定是否实现。
 - 验收标准：

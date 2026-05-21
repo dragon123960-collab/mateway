@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
@@ -346,7 +347,10 @@ func (l *AgentLoop) finalReply() Response {
 	if l.runtime.Observer != nil {
 		l.runtime.Observer.Reply(l.state.traceID, l.state.replyText, l.state.failed)
 	}
-	l.saveSession(resp)
+	learning := l.saveSession(resp)
+	if learning.CandidateGenerated {
+		resp.Reply.Text = strings.TrimSpace(resp.Reply.Text + "\n\n" + skillCandidatePrompt(learning))
+	}
 	return resp
 }
 
@@ -364,9 +368,9 @@ func (l *AgentLoop) fail(err error) Response {
 	return resp
 }
 
-func (l *AgentLoop) saveSession(resp Response) {
+func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 	if l.runtime.Sessions == nil {
-		return
+		return memory.ProcessResult{}
 	}
 	finishedAt := time.Now()
 	task := l.baseTaskForSave()
@@ -434,7 +438,7 @@ func (l *AgentLoop) saveSession(resp Response) {
 			"session_key": l.state.message.SessionKey,
 			"error":       err.Error(),
 		})
-		return
+		return memory.ProcessResult{}
 	}
 	l.state.session = next
 	l.state.currentTask = session.ActiveTask(next)
@@ -446,6 +450,61 @@ func (l *AgentLoop) saveSession(resp Response) {
 		"task_status":  task.Status,
 		"result_count": task.ResultCount,
 	})
+	return l.recordLearningPattern(resp, task)
+}
+
+func (l *AgentLoop) recordLearningPattern(resp Response, task session.TaskState) memory.ProcessResult {
+	if l.runtime.Config == nil || !l.runtime.Config.Learning.Enabled || !l.runtime.Config.Learning.SkillCrystallization.Enabled {
+		return memory.ProcessResult{}
+	}
+	if task.Status != session.TaskCompleted || resp.Failed || resp.AwaitConfirm || resp.AwaitUserInput {
+		return memory.ProcessResult{}
+	}
+	agentID := firstNonEmpty(l.runtime.Config.Agents.Default, "main")
+	artifacts := make([]memory.Artifact, 0, len(task.Artifacts))
+	for _, artifact := range task.Artifacts {
+		artifacts = append(artifacts, memory.Artifact{
+			Kind:      artifact.Kind,
+			Path:      artifact.Path,
+			Label:     artifact.Label,
+			SourceURL: artifact.SourceURL,
+			Summary:   artifact.Summary,
+		})
+	}
+	result, err := l.runtime.Memory.ProcessTask(memory.TaskOutcome{
+		AgentID:        agentID,
+		TraceID:        l.state.traceID,
+		TaskID:         task.ID,
+		Intent:         task.ResolvedQuery,
+		PlanSummary:    task.PlanSummary,
+		Tools:          task.ToolNames,
+		SelectedSkills: task.SelectedSkills,
+		Success:        true,
+		Failed:         resp.Failed,
+		AwaitConfirm:   resp.AwaitConfirm,
+		AwaitUserInput: resp.AwaitUserInput,
+		Artifacts:      artifacts,
+		ReplyPreview:   task.ReplyPreview,
+		FinishedAt:     task.FinishedAt,
+	}, memory.LearningConfig{
+		Enabled:            l.runtime.Config.Learning.Enabled && l.runtime.Config.Learning.SkillCrystallization.Enabled,
+		SuccessThreshold:   l.runtime.Config.Learning.SkillCrystallization.SuccessThreshold,
+		RequireUserConfirm: l.runtime.Config.Learning.SkillCrystallization.RequireUserConfirm,
+	})
+	if err != nil {
+		l.runtime.Logger.Event("runtime.learning_failed", map[string]any{"trace_id": l.state.traceID, "error": err.Error()})
+		return memory.ProcessResult{}
+	}
+	if result.PatternKey != "" {
+		l.runtime.Logger.Event("runtime.learning_pattern_recorded", map[string]any{
+			"trace_id":            l.state.traceID,
+			"pattern_key":         result.PatternKey,
+			"success_count":       result.SuccessCount,
+			"candidate_generated": result.CandidateGenerated,
+			"candidate_path":      result.CandidatePath,
+		})
+	}
+	return result
 }
 
 func (l *AgentLoop) saveConversationOnly(resp Response) {
@@ -472,6 +531,10 @@ func (l *AgentLoop) saveConversationOnly(resp Response) {
 		"session_key": next.SessionKey,
 		"turn_count":  next.TurnCount,
 	})
+}
+
+func skillCandidatePrompt(result memory.ProcessResult) string {
+	return fmt.Sprintf("Learning note: this workflow pattern has succeeded %d times, so I created a proposed skill candidate for review: %s\nIt has not been enabled automatically.", result.SuccessCount, result.CandidatePath)
 }
 
 func (l *AgentLoop) baseTaskForSave() session.TaskState {

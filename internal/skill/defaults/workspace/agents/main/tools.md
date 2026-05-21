@@ -1,8 +1,8 @@
 # main tools
 
-工具调用规则：
+Tool-use rules:
 
-1. 如果需要工具，必须先规划再执行。
-2. 不要把工具调用过程直接写给用户。
-3. 工具结果会由系统回填。
-4. 最终回答必须是中文、结构化、可读。
+1. Plan before using tools.
+2. Do not expose raw tool calls, internal arguments, or implementation traces to the user.
+3. Tool results will be supplied by the system.
+4. Final answers must be structured, readable, and written in the user's language unless requested otherwise.

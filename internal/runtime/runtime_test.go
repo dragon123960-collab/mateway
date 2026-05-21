@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
@@ -76,6 +78,52 @@ func TestRuntimeRepairsOnce(t *testing.T) {
 	}
 	if resp.Failed {
 		t.Fatalf("expected repaired response")
+	}
+}
+
+func TestRuntimeCreatesSkillCandidateAfterSuccessfulPatternThreshold(t *testing.T) {
+	workspace := t.TempDir()
+	fp := &fakePlanner{plan: model.Plan{Summary: "review release notes", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}
+	reg := tool.NewRegistry()
+	reg.Register(tool.TimeNow())
+	rt := Runtime{
+		Config: &config.Root{
+			App: config.AppConfig{Workspace: workspace},
+			Agents: config.AgentsConfig{
+				Default:  "main",
+				Profiles: []config.AgentProfileConfig{{ID: "main"}},
+			},
+			Learning: config.LearningConfig{
+				Enabled: true,
+				SkillCrystallization: config.SkillCrystallizationConfig{
+					Enabled:            true,
+					SuccessThreshold:   1,
+					RequireUserConfirm: true,
+				},
+			},
+		},
+		Model:    fp,
+		Tools:    reg,
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:learning", Text: "review release notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "proposed skill candidate") {
+		t.Fatalf("expected learning prompt in reply, got %q", resp.Reply.Text)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "skill-candidate-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one skill candidate, got %v", matches)
 	}
 }
 
@@ -295,10 +343,10 @@ func TestRuntimeInjectsChineseSummarySkill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(fp.lastPlanSkillPrompt, "当前日期：") || !strings.Contains(fp.lastPlanSkillPrompt, "用户时区：") {
+	if !strings.Contains(fp.lastPlanSkillPrompt, "Current date:") || !strings.Contains(fp.lastPlanSkillPrompt, "User timezone:") {
 		t.Fatalf("expected plan prompt to include date/timezone context, got %q", fp.lastPlanSkillPrompt)
 	}
-	if !strings.Contains(fp.lastPlanSkillPrompt, "当前环境：") || !strings.Contains(fp.lastPlanSkillPrompt, "操作系统:") {
+	if !strings.Contains(fp.lastPlanSkillPrompt, "Current environment:") || !strings.Contains(fp.lastPlanSkillPrompt, "operating_system:") {
 		t.Fatalf("expected plan prompt to include environment context, got %q", fp.lastPlanSkillPrompt)
 	}
 	if !strings.Contains(fp.lastSynthesizeSkillPrompt, "chinese-summary") {

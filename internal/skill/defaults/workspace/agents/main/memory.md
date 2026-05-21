@@ -1,3 +1,5 @@
 # main memory
 
-当前没有额外长期记忆。
+No durable long-term memory has been recorded yet.
+
+Use this file only for stable, user-approved facts or links to curated memory wiki pages.

@@ -1,9 +1,0 @@
-name: local-mlx
-provider: mlx_lm
-api: openai
-model: Qwen2.5-14B-Instruct-4bit
-api_base: http://127.0.0.1:8080/v1
-api_key: local
-strip_reasoning: false
-enabled: true
-description: Local OpenAI-compatible model served by mlx_lm; useful as followup or fallback model.

@@ -13,13 +13,16 @@ import (
 )
 
 type Root struct {
-	App      AppConfig      `yaml:"app"`
-	Security SecurityConfig `yaml:"security"`
-	Search   SearchConfig   `yaml:"search"`
-	Model    ModelSelection `yaml:"model"`
-	Agents   AgentsConfig   `yaml:"agents"`
-	Models   []ModelConfig  `yaml:"-"`
-	Channels ChannelsConfig `yaml:"-"`
+	App       AppConfig       `yaml:"app"`
+	Security  SecurityConfig  `yaml:"security"`
+	Search    SearchConfig    `yaml:"search"`
+	Model     ModelSelection  `yaml:"model"`
+	Memory    MemoryConfig    `yaml:"memory"`
+	Learning  LearningConfig  `yaml:"learning"`
+	Scheduler SchedulerConfig `yaml:"scheduler"`
+	Agents    AgentsConfig    `yaml:"agents"`
+	Models    []ModelConfig   `yaml:"-"`
+	Channels  ChannelsConfig  `yaml:"-"`
 }
 
 type AppConfig struct {
@@ -77,6 +80,34 @@ type ModelConfig struct {
 	Description    string `yaml:"description"`
 }
 
+type MemoryConfig struct {
+	Enabled           bool     `yaml:"enabled"`
+	Root              string   `yaml:"root"`
+	RecentDays        int      `yaml:"recent_days"`
+	AutoPropose       bool     `yaml:"auto_propose"`
+	AutoCommitLowRisk bool     `yaml:"auto_commit_low_risk"`
+	RequireConfirmFor []string `yaml:"require_confirm_for"`
+}
+
+type LearningConfig struct {
+	Enabled              bool                       `yaml:"enabled"`
+	SkillCrystallization SkillCrystallizationConfig `yaml:"skill_crystallization"`
+}
+
+type SkillCrystallizationConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	SuccessThreshold   int    `yaml:"success_threshold"`
+	MinConfidence      string `yaml:"min_confidence"`
+	RequireUserConfirm bool   `yaml:"require_user_confirm"`
+	AskTiming          string `yaml:"ask_timing"`
+}
+
+type SchedulerConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Timezone string `yaml:"timezone"`
+	StateDir string `yaml:"state_dir"`
+}
+
 type AgentsConfig struct {
 	Default  string               `yaml:"default"`
 	Profiles []AgentProfileConfig `yaml:"profiles"`
@@ -98,9 +129,16 @@ type AgentProfileConfig struct {
 }
 
 type HeartbeatConfig struct {
-	Enabled    bool                `yaml:"enabled"`
-	Interval   string              `yaml:"interval"`
-	QuietHours HeartbeatQuietHours `yaml:"quiet_hours"`
+	Enabled         bool                `yaml:"enabled"`
+	Interval        string              `yaml:"interval"`
+	Schedule        HeartbeatSchedule   `yaml:"schedule"`
+	Jobs            []string            `yaml:"jobs"`
+	AutoSendSummary bool                `yaml:"auto_send_summary"`
+	QuietHours      HeartbeatQuietHours `yaml:"quiet_hours"`
+}
+
+type HeartbeatSchedule struct {
+	DailyAt string `yaml:"daily_at"`
 }
 
 type HeartbeatQuietHours struct {
@@ -256,7 +294,7 @@ func (r *Root) normalizeAgents() {
 	if len(r.Agents.Profiles) == 0 {
 		r.Agents.Profiles = []AgentProfileConfig{{
 			ID:               r.Agents.Default,
-			Name:             "主助理",
+			Name:             "Main Assistant",
 			Default:          true,
 			SessionNamespace: r.Agents.Default,
 			Model:            r.Model,

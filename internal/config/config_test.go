@@ -103,6 +103,22 @@ func TestEnsureDefaultConfigFilesCreatesSamplesAndRealConfig(t *testing.T) {
 			t.Fatalf("expected %s to exist: %v", path, err)
 		}
 	}
+	memoryPaths := []string{
+		"README.md",
+		"schema.md",
+		"index.md",
+		"log.md",
+		filepath.Join("user", "index.md"),
+		filepath.Join("org", "index.md"),
+		filepath.Join("agents", "main", "memory.md"),
+		filepath.Join("agents", "main", "index.md"),
+	}
+	for _, rel := range memoryPaths {
+		path := filepath.Join(home, "workspace", "memory", rel)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected %s to exist: %v", path, err)
+		}
+	}
 }
 
 func TestEnsureDefaultConfigFilesDoesNotOverwriteExistingConfig(t *testing.T) {

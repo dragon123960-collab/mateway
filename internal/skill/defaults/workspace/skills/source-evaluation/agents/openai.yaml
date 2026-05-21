@@ -1,3 +1,3 @@
 display_name: Source Evaluation
 short_description: Rank and filter sources by authority, freshness, and directness.
-default_prompt: 评估来源质量并优先保留高可信结论
+default_prompt: Evaluate source quality and preserve high-confidence conclusions.

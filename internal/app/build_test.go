@@ -1,6 +1,8 @@
 package app
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -67,5 +69,16 @@ func TestDefaultAgentStrictFailsOnUnknownDefault(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `configured default agent "missing"`) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnsureLayoutBackfillsMemoryTemplates(t *testing.T) {
+	home := t.TempDir()
+	if err := ensureLayout(home); err != nil {
+		t.Fatalf("ensure layout: %v", err)
+	}
+	path := filepath.Join(home, "workspace", "memory", "README.md")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected memory template to be backfilled: %v", err)
 	}
 }

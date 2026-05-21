@@ -18,6 +18,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/observer"
 	runtimepkg "github.com/dongping/mateway/internal/runtime"
 )
@@ -97,9 +98,39 @@ func run() error {
 		}
 	case "trace":
 		return runTrace(args[1:], os.Stdout)
+	case "memory":
+		return runMemory(args[1:], os.Stdout)
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runMemory(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory <lint>")
+	}
+	switch args[0] {
+	case "lint":
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		report, err := memory.Lint(filepath.Join(a.Config.App.Workspace, "memory"))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Memory lint checked %s\n", report.Root)
+		if len(report.Issues) == 0 {
+			fmt.Fprintln(out, "No issues found.")
+			return nil
+		}
+		for _, issue := range report.Issues {
+			fmt.Fprintf(out, "- [%s] %s: %s\n", issue.Code, issue.Path, issue.Message)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory <lint>")
 	}
 }
 
@@ -196,8 +227,8 @@ func runTest(args []string) error {
 
 func parseTestOptions(args []string) (testCommandOptions, error) {
 	opts := testCommandOptions{
-		Title:   "默认测试任务",
-		Message: "请执行一次完整的真实模型流程测试，并返回你发现的问题、结果和执行过程。",
+		Title:   "default-test-task",
+		Message: "Run one complete real-model workflow test and report the result, issues found, and execution details.",
 		Channel: "cli",
 		Home:    "",
 	}
@@ -322,27 +353,27 @@ func writeTaskReport(report taskReport, outDir string) (string, error) {
 
 func writeTaskReportMarkdown(b *strings.Builder, report taskReport) {
 	fmt.Fprintf(b, "# %s\n\n", report.Title)
-	fmt.Fprintln(b, "## 问题")
+	fmt.Fprintln(b, "## Question")
 	fmt.Fprintln(b, report.Question)
 	fmt.Fprintln(b)
-	fmt.Fprintln(b, "## 结果")
+	fmt.Fprintln(b, "## Result")
 	fmt.Fprintln(b, firstNonEmptyLocal(report.ReplyText, report.Result))
 	fmt.Fprintln(b)
-	fmt.Fprintln(b, "## 结论")
+	fmt.Fprintln(b, "## Conclusion")
 	if report.Failed {
-		fmt.Fprintln(b, "任务未完全成功。")
+		fmt.Fprintln(b, "The task did not complete successfully.")
 	} else if report.AwaitConfirm {
-		fmt.Fprintln(b, "任务已进入待确认状态。")
+		fmt.Fprintln(b, "The task is waiting for confirmation.")
 	} else if report.AwaitUserInput {
-		fmt.Fprintln(b, "任务已进入待补充信息状态。")
+		fmt.Fprintln(b, "The task is waiting for additional user input.")
 	} else if len(report.QualityNotes) > 0 {
-		fmt.Fprintln(b, "任务机制已完成，但答案质量需要人工复核。")
+		fmt.Fprintln(b, "The task mechanism completed, but the answer quality needs human review.")
 	} else {
-		fmt.Fprintln(b, "任务已完成。")
+		fmt.Fprintln(b, "The task completed.")
 	}
 	if len(report.QualityNotes) > 0 {
 		fmt.Fprintln(b)
-		fmt.Fprintln(b, "## 质量提示")
+		fmt.Fprintln(b, "## Quality Notes")
 		for _, note := range report.QualityNotes {
 			fmt.Fprintf(b, "- %s\n", note)
 		}
@@ -367,7 +398,7 @@ func writeTaskReportMarkdown(b *strings.Builder, report taskReport) {
 		}
 	}
 	fmt.Fprintln(b)
-	fmt.Fprintln(b, "## 执行过程与参数")
+	fmt.Fprintln(b, "## Execution Metadata")
 	writeTaskMetaLine(b, "trace_id", report.TraceID)
 	writeTaskMetaLine(b, "session_key", report.SessionKey)
 	writeTaskMetaLine(b, "channel", report.Channel)
@@ -510,28 +541,30 @@ func qualityNotesForReport(question string, resp runtimepkg.Response) []string {
 	var notes []string
 	reply := strings.TrimSpace(resp.Reply.Text)
 	if len([]rune(reply)) < 120 {
-		notes = append(notes, "最终回复较短，可能只是机制跑通，未必覆盖了足够分析深度。")
+		notes = append(notes, "The final reply is short; the mechanism may have completed without enough analytical depth.")
 	}
 	if len(resp.Results) == 0 {
-		notes = append(notes, "本次没有工具结果作为证据，若任务要求检索、文件分析或执行操作，需要人工确认是否足够。")
+		notes = append(notes, "No tool result was captured as evidence; review manually if the task required search, file analysis, or execution.")
 	}
 	if looksAnalyticalTestQuestion(question) && len(resp.Results) <= 1 {
-		notes = append(notes, "问题看起来需要分析或交叉验证，但工具证据较少，建议人工复核结论质量。")
+		notes = append(notes, "The question appears to require analysis or cross-checking, but tool evidence is limited.")
 	}
 	lower := strings.ToLower(reply)
-	if strings.Contains(lower, "echo") || strings.Contains(reply, "工具调用") && len([]rune(reply)) < 300 {
-		notes = append(notes, "回复可能偏工具痕迹或形式化总结，建议确认是否真正回答了原问题。")
+	if strings.Contains(lower, "echo") || strings.Contains(lower, "tool call") && len([]rune(reply)) < 300 {
+		notes = append(notes, "The reply may contain tool-call residue or an overly formal summary; confirm it answered the original question.")
 	}
 	return notes
 }
 
 func looksAnalyticalTestQuestion(question string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(question))
-	return strings.Contains(normalized, "分析") ||
-		strings.Contains(normalized, "总结") ||
-		strings.Contains(normalized, "趋势") ||
-		strings.Contains(normalized, "评估") ||
-		strings.Contains(normalized, "对比") ||
+	return strings.Contains(normalized, "analysis") ||
+		strings.Contains(normalized, "analyze") ||
+		strings.Contains(normalized, "summary") ||
+		strings.Contains(normalized, "summarize") ||
+		strings.Contains(normalized, "trend") ||
+		strings.Contains(normalized, "evaluate") ||
+		strings.Contains(normalized, "compare") ||
 		strings.Contains(normalized, "review") ||
 		strings.Contains(normalized, "research")
 }
@@ -706,6 +739,7 @@ Commands:
   gateway restart        restart OS-managed gateway service
   gateway stop           stop OS-managed gateway service
   gateway status         show service and instance-lock status
+  memory lint            check Markdown memory wiki health without modifying files
   trace tail             follow today's structured trace
   trace show <trace_id>  show events for one trace id
 

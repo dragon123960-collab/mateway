@@ -2,8 +2,8 @@ package runtime
 
 import (
 	"fmt"
-	"os/exec"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -26,41 +26,41 @@ func buildModelContextPrompt(msg string, stage string, matches []skill.Match, to
 	now := time.Now()
 	files := loadAgentPromptFiles(toolCtx.Workspace, "main")
 	sections := []string{
-		"你是用户的个人工作助理 Agent。",
+		"You are Mateway, a practical personal work assistant agent.",
 		"",
-		"你的核心目标：",
-		"帮助用户完成工作，整理信息，调用工具，输出清晰中文结论。",
+		"Core objective:",
+		"Help the user complete work, organize information, call tools safely, and produce clear conclusions in the user's language.",
 		"",
-		"当前日期：",
+		"Current date:",
 		now.Format("2006-01-02"),
 		"",
-		"用户时区：",
+		"User timezone:",
 		firstNonEmpty(now.Location().String(), "Asia/Shanghai"),
 		"",
-		"当前用户请求：",
+		"Current user request:",
 		strings.TrimSpace(msg),
 		"",
 	}
 	if env := renderEnvironmentContext(toolCtx); env != "" {
-		sections = append(sections, "", "当前环境：", env)
+		sections = append(sections, "", "Current environment:", env)
 	}
 	if extra := renderAgentPromptFiles(files); extra != "" {
 		sections = append(sections, "", extra)
 	}
 	if selected := renderSelectedSkills(matches); selected != "" {
-		sections = append(sections, "", "当前可用 Skills：", selected)
+		sections = append(sections, "", "Selected skills:", selected)
 	}
 	if toolsText := renderToolNames(toolDefs); toolsText != "" {
-		sections = append(sections, "", "当前可用工具：", toolsText)
+		sections = append(sections, "", "Available tools:", toolsText)
 	}
 	sections = append(sections,
 		"",
-		"工具调用规则：",
-		"1. 不要把工具调用过程直接写给用户。",
-		"2. 工具结果会由系统回填。",
-		"3. 最终回答必须是中文、结构化、可读。",
+		"Tool-use rules:",
+		"1. Do not expose raw tool calls or internal tool arguments to the user.",
+		"2. Tool results will be supplied by the system.",
+		"3. Final answers must be structured, readable, and written in the user's language unless the user requests otherwise.",
 		"",
-		"当前阶段：",
+		"Current stage:",
 		stage,
 	)
 	return strings.TrimSpace(strings.Join(sections, "\n"))
@@ -107,15 +107,15 @@ func renderAgentPromptFiles(files agentPromptFiles) string {
 
 func renderEnvironmentContext(toolCtx tool.Context) string {
 	lines := []string{
-		"- 操作系统: " + runtime.GOOS,
-		"- 架构: " + runtime.GOARCH,
+		"- operating_system: " + runtime.GOOS,
+		"- architecture: " + runtime.GOARCH,
 		"- shell: " + firstNonEmpty(strings.TrimSpace(os.Getenv("SHELL")), "unknown"),
 		"- home: " + firstNonEmpty(toolCtx.Home, "unknown"),
 		"- workspace: " + firstNonEmpty(toolCtx.Workspace, "unknown"),
 		"- project_root: " + firstNonEmpty(toolCtx.ProjectRoot, "unknown"),
 	}
 	if cmds := availableCommandSummary(); cmds != "" {
-		lines = append(lines, "- 常用命令: "+cmds)
+		lines = append(lines, "- available_commands: "+cmds)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -133,7 +133,7 @@ func availableCommandSummary() string {
 
 func renderSelectedSkills(matches []skill.Match) string {
 	if len(matches) == 0 {
-		return "无"
+		return "none"
 	}
 	lines := make([]string, 0, len(matches))
 	for _, match := range matches {
@@ -184,7 +184,7 @@ func controlReplyText(results []model.ToolResult, style string) string {
 				}
 			}
 		}
-		return "还需要你补充一点信息，我才能继续。"
+		return "I need one more detail from you before I can continue."
 	}
 	if style == "approval_pending" {
 		for i := len(results) - 1; i >= 0; i-- {
@@ -192,7 +192,7 @@ func controlReplyText(results []model.ToolResult, style string) string {
 				return text
 			}
 		}
-		return "需要确认后才能继续。"
+		return "I need your confirmation before I can continue."
 	}
 	return fallbackSynthesis(results)
 }

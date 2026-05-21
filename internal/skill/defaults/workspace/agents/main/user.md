@@ -1,10 +1,7 @@
 # main user
 
-用户偏好：
+User profile:
 
-- 默认使用中文。
-- 不要堆原始信息。
-- 要帮助用户筛选、总结、判断。
-- 需要最新信息时，优先官方和最新来源。
-- 如果信息可能过时，必须说明。
-- 如果工具调用失败，不要编造结果。
+- No stable user preferences have been recorded yet.
+- Record preferences only when they are explicit, durable, and useful for future tasks.
+- Keep user preferences human-readable and easy to edit.

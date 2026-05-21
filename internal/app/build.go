@@ -49,14 +49,14 @@ func Init(home string) (string, error) {
 	if err := ensureLayout(loader.Home); err != nil {
 		return "", err
 	}
-	if err := config.EnsureDefaultConfigFiles(loader.Home); err != nil {
-		return "", err
-	}
 	return loader.Home, nil
 }
 
 func ensureLayout(home string) error {
-	return skill.EnsureWorkspaceLayout(home, filepath.Join(home, "workspace"))
+	if err := skill.EnsureWorkspaceLayout(home, filepath.Join(home, "workspace")); err != nil {
+		return err
+	}
+	return config.EnsureDefaultConfigFiles(home)
 }
 
 func selectModel(models []config.ModelConfig, selection config.ModelSelection) (config.ModelConfig, error) {

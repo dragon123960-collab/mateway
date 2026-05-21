@@ -25,6 +25,14 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("channels", "_README.md"), Content: channelsReadmeTemplate},
 		{RelPath: filepath.Join("channels", "feishu.yaml"), Content: feishuYAMLTemplate},
 		{RelPath: filepath.Join("channels", "feishu.sample.yaml"), Content: feishuSampleYAMLTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "README.md"), Content: memoryReadmeTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "schema.md"), Content: memorySchemaTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "index.md"), Content: memoryIndexTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "log.md"), Content: memoryLogTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "user", "index.md"), Content: memoryUserIndexTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "org", "index.md"), Content: memoryOrgIndexTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "agents", "main", "memory.md"), Content: memoryAgentEntryTemplate},
+		{RelPath: filepath.Join("..", "workspace", "memory", "agents", "main", "index.md"), Content: memoryAgentIndexTemplate},
 	}
 	for _, file := range files {
 		path := filepath.Join(loader.ConfigDir(), file.RelPath)
@@ -64,11 +72,37 @@ model:
     synthesis: minimax
     followup: minimax
 
+memory:
+  enabled: true
+  root: ""
+  recent_days: 3
+  auto_propose: true
+  auto_commit_low_risk: false
+  require_confirm_for:
+    - user_preference
+    - org_knowledge
+    - long_memory
+    - skill_candidate
+
+learning:
+  enabled: true
+  skill_crystallization:
+    enabled: true
+    success_threshold: 3
+    min_confidence: medium
+    require_user_confirm: true
+    ask_timing: next_interaction
+
+scheduler:
+  enabled: false
+  timezone: Asia/Shanghai
+  state_dir: ""
+
 agents:
   default: main
   profiles:
     - id: main
-      name: 主助理
+      name: Main Assistant
       default: true
       session_namespace: main
       model:
@@ -82,6 +116,13 @@ agents:
       heartbeat:
         enabled: false
         interval: 30m
+        schedule:
+          daily_at: "03:30"
+        jobs:
+          - memory_daily_review
+          - memory_recent_compact
+          - memory_lint
+        auto_send_summary: false
         quiet_hours:
           start: "23:00"
           end: "08:00"
@@ -196,9 +237,9 @@ MATEWAY_FEISHU_VERIFICATION_TOKEN=
 MATEWAY_FEISHU_ENCRYPT_KEY=
 `
 
-const configReadmeTemplate = `# Mateway 配置说明
+const configReadmeTemplate = `# Mateway Configuration
 
-运行时默认结构：
+Default runtime layout:
 
 ` + "```text" + `
 ~/.mateway/config/
@@ -216,18 +257,21 @@ const configReadmeTemplate = `# Mateway 配置说明
     feishu.sample.yaml
 ` + "```" + `
 
-说明：
+Notes:
 
-- ` + "`config.yaml`" + ` 定义 app、security、search、全局 model 默认值和 agent profiles。
-- ` + "`models/*.yaml`" + ` 只声明模型端点、API 类型、模型名、密钥来源。
-- ` + "`channels/feishu.yaml`" + ` 定义飞书接入配置，默认关闭。
-- ` + "`mateway.env`" + ` 用于放本机密钥，不应提交。
-- ` + "`*.sample.yaml`" + ` 是用户参考模板，当前 loader 不会读取。
-- 顶层 ` + "`model`" + ` 是全局默认模板；具体 agent 的 ` + "`agents.profiles[].model`" + ` 会覆盖它。
-- ` + "`roles.planning/repair/synthesis/followup`" + ` 是运行阶段模型预留配置，当前先由默认模型主导。
-- ` + "`security.enforce_workspace_paths: true`" + ` 表示文件工具限制在 projectRoot、workspace 和 accessible_paths 下。
+- ` + "`config.yaml`" + ` defines app paths, security, search, global model defaults, and agent profiles.
+- ` + "`models/*.yaml`" + ` declares model endpoints, API compatibility, model names, and secret sources.
+- ` + "`channels/feishu.yaml`" + ` configures Feishu and is disabled by default.
+- ` + "`mateway.env`" + ` stores local secrets and should not be committed.
+- ` + "`*.sample.yaml`" + ` files are user templates and are ignored by the runtime loader.
+- Top-level ` + "`model`" + ` is the global default template; ` + "`agents.profiles[].model`" + ` overrides it for a specific agent.
+- ` + "`roles.planning/repair/synthesis/followup`" + ` reserves model choices for runtime phases. The default model is used until role routing is implemented.
+- ` + "`security.enforce_workspace_paths: true`" + ` restricts file tools to projectRoot, workspace, and accessible_paths.
+- ` + "`memory`" + ` configures the Markdown/Obsidian-compatible memory wiki and proposal policy.
+- ` + "`learning.skill_crystallization`" + ` controls event-driven skill candidate generation after repeated successful patterns.
+- ` + "`scheduler`" + ` is reserved for best-effort background maintenance; it is not a strict cron.
 
-新用户可复制 sample 文件：
+New users may copy sample files:
 
 ` + "```bash" + `
 cp config.sample.yaml config.yaml
@@ -236,6 +280,85 @@ cp models/minimax.sample.yaml models/minimax.yaml
 cp models/local-mlx.sample.yaml models/local-mlx.yaml
 cp channels/feishu.sample.yaml channels/feishu.yaml
 ` + "```" + `
+`
+
+const memoryReadmeTemplate = `# Mateway Memory Wiki
+
+This directory is the local Markdown/Obsidian-compatible memory wiki.
+
+- Markdown files are the source of truth.
+- SQLite indexes, if added later, must be rebuildable from Markdown.
+- Agent-private memory lives under ` + "`agents/<agent_id>/`" + `.
+- Shared user memory lives under ` + "`user/`" + `.
+- Shared organization memory lives under ` + "`org/`" + `.
+- High-impact memories and skill candidates should start in an inbox as proposals.
+`
+
+const memorySchemaTemplate = `# Memory Schema
+
+Every durable memory page should use YAML frontmatter:
+
+` + "```yaml" + `
+---
+type: project | system | preference | playbook | decision | source | skill_candidate
+scope: agent | user | org
+owner_agent: main
+visibility: private | shared-user | shared-org
+status: active | proposed | deprecated
+tags: []
+aliases: []
+sources: []
+confidence: high | medium | low
+created_at: 2026-05-20
+updated_at: 2026-05-20
+---
+` + "```" + `
+
+Use Obsidian-style ` + "`[[wikilinks]]`" + ` for graph connections.
+`
+
+const memoryIndexTemplate = `# Memory Index
+
+- [[schema]]
+- [[log]]
+- [[user/index]]
+- [[org/index]]
+- [[agents/main/index]]
+`
+
+const memoryLogTemplate = `# Memory Log
+
+Append memory operations here: ingest, query, lint, commit, and skill-candidate promotion.
+`
+
+const memoryUserIndexTemplate = `# Shared User Memory
+
+Use this area for stable user preferences and cross-agent user facts.
+`
+
+const memoryOrgIndexTemplate = `# Shared Organization Memory
+
+Use this area for organization systems, terminology, workflows, and playbooks.
+`
+
+const memoryAgentEntryTemplate = `# Agent Memory Entry
+
+This is the prompt-facing memory entry for the agent.
+
+Keep it short. Link to detailed wiki pages instead of copying everything here.
+
+- Agent memory index: [[index]]
+`
+
+const memoryAgentIndexTemplate = `# Main Agent Memory
+
+## Recent
+
+## Long-Term
+
+## Inbox
+
+## Learning
 `
 
 const channelsReadmeTemplate = `# Channel Configs
