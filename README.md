@@ -51,6 +51,26 @@ Still evolving:
 - optional FTS5 or embedding-backed retrieval
 - packaging, release automation, and more production hardening
 
+## Releases
+
+GitHub releases are intended to ship prebuilt binaries in addition to source archives.
+
+Recommended release assets:
+
+- `mateway_darwin_arm64`
+- `mateway_darwin_amd64`
+- `mateway_linux_arm64`
+- `mateway_linux_amd64`
+- `mateway_windows_amd64.exe`
+
+For local release builds:
+
+```bash
+./build-release.sh v0.1.0
+```
+
+For tag-driven release uploads, the repository includes a GitHub Actions workflow under `.github/workflows/release.yml`.
+
 ## Quick Start
 
 Build from source:

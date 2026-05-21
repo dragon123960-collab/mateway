@@ -51,6 +51,26 @@ Mateway 仍处于早期阶段，但已经可以作为第一版单 Agent runtime 
 - 可选 FTS5 或 embedding 检索增强
 - 打包、发布自动化和更多生产级加固
 
+## 发布版本
+
+GitHub release 除了源码压缩包之外，还应该附带预编译二进制文件。
+
+推荐的 release 产物：
+
+- `mateway_darwin_arm64`
+- `mateway_darwin_amd64`
+- `mateway_linux_arm64`
+- `mateway_linux_amd64`
+- `mateway_windows_amd64.exe`
+
+本地构建 release 产物：
+
+```bash
+./build-release.sh v0.1.0
+```
+
+tag 触发的自动上传流程位于 `.github/workflows/release.yml`。
+
 ## 快速开始
 
 从源码构建：
