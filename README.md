@@ -49,7 +49,16 @@ Download or build one `mateway` binary, then initialize local runtime files:
 mateway init
 ```
 
-This creates `~/.mateway` and writes configuration, sample files, docs, workspace skills, and the default agent context. Existing real config files are not overwritten.
+This creates `~/.mateway` and writes configuration, sample files, docs, memory scaffolding, and default skill templates. Existing real config files are not overwritten.
+
+### `mateway init` vs `mateway gateway serve`
+
+- `mateway init` bootstraps local files under `~/.mateway`. Use it on a new machine or when you want to regenerate missing templates.
+- `mateway gateway serve` starts the actual foreground gateway process. It loads config, acquires the single-instance lock, and runs the CLI/Feishu runtime loop.
+- `gateway serve` is the runtime entrypoint; `init` is the filesystem/bootstrap entrypoint.
+- `gateway serve` is what you run under LaunchAgent, systemd, or another service manager.
+- `init` does not connect to Feishu or process user messages.
+- `init` does not require valid model or Feishu secrets to complete, while `gateway serve` does.
 
 Important generated files:
 
@@ -112,6 +121,7 @@ Runtime config lives under `~/.mateway/config`.
 - `channels/feishu.yaml` configures Feishu.
 - `mateway.env` stores local secrets and should not be committed.
 - `*.sample.yaml` files are user templates and are ignored by the runtime loader.
+- `gateway serve` uses the generated config and templates; `init` only creates them.
 
 Model config currently supports:
 
