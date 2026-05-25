@@ -24,6 +24,14 @@ func CheckDraft(input CreateInput) DraftCheck {
 		questions = append(questions, "定时触发时，希望我具体做什么？")
 	}
 	switch draftScheduleKind(input) {
+	case "once":
+		if strings.TrimSpace(input.RunAt) == "" {
+			missing["run_at"] = ""
+			questions = append(questions, "一次性任务什么时候运行？请用 RFC3339 时间，例如 2026-05-25T10:30:00+08:00。")
+		} else if _, err := parseRunAt(input.RunAt); err != nil {
+			missing["run_at"] = strings.TrimSpace(input.RunAt)
+			questions = append(questions, "一次性任务时间需要用 RFC3339 格式，例如 2026-05-25T10:30:00+08:00。")
+		}
 	case "daily":
 		if strings.TrimSpace(input.DailyAt) == "" {
 			missing["daily_at"] = ""
@@ -59,14 +67,14 @@ func CheckDraft(input CreateInput) DraftCheck {
 	case "interval":
 		if strings.TrimSpace(input.Interval) == "" {
 			missing["interval"] = ""
-			questions = append(questions, "每隔多久运行一次？请用类似 2h 的时长格式。")
+			questions = append(questions, "每隔多久重复运行一次？请用类似 2h 的时长格式。")
 		} else if _, err := time.ParseDuration(input.Interval); err != nil {
 			missing["interval"] = strings.TrimSpace(input.Interval)
-			questions = append(questions, "间隔需要是类似 2h 的时长格式。每隔多久运行一次？")
+			questions = append(questions, "重复间隔需要是类似 2h 的时长格式。每隔多久运行一次？")
 		}
 	default:
-		missing["daily_at"] = ""
-		questions = append(questions, "这个任务什么时候运行？")
+		missing["schedule"] = ""
+		questions = append(questions, "这个任务是一次性运行，还是每天/每周/每月/每隔一段时间重复运行？")
 	}
 	if len(missing) == 0 {
 		return DraftCheck{Ready: true}
@@ -80,6 +88,9 @@ func CheckDraft(input CreateInput) DraftCheck {
 }
 
 func draftScheduleKind(input CreateInput) string {
+	if strings.TrimSpace(input.RunAt) != "" {
+		return "once"
+	}
 	if strings.TrimSpace(input.Interval) != "" {
 		return "interval"
 	}
@@ -89,7 +100,10 @@ func draftScheduleKind(input CreateInput) string {
 	if strings.TrimSpace(input.WeeklyAt) != "" || strings.TrimSpace(input.Weekday) != "" || len(input.Weekdays) > 0 {
 		return "weekly"
 	}
-	return "daily"
+	if strings.TrimSpace(input.DailyAt) != "" {
+		return "daily"
+	}
+	return ""
 }
 
 func ApplyDraftFields(input CreateInput, fields map[string]string) CreateInput {
@@ -105,6 +119,8 @@ func ApplyDraftFields(input CreateInput, fields map[string]string) CreateInput {
 			input.Title = value
 		case "prompt":
 			input.Prompt = value
+		case "run_at":
+			input.RunAt = value
 		case "daily_at":
 			input.DailyAt = value
 		case "weekly_at":

@@ -643,6 +643,57 @@ func TestRuntimeCreatesMemoryProposalAfterGroundedSuccessfulTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeSkipsLearningForTestLikeSession(t *testing.T) {
+	workspace := t.TempDir()
+	reg := tool.NewBuiltinRegistry()
+	fp := &fakePlanner{plan: model.Plan{Summary: "read project memory", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.summary", Args: map[string]string{"path": filepath.Join(workspace, "project.md")},
+	}}}}
+	if err := os.WriteFile(filepath.Join(workspace, "project.md"), []byte("# Project\n\nlearning input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{
+				Default:  "main",
+				Profiles: []config.AgentProfileConfig{{ID: "main"}},
+			},
+			Learning: config.LearningConfig{
+				Enabled: true,
+				SkillCrystallization: config.SkillCrystallizationConfig{
+					Enabled:            true,
+					SuccessThreshold:   1,
+					RequireUserConfirm: true,
+				},
+			},
+		},
+		Model:    fp,
+		Tools:    reg,
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "test-thread", UserID: "local", SessionKey: "test:cli-learning", Text: "review release notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(resp.Reply.Text, "proposed skill candidate") {
+		t.Fatalf("expected no learning prompt for test-like session, got %q", resp.Reply.Text)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "skill-candidate-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no skill candidate for test-like session, got %v", matches)
+	}
+}
+
 func TestRuntimeSkipsMemoryProposalWithoutEvidence(t *testing.T) {
 	workspace := t.TempDir()
 	fp := &fakePlanner{plan: model.Plan{Summary: "time only", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}

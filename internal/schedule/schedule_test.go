@@ -138,6 +138,46 @@ func TestStoreDueWeeklyAndInterval(t *testing.T) {
 	}
 }
 
+func TestStoreDueOneShotRunsOnce(t *testing.T) {
+	home := t.TempDir()
+	store := NewStore(home)
+	runAt := time.Date(2026, 5, 25, 10, 30, 0, 0, time.FixedZone("CST", 8*3600))
+	task, _, err := store.Create(CreateInput{
+		ID:     "mail-once",
+		Title:  "Mail Once",
+		Prompt: "Remind me to check mail.",
+		RunAt:  runAt.Format(time.RFC3339),
+		Now:    runAt.Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	due, err := store.Due(runAt.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("due before run_at: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("expected not due before run_at, got %#v", due)
+	}
+	due, err = store.Due(runAt)
+	if err != nil {
+		t.Fatalf("due at run_at: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != task.ID {
+		t.Fatalf("expected one-shot task due once, got %#v", due)
+	}
+	if err := store.WriteRunState(RunState{TaskID: task.ID, LastRunAt: runAt, Status: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	due, err = store.Due(runAt.Add(24 * time.Hour))
+	if err != nil {
+		t.Fatalf("due after run: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("expected one-shot not due after first run, got %#v", due)
+	}
+}
+
 func TestStoreDueMultipleWeekdaysAndMonthly(t *testing.T) {
 	home := t.TempDir()
 	store := NewStore(home)

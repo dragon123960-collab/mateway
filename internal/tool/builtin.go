@@ -27,8 +27,12 @@ import (
 func RegisterBuiltins(r *Registry) {
 	r.Register(TimeNow())
 	r.Register(ConfigSummary())
+	r.Register(MemoryList())
+	r.Register(MemoryShow())
 	r.Register(MemorySearch())
 	r.Register(MemoryIndex())
+	r.Register(MemoryCommit())
+	r.Register(MemoryReject())
 	r.Register(SkillSearch())
 	r.Register(SkillInstall())
 	r.Register(SoftwareSearch())
@@ -251,6 +255,7 @@ func ScheduleCreate() Definition {
 			"id":          "optional schedule id",
 			"title":       "schedule title",
 			"prompt":      "task prompt to execute when the schedule fires",
+			"run_at":      "RFC3339 timestamp for one-shot schedules",
 			"daily_at":    "HH:MM for daily schedule",
 			"weekly_at":   "HH:MM for weekly schedule",
 			"weekday":     "weekday for weekly schedule",
@@ -385,6 +390,7 @@ func ScheduleUpdate() Definition {
 			"id":          "schedule id",
 			"title":       "optional new title",
 			"prompt":      "optional new prompt",
+			"run_at":      "optional RFC3339 timestamp for one-shot schedules",
 			"daily_at":    "optional HH:MM for daily schedule",
 			"weekly_at":   "optional HH:MM for weekly schedule",
 			"weekday":     "optional weekday for weekly schedule",
@@ -464,6 +470,7 @@ func scheduleInputFromArgs(call Call) schedule.CreateInput {
 		Title:        call.Args["title"],
 		Prompt:       call.Args["prompt"],
 		AgentID:      firstNonEmpty(call.Args["agent_id"], "main"),
+		RunAt:        call.Args["run_at"],
 		DailyAt:      call.Args["daily_at"],
 		WeeklyAt:     call.Args["weekly_at"],
 		Weekday:      call.Args["weekday"],
@@ -480,7 +487,7 @@ func scheduleInputFromArgs(call Call) schedule.CreateInput {
 }
 
 func hasScheduleSpecArgs(args map[string]string) bool {
-	for _, key := range []string{"daily_at", "weekly_at", "weekday", "weekdays", "monthly_at", "monthly_day", "interval"} {
+	for _, key := range []string{"run_at", "daily_at", "weekly_at", "weekday", "weekdays", "monthly_at", "monthly_day", "interval"} {
 		if strings.TrimSpace(args[key]) != "" {
 			return true
 		}
@@ -503,6 +510,11 @@ func splitCommaArg(value string) []string {
 
 func buildScheduleSpecForTool(input schedule.CreateInput) (schedule.ScheduleSpec, error) {
 	switch {
+	case strings.TrimSpace(input.RunAt) != "":
+		if _, err := time.Parse(time.RFC3339, strings.TrimSpace(input.RunAt)); err != nil {
+			return schedule.ScheduleSpec{}, fmt.Errorf("schedule.run_at must be RFC3339")
+		}
+		return schedule.ScheduleSpec{Kind: "once", RunAt: strings.TrimSpace(input.RunAt)}, nil
 	case strings.TrimSpace(input.Interval) != "":
 		if _, err := time.ParseDuration(strings.TrimSpace(input.Interval)); err != nil {
 			return schedule.ScheduleSpec{}, fmt.Errorf("schedule.interval must be a duration")
@@ -664,6 +676,87 @@ func MemorySearch() Definition {
 	}
 }
 
+func MemoryList() Definition {
+	return Definition{
+		Name:        "memory.list",
+		Description: "List inbox or long memory items by area and optional status.",
+		Metadata: Metadata{
+			Purpose:            "inspect inbox or long memory items",
+			WhenToUse:          []string{"review inbox proposals", "check pending memory items", "inspect long memory entries"},
+			WhenNotToUse:       []string{"semantic long-memory lookup"},
+			OutputContract:     []string{"item id", "status", "type", "updated date"},
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"no memory items found"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "memory:list",
+		},
+		Risk: RiskSafeRead,
+		ArgsSchema: map[string]string{
+			"agent":  "optional agent id, defaults to main",
+			"area":   "optional memory area: inbox or long",
+			"status": "optional filter such as proposed, active, rejected, or committed",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			agentID := firstNonEmpty(call.Args["agent"], "main")
+			area := firstNonEmpty(call.Args["area"], "inbox")
+			status := strings.TrimSpace(call.Args["status"])
+			items, err := store.List(memory.ListOptions{AgentID: agentID, Area: area, Status: status})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{
+				OK:       true,
+				Output:   renderMemoryListOutput(agentID, area, status, items),
+				Evidence: memoryListEvidence(agentID, area, status, items),
+			}
+		},
+	}
+}
+
+func MemoryShow() Definition {
+	return Definition{
+		Name:        "memory.show",
+		Description: "Show one memory item by proposal id or path.",
+		Metadata: Metadata{
+			Purpose:        "inspect one memory item in full",
+			WhenToUse:      []string{"review one proposal before commit or reject"},
+			OutputContract: []string{"item id", "path", "full text"},
+			AcceptanceMode: AcceptanceCodeOnly,
+			ParallelMode:   ParallelReadOnlyOK,
+			ResourceScope:  "memory:item",
+		},
+		Risk: RiskSafeRead,
+		ArgsSchema: map[string]string{
+			"agent": "optional agent id, defaults to main",
+			"id":    "proposal id or path",
+			"path":  "proposal path; alias of id",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			ref := strings.TrimSpace(firstNonEmpty(call.Args["id"], call.Args["path"], call.Args["proposal"]))
+			if ref == "" {
+				return ErrorResult("memory id or path is required")
+			}
+			result, err := store.Show(firstNonEmpty(call.Args["agent"], "main"), ref)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{
+				OK:       true,
+				Output:   renderMemoryShowOutput(result),
+				Evidence: map[string]any{"kind": "memory_show", "id": result.ID, "path": result.Path},
+			}
+		},
+	}
+}
+
 func memorySearchEvidence(query string, results []memory.SearchResult) map[string]any {
 	evidence := map[string]any{
 		"kind":         "memory_search",
@@ -676,6 +769,102 @@ func memorySearchEvidence(query string, results []memory.SearchResult) map[strin
 		evidence["end_line"] = results[0].EndLine
 	}
 	return evidence
+}
+
+func MemoryCommit() Definition {
+	return Definition{
+		Name:        "memory.commit",
+		Description: "Promote one inbox memory proposal into long memory.",
+		Metadata: Metadata{
+			Purpose:            "commit a reviewed memory proposal into long memory",
+			WhenToUse:          []string{"approve a stable memory proposal", "promote reviewed memory from inbox"},
+			WhenNotToUse:       []string{"skill candidate promotion", "bulk delete via shell"},
+			RequiredArgs:       []string{"proposal"},
+			OutputContract:     []string{"source path", "target path"},
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"memory proposal path is required", "must have frontmatter with status: proposed"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "memory:mutation",
+		},
+		Risk: RiskGuardedMutation,
+		ArgsSchema: map[string]string{
+			"agent":    "optional agent id, defaults to main",
+			"proposal": "proposal id or path",
+			"title":    "optional title override for committed memory",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			proposal := strings.TrimSpace(firstNonEmpty(call.Args["proposal"], call.Args["id"], call.Args["path"]))
+			if proposal == "" {
+				return ErrorResult("proposal is required")
+			}
+			result, err := store.Commit(memory.CommitInput{
+				AgentID:  firstNonEmpty(call.Args["agent"], "main"),
+				Proposal: proposal,
+				Title:    strings.TrimSpace(call.Args["title"]),
+				At:       time.Now(),
+			})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{
+				OK:       true,
+				Output:   renderMemoryCommitOutput(result),
+				Evidence: map[string]any{"kind": "memory_commit", "source_path": result.SourcePath, "target_path": result.TargetPath},
+			}
+		},
+	}
+}
+
+func MemoryReject() Definition {
+	return Definition{
+		Name:        "memory.reject",
+		Description: "Reject one inbox memory proposal without deleting the file.",
+		Metadata: Metadata{
+			Purpose:            "reject an inbox memory proposal safely",
+			WhenToUse:          []string{"clear a bad proposal from inbox review", "mark unstable memory as rejected"},
+			WhenNotToUse:       []string{"removing files with rm", "promoting approved memory"},
+			RequiredArgs:       []string{"proposal"},
+			OutputContract:     []string{"proposal path", "updated status"},
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"proposal is required", "only proposed memory items can be rejected"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "memory:mutation",
+		},
+		Risk: RiskGuardedMutation,
+		ArgsSchema: map[string]string{
+			"agent":    "optional agent id, defaults to main",
+			"proposal": "proposal id or path",
+			"reason":   "optional rejection reason",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			proposal := strings.TrimSpace(firstNonEmpty(call.Args["proposal"], call.Args["id"], call.Args["path"]))
+			if proposal == "" {
+				return ErrorResult("proposal is required")
+			}
+			result, err := store.Reject(memory.RejectInput{
+				AgentID:  firstNonEmpty(call.Args["agent"], "main"),
+				Proposal: proposal,
+				Reason:   strings.TrimSpace(call.Args["reason"]),
+				At:       time.Now(),
+			})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{
+				OK:       true,
+				Output:   renderMemoryRejectOutput(result),
+				Evidence: map[string]any{"kind": "memory_reject", "path": result.Path},
+			}
+		},
+	}
 }
 
 func MemoryIndex() Definition {
@@ -724,6 +913,44 @@ func MemoryIndex() Definition {
 			}
 		},
 	}
+}
+
+func renderMemoryListOutput(agentID, area, status string, items []memory.MemoryItem) string {
+	if len(items) == 0 {
+		return fmt.Sprintf("No memory items found for area=%s status=%s agent=%s.", firstNonEmpty(area, "inbox"), firstNonEmpty(status, "any"), firstNonEmpty(agentID, "main"))
+	}
+	lines := []string{fmt.Sprintf("Memory items for area=%s status=%s agent=%s:", firstNonEmpty(area, "inbox"), firstNonEmpty(status, "any"), firstNonEmpty(agentID, "main"))}
+	for _, item := range items {
+		lines = append(lines, fmt.Sprintf("- %s\t%s\t%s\t%s\t%s", item.ID, item.Status, item.Kind, item.Updated, item.Title))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func memoryListEvidence(agentID, area, status string, items []memory.MemoryItem) map[string]any {
+	evidence := map[string]any{
+		"kind":       "memory_list",
+		"agent":      firstNonEmpty(agentID, "main"),
+		"area":       firstNonEmpty(area, "inbox"),
+		"status":     status,
+		"item_count": len(items),
+	}
+	if len(items) > 0 {
+		evidence["first_id"] = items[0].ID
+		evidence["first_path"] = items[0].Path
+	}
+	return evidence
+}
+
+func renderMemoryShowOutput(result memory.ShowResult) string {
+	return fmt.Sprintf("Memory item: %s\nPath: %s\n\n%s", result.ID, result.Path, result.Text)
+}
+
+func renderMemoryCommitOutput(result memory.CommitResult) string {
+	return fmt.Sprintf("Memory committed.\nSource: %s\nTarget: %s", result.SourcePath, result.TargetPath)
+}
+
+func renderMemoryRejectOutput(result memory.RejectResult) string {
+	return fmt.Sprintf("Memory proposal rejected: %s", result.Path)
 }
 
 func WebSearch() Definition {

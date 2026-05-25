@@ -186,6 +186,58 @@ func TestMemoryToolsSearchAndIndex(t *testing.T) {
 	}
 }
 
+func TestMemoryToolsListShowRejectAndCommit(t *testing.T) {
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	proposal, err := store.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Title:   "Review Memory",
+		Body:    "Review this proposal before promotion.",
+		Sources: []string{"manual"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "inbox", "status": "proposed"},
+		Context: Context{Workspace: workspace},
+	})
+	if !list.OK || !strings.Contains(list.Output, proposal.ID) {
+		t.Fatalf("expected list output to include proposal, got %#v", list)
+	}
+	show := MemoryShow().Run(context.Background(), Call{
+		Args:    map[string]string{"id": proposal.ID},
+		Context: Context{Workspace: workspace},
+	})
+	if !show.OK || !strings.Contains(show.Output, "Review Memory") {
+		t.Fatalf("expected show output to include proposal body, got %#v", show)
+	}
+	reject := MemoryReject().Run(context.Background(), Call{
+		Args:    map[string]string{"proposal": proposal.ID, "reason": "test reject"},
+		Context: Context{Workspace: workspace},
+	})
+	if !reject.OK || !strings.Contains(reject.Output, "rejected") {
+		t.Fatalf("expected reject success, got %#v", reject)
+	}
+
+	second, err := store.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Title:   "Commit Memory",
+		Body:    "This proposal should become long memory.",
+		Sources: []string{"manual"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := MemoryCommit().Run(context.Background(), Call{
+		Args:    map[string]string{"proposal": second.ID},
+		Context: Context{Workspace: workspace},
+	})
+	if !commit.OK || !strings.Contains(commit.Output, "Memory committed.") {
+		t.Fatalf("expected commit success, got %#v", commit)
+	}
+}
+
 func TestScheduleToolsConfirmationBoundary(t *testing.T) {
 	home := t.TempDir()
 	ctx := Context{Home: home, ProjectRoot: home, Workspace: home}
@@ -213,6 +265,26 @@ func TestScheduleToolsConfirmationBoundary(t *testing.T) {
 	}
 	if RequireConfirmForTool("schedule.update", map[string]string{"id": "ai-trends"}) {
 		t.Fatalf("expected schedule.update not to require confirmation")
+	}
+}
+
+func TestScheduleCreateSupportsOneShotRunAt(t *testing.T) {
+	home := t.TempDir()
+	ctx := Context{Home: home, ProjectRoot: home, Workspace: home}
+	create := ScheduleCreate().Run(context.Background(), Call{
+		Args: map[string]string{
+			"id":     "mail-once",
+			"title":  "Mail Once",
+			"prompt": "Remind me to check mail.",
+			"run_at": "2026-05-25T10:30:00+08:00",
+		},
+		Context: ctx,
+	})
+	if !create.OK || create.RequiresConfirm {
+		t.Fatalf("expected one-shot schedule create without confirmation, got %#v", create)
+	}
+	if got, _ := create.Evidence["schedule"].(string); got != "once@2026-05-25T10:30:00+08:00" {
+		t.Fatalf("expected one-shot schedule evidence, got %#v", create.Evidence)
 	}
 }
 

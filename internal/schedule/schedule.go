@@ -42,6 +42,7 @@ type Endpoint struct {
 
 type ScheduleSpec struct {
 	Kind       string   `yaml:"kind" json:"kind"`
+	RunAt      string   `yaml:"run_at,omitempty" json:"run_at,omitempty"`
 	DailyAt    string   `yaml:"daily_at,omitempty" json:"daily_at,omitempty"`
 	WeeklyAt   string   `yaml:"weekly_at,omitempty" json:"weekly_at,omitempty"`
 	Weekday    string   `yaml:"weekday,omitempty" json:"weekday,omitempty"`
@@ -73,6 +74,7 @@ type CreateInput struct {
 	Title        string
 	Prompt       string
 	AgentID      string
+	RunAt        string
 	DailyAt      string
 	WeeklyAt     string
 	Weekday      string
@@ -404,6 +406,10 @@ func validateTask(task Task) error {
 		return fmt.Errorf("task prompt is required")
 	}
 	switch normalizeScheduleKind(task.Schedule) {
+	case "once":
+		if _, err := parseRunAt(task.Schedule.RunAt); err != nil {
+			return fmt.Errorf("schedule.run_at must be RFC3339")
+		}
 	case "daily":
 		if _, _, ok := parseClock(task.Schedule.DailyAt); !ok {
 			return fmt.Errorf("schedule.daily_at must be HH:MM")
@@ -433,6 +439,9 @@ func validateTask(task Task) error {
 }
 
 func scheduleSpecFromInput(input CreateInput) ScheduleSpec {
+	if strings.TrimSpace(input.RunAt) != "" {
+		return ScheduleSpec{Kind: "once", RunAt: strings.TrimSpace(input.RunAt)}
+	}
 	if strings.TrimSpace(input.Interval) != "" {
 		return ScheduleSpec{Kind: "interval", Interval: strings.TrimSpace(input.Interval)}
 	}
@@ -454,6 +463,9 @@ func normalizeScheduleKind(spec ScheduleSpec) string {
 	if strings.TrimSpace(spec.Kind) != "" {
 		return strings.ToLower(strings.TrimSpace(spec.Kind))
 	}
+	if strings.TrimSpace(spec.RunAt) != "" {
+		return "once"
+	}
 	if strings.TrimSpace(spec.Interval) != "" {
 		return "interval"
 	}
@@ -468,6 +480,12 @@ func normalizeScheduleKind(spec ScheduleSpec) string {
 
 func isDueNow(task Task, state State, now time.Time) bool {
 	switch normalizeScheduleKind(task.Schedule) {
+	case "once":
+		runAt, err := parseRunAt(task.Schedule.RunAt)
+		if err != nil {
+			return false
+		}
+		return !now.Before(runAt.In(now.Location())) && !ranEver(state, task.ID)
 	case "daily":
 		return pastDailyTime(now, task.Schedule.DailyAt) && !ranToday(state, task.ID, now)
 	case "weekly":
@@ -538,6 +556,11 @@ func lastRunAt(state State, taskID string) (time.Time, bool) {
 		return item.LastRunAt, true
 	}
 	return time.Time{}, false
+}
+
+func ranEver(state State, taskID string) bool {
+	_, ok := lastRunAt(state, taskID)
+	return ok
 }
 
 func scheduleWeekdays(spec ScheduleSpec) []string {
@@ -620,6 +643,8 @@ func parseWeekday(value string) (time.Weekday, bool) {
 
 func Summary(spec ScheduleSpec) string {
 	switch normalizeScheduleKind(spec) {
+	case "once":
+		return "once@" + spec.RunAt
 	case "weekly":
 		return "weekly:" + strings.Join(scheduleWeekdays(spec), ",") + "@" + spec.WeeklyAt
 	case "monthly":
@@ -629,6 +654,10 @@ func Summary(spec ScheduleSpec) string {
 	default:
 		return "daily@" + spec.DailyAt
 	}
+}
+
+func parseRunAt(value string) (time.Time, error) {
+	return time.Parse(time.RFC3339, strings.TrimSpace(value))
 }
 
 func parseClock(value string) (int, int, bool) {

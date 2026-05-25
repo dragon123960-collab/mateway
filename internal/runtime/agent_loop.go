@@ -883,6 +883,8 @@ func (l *AgentLoop) recordLearningPattern(resp Response, task session.TaskState)
 	}
 	result, err := l.runtime.Memory.ProcessTask(memory.TaskOutcome{
 		AgentID:        agentID,
+		Channel:        l.state.message.Channel,
+		SessionKey:     l.state.message.SessionKey,
 		TraceID:        l.state.traceID,
 		TaskID:         task.ID,
 		Intent:         task.ResolvedQuery,

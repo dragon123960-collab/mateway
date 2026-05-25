@@ -44,6 +44,37 @@ func TestProcessTaskGeneratesSkillCandidateAtThreshold(t *testing.T) {
 	}
 }
 
+func TestProcessTaskSkipsTestLikeOutcomes(t *testing.T) {
+	store := NewStore(t.TempDir())
+	cfg := LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	outcome := TaskOutcome{
+		AgentID:     "main",
+		SessionKey:  "test:memory-learning",
+		TraceID:     "cli-test-learning",
+		TaskID:      "task-1",
+		Intent:      "review latest release notes",
+		PlanSummary: "review release notes",
+		Tools:       []string{"web.search", "file.summary"},
+		Success:     true,
+		FinishedAt:  time.Now(),
+	}
+
+	result, err := store.ProcessTask(outcome, cfg)
+	if err != nil {
+		t.Fatalf("process task: %v", err)
+	}
+	if result.CandidateGenerated || result.CandidatePath != "" || result.PatternKey != "" {
+		t.Fatalf("expected test-like outcome to be skipped, got %#v", result)
+	}
+	matches, err := filepath.Glob(filepath.Join(store.Root, "agents", "main", "inbox", "skill-candidate-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no skill candidate for test-like outcome, got %v", matches)
+	}
+}
+
 func TestLintReportsBrokenLinksAndMissingFrontmatter(t *testing.T) {
 	root := t.TempDir()
 	longDir := filepath.Join(root, "agents", "main", "long")

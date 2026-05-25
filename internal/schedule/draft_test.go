@@ -10,8 +10,8 @@ func TestCheckDraftReturnsMissingFields(t *testing.T) {
 	if _, ok := check.MissingFields["prompt"]; !ok {
 		t.Fatalf("expected prompt missing, got %#v", check.MissingFields)
 	}
-	if _, ok := check.MissingFields["daily_at"]; !ok {
-		t.Fatalf("expected daily_at missing, got %#v", check.MissingFields)
+	if _, ok := check.MissingFields["schedule"]; !ok {
+		t.Fatalf("expected schedule missing, got %#v", check.MissingFields)
 	}
 	if len(check.Questions) != 2 || check.ClarifyMessage == "" {
 		t.Fatalf("expected questions, got %#v", check)
@@ -32,6 +32,13 @@ func TestCheckDraftReady(t *testing.T) {
 	check := CheckDraft(CreateInput{Title: "Daily AI Trends", Prompt: "Collect AI trend articles.", DailyAt: "09:00"})
 	if !check.Ready || len(check.MissingFields) != 0 {
 		t.Fatalf("expected ready draft, got %#v", check)
+	}
+}
+
+func TestCheckDraftReadyForOneShotRunAt(t *testing.T) {
+	check := CheckDraft(CreateInput{Title: "Mail Reminder", Prompt: "Remind me to check mail.", RunAt: "2026-05-25T10:30:00+08:00"})
+	if !check.Ready || len(check.MissingFields) != 0 {
+		t.Fatalf("expected ready one-shot draft, got %#v", check)
 	}
 }
 

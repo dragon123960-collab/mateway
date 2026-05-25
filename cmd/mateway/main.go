@@ -138,6 +138,7 @@ func runSchedule(args []string, out io.Writer) error {
 			Title:        opts.Title,
 			Prompt:       opts.Prompt,
 			AgentID:      opts.AgentID,
+			RunAt:        opts.RunAt,
 			DailyAt:      opts.DailyAt,
 			WeeklyAt:     opts.WeeklyAt,
 			Weekday:      opts.Weekday,
@@ -168,6 +169,7 @@ func runSchedule(args []string, out io.Writer) error {
 			Title:        opts.Title,
 			Prompt:       opts.Prompt,
 			AgentID:      opts.AgentID,
+			RunAt:        opts.RunAt,
 			DailyAt:      opts.DailyAt,
 			WeeklyAt:     opts.WeeklyAt,
 			Weekday:      opts.Weekday,
@@ -343,6 +345,7 @@ type scheduleCreateOptions struct {
 	Title        string
 	Prompt       string
 	AgentID      string
+	RunAt        string
 	DailyAt      string
 	WeeklyAt     string
 	Weekday      string
@@ -359,7 +362,7 @@ type scheduleCreateOptions struct {
 }
 
 func parseScheduleCreateOptions(args []string) (scheduleCreateOptions, error) {
-	opts := scheduleCreateOptions{AgentID: "main", DailyAt: "09:00", Channel: "cli", DeliveryMode: "artifact"}
+	opts := scheduleCreateOptions{AgentID: "main", Channel: "cli", DeliveryMode: "artifact"}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--id":
@@ -392,6 +395,12 @@ func parseScheduleCreateOptions(args []string) (scheduleCreateOptions, error) {
 				return opts, err
 			}
 			opts.DailyAt, i = value, next
+		case "--run-at":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.RunAt, i = value, next
 		case "--weekly-at":
 			value, next, err := optionValue(args, i)
 			if err != nil {
@@ -473,9 +482,23 @@ func parseScheduleCreateOptions(args []string) (scheduleCreateOptions, error) {
 		}
 	}
 	if strings.TrimSpace(opts.Title) == "" || strings.TrimSpace(opts.Prompt) == "" {
-		return opts, fmt.Errorf("usage: mateway schedule create --title <title> --prompt <text> [--daily-at HH:MM]")
+		return opts, fmt.Errorf("usage: mateway schedule create --title <title> --prompt <text> (--run-at RFC3339 | --daily-at HH:MM | --weekly-at HH:MM --weekday DAY | --monthly-at HH:MM --monthly-day N | --interval 2h)")
+	}
+	if !opts.hasSchedule() {
+		return opts, fmt.Errorf("schedule time is required: use --run-at for one-shot tasks, or an explicit recurring option such as --daily-at/--interval")
 	}
 	return opts, nil
+}
+
+func (o scheduleCreateOptions) hasSchedule() bool {
+	return strings.TrimSpace(o.RunAt) != "" ||
+		strings.TrimSpace(o.DailyAt) != "" ||
+		strings.TrimSpace(o.WeeklyAt) != "" ||
+		strings.TrimSpace(o.Weekday) != "" ||
+		len(o.Weekdays) > 0 ||
+		strings.TrimSpace(o.MonthlyAt) != "" ||
+		o.MonthlyDay > 0 ||
+		strings.TrimSpace(o.Interval) != ""
 }
 
 func parseScheduleProposalStatus(args []string) (string, error) {
@@ -1056,29 +1079,29 @@ type testCommandOptions struct {
 }
 
 type taskReport struct {
-	Title          string
-	Question       string
-	Result         string
-	ReplyText      string
-	Failed         bool
-	AwaitConfirm   bool
-	AwaitUserInput bool
+	Title             string
+	Question          string
+	Result            string
+	ReplyText         string
+	Failed            bool
+	AwaitConfirm      bool
+	AwaitUserInput    bool
 	FinalAcceptStatus string
 	FinalAcceptReason string
-	TraceID        string
-	TraceFile      string
-	SessionKey     string
-	Channel        string
-	UserID         string
-	ThreadID       string
-	Home           string
-	ProjectRoot    string
-	GeneratedAt    time.Time
-	QualityNotes   []string
-	Skills         []skillEvent
-	Events         []map[string]any
-	Plan           any
-	ToolResults    []any
+	TraceID           string
+	TraceFile         string
+	SessionKey        string
+	Channel           string
+	UserID            string
+	ThreadID          string
+	Home              string
+	ProjectRoot       string
+	GeneratedAt       time.Time
+	QualityNotes      []string
+	Skills            []skillEvent
+	Events            []map[string]any
+	Plan              any
+	ToolResults       []any
 }
 
 type skillEvent struct {
@@ -1357,27 +1380,27 @@ func parseTestOptions(args []string) (testCommandOptions, error) {
 func buildTaskReport(a *app.App, opts testCommandOptions, msg channel.InboundMessage, resp runtimepkg.Response) (taskReport, error) {
 	traceID := firstNonEmptyLocal(resp.TraceID, traceIDForMessageLocal(msg))
 	report := taskReport{
-		Title:          opts.Title,
-		Question:       opts.Message,
-		Result:         firstNonEmptyLocal(resp.Reply.Text, ""),
-		ReplyText:      resp.Reply.Text,
-		Failed:         resp.Failed,
-		AwaitConfirm:   resp.AwaitConfirm,
-		AwaitUserInput: resp.AwaitUserInput,
+		Title:             opts.Title,
+		Question:          opts.Message,
+		Result:            firstNonEmptyLocal(resp.Reply.Text, ""),
+		ReplyText:         resp.Reply.Text,
+		Failed:            resp.Failed,
+		AwaitConfirm:      resp.AwaitConfirm,
+		AwaitUserInput:    resp.AwaitUserInput,
 		FinalAcceptStatus: resp.FinalAcceptStatus,
 		FinalAcceptReason: resp.FinalAcceptReason,
-		TraceID:        traceID,
-		SessionKey:     msg.SessionKey,
-		Channel:        msg.Channel,
-		UserID:         msg.UserID,
-		ThreadID:       msg.ThreadID,
-		Home:           a.Config.App.Home,
-		ProjectRoot:    firstNonEmptyLocal(opts.ProjectRoot, a.Runtime.ToolCtx.ProjectRoot),
-		GeneratedAt:    time.Now(),
-		QualityNotes:   qualityNotesForReport(opts.Message, resp),
-		Skills:         collectSkillsForReport(traceID, a.Config.App.Home),
-		Plan:           resp.Plan,
-		ToolResults:    make([]any, 0, len(resp.Results)),
+		TraceID:           traceID,
+		SessionKey:        msg.SessionKey,
+		Channel:           msg.Channel,
+		UserID:            msg.UserID,
+		ThreadID:          msg.ThreadID,
+		Home:              a.Config.App.Home,
+		ProjectRoot:       firstNonEmptyLocal(opts.ProjectRoot, a.Runtime.ToolCtx.ProjectRoot),
+		GeneratedAt:       time.Now(),
+		QualityNotes:      qualityNotesForReport(opts.Message, resp),
+		Skills:            collectSkillsForReport(traceID, a.Config.App.Home),
+		Plan:              resp.Plan,
+		ToolResults:       make([]any, 0, len(resp.Results)),
 	}
 	for _, result := range resp.Results {
 		report.ToolResults = append(report.ToolResults, result)

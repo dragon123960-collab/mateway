@@ -21,6 +21,8 @@ type LearningConfig struct {
 
 type TaskOutcome struct {
 	AgentID        string
+	Channel        string
+	SessionKey     string
 	TraceID        string
 	TaskID         string
 	Intent         string
@@ -89,6 +91,9 @@ func (s Store) ProcessTask(outcome TaskOutcome, cfg LearningConfig) (ProcessResu
 	if !cfg.Enabled || !outcome.Success || outcome.Failed || outcome.AwaitConfirm || outcome.AwaitUserInput {
 		return ProcessResult{}, nil
 	}
+	if shouldSkipLearningOutcome(outcome) {
+		return ProcessResult{}, nil
+	}
 	if strings.TrimSpace(outcome.AgentID) == "" {
 		outcome.AgentID = "main"
 	}
@@ -151,6 +156,43 @@ func (s Store) ProcessTask(outcome TaskOutcome, cfg LearningConfig) (ProcessResu
 		result.CandidatePath = path
 	}
 	return result, nil
+}
+
+func shouldSkipLearningOutcome(outcome TaskOutcome) bool {
+	fields := []string{
+		outcome.Channel,
+		outcome.SessionKey,
+		outcome.TraceID,
+		outcome.TaskID,
+	}
+	for _, field := range fields {
+		if looksLikeTestIdentifier(field) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeTestIdentifier(value string) bool {
+	text := strings.ToLower(strings.TrimSpace(value))
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"test:",
+		"test-",
+		"-test",
+		"cli-test",
+		"feishu-test",
+		"schedule:test",
+		"eval",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func PatternKey(outcome TaskOutcome) string {
