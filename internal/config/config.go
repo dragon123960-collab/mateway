@@ -38,8 +38,12 @@ type SecurityConfig struct {
 }
 
 type SearchConfig struct {
-	DefaultTool string                `yaml:"default_tool"`
-	Providers   SearchProvidersConfig `yaml:"providers"`
+	DefaultTool        string                `yaml:"default_tool"`
+	ProviderOrder      []string              `yaml:"provider_order"`
+	CacheEnabled       bool                  `yaml:"cache_enabled"`
+	CacheTTLHours      int                   `yaml:"cache_ttl_hours"`
+	FreshCacheTTLHours int                   `yaml:"fresh_cache_ttl_hours"`
+	Providers          SearchProvidersConfig `yaml:"providers"`
 }
 
 type SearchProvidersConfig struct {
@@ -54,6 +58,8 @@ type SearchProviderConfig struct {
 	APIKeyEnv      string   `yaml:"api_key_env"`
 	TimeoutSeconds int      `yaml:"timeout_seconds"`
 	MaxResults     int      `yaml:"max_results"`
+	DailyBudget    int      `yaml:"daily_budget"`
+	MonthlyBudget  int      `yaml:"monthly_budget"`
 	SearchDepth    string   `yaml:"search_depth"`
 	Topic          string   `yaml:"topic"`
 	IncludeDomains []string `yaml:"include_domains"`

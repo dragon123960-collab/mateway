@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
@@ -32,6 +34,7 @@ type Runtime struct {
 	Observer  Observer
 	Sessions  session.Store
 	Memory    memory.Store
+	Acceptors *AcceptanceRegistry
 }
 
 type Observer interface {
@@ -44,13 +47,15 @@ type Observer interface {
 }
 
 type Response struct {
-	Reply          channel.OutboundMessage
-	TraceID        string
-	Plan           model.Plan
-	Results        []model.ToolResult
-	AwaitConfirm   bool
-	AwaitUserInput bool
-	Failed         bool
+	Reply             channel.OutboundMessage
+	TraceID           string
+	Plan              model.Plan
+	Results           []model.ToolResult
+	AwaitConfirm      bool
+	AwaitUserInput    bool
+	Failed            bool
+	FinalAcceptStatus string
+	FinalAcceptReason string
 }
 
 func New(cfg *config.Root, planner model.Planner, registry *tool.Registry, logger observer.Logger, projectRoot string) Runtime {
@@ -74,6 +79,7 @@ func New(cfg *config.Root, planner model.Planner, registry *tool.Registry, logge
 		MaxSteps:  6,
 		Sessions:  session.NewFileStore(filepath.Join(home, "run", "sessions")),
 		Memory:    memory.NewStore(ctx.Workspace),
+		Acceptors: NewAcceptanceRegistry(),
 	}
 }
 
@@ -89,15 +95,24 @@ func BuildToolContext(cfg *config.Root, projectRoot string) tool.Context {
 		workspace = cfg.App.Workspace
 		allowed = append(allowed, cfg.Security.AccessiblePaths...)
 		search = tool.SearchConfig{
-			TavilyEnabled:        cfg.Search.Providers.Tavily.Enabled,
-			TavilyBaseURL:        cfg.Search.Providers.Tavily.BaseURL,
-			TavilyAPIKey:         cfg.Search.Providers.Tavily.ResolvedAPIKey(),
-			TavilyMaxResults:     cfg.Search.Providers.Tavily.MaxResults,
-			TavilySearchDepth:    cfg.Search.Providers.Tavily.SearchDepth,
-			TavilyTopic:          cfg.Search.Providers.Tavily.Topic,
-			DuckDuckGoEnabled:    cfg.Search.Providers.DuckDuckGo.Enabled,
-			DuckDuckGoMaxResults: cfg.Search.Providers.DuckDuckGo.MaxResults,
-			DuckDuckGoRegion:     cfg.Search.Providers.DuckDuckGo.Region,
+			CacheDir:                 filepath.Join(firstNonEmpty(cfg.App.Workspace, cfg.App.Home, config.DefaultHome()), "web-cache"),
+			CacheEnabled:             cfg.Search.CacheEnabled,
+			CacheTTLHours:            cfg.Search.CacheTTLHours,
+			FreshCacheTTLHours:       cfg.Search.FreshCacheTTLHours,
+			ProviderOrder:            append([]string(nil), cfg.Search.ProviderOrder...),
+			TavilyEnabled:            cfg.Search.Providers.Tavily.Enabled,
+			TavilyBaseURL:            cfg.Search.Providers.Tavily.BaseURL,
+			TavilyAPIKey:             cfg.Search.Providers.Tavily.ResolvedAPIKey(),
+			TavilyTimeoutSeconds:     cfg.Search.Providers.Tavily.TimeoutSeconds,
+			TavilyMaxResults:         cfg.Search.Providers.Tavily.MaxResults,
+			TavilyDailyBudget:        cfg.Search.Providers.Tavily.DailyBudget,
+			TavilyMonthlyBudget:      cfg.Search.Providers.Tavily.MonthlyBudget,
+			TavilySearchDepth:        cfg.Search.Providers.Tavily.SearchDepth,
+			TavilyTopic:              cfg.Search.Providers.Tavily.Topic,
+			DuckDuckGoEnabled:        cfg.Search.Providers.DuckDuckGo.Enabled,
+			DuckDuckGoTimeoutSeconds: cfg.Search.Providers.DuckDuckGo.TimeoutSeconds,
+			DuckDuckGoMaxResults:     cfg.Search.Providers.DuckDuckGo.MaxResults,
+			DuckDuckGoRegion:         cfg.Search.Providers.DuckDuckGo.Region,
 		}
 	}
 	return tool.Context{
@@ -133,75 +148,363 @@ func (r Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respon
 	return loop.Run(ctx)
 }
 
-func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool) ([]model.ToolResult, string) {
+func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string, previousSteps map[string]session.StepState, previousResults []model.ToolResult) ([]model.ToolResult, string) {
 	var results []model.ToolResult
+	approvalConsumed := false
 	steps := plan.Steps
 	if r.MaxSteps > 0 && len(steps) > r.MaxSteps {
 		steps = steps[:r.MaxSteps]
 	}
-	for _, step := range steps {
-		if strings.TrimSpace(step.Tool) == "" {
-			tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "tool is required", Output: "tool is required"}
-			results = append(results, tr)
+	completed := reusableResultsMap(previousSteps, previousResults)
+	for i := 0; i < len(steps); {
+		if failedDep := firstFailedDependency(steps[i], completed); failedDep != "" {
+			result := dependencyFailedResult(steps[i], failedDep)
+			results = append(results, result)
+			completed[result.StepID] = result
+			r.Logger.Event("runtime.step_skipped", map[string]any{"trace_id": traceID, "step_id": steps[i].ID, "tool": steps[i].Tool, "reason": result.Error, "dependency": failedDep})
 			if r.Observer != nil {
-				r.Observer.ToolDone(traceID, tr)
+				r.Observer.ToolDone(traceID, result)
 			}
+			i++
 			continue
 		}
-		r.Logger.Event("runtime.tool_start", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "goal": step.Goal, "risk": step.Risk, "requires_confirm": step.RequiresConfirm})
-		if r.Observer != nil {
-			r.Observer.ToolStart(traceID, step)
-		}
-		def, ok := r.Tools.Get(step.Tool)
-		if !ok {
-			tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "unknown tool", Output: "unknown tool: " + step.Tool}
-			results = append(results, tr)
-			r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "error": tr.Error})
-			if r.Observer != nil {
-				r.Observer.ToolDone(traceID, tr)
-			}
+		if reused, ok := reuseStepResult(steps[i], completed); ok {
+			results = append(results, reused)
+			completed[reused.StepID] = reused
+			i++
 			continue
 		}
-		args := copyArgs(step.Args)
-		delete(args, "confirmed")
-		delete(args, "confirm")
-		needsConfirm := tool.RequireConfirmForTool(step.Tool, args)
-		if needsConfirm && !approvalGranted {
-			tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "await_confirm", Output: confirmPromptForStep(step, args), Evidence: map[string]any{"kind": "step_confirm", "goal": step.Goal, "tool": step.Tool}}
-			results = append(results, tr)
-			r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm"})
-			if r.Observer != nil {
-				r.Observer.ToolDone(traceID, tr)
-			}
-			return results, "await_confirm"
+		batch, next := executableBatch(steps, i, completed, r.Tools)
+		if len(batch) == 0 {
+			batch = []model.PlanStep{steps[i]}
+			next = i + 1
 		}
-		call := tool.Call{Name: step.Tool, Args: args, Confirmed: approvalGranted, Context: r.ToolCtx}
-		result := def.Run(ctx, call)
-		tr := model.ToolResult{
-			StepID:   step.ID,
-			Tool:     step.Tool,
-			OK:       result.OK,
-			Output:   tool.Truncate(result.Output, tool.DefaultOutputLimit),
-			Evidence: result.Evidence,
-			Error:    result.Error,
+		batchResults, control, consumed := r.executeStepBatch(ctx, traceID, batch, approvalGranted, approvedStepID, approvalConsumed)
+		if consumed {
+			approvalConsumed = true
 		}
-		if result.RequiresConfirm {
-			tr.Error = "await_confirm"
-			tr.Output = result.ConfirmMessage
-			results = append(results, tr)
-			r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm", "evidence": result.Evidence})
-			if r.Observer != nil {
-				r.Observer.ToolDone(traceID, tr)
-			}
-			return results, "await_confirm"
+		results = append(results, batchResults...)
+		for _, result := range batchResults {
+			completed[result.StepID] = result
 		}
-		results = append(results, tr)
-		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": tr.OK, "error": tr.Error, "output_chars": len(tr.Output), "evidence": tr.Evidence})
+		if control != "" {
+			return results, control
+		}
+		i = next
+	}
+	return results, ""
+}
+
+func executableBatch(steps []model.PlanStep, start int, completed map[string]model.ToolResult, registry *tool.Registry) ([]model.PlanStep, int) {
+	if start >= len(steps) {
+		return nil, start
+	}
+	first := steps[start]
+	if !stepDependenciesSatisfied(first, completed) || !stepCanRunParallel(first, registry) {
+		return []model.PlanStep{first}, start + 1
+	}
+	batch := []model.PlanStep{first}
+	scopes := map[string]struct{}{parallelScope(first, registry): {}}
+	for i := start + 1; i < len(steps) && len(batch) < 3; i++ {
+		step := steps[i]
+		if !stepDependenciesSatisfied(step, completed) || !stepCanRunParallel(step, registry) {
+			break
+		}
+		scope := parallelScope(step, registry)
+		if scope == "" {
+			scope = "step:" + step.ID
+		}
+		if _, exists := scopes[scope]; exists {
+			break
+		}
+		batch = append(batch, step)
+		scopes[scope] = struct{}{}
+	}
+	if len(batch) == 1 {
+		return batch, start + 1
+	}
+	return batch, start + len(batch)
+}
+
+func stepDependenciesSatisfied(step model.PlanStep, completed map[string]model.ToolResult) bool {
+	for _, dep := range step.DependsOn {
+		result, ok := completed[strings.TrimSpace(dep)]
+		if !ok || !result.OK {
+			return false
+		}
+	}
+	return true
+}
+
+func firstFailedDependency(step model.PlanStep, completed map[string]model.ToolResult) string {
+	for _, dep := range step.DependsOn {
+		dep = strings.TrimSpace(dep)
+		if dep == "" {
+			continue
+		}
+		result, ok := completed[dep]
+		if ok && !result.OK {
+			return dep
+		}
+	}
+	return ""
+}
+
+func dependencyFailedResult(step model.PlanStep, dep string) model.ToolResult {
+	reason := "dependency_failed: " + dep
+	return model.ToolResult{
+		StepID: step.ID,
+		Tool:   step.Tool,
+		OK:     false,
+		Error:  "dependency_failed",
+		Output: reason,
+		Evidence: map[string]any{
+			"kind":       "dependency_failed",
+			"dependency": dep,
+		},
+	}
+}
+
+func stepCanRunParallel(step model.PlanStep, registry *tool.Registry) bool {
+	def, ok := registry.Get(step.Tool)
+	if !ok {
+		return false
+	}
+	if def.Risk != tool.RiskSafeRead {
+		return false
+	}
+	switch def.Metadata.ParallelMode {
+	case tool.ParallelReadOnlyOK, tool.ParallelIsolatedOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+func parallelScope(step model.PlanStep, registry *tool.Registry) string {
+	def, ok := registry.Get(step.Tool)
+	if !ok {
+		return ""
+	}
+	scope := strings.TrimSpace(def.Metadata.ResourceScope)
+	if strings.Contains(scope, "filesystem") {
+		if path := strings.TrimSpace(step.Args["path"]); path != "" {
+			return scope + ":" + path
+		}
+	}
+	if strings.Contains(scope, "query") {
+		if q := strings.TrimSpace(firstNonEmpty(step.Args["query"], step.Args["q"])); q != "" {
+			return scope + ":" + q
+		}
+	}
+	return scope
+}
+
+func (r Runtime) executeStepBatch(ctx context.Context, traceID string, batch []model.PlanStep, approvalGranted bool, approvedStepID string, approvalConsumed bool) ([]model.ToolResult, string, bool) {
+	if len(batch) == 1 {
+		result, control, consumed := r.executeSingleStep(ctx, traceID, batch[0], approvalGranted, approvedStepID, approvalConsumed)
+		return []model.ToolResult{result}, control, consumed
+	}
+	type item struct {
+		index    int
+		result   model.ToolResult
+		control  string
+		consumed bool
+	}
+	out := make([]item, len(batch))
+	var wg sync.WaitGroup
+	for i, step := range batch {
+		wg.Add(1)
+		go func(index int, current model.PlanStep) {
+			defer wg.Done()
+			result, control, consumed := r.executeSingleStep(ctx, traceID, current, approvalGranted, approvedStepID, approvalConsumed)
+			out[index] = item{index: index, result: result, control: control, consumed: consumed}
+		}(i, step)
+	}
+	wg.Wait()
+	sort.Slice(out, func(i, j int) bool { return out[i].index < out[j].index })
+	results := make([]model.ToolResult, 0, len(out))
+	consumed := approvalConsumed
+	for _, item := range out {
+		results = append(results, item.result)
+		if item.consumed {
+			consumed = true
+		}
+	}
+	for _, item := range out {
+		if item.control != "" {
+			return results, item.control, consumed
+		}
+	}
+	return results, "", consumed
+}
+
+func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step model.PlanStep, approvalGranted bool, approvedStepID string, approvalConsumed bool) (model.ToolResult, string, bool) {
+	consumed := approvalConsumed
+	if strings.TrimSpace(step.Tool) == "" {
+		tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "tool is required", Output: "tool is required"}
 		if r.Observer != nil {
 			r.Observer.ToolDone(traceID, tr)
 		}
+		return tr, "", consumed
 	}
-	return results, ""
+	r.Logger.Event("runtime.tool_start", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "goal": step.Goal, "risk": step.Risk, "requires_confirm": step.RequiresConfirm})
+	if r.Observer != nil {
+		r.Observer.ToolStart(traceID, step)
+	}
+	def, ok := r.Tools.Get(step.Tool)
+	if !ok {
+		tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "unknown tool", Output: "unknown tool: " + step.Tool}
+		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "error": tr.Error})
+		if r.Observer != nil {
+			r.Observer.ToolDone(traceID, tr)
+		}
+		return tr, "", consumed
+	}
+	args := copyArgs(step.Args)
+	delete(args, "confirmed")
+	delete(args, "confirm")
+	needsConfirm := tool.RequireConfirmForTool(step.Tool, args)
+	stepApproved := false
+	if approvalGranted {
+		switch {
+		case approvedStepID != "" && strings.TrimSpace(step.ID) == strings.TrimSpace(approvedStepID):
+			stepApproved = true
+		case approvedStepID == "" && needsConfirm && !approvalConsumed:
+			stepApproved = true
+		}
+	}
+	if needsConfirm && !stepApproved {
+		tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "await_confirm", Output: confirmPromptForStep(step, args), Evidence: map[string]any{"kind": "step_confirm", "goal": step.Goal, "tool": step.Tool, "step_id": step.ID}}
+		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm"})
+		if r.Observer != nil {
+			r.Observer.ToolDone(traceID, tr)
+		}
+		return tr, "await_confirm", consumed
+	}
+	call := tool.Call{Name: step.Tool, Args: args, Confirmed: stepApproved, Context: r.ToolCtx}
+	if stepApproved {
+		consumed = true
+	}
+	result := def.Run(ctx, call)
+	tr := model.ToolResult{
+		StepID:   step.ID,
+		Tool:     step.Tool,
+		OK:       result.OK,
+		Output:   tool.Truncate(result.Output, tool.DefaultOutputLimit),
+		Evidence: result.Evidence,
+		Error:    result.Error,
+	}
+	if result.RequiresConfirm {
+		tr.Error = "await_confirm"
+		tr.Output = result.ConfirmMessage
+		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm", "evidence": result.Evidence})
+		if r.Observer != nil {
+			r.Observer.ToolDone(traceID, tr)
+		}
+		return tr, "await_confirm", consumed
+	}
+	accept := codeAcceptStep(step, tr, def, r.Acceptors)
+	if shouldLLMAcceptStep(step, def, accept, nil) {
+		accept = llmAcceptStep(ctx, r.Model, step.Goal, step, tr, def, r.Acceptors)
+	}
+	r.Logger.Event("runtime.step_accept", map[string]any{
+		"trace_id": traceID,
+		"step_id":  step.ID,
+		"tool":     step.Tool,
+		"status":   accept.Status,
+		"reason":   accept.Reason,
+		"source":   accept.Source,
+	})
+	if accept.Status == AcceptanceHardFail {
+		tr.OK = false
+		tr.Error = "step_verification_failed"
+		tr.Output = strings.TrimSpace(tr.Output + "\n\nverification failed:\n" + firstNonEmpty(accept.Reason, "step rejected"))
+		r.Logger.Event("runtime.execution_drift", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "errors": []string{accept.Reason}})
+		if r.Observer != nil {
+			r.Observer.ToolDone(traceID, tr)
+		}
+		return tr, "", consumed
+	}
+	if accept.Status == AcceptanceUsable {
+		tr.OK = true
+		tr.Error = ""
+		r.Logger.Event("runtime.execution_usable", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "reason": accept.Reason})
+	}
+	if accept.Status == AcceptanceSuspect {
+		tr.OK = false
+		tr.Error = "step_acceptance_suspect"
+		if accept.Reason != "" {
+			tr.Output = strings.TrimSpace(tr.Output + "\n\nacceptance suspect:\n" + accept.Reason)
+		}
+		r.Logger.Event("runtime.execution_drift", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "errors": []string{accept.Reason}})
+		if r.Observer != nil {
+			r.Observer.ToolDone(traceID, tr)
+		}
+		return tr, "", consumed
+	}
+	r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": tr.OK, "error": tr.Error, "output_chars": len(tr.Output), "evidence": tr.Evidence})
+	if r.Observer != nil {
+		r.Observer.ToolDone(traceID, tr)
+	}
+	return tr, "", consumed
+}
+
+func (r Runtime) ExecutePlanForEval(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string) ([]model.ToolResult, string) {
+	return r.executePlan(ctx, traceID, plan, approvalGranted, approvedStepID, nil, nil)
+}
+
+func reusableResultsMap(previousSteps map[string]session.StepState, previousResults []model.ToolResult) map[string]model.ToolResult {
+	out := map[string]model.ToolResult{}
+	for id, prev := range previousSteps {
+		if prev.Status != "passed" && prev.Status != "usable" {
+			continue
+		}
+		out[id] = model.ToolResult{
+			StepID:   prev.ID,
+			Tool:     prev.Tool,
+			OK:       prev.ResultOK,
+			Output:   prev.ResultSummary,
+			Evidence: prev.Evidence,
+			Error:    prev.ResultError,
+		}
+	}
+	for _, prev := range previousResults {
+		if !prev.OK {
+			continue
+		}
+		out[strings.TrimSpace(prev.StepID)] = prev
+	}
+	return out
+}
+
+func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult) (model.ToolResult, bool) {
+	if reusable == nil {
+		return model.ToolResult{}, false
+	}
+	id := strings.TrimSpace(step.ID)
+	if id == "" {
+		return model.ToolResult{}, false
+	}
+	prev, ok := reusable[id]
+	if !ok {
+		return model.ToolResult{}, false
+	}
+	if strings.TrimSpace(prev.Tool) != strings.TrimSpace(step.Tool) || !prev.OK {
+		return model.ToolResult{}, false
+	}
+	if !stepReusable(step, prev) {
+		return model.ToolResult{}, false
+	}
+	return prev, true
+}
+
+func stepReusable(step model.PlanStep, result model.ToolResult) bool {
+	switch strings.TrimSpace(step.Tool) {
+	case "time.now":
+		return false
+	}
+	return len(result.Evidence) > 0
 }
 
 func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results []model.ToolResult, err error) Response {
@@ -213,6 +516,8 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 		Reply:   r.sanitizeReply(channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: userFacingError(err), Style: "error"}),
 		TraceID: traceIDForMessage(msg),
 		Plan:    p, Results: results, Failed: true,
+		FinalAcceptStatus: string(AcceptanceRejected),
+		FinalAcceptReason: err.Error(),
 	}
 }
 
@@ -223,7 +528,10 @@ func userFacingError(err error) string {
 	text := err.Error()
 	lower := strings.ToLower(text)
 	if strings.Contains(lower, "insufficient tool evidence") {
-		return "我没有拿到足够的工具证据，所以先停下，避免给出没有依据的结论。你可以再试一次，我会先读取相关项目证据。"
+		return "我没有拿到足够的工具证据，所以先停下，避免给出没有依据的结论。你可以稍后重试，或补充可用来源/文件路径后让我继续。"
+	}
+	if strings.Contains(lower, "plan contract verification") {
+		return "我生成的执行计划没有通过合同校验，已经尝试自动修复一次，但仍缺少必要工具参数、依赖或证据设计，所以先停下。"
 	}
 	if strings.Contains(lower, "unexpected eof") ||
 		strings.Contains(lower, "model request") ||
@@ -239,7 +547,7 @@ func userFacingError(err error) string {
 
 func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
 	switch step.Tool {
-	case "shell.run":
+	case "shell.run", "terminal.run":
 		command := strings.TrimSpace(args["command"])
 		if command != "" {
 			return "这个命令可能会修改或删除本地内容，执行前需要你确认。\n\n命令：`" + command + "`\n\n回复“确认”继续执行，或回复“取消”放弃。"
@@ -249,12 +557,46 @@ func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
 		if path != "" {
 			return "这个文件操作会修改本地文件，执行前需要你确认。\n\n文件：" + path + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
 		}
+	case "skill.install":
+		name := firstNonEmpty(args["name"], args["url"], args["query"])
+		if name != "" {
+			text := "这个操作会安装一个 agent skill，执行前需要你确认。\n\n技能：" + name
+			if source := strings.TrimSpace(args["url"]); source != "" {
+				text += "\n来源：" + source
+			}
+			return text + "\n目标：Mateway workspace 的 skills 目录\n\n回复“确认”继续执行，或回复“取消”放弃。"
+		}
+	case "software.install":
+		command := strings.TrimSpace(args["command"])
+		verify := strings.TrimSpace(args["verify_command"])
+		if verify == "" {
+			verify = softwareInstallVerifyCommand(args["executable"])
+		}
+		if command != "" {
+			text := "这个安装操作会修改本地环境，执行前需要你确认。\n\n安装命令：`" + command + "`"
+			if verify != "" {
+				text += "\n验证命令：`" + verify + "`"
+			}
+			if source := strings.TrimSpace(args["source_url"]); source != "" {
+				text += "\n来源：" + source
+			}
+			return text + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
+		}
 	}
 	goal := strings.TrimSpace(step.Goal)
 	if goal == "" {
 		goal = step.Tool
 	}
 	return "这一步需要你确认后我才能继续。\n\n操作：" + goal + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
+}
+
+func softwareInstallVerifyCommand(executable string) string {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return ""
+	}
+	quoted := "'" + strings.ReplaceAll(executable, "'", "'\\''") + "'"
+	return "command -v " + quoted + " && " + quoted + " --version"
 }
 
 func (r Runtime) sanitizeReply(reply channel.OutboundMessage) channel.OutboundMessage {
@@ -273,14 +615,14 @@ func hasRepairableFailure(results []model.ToolResult) bool {
 	return false
 }
 
-func needsGroundedProjectEvidence(user string, results []model.ToolResult) bool {
-	if !requiresProjectEvidence(user) {
+func needsGroundingEvidence(user string, results []model.ToolResult) bool {
+	if !requiresGroundingEvidence(user) {
 		return false
 	}
 	return !hasGroundingEvidence(results)
 }
 
-func requiresProjectEvidence(user string) bool {
+func requiresGroundingEvidence(user string) bool {
 	normalized := normalizeIntentText(user)
 	if normalized == "" {
 		return false
@@ -288,7 +630,19 @@ func requiresProjectEvidence(user string) bool {
 	hasLocalSubject := strings.Contains(normalized, "mateway") ||
 		textmatch.ContainsGroup(normalized, "project_subject")
 	hasKnowledgeAction := textmatch.ContainsGroup(normalized, "project_action")
-	return hasLocalSubject && hasKnowledgeAction
+	if hasLocalSubject && hasKnowledgeAction {
+		return true
+	}
+	if strings.Contains(normalized, "文件") || strings.Contains(normalized, "文档") || strings.Contains(normalized, "readme") {
+		return strings.Contains(normalized, "总结") || strings.Contains(normalized, "读取") || strings.Contains(normalized, "内容")
+	}
+	if strings.Contains(normalized, "安装") || strings.Contains(normalized, "install") {
+		return true
+	}
+	if strings.Contains(normalized, "最新") || strings.Contains(normalized, "current") || strings.Contains(normalized, "today") {
+		return true
+	}
+	return false
 }
 
 func hasGroundingEvidence(results []model.ToolResult) bool {
@@ -297,14 +651,38 @@ func hasGroundingEvidence(results []model.ToolResult) bool {
 			continue
 		}
 		switch strings.TrimSpace(result.Tool) {
-		case "file.read", "file.summary", "project.index":
+		case "file.read", "file.summary", "project.index", "web.search", "web.fetch", "software.search", "skill.search", "software.install", "skill.install", "terminal.run":
 			return true
 		}
-		if kind, _ := result.Evidence["kind"].(string); kind == "file_read" || kind == "file_summary" || kind == "project_index" {
+		if kind, _ := result.Evidence["kind"].(string); groundingEvidenceKind(kind) {
 			return true
 		}
 	}
 	return false
+}
+
+func groundingEvidenceKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "file_read", "file_summary", "project_index", "web_search", "web_fetch", "software_search", "skill_search", "software_install", "skill_install", "terminal", "shell", "memory_search", "memory_index", "schedule_create", "schedule_list", "schedule_show", "schedule_pause", "schedule_resume", "schedule_update", "schedule_delete":
+		return true
+	default:
+		return false
+	}
+}
+
+func repairReasonFromResults(results []model.ToolResult) string {
+	for _, result := range results {
+		if result.OK {
+			continue
+		}
+		if result.Error != "" {
+			return result.Error
+		}
+		if strings.TrimSpace(result.Output) != "" {
+			return strings.TrimSpace(result.Output)
+		}
+	}
+	return ""
 }
 
 func normalizeIntentText(text string) string {

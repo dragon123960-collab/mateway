@@ -101,6 +101,11 @@ func LoadDefinition(dir string) (Definition, error) {
 		WhenContains:     meta.WhenContains,
 		WhenResultKinds:  meta.WhenResultKinds,
 		WhenUserLanguage: meta.WhenUserLanguage,
+		UseFor:           meta.UseFor,
+		Produces:         meta.Produces,
+		AcceptanceMode:   meta.AcceptanceMode,
+		ParallelMode:     meta.ParallelMode,
+		AcceptancePrompt: meta.AcceptancePrompt,
 		Instruction:      strings.TrimSpace(body),
 		Dir:              dir,
 	}, nil

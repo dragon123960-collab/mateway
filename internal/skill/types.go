@@ -10,6 +10,11 @@ type Definition struct {
 	WhenContains     []string
 	WhenResultKinds  []string
 	WhenUserLanguage string
+	UseFor           []string
+	Produces         []string
+	AcceptanceMode   string
+	ParallelMode     string
+	AcceptancePrompt string
 	Dir              string
 	Instruction      string
 }

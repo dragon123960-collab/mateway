@@ -43,6 +43,19 @@ func (r *Registry) Definitions() []Definition {
 	names := r.Names()
 	out := make([]Definition, 0, len(names))
 	for _, name := range names {
+		def := r.tools[name]
+		if def.Hidden {
+			continue
+		}
+		out = append(out, def)
+	}
+	return out
+}
+
+func (r *Registry) AllDefinitions() []Definition {
+	names := r.Names()
+	out := make([]Definition, 0, len(names))
+	for _, name := range names {
 		out = append(out, r.tools[name])
 	}
 	return out
@@ -51,6 +64,18 @@ func (r *Registry) Definitions() []Definition {
 func (r *Registry) Names() []string {
 	names := make([]string, 0, len(r.tools))
 	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (r *Registry) VisibleNames() []string {
+	names := make([]string, 0, len(r.tools))
+	for name, def := range r.tools {
+		if def.Hidden {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)

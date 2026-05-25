@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/model"
+	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
 	"github.com/dongping/mateway/internal/tool"
 )
@@ -23,8 +24,10 @@ type agentPromptFiles struct {
 }
 
 type promptContextOptions struct {
-	ShortMemory string
-	LongMemory  string
+	ShortMemory   string
+	LongMemory    string
+	Understanding taskUnderstanding
+	CurrentTask   *session.TaskState
 }
 
 func buildModelContextPrompt(msg string, stage string, matches []skill.Match, toolDefs []tool.Definition, toolCtx tool.Context, opts ...promptContextOptions) string {
@@ -61,6 +64,12 @@ func buildModelContextPrompt(msg string, stage string, matches []skill.Match, to
 	}
 	if memory := strings.TrimSpace(option.LongMemory); memory != "" {
 		sections = append(sections, "", "Relevant long memory:", memory)
+	}
+	if understanding := renderUnderstanding(option.Understanding); understanding != "" {
+		sections = append(sections, "", "Task understanding:", understanding)
+	}
+	if progress := renderCurrentTaskProgress(option.CurrentTask); progress != "" {
+		sections = append(sections, "", "Current execution progress:", progress)
 	}
 	if selected := renderSelectedSkills(matches); selected != "" {
 		sections = append(sections, "", "Selected skills:", selected)
@@ -159,6 +168,74 @@ func renderSelectedSkills(matches []skill.Match) string {
 		if strings.TrimSpace(match.Reason) != "" {
 			line += " (" + match.Reason + ")"
 		}
+		if len(match.Definition.UseFor) > 0 {
+			line += "\n  use_for: " + strings.Join(match.Definition.UseFor, ", ")
+		}
+		if len(match.Definition.Produces) > 0 {
+			line += "\n  produces: " + strings.Join(match.Definition.Produces, ", ")
+		}
+		if strings.TrimSpace(match.Definition.AcceptanceMode) != "" {
+			line += "\n  acceptance_mode: " + match.Definition.AcceptanceMode
+		}
+		if strings.TrimSpace(match.Definition.ParallelMode) != "" {
+			line += "\n  parallel_mode: " + match.Definition.ParallelMode
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderUnderstanding(understanding taskUnderstanding) string {
+	if strings.TrimSpace(understanding.Goal) == "" {
+		return ""
+	}
+	lines := []string{"- goal: " + understanding.Goal}
+	if len(understanding.Capabilities) > 0 {
+		lines = append(lines, "- capabilities: "+strings.Join(understanding.Capabilities, ", "))
+	}
+	if len(understanding.CompletionDraft) > 0 {
+		lines = append(lines, "- completion_draft: "+strings.Join(understanding.CompletionDraft, " | "))
+	}
+	if len(understanding.EvidenceHints) > 0 {
+		lines = append(lines, "- evidence_hints: "+strings.Join(understanding.EvidenceHints, " | "))
+	}
+	if len(understanding.Constraints) > 0 {
+		lines = append(lines, "- constraints: "+strings.Join(understanding.Constraints, ", "))
+	}
+	if strings.TrimSpace(understanding.RiskLevel) != "" {
+		lines = append(lines, "- risk_level: "+understanding.RiskLevel)
+	}
+	if understanding.NeedsGrounding {
+		lines = append(lines, "- needs_grounding: true")
+	}
+	if understanding.NeedsMutation {
+		lines = append(lines, "- needs_mutation: true")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderCurrentTaskProgress(task *session.TaskState) string {
+	if task == nil || len(task.StepOrder) == 0 || len(task.StepStates) == 0 {
+		return ""
+	}
+	lines := []string{}
+	if strings.TrimSpace(task.ExecutionStatus) != "" {
+		lines = append(lines, "- execution_status: "+task.ExecutionStatus)
+	}
+	lines = append(lines, "- completed_steps should not be repeated unless the plan has materially changed.")
+	lines = append(lines, "Step progress:")
+	for _, id := range task.StepOrder {
+		step, ok := task.StepStates[id]
+		if !ok {
+			continue
+		}
+		line := "- " + id + " status=" + firstNonEmpty(step.Status, "unknown") + " tool=" + firstNonEmpty(step.Tool, "unknown")
+		if strings.TrimSpace(step.AcceptanceStatus) != "" {
+			line += " acceptance=" + step.AcceptanceStatus
+		}
+		if strings.TrimSpace(step.ResultSummary) != "" {
+			line += " result=" + compactText(step.ResultSummary, 120)
+		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
@@ -170,7 +247,26 @@ func renderToolNames(defs []tool.Definition) string {
 	}
 	names := make([]string, 0, len(defs))
 	for _, def := range defs {
-		names = append(names, fmt.Sprintf("- %s: %s", def.Name, def.Description))
+		line := fmt.Sprintf("- %s: %s", def.Name, def.Description)
+		if len(def.Metadata.WhenToUse) > 0 {
+			line += "\n  when_to_use: " + strings.Join(def.Metadata.WhenToUse, ", ")
+		}
+		if len(def.Metadata.WhenNotToUse) > 0 {
+			line += "\n  when_not_to_use: " + strings.Join(def.Metadata.WhenNotToUse, ", ")
+		}
+		if len(def.Metadata.OutputContract) > 0 {
+			line += "\n  output_contract: " + strings.Join(def.Metadata.OutputContract, ", ")
+		}
+		if def.Metadata.AcceptanceMode != "" {
+			line += "\n  acceptance_mode: " + string(def.Metadata.AcceptanceMode)
+		}
+		if def.Metadata.ParallelMode != "" {
+			line += "\n  parallel_mode: " + string(def.Metadata.ParallelMode)
+		}
+		if strings.TrimSpace(def.Metadata.ResourceScope) != "" {
+			line += "\n  resource_scope: " + def.Metadata.ResourceScope
+		}
+		names = append(names, line)
 	}
 	return strings.Join(names, "\n")
 }

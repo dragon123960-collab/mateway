@@ -18,6 +18,7 @@ const (
 	bindingApprovalReply          = "approval_reply"
 	bindingPendingApprovalBlocked = "pending_approval_blocked"
 	bindingReplacePendingApproval = "replace_pending_approval"
+	bindingResumePendingApproval  = "resume_pending_approval"
 	bindingSlotFill               = "slot_fill"
 	bindingActiveFollowup         = "active_followup"
 	bindingOpenTaskFollowup       = "open_task_followup"
@@ -38,6 +39,7 @@ type taskBindingDecision struct {
 	FilledFields    map[string]string
 	ClarifyPrompt   string
 	ApprovalGranted bool
+	ApprovalStepID  string
 }
 
 func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision {
@@ -46,7 +48,19 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 		"session_key": l.state.message.SessionKey,
 		"active_task": l.state.session.ActiveTaskID,
 	})
+	if len(l.state.session.Tasks) == 0 && shouldTreatEmptySessionAsNewTask(l.state.message.Text) {
+		return taskBindingDecision{
+			Kind:          bindingNewTask,
+			TargetTaskID:  l.state.traceID,
+			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
+			Reason:        "session has no existing tasks; treating input as a new task",
+			Confidence:    0.99,
+		}
+	}
 	if decision, ok := l.resolveApprovalReply(); ok {
+		return decision
+	}
+	if decision, ok := l.resolveSuspendedApprovalReply(); ok {
 		return decision
 	}
 	if decision, ok := l.resolvePendingApprovalBlock(); ok {
@@ -70,6 +84,23 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 	}
 }
 
+func shouldTreatEmptySessionAsNewTask(text string) bool {
+	normalized := normalizeFollowupText(text)
+	if normalized == "" {
+		return false
+	}
+	newTaskCues := []string{
+		"帮我", "帮忙", "看看", "诊断", "搜索", "总结", "安装", "创建", "删除", "更新", "检查", "运行",
+		"diagnose", "check", "search", "summarize", "install", "create", "delete", "update", "run",
+	}
+	for _, cue := range newTaskCues {
+		if strings.Contains(normalized, cue) {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 	l.state.binding = decision
 	l.state.resolvedQuery = firstNonEmpty(decision.ResolvedQuery, l.state.message.Text)
@@ -89,14 +120,6 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 		l.saveConversationOnly(resp)
 		return &resp
 	case bindingReplacePendingApproval:
-		if active != nil {
-			active.Status = session.TaskAbandoned
-			active.PendingApproval = nil
-			active.PendingQuestions = nil
-			active.PendingFields = nil
-			active.UpdatedAt = l.state.startedAt
-			l.state.session.Tasks[active.ID] = *active
-		}
 		task := session.TaskState{
 			ID:            decision.TargetTaskID,
 			TraceID:       l.state.traceID,
@@ -168,7 +191,14 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 			task.UpdatedAt = l.state.startedAt
 			if decision.Kind == bindingApprovalReply {
 				task.Status = session.TaskOpen
-				task.PendingApproval = nil
+				if decision.ApprovalGranted && decision.ApprovalStepID != "" {
+					task.PendingApproval = &session.PendingApproval{
+						ApprovalType:    "boolean_confirm",
+						RequestedAction: "approved:" + decision.ApprovalStepID,
+					}
+				} else {
+					task.PendingApproval = nil
+				}
 				task.PendingQuestions = nil
 			}
 			if decision.Kind == bindingSlotFill {
@@ -198,13 +228,25 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 		l.state.currentTask = active
 	}
 	if l.state.currentTask != nil {
+		if len(l.state.currentTask.StepStates) > 0 && decision.Kind != bindingNewTask && decision.Kind != bindingHistoricalContinuation {
+			l.state.currentTask.ExecutionStatus = "executing"
+		}
 		l.state.topic = firstNonEmpty(l.state.currentTask.Topic, l.state.topic)
 		l.runtime.Logger.Event("runtime.task_activated", map[string]any{
 			"trace_id":    l.state.traceID,
 			"task_id":     l.state.currentTask.ID,
 			"kind":        decision.Kind,
 			"task_status": l.state.currentTask.Status,
+			"step_states": len(l.state.currentTask.StepStates),
 		})
+		if len(l.state.currentTask.StepStates) > 0 && decision.Kind != bindingNewTask && decision.Kind != bindingHistoricalContinuation {
+			l.runtime.Logger.Event("runtime.task_resume_execution", map[string]any{
+				"trace_id":       l.state.traceID,
+				"task_id":        l.state.currentTask.ID,
+				"execution":      l.state.currentTask.ExecutionStatus,
+				"completed_steps": completedStepCount(l.state.currentTask.StepStates),
+			})
+		}
 		if decision.Kind == bindingSlotFill && len(l.state.currentTask.PendingFields) > 0 {
 			text := firstNonEmpty(strings.Join(l.state.currentTask.PendingQuestions, "\n"), "我还需要你补充一个信息才能继续。")
 			reply := l.runtime.sanitizeReply(channel.OutboundMessage{
@@ -244,6 +286,16 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 	return nil
 }
 
+func completedStepCount(steps map[string]session.StepState) int {
+	count := 0
+	for _, step := range steps {
+		if step.Status == "passed" || step.Status == "usable" {
+			count++
+		}
+	}
+	return count
+}
+
 func (l *AgentLoop) resolveApprovalReply() (taskBindingDecision, bool) {
 	task := session.ActiveTask(l.state.session)
 	if task == nil || task.PendingApproval == nil {
@@ -269,7 +321,33 @@ func (l *AgentLoop) resolveApprovalReply() (taskBindingDecision, bool) {
 			Reason:          "matched approval reply for active task",
 			Confidence:      0.98,
 			ApprovalGranted: approved,
+			ApprovalStepID:  pendingApprovalStepID(task.PendingApproval),
 		}, true
+	}
+	return taskBindingDecision{}, false
+}
+
+func (l *AgentLoop) resolveSuspendedApprovalReply() (taskBindingDecision, bool) {
+	text := normalizeFollowupText(l.state.message.Text)
+	if text == "" {
+		return taskBindingDecision{}, false
+	}
+	for _, task := range suspendedApprovalTasks(l.state.session) {
+		if approved, ok := parseSuspendedApprovalDecision(text, task.PendingApproval); ok {
+			action := "Continue the suspended task"
+			if approved {
+				action = "Continue and approve the suspended task"
+			}
+			return taskBindingDecision{
+				Kind:            bindingApprovalReply,
+				TargetTaskID:    task.ID,
+				ResolvedQuery:   action + ":\n" + firstNonEmpty(task.ResolvedQuery, task.UserText),
+				Reason:          "matched approval reply for suspended pending task",
+				Confidence:      0.93,
+				ApprovalGranted: approved,
+				ApprovalStepID:  pendingApprovalStepID(task.PendingApproval),
+			}, true
+		}
 	}
 	return taskBindingDecision{}, false
 }
@@ -301,6 +379,49 @@ func (l *AgentLoop) resolvePendingApprovalBlock() (taskBindingDecision, bool) {
 		Confidence:    0.95,
 		ClarifyPrompt: "当前还有一个操作等待确认：\n\n" + prompt + "\n\n请先回复“确认”继续，或回复“取消”放弃。处理完以后再发送新的任务。",
 	}, true
+}
+
+func suspendedApprovalTasks(st session.State) []session.TaskState {
+	var out []session.TaskState
+	for i := len(st.TaskOrder) - 1; i >= 0; i-- {
+		id := st.TaskOrder[i]
+		if id == st.ActiveTaskID {
+			continue
+		}
+		task, ok := st.Tasks[id]
+		if ok && task.Status == session.TaskAwaitConfirm && task.PendingApproval != nil {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+func parseSuspendedApprovalDecision(text string, approval *session.PendingApproval) (bool, bool) {
+	if !wantsSuspendedApproval(text) {
+		return false, false
+	}
+	if approved, ok := parseApprovalDecision(text, approval); ok {
+		return approved, true
+	}
+	switch {
+	case textmatch.ContainsGroup(text, "approval_yes") || strings.Contains(text, "yes") || strings.Contains(text, "ok"):
+		return true, true
+	case textmatch.ContainsGroup(text, "approval_no") || strings.Contains(text, "no") || strings.Contains(text, "cancel"):
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func wantsSuspendedApproval(text string) bool {
+	return strings.Contains(text, "刚才") ||
+		strings.Contains(text, "之前") ||
+		strings.Contains(text, "上一个") ||
+		strings.Contains(text, "安装") ||
+		strings.Contains(text, "继续") ||
+		strings.Contains(text, "previous") ||
+		strings.Contains(text, "suspended") ||
+		strings.Contains(text, "install")
 }
 
 func (l *AgentLoop) resolveSlotFill() (taskBindingDecision, bool) {
@@ -624,7 +745,7 @@ func parseApprovalDecision(text string, approval *session.PendingApproval) (bool
 		return false, false
 	}
 	switch approval.ApprovalType {
-	case "boolean_confirm", "schedule_proposal_confirm", "schedule_mutation_confirm", "":
+	case "boolean_confirm", "":
 		switch {
 		case textmatch.ExactGroup(text, "approval_yes") || text == "yes" || text == "y" || text == "ok":
 			return true, true
@@ -639,6 +760,17 @@ func parseApprovalDecision(text string, approval *session.PendingApproval) (bool
 	return false, false
 }
 
+func pendingApprovalStepID(approval *session.PendingApproval) string {
+	if approval == nil {
+		return ""
+	}
+	action := strings.TrimSpace(approval.RequestedAction)
+	if strings.HasPrefix(action, "step:") {
+		return strings.TrimSpace(strings.TrimPrefix(action, "step:"))
+	}
+	return ""
+}
+
 func isPendingApprovalReplacementRequest(text string) bool {
 	normalized := normalizeFollowupText(text)
 	if normalized == "" {
@@ -650,6 +782,7 @@ func isPendingApprovalReplacementRequest(text string) bool {
 	}
 	methodCues := []string{
 		"homebrew", "brew", "go install", "npm", "pnpm", "pip", "uv", "docker", "源码", "source", "binary", "release",
+		"git", "github", "认证", "鉴权", "登录", "auth", "login", "credential", "ssh",
 	}
 	hasReplacementCue := false
 	for _, cue := range replacementCues {

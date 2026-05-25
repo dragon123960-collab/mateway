@@ -145,17 +145,23 @@ security:
 
 search:
   default_tool: tavily
+  provider_order: [cache, duckduckgo, tavily]
+  cache_enabled: true
+  cache_ttl_hours: 168
+  fresh_cache_ttl_hours: 6
   providers:
     tavily:
       enabled: false
       api_key_env: TAVILY_API_KEY
-      timeout_seconds: 20
+      timeout_seconds: 8
       max_results: 5
+      daily_budget: 20
+      monthly_budget: 900
       search_depth: basic
       topic: general
     duckduckgo:
       enabled: true
-      timeout_seconds: 10
+      timeout_seconds: 4
       max_results: 5
       region: cn-zh
 `

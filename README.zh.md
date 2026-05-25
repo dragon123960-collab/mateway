@@ -31,16 +31,17 @@ Mateway 仍处于早期阶段，但已经可以作为第一版单 Agent runtime 
 
 已实现：
 
-- CLI 命令：`init`、`doctor`、`ask`、`test`、`trace`、`memory`、`heartbeat`、`schedule`、`gateway`
+- CLI 命令：`init`、`doctor`、`ask`、`test`、`eval`、`trace`、`memory`、`heartbeat`、`schedule`、`gateway`
 - 飞书 WebSocket receive/reply/reaction
 - 兼容 Anthropic 和 OpenAI API 的模型客户端
 - 可配置 model 和 agent profiles
-- 内置工具：time、config summary、web search、file read/write/patch、shell run、project index、file summary、memory search/index、user ask
+- 内置工具：time、config summary、web search、file read/write/patch、terminal run、project index、file summary、memory search/index、user ask
 - path guard、危险命令 guard、输出截断和回复清洗
 - 持久化 session/task state 和 follow-up 解析
 - Markdown memory proposal、commit、reject、lint、index 和 search
 - 用于 memory lint/review/compact/index rebuild 的 heartbeat 维护任务
-- 自然语言用户定时任务，支持 proposal、确认、修改、到期检测和 runtime 执行
+- planner 选择的用户定时任务工具，支持到期检测和 runtime 执行
+- 真实模型 planner routing 评测：`mateway eval routing`
 - workspace skill discovery 和默认 skills
 
 仍在演进：
@@ -195,13 +196,13 @@ mateway schedule due
 mateway schedule run-due
 ```
 
-也可以通过 runtime 用自然语言创建定时任务：
+自然语言创建定时任务会走普通 runtime planning loop。planner 应选择 `schedule.create` 并补齐字段；信息不足时先补问：
 
 ```text
 Every day at 9:00, collect recent AI trend articles and write a short sourced report.
 ```
 
-Mateway 会先写入 proposal，并在启用前要求用户确认。
+schedule CLI 仍保留 proposal/review 命令，供手动工作流使用；runtime 创建定时任务则直接通过工具执行。
 
 ## 飞书
 
@@ -259,7 +260,7 @@ Mateway 有两个不同的后台概念：
 生命周期是：
 
 ```text
-draft -> fill missing info -> proposal -> user confirmation -> active task -> due run -> artifact
+user request -> planner selects schedule tool -> task YAML -> due run -> runtime invocation -> artifact
 ```
 
 ## Skills 与 Connectors

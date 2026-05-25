@@ -10,11 +10,43 @@ const (
 	RiskDangerous       Risk = "dangerous_execute"
 )
 
+type AcceptanceMode string
+
+const (
+	AcceptanceCodeOnly AcceptanceMode = "code_only"
+	AcceptanceCodeLLM  AcceptanceMode = "code_then_llm"
+	AcceptanceLLM      AcceptanceMode = "llm_default"
+)
+
+type ParallelMode string
+
+const (
+	ParallelForbid       ParallelMode = "forbid"
+	ParallelReadOnlyOK   ParallelMode = "read_only_ok"
+	ParallelIsolatedOnly ParallelMode = "isolated_only"
+)
+
+type Metadata struct {
+	Purpose            string
+	WhenToUse          []string
+	WhenNotToUse       []string
+	RequiredArgs       []string
+	OutputContract     []string
+	AcceptanceSpecRef  string
+	AcceptanceMode     AcceptanceMode
+	SoftFailureSignals []string
+	ParallelMode       ParallelMode
+	ResourceScope      string
+	RecoverHints       []string
+}
+
 type Definition struct {
 	Name        string
 	Description string
 	ArgsSchema  map[string]string
+	Metadata    Metadata
 	Risk        Risk
+	Hidden      bool
 	Run         func(context.Context, Call) Result
 }
 
@@ -35,15 +67,24 @@ type Context struct {
 }
 
 type SearchConfig struct {
-	TavilyEnabled        bool
-	TavilyBaseURL        string
-	TavilyAPIKey         string
-	TavilyMaxResults     int
-	TavilySearchDepth    string
-	TavilyTopic          string
-	DuckDuckGoEnabled    bool
-	DuckDuckGoMaxResults int
-	DuckDuckGoRegion     string
+	CacheDir                 string
+	CacheEnabled             bool
+	CacheTTLHours            int
+	FreshCacheTTLHours       int
+	ProviderOrder            []string
+	TavilyEnabled            bool
+	TavilyBaseURL            string
+	TavilyAPIKey             string
+	TavilyTimeoutSeconds     int
+	TavilyMaxResults         int
+	TavilyDailyBudget        int
+	TavilyMonthlyBudget      int
+	TavilySearchDepth        string
+	TavilyTopic              string
+	DuckDuckGoEnabled        bool
+	DuckDuckGoTimeoutSeconds int
+	DuckDuckGoMaxResults     int
+	DuckDuckGoRegion         string
 }
 
 type Result struct {

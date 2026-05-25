@@ -3,6 +3,7 @@ package tool
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/skill"
 	"github.com/dongping/mateway/internal/textmatch"
 )
@@ -30,12 +32,22 @@ func RegisterBuiltins(r *Registry) {
 	r.Register(SkillSearch())
 	r.Register(SkillInstall())
 	r.Register(SoftwareSearch())
+	r.Register(SoftwareInstall())
+	r.Register(ScheduleCreate())
+	r.Register(ScheduleList())
+	r.Register(ScheduleShow())
+	r.Register(SchedulePause())
+	r.Register(ScheduleResume())
+	r.Register(ScheduleUpdate())
+	r.Register(ScheduleDelete())
 	r.Register(WebSearch())
+	r.Register(WebFetch())
 	r.Register(FileRead())
 	r.Register(ProjectIndex())
 	r.Register(FileSummary())
 	r.Register(FileWrite())
 	r.Register(FilePatch())
+	r.Register(TerminalRun())
 	r.Register(ShellRun())
 	r.Register(UserAsk())
 }
@@ -43,8 +55,20 @@ func RegisterBuiltins(r *Registry) {
 func SkillSearch() Definition {
 	return Definition{
 		Name:        "skill.search",
-		Description: "Search installable agent skills from configured remote catalogs, then report local Mateway workspace install state.",
-		Risk:        RiskSafeRead,
+		Description: "Search installable agent skills from configured remote catalogs, then report local Mateway workspace install state. This tool never installs; when the user asks to install, plan skill.install after search.",
+		Metadata: Metadata{
+			Purpose:            "search installable agent skills",
+			WhenToUse:          []string{"find agent skill", "look up installable skill by capability"},
+			WhenNotToUse:       []string{"installing directly without search"},
+			RequiredArgs:       []string{"query"},
+			OutputContract:     []string{"query", "result count"},
+			AcceptanceSpecRef:  "skill.search/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"no matching skills found"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "skill:query",
+		},
+		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"query": "skill search query",
 			"limit": "optional result limit",
@@ -71,8 +95,20 @@ func SkillSearch() Definition {
 func SkillInstall() Definition {
 	return Definition{
 		Name:        "skill.install",
-		Description: "Install one agent skill into the Mateway workspace skills directory. Requires confirmation before writing files.",
-		Risk:        RiskGuardedMutation,
+		Description: "Install one agent skill into the Mateway workspace skills directory. The name argument can be an exact skill name, URL, or capability query; the installer resolves the best catalog match.",
+		Metadata: Metadata{
+			Purpose:            "install an agent skill into the workspace",
+			WhenToUse:          []string{"install selected skill", "materialize skill into workspace"},
+			WhenNotToUse:       []string{"searching only"},
+			RequiredArgs:       []string{"name"},
+			OutputContract:     []string{"skill name", "target path", "install source"},
+			AcceptanceSpecRef:  "skill.install/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"skill name or url is required"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "skill:install",
+		},
+		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
 			"name": "skill name or URL",
 			"url":  "optional direct skill URL",
@@ -81,11 +117,6 @@ func SkillInstall() Definition {
 			ref := strings.TrimSpace(firstNonEmpty(call.Args["url"], call.Args["name"], call.Args["query"]))
 			if ref == "" {
 				return ErrorResult("skill name or URL is required")
-			}
-			if !call.Confirmed {
-				items, _ := skill.SearchCatalog(ctx, call.Context.Workspace, ref, skill.CatalogSearchOptions{Limit: 1})
-				preview := renderSkillInstallPreview(ref, call.Context.Workspace, items)
-				return ConfirmResult(preview, map[string]any{"kind": "skill_install_preview", "ref": ref, "workspace": call.Context.Workspace})
 			}
 			result, err := skill.InstallCatalogSkill(ctx, call.Context.Workspace, ref, skill.CatalogSearchOptions{Limit: 1})
 			if err != nil {
@@ -104,7 +135,19 @@ func SoftwareSearch() Definition {
 	return Definition{
 		Name:        "software.search",
 		Description: "Search public software, CLI tools, repositories, and installation clues with GitHub-first fallback behavior.",
-		Risk:        RiskSafeRead,
+		Metadata: Metadata{
+			Purpose:            "search public software and installation clues",
+			WhenToUse:          []string{"find CLI tools", "find installation sources", "look up software repository"},
+			WhenNotToUse:       []string{"local project inspection"},
+			RequiredArgs:       []string{"query"},
+			OutputContract:     []string{"query", "provider", "result count"},
+			AcceptanceSpecRef:  "software.search/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"no software results found"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "software:query",
+		},
+		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"query": "software or CLI query",
 			"limit": "optional result limit",
@@ -127,12 +170,407 @@ func SoftwareSearch() Definition {
 	}
 }
 
+func SoftwareInstall() Definition {
+	return Definition{
+		Name:        "software.install",
+		Description: "Install CLI software with an explicit install command, then verify the installed executable and return next commands.",
+		Metadata: Metadata{
+			Purpose:            "install CLI software and verify the result",
+			WhenToUse:          []string{"install a CLI from explicit upstream command", "verify installed executable"},
+			WhenNotToUse:       []string{"guessing install commands"},
+			RequiredArgs:       []string{"command"},
+			OutputContract:     []string{"install command", "verify command", "verified status"},
+			AcceptanceSpecRef:  "software.install/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"install command is required", "not found", "permission denied", "timed out"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "software:install",
+		},
+		Risk: RiskGuardedMutation,
+		ArgsSchema: map[string]string{
+			"name":           "software name",
+			"method":         "install method from upstream docs, for example npm, npx, brew, go, pip, cargo, or binary",
+			"command":        "required install command copied from upstream docs or selected by the user",
+			"verify_command": "optional verification command; defaults to command -v <executable> && <executable> --version",
+			"executable":     "optional installed executable name",
+			"source_url":     "optional upstream documentation URL",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			name := strings.TrimSpace(firstNonEmpty(call.Args["name"], call.Args["package"], call.Args["tool"], call.Args["executable"]))
+			method := strings.ToLower(strings.TrimSpace(call.Args["method"]))
+			installCommand := strings.TrimSpace(call.Args["command"])
+			executable := strings.TrimSpace(firstNonEmpty(call.Args["executable"], executableFromInstallCommand(installCommand), name))
+			verifyCommand := strings.TrimSpace(call.Args["verify_command"])
+			if verifyCommand == "" {
+				verifyCommand = defaultVerifyCommand(executable)
+			}
+			if installCommand == "" {
+				return ErrorResult("install command is required; run software.search or read the upstream install docs before using software.install")
+			}
+			ok, exitCode, output := runReadOnlyCommand(ctx, installCommand, call.Context.ProjectRoot)
+			verifyOK, verifyExit, verifyOutput := runReadOnlyCommand(ctx, verifyCommand, call.Context.ProjectRoot)
+			result := renderSoftwareInstallResult(name, executable, installCommand, ok, exitCode, output, verifyCommand, verifyOK, verifyExit, verifyOutput)
+			return Result{
+				OK:     ok && verifyOK,
+				Output: result,
+				Error:  softwareInstallError(ok, verifyOK, output, verifyOutput),
+				Evidence: map[string]any{
+					"kind":              "software_install",
+					"name":              name,
+					"method":            method,
+					"command":           installCommand,
+					"exit_code":         exitCode,
+					"verify_command":    verifyCommand,
+					"verify_exit_code":  verifyExit,
+					"verified":          verifyOK,
+					"installed_command": executable,
+					"source_url":        call.Args["source_url"],
+				},
+			}
+		},
+	}
+}
+
+func ScheduleCreate() Definition {
+	return Definition{
+		Name:        "schedule.create",
+		Description: "Create a user scheduled task YAML under the Mateway home directory after all required fields are known.",
+		Metadata: Metadata{
+			Purpose:            "create a user scheduled task",
+			WhenToUse:          []string{"create recurring task", "set daily or weekly schedule"},
+			RequiredArgs:       []string{"title", "prompt"},
+			OutputContract:     []string{"task id", "status", "schedule", "path"},
+			AcceptanceSpecRef:  "schedule.create/default",
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"missing_schedule_fields"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "schedule:task",
+		},
+		Risk: RiskGuardedMutation,
+		ArgsSchema: map[string]string{
+			"id":          "optional schedule id",
+			"title":       "schedule title",
+			"prompt":      "task prompt to execute when the schedule fires",
+			"daily_at":    "HH:MM for daily schedule",
+			"weekly_at":   "HH:MM for weekly schedule",
+			"weekday":     "weekday for weekly schedule",
+			"monthly_at":  "HH:MM for monthly schedule",
+			"monthly_day": "day of month",
+			"interval":    "duration such as 2h",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			input := scheduleInputFromArgs(call)
+			check := schedule.CheckDraft(input)
+			if !check.Ready {
+				return Result{OK: false, Output: check.ClarifyMessage, Error: "missing_schedule_fields", Evidence: map[string]any{"kind": "schedule_missing_fields", "missing_fields": check.MissingFields}}
+			}
+			task, path, err := schedule.NewStore(call.Context.Home).Create(input)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{OK: true, Output: renderScheduleTaskOutput("created", task, path), Evidence: scheduleTaskEvidence("schedule_create", task, path)}
+		},
+	}
+}
+
+func ScheduleList() Definition {
+	return Definition{
+		Name:        "schedule.list",
+		Description: "List user scheduled tasks from the Mateway home directory.",
+		Metadata: Metadata{
+			Purpose:           "list schedule tasks",
+			WhenToUse:         []string{"inspect existing schedules"},
+			OutputContract:    []string{"task count"},
+			AcceptanceSpecRef: "schedule.list/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelReadOnlyOK,
+			ResourceScope:     "schedule:list",
+		},
+		Risk:       RiskSafeRead,
+		ArgsSchema: map[string]string{},
+		Run: func(ctx context.Context, call Call) Result {
+			tasks, err := schedule.NewStore(call.Context.Home).List()
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{OK: true, Output: renderScheduleList(tasks), Evidence: map[string]any{"kind": "schedule_list", "task_count": len(tasks)}}
+		},
+	}
+}
+
+func ScheduleShow() Definition {
+	return Definition{
+		Name:        "schedule.show",
+		Description: "Show one user scheduled task.",
+		Metadata: Metadata{
+			Purpose:           "show one schedule task",
+			WhenToUse:         []string{"inspect one schedule by id"},
+			RequiredArgs:      []string{"id"},
+			OutputContract:    []string{"task id", "status", "path"},
+			AcceptanceSpecRef: "schedule.show/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelReadOnlyOK,
+			ResourceScope:     "schedule:task",
+		},
+		Risk:       RiskSafeRead,
+		ArgsSchema: map[string]string{"id": "schedule id"},
+		Run: func(ctx context.Context, call Call) Result {
+			id := strings.TrimSpace(call.Args["id"])
+			if id == "" {
+				return ErrorResult("id is required")
+			}
+			task, path, err := schedule.NewStore(call.Context.Home).Show(id)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{OK: true, Output: renderScheduleTaskOutput("found", task, path), Evidence: scheduleTaskEvidence("schedule_show", task, path)}
+		},
+	}
+}
+
+func SchedulePause() Definition {
+	return scheduleStatusTool("schedule.pause", "Pause one user scheduled task.", schedule.StatusPaused, "paused")
+}
+
+func ScheduleResume() Definition {
+	return scheduleStatusTool("schedule.resume", "Resume one paused user scheduled task.", schedule.StatusActive, "resumed")
+}
+
+func scheduleStatusTool(name, description, status, verb string) Definition {
+	return Definition{
+		Name:        name,
+		Description: description,
+		Metadata: Metadata{
+			Purpose:           "change schedule task status",
+			WhenToUse:         []string{"pause schedule", "resume schedule"},
+			RequiredArgs:      []string{"id"},
+			OutputContract:    []string{"task id", "status", "path"},
+			AcceptanceSpecRef: name + "/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelForbid,
+			ResourceScope:     "schedule:task",
+		},
+		Risk:       RiskGuardedMutation,
+		ArgsSchema: map[string]string{"id": "schedule id"},
+		Run: func(ctx context.Context, call Call) Result {
+			id := strings.TrimSpace(call.Args["id"])
+			if id == "" {
+				return ErrorResult("id is required")
+			}
+			task, path, err := schedule.NewStore(call.Context.Home).SetStatus(id, status)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{OK: true, Output: renderScheduleTaskOutput(verb, task, path), Evidence: scheduleTaskEvidence(name, task, path)}
+		},
+	}
+}
+
+func ScheduleUpdate() Definition {
+	return Definition{
+		Name:        "schedule.update",
+		Description: "Update user scheduled task fields. Provide only fields that should change.",
+		Metadata: Metadata{
+			Purpose:           "update a schedule task",
+			WhenToUse:         []string{"change schedule fields", "change prompt or title"},
+			RequiredArgs:      []string{"id"},
+			OutputContract:    []string{"task id", "status", "schedule", "path"},
+			AcceptanceSpecRef: "schedule.update/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelForbid,
+			ResourceScope:     "schedule:task",
+		},
+		Risk: RiskGuardedMutation,
+		ArgsSchema: map[string]string{
+			"id":          "schedule id",
+			"title":       "optional new title",
+			"prompt":      "optional new prompt",
+			"daily_at":    "optional HH:MM for daily schedule",
+			"weekly_at":   "optional HH:MM for weekly schedule",
+			"weekday":     "optional weekday for weekly schedule",
+			"monthly_at":  "optional HH:MM for monthly schedule",
+			"monthly_day": "optional day of month",
+			"interval":    "optional duration such as 2h",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			id := strings.TrimSpace(call.Args["id"])
+			if id == "" {
+				return ErrorResult("id is required")
+			}
+			input := scheduleInputFromArgs(call)
+			var spec *schedule.ScheduleSpec
+			if hasScheduleSpecArgs(call.Args) {
+				tmp := schedule.ApplyDraftFields(schedule.CreateInput{Title: "tmp", Prompt: "tmp", DailyAt: call.Args["daily_at"]}, map[string]string{})
+				tmp.DailyAt = input.DailyAt
+				tmp.WeeklyAt = input.WeeklyAt
+				tmp.Weekday = input.Weekday
+				tmp.Weekdays = input.Weekdays
+				tmp.MonthlyAt = input.MonthlyAt
+				tmp.MonthlyDay = input.MonthlyDay
+				tmp.Interval = input.Interval
+				built, err := buildScheduleSpecForTool(tmp)
+				if err != nil {
+					return ErrorResult(err.Error())
+				}
+				spec = &built
+			}
+			task, path, err := schedule.NewStore(call.Context.Home).Update(id, schedule.UpdateInput{
+				Title:    call.Args["title"],
+				Prompt:   call.Args["prompt"],
+				AgentID:  call.Args["agent_id"],
+				Schedule: spec,
+			})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{OK: true, Output: renderScheduleTaskOutput("updated", task, path), Evidence: scheduleTaskEvidence("schedule_update", task, path)}
+		},
+	}
+}
+
+func ScheduleDelete() Definition {
+	return Definition{
+		Name:        "schedule.delete",
+		Description: "Delete a user scheduled task. This destructive action requires runtime confirmation.",
+		Metadata: Metadata{
+			Purpose:           "delete a schedule task",
+			WhenToUse:         []string{"remove recurring schedule"},
+			RequiredArgs:      []string{"id"},
+			OutputContract:    []string{"task id", "path"},
+			AcceptanceSpecRef: "schedule.delete/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelForbid,
+			ResourceScope:     "schedule:task",
+		},
+		Risk:       RiskGuardedMutation,
+		ArgsSchema: map[string]string{"id": "schedule id"},
+		Run: func(ctx context.Context, call Call) Result {
+			id := strings.TrimSpace(call.Args["id"])
+			if id == "" {
+				return ErrorResult("id is required")
+			}
+			path, err := schedule.NewStore(call.Context.Home).Delete(id)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{OK: true, Output: "Deleted schedule task " + id + "\nPath: " + path, Evidence: map[string]any{"kind": "schedule_delete", "task_id": id, "path": path}}
+		},
+	}
+}
+
+func scheduleInputFromArgs(call Call) schedule.CreateInput {
+	return schedule.CreateInput{
+		ID:           call.Args["id"],
+		Title:        call.Args["title"],
+		Prompt:       call.Args["prompt"],
+		AgentID:      firstNonEmpty(call.Args["agent_id"], "main"),
+		DailyAt:      call.Args["daily_at"],
+		WeeklyAt:     call.Args["weekly_at"],
+		Weekday:      call.Args["weekday"],
+		Weekdays:     splitCommaArg(call.Args["weekdays"]),
+		MonthlyAt:    call.Args["monthly_at"],
+		MonthlyDay:   parsePositiveArg(call.Args["monthly_day"], 0),
+		Interval:     call.Args["interval"],
+		Channel:      firstNonEmpty(call.Args["channel"], "cli"),
+		ThreadID:     call.Args["thread_id"],
+		UserID:       call.Args["user_id"],
+		DeliveryMode: firstNonEmpty(call.Args["delivery_mode"], "artifact"),
+		DeliveryPath: call.Args["delivery_path"],
+	}
+}
+
+func hasScheduleSpecArgs(args map[string]string) bool {
+	for _, key := range []string{"daily_at", "weekly_at", "weekday", "weekdays", "monthly_at", "monthly_day", "interval"} {
+		if strings.TrimSpace(args[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func splitCommaArg(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	var out []string
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func buildScheduleSpecForTool(input schedule.CreateInput) (schedule.ScheduleSpec, error) {
+	switch {
+	case strings.TrimSpace(input.Interval) != "":
+		if _, err := time.ParseDuration(strings.TrimSpace(input.Interval)); err != nil {
+			return schedule.ScheduleSpec{}, fmt.Errorf("schedule.interval must be a duration")
+		}
+		return schedule.ScheduleSpec{Kind: "interval", Interval: strings.TrimSpace(input.Interval)}, nil
+	case strings.TrimSpace(input.MonthlyAt) != "" || input.MonthlyDay > 0:
+		if input.MonthlyDay < 1 || input.MonthlyDay > 31 {
+			return schedule.ScheduleSpec{}, fmt.Errorf("schedule.monthly_day must be between 1 and 31")
+		}
+		return schedule.ScheduleSpec{Kind: "monthly", MonthlyAt: firstNonEmpty(input.MonthlyAt, input.DailyAt, "09:00"), MonthlyDay: input.MonthlyDay}, nil
+	case strings.TrimSpace(input.WeeklyAt) != "" || strings.TrimSpace(input.Weekday) != "" || len(input.Weekdays) > 0:
+		weekdays := input.Weekdays
+		if len(weekdays) == 0 && strings.TrimSpace(input.Weekday) != "" {
+			weekdays = []string{strings.TrimSpace(input.Weekday)}
+		}
+		return schedule.ScheduleSpec{Kind: "weekly", WeeklyAt: firstNonEmpty(input.WeeklyAt, input.DailyAt, "09:00"), Weekday: input.Weekday, Weekdays: weekdays}, nil
+	default:
+		return schedule.ScheduleSpec{Kind: "daily", DailyAt: firstNonEmpty(input.DailyAt, "09:00")}, nil
+	}
+}
+
+func renderScheduleTaskOutput(verb string, task schedule.Task, path string) string {
+	return strings.Join([]string{
+		"Schedule task " + verb + ": " + task.Title,
+		"ID: " + task.ID,
+		"Status: " + task.Status,
+		"Schedule: " + schedule.Summary(task.Schedule),
+		"Prompt: " + task.Prompt,
+		"Path: " + path,
+	}, "\n")
+}
+
+func renderScheduleList(tasks []schedule.Task) string {
+	if len(tasks) == 0 {
+		return "No schedule tasks found."
+	}
+	lines := []string{"Schedule tasks:"}
+	for _, task := range tasks {
+		lines = append(lines, fmt.Sprintf("- %s [%s] %s: %s", task.ID, task.Status, schedule.Summary(task.Schedule), task.Title))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func scheduleTaskEvidence(kind string, task schedule.Task, path string) map[string]any {
+	return map[string]any{
+		"kind":     kind,
+		"task_id":  task.ID,
+		"title":    task.Title,
+		"status":   task.Status,
+		"schedule": schedule.Summary(task.Schedule),
+		"path":     path,
+	}
+}
+
 func TimeNow() Definition {
 	return Definition{
 		Name:        "time.now",
 		Description: "Return current local time, date, and timezone.",
-		Risk:        RiskSafeRead,
-		ArgsSchema:  map[string]string{"timezone": "optional IANA timezone, defaults to local"},
+		Metadata: Metadata{
+			Purpose:        "get current date and time",
+			WhenToUse:      []string{"current time", "today", "timezone-sensitive task"},
+			OutputContract: []string{"timezone", "unix timestamp"},
+			AcceptanceMode: AcceptanceCodeOnly,
+			ParallelMode:   ParallelReadOnlyOK,
+			ResourceScope:  "system:time",
+		},
+		Risk:       RiskSafeRead,
+		ArgsSchema: map[string]string{"timezone": "optional IANA timezone, defaults to local"},
 		Run: func(ctx context.Context, call Call) Result {
 			loc := time.Local
 			if tz := strings.TrimSpace(call.Args["timezone"]); tz != "" {
@@ -154,8 +592,16 @@ func ConfigSummary() Definition {
 	return Definition{
 		Name:        "config.summary",
 		Description: "Return safe summary of loaded Mateway configuration without secrets.",
-		Risk:        RiskSafeRead,
-		ArgsSchema:  map[string]string{},
+		Metadata: Metadata{
+			Purpose:        "inspect runtime configuration safely",
+			WhenToUse:      []string{"configuration summary", "debug runtime config"},
+			OutputContract: []string{"config summary text"},
+			AcceptanceMode: AcceptanceCodeOnly,
+			ParallelMode:   ParallelReadOnlyOK,
+			ResourceScope:  "config:summary",
+		},
+		Risk:       RiskSafeRead,
+		ArgsSchema: map[string]string{},
 		Run: func(ctx context.Context, call Call) Result {
 			return Result{OK: true, Output: call.Context.ConfigSummary, Evidence: map[string]any{"kind": "config_summary"}}
 		},
@@ -166,7 +612,19 @@ func MemorySearch() Definition {
 	return Definition{
 		Name:        "memory.search",
 		Description: "Search reviewed long memory and return snippets with path and line evidence.",
-		Risk:        RiskSafeRead,
+		Metadata: Metadata{
+			Purpose:            "search reviewed long memory",
+			WhenToUse:          []string{"user preference lookup", "stable memory lookup"},
+			WhenNotToUse:       []string{"raw session history"},
+			RequiredArgs:       []string{"query"},
+			OutputContract:     []string{"path", "line range", "result count"},
+			AcceptanceSpecRef:  "memory.search/default",
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"no matching long memory found"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "memory:query",
+		},
+		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"query":   "search query",
 			"agent":   "optional agent id, defaults to main",
@@ -224,7 +682,16 @@ func MemoryIndex() Definition {
 	return Definition{
 		Name:        "memory.index",
 		Description: "Return a concise summary of the rebuildable memory index.",
-		Risk:        RiskSafeRead,
+		Metadata: Metadata{
+			Purpose:           "inspect or rebuild memory index summary",
+			WhenToUse:         []string{"memory index status", "memory index rebuild"},
+			OutputContract:    []string{"index path", "entry count"},
+			AcceptanceSpecRef: "memory.index/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelReadOnlyOK,
+			ResourceScope:     "memory:index",
+		},
+		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"rebuild": "optional true to rebuild index before reading",
 		},
@@ -262,26 +729,67 @@ func MemoryIndex() Definition {
 func WebSearch() Definition {
 	return Definition{
 		Name:        "web.search",
-		Description: "Search the web. Uses Tavily when configured, then DuckDuckGo fallback.",
-		Risk:        RiskSafeRead,
+		Description: "Search the web with local cache, provider order, and budget-aware Tavily fallback.",
+		Metadata: Metadata{
+			Purpose:            "search public web information",
+			WhenToUse:          []string{"web lookup", "latest information", "public documentation"},
+			WhenNotToUse:       []string{"local file search", "project inspection"},
+			RequiredArgs:       []string{"query"},
+			OutputContract:     []string{"query", "provider", "result count"},
+			AcceptanceSpecRef:  "web.search/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"no results"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "web:query",
+		},
+		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"query":       "search query",
 			"max_results": "optional max results",
+			"freshness":   "optional: fresh/current to prefer fresh provider results over cache",
+			"provider":    "optional provider override: cache, duckduckgo, tavily",
 		},
 		Run: func(ctx context.Context, call Call) Result {
 			query := strings.TrimSpace(firstNonEmpty(call.Args["query"], call.Args["q"]))
 			if query == "" {
 				return ErrorResult("query is required")
 			}
-			if call.Context.Search.TavilyEnabled && strings.TrimSpace(call.Context.Search.TavilyAPIKey) != "" {
-				if result := tavilySearch(ctx, call.Context.Search, query); result.OK {
-					return result
-				}
+			return runWebSearch(ctx, call.Context.Search, query, call.Args)
+		},
+	}
+}
+
+func WebFetch() Definition {
+	return Definition{
+		Name:        "web.fetch",
+		Description: "Fetch one known URL and return title, text preview, URL, status, and source evidence. Use this when a URL is already known instead of searching again.",
+		Metadata: Metadata{
+			Purpose:            "fetch known web page",
+			WhenToUse:          []string{"known URL", "read linked page", "verify source page"},
+			WhenNotToUse:       []string{"discovering unknown sources"},
+			RequiredArgs:       []string{"url"},
+			OutputContract:     []string{"url", "status", "title", "text preview"},
+			AcceptanceSpecRef:  "web.fetch/default",
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"unsupported url scheme", "status="},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "web:url",
+		},
+		Risk: RiskSafeRead,
+		ArgsSchema: map[string]string{
+			"url":     "URL to fetch",
+			"timeout": "optional timeout seconds, max 30",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			rawURL := strings.TrimSpace(call.Args["url"])
+			if rawURL == "" {
+				return ErrorResult("url is required")
 			}
-			if !call.Context.Search.DuckDuckGoEnabled {
-				return ErrorResult("web.search has no enabled provider")
+			timeout := parsePositiveArg(call.Args["timeout"], 8)
+			if timeout > 30 {
+				timeout = 30
 			}
-			return duckDuckGoSearch(ctx, call.Context.Search, query)
+			return webFetchURL(ctx, rawURL, time.Duration(timeout)*time.Second)
 		},
 	}
 }
@@ -290,8 +798,19 @@ func FileRead() Definition {
 	return Definition{
 		Name:        "file.read",
 		Description: "Read a text file under the project root or Mateway workspace.",
-		Risk:        RiskSafeRead,
-		ArgsSchema:  map[string]string{"path": "file path"},
+		Metadata: Metadata{
+			Purpose:           "read one text file",
+			WhenToUse:         []string{"need exact file contents"},
+			WhenNotToUse:      []string{"directory overview", "writing files"},
+			RequiredArgs:      []string{"path"},
+			OutputContract:    []string{"file path", "line range", "bytes"},
+			AcceptanceSpecRef: "file.read/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelReadOnlyOK,
+			ResourceScope:     "filesystem:path",
+		},
+		Risk:       RiskSafeRead,
+		ArgsSchema: map[string]string{"path": "file path"},
 		Run: func(ctx context.Context, call Call) Result {
 			path, err := ResolveAllowedPath(call.Args["path"], call.Context)
 			if err != nil {
@@ -315,19 +834,26 @@ func FileRead() Definition {
 func FileWrite() Definition {
 	return Definition{
 		Name:        "file.write",
-		Description: "Write a text file under allowed roots. Requires confirmation by default.",
-		Risk:        RiskGuardedMutation,
-		ArgsSchema:  map[string]string{"path": "file path", "content": "new file content"},
+		Description: "Write a text file under allowed roots.",
+		Metadata: Metadata{
+			Purpose:           "write text content to file",
+			WhenToUse:         []string{"create file", "replace file content"},
+			WhenNotToUse:      []string{"small in-place edit"},
+			RequiredArgs:      []string{"path", "content"},
+			OutputContract:    []string{"file path", "bytes written"},
+			AcceptanceSpecRef: "file.write/default",
+			AcceptanceMode:    AcceptanceCodeOnly,
+			ParallelMode:      ParallelForbid,
+			ResourceScope:     "filesystem:path",
+		},
+		Risk:       RiskGuardedMutation,
+		ArgsSchema: map[string]string{"path": "file path", "content": "new file content"},
 		Run: func(ctx context.Context, call Call) Result {
 			path, err := ResolveAllowedPath(call.Args["path"], call.Context)
 			if err != nil {
 				return ErrorResult(err.Error())
 			}
 			content := call.Args["content"]
-			preview := fmt.Sprintf("Write preview for %s\n\n%s", path, Truncate(content, 3000))
-			if !call.Confirmed {
-				return ConfirmResult("file.write requires confirmation before writing.\n\n"+preview, map[string]any{"kind": "write_preview", "path": path, "bytes": len(content)})
-			}
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				return ErrorResult(err.Error())
 			}
@@ -342,8 +868,20 @@ func FileWrite() Definition {
 func FilePatch() Definition {
 	return Definition{
 		Name:        "file.patch",
-		Description: "Patch a text file by replacing old text with new text, or appending content. Requires confirmation by default.",
-		Risk:        RiskGuardedMutation,
+		Description: "Patch a text file by replacing old text with new text, or appending content.",
+		Metadata: Metadata{
+			Purpose:            "apply targeted patch to one text file",
+			WhenToUse:          []string{"in-place edit", "append content", "single replacement"},
+			WhenNotToUse:       []string{"create brand-new file tree"},
+			RequiredArgs:       []string{"path"},
+			OutputContract:     []string{"file path", "diff summary"},
+			AcceptanceSpecRef:  "file.patch/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"old text not found", "old text is not unique"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "filesystem:path",
+		},
+		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
 			"path":      "file path",
 			"old":       "old text to replace",
@@ -385,9 +923,6 @@ func FilePatch() Definition {
 				return ErrorResult("old or append is required")
 			}
 			diff := simpleDiff(oldText, newText)
-			if !call.Confirmed {
-				return ConfirmResult("file.patch requires confirmation before applying.\n\n"+Truncate(diff, 4000), map[string]any{"kind": "patch_preview", "path": path})
-			}
 			if err := os.WriteFile(path, []byte(newText), 0o644); err != nil {
 				return ErrorResult(err.Error())
 			}
@@ -399,8 +934,9 @@ func FilePatch() Definition {
 func ShellRun() Definition {
 	return Definition{
 		Name:        "shell.run",
-		Description: "Run a non-interactive local shell command with timeout. Dangerous commands require confirmation.",
+		Description: "Deprecated compatibility alias for terminal.run. Do not plan new work with this tool.",
 		Risk:        RiskDangerous,
+		Hidden:      true,
 		ArgsSchema: map[string]string{
 			"command":   "shell command",
 			"workdir":   "optional working directory",
@@ -414,44 +950,56 @@ func ShellRun() Definition {
 			if IsDangerousCommand(command) && !call.Confirmed {
 				return ConfirmResult("shell.run blocked pending confirmation for dangerous command:\n\n"+command, map[string]any{"kind": "command_confirm", "command": command})
 			}
-			workdir := call.Context.ProjectRoot
-			if raw := strings.TrimSpace(call.Args["workdir"]); raw != "" {
-				resolved, err := ResolveAllowedPath(raw, call.Context)
-				if err != nil {
-					return ErrorResult(err.Error())
-				}
-				workdir = resolved
-			}
-			runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(runCtx, "sh", "-lc", command)
-			cmd.Dir = workdir
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-			err := cmd.Run()
-			exitCode := 0
+			run, err := executeLocalCommand(ctx, command, call.Context, call.Args["workdir"], 60*time.Second)
 			if err != nil {
-				exitCode = 1
-				if exitErr, ok := err.(*exec.ExitError); ok {
-					exitCode = exitErr.ExitCode()
-				}
+				return ErrorResult(err.Error())
 			}
-			output := strings.TrimSpace(stdout.String())
-			errText := strings.TrimSpace(stderr.String())
-			combined := strings.TrimSpace(output)
-			if errText != "" {
-				combined += "\n\nstderr:\n" + errText
+			return run.toResult("shell")
+		},
+	}
+}
+
+func TerminalRun() Definition {
+	return Definition{
+		Name:        "terminal.run",
+		Description: "Run a local terminal command for safe diagnostics, CLI status checks, logs, tests, builds, and small scripts. Prefer this for checking local software such as gateway status: first verify the CLI exists with command -v, then run the read-only status command. Dangerous commands require confirmation.",
+		Metadata: Metadata{
+			Purpose:            "run local terminal command",
+			WhenToUse:          []string{"diagnostics", "status checks", "tests", "builds", "small scripts"},
+			WhenNotToUse:       []string{"file editing when dedicated tools exist"},
+			RequiredArgs:       []string{"command"},
+			OutputContract:     []string{"exit code", "stdout", "stderr", "timed_out"},
+			AcceptanceSpecRef:  "terminal.run/diagnostic",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"not found", "data not found", "no results", "permission denied", "unauthorized", "timed out"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "terminal:command",
+			RecoverHints:       []string{"retry with narrower command", "ask user when destructive command is needed"},
+		},
+		Risk: RiskDangerous,
+		ArgsSchema: map[string]string{
+			"command": "command to run",
+			"workdir": "optional working directory within allowed roots",
+			"timeout": "optional timeout seconds, max 300",
+			"purpose": "short diagnostic purpose",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			command := strings.TrimSpace(call.Args["command"])
+			if command == "" {
+				return ErrorResult("command is required")
 			}
-			if combined == "" {
-				combined = fmt.Sprintf("command exited with code %d", exitCode)
+			if IsDangerousCommand(command) && !call.Confirmed {
+				return ConfirmResult("terminal.run blocked pending confirmation for dangerous command:\n\n"+command, map[string]any{"kind": "command_confirm", "command": command})
 			}
-			return Result{OK: err == nil, Output: Truncate(combined, DefaultOutputLimit), Error: errorString(err), Evidence: map[string]any{
-				"kind":      "shell",
-				"command":   command,
-				"workdir":   workdir,
-				"exit_code": exitCode,
-			}}
+			run, err := executeLocalCommand(ctx, command, call.Context, call.Args["workdir"], parseTerminalTimeout(call.Args["timeout"], 60*time.Second))
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			result := run.toResult("terminal")
+			if purpose := strings.TrimSpace(call.Args["purpose"]); purpose != "" {
+				result.Evidence["purpose"] = purpose
+			}
+			return result
 		},
 	}
 }
@@ -474,7 +1022,7 @@ func UserAsk() Definition {
 
 func renderSkillSearchOutput(query string, items []skill.CatalogItem) string {
 	if len(items) == 0 {
-		return "No matching skills found for: " + query
+		return "No matching skills found for: " + query + "\nSearched priority catalogs: skills.sh, skillhub.cn, clawhub.ai, then fallback web search.\nTry broader capability phrases, for example: rewriting, tone, writing assistant, copy editing, humanize text."
 	}
 	lines := []string{"Skill search results for: " + query}
 	for i, item := range items {
@@ -516,9 +1064,9 @@ func renderSkillInstallPreview(ref, workspace string, items []skill.CatalogItem)
 
 func renderSkillInstallOutput(result skill.InstallResult) string {
 	if result.AlreadyDone {
-		return fmt.Sprintf("Skill already installed: %s\nPath: %s", result.Item.Name, result.TargetPath)
+		return fmt.Sprintf("Skill already installed: %s\nPath: %s\n\nYou can now ask Mateway to use this skill on matching tasks.", result.Item.Name, result.TargetPath)
 	}
-	return fmt.Sprintf("Skill installed: %s\nSource: %s\nPath: %s", result.Item.Name, result.Item.Source, result.TargetPath)
+	return fmt.Sprintf("Skill installed: %s\nSource: %s\nPath: %s\n\nYou can now test it with a matching request. For example, ask me to open a website, inspect a page, click a button, or take a screenshot.", result.Item.Name, result.Item.Source, result.TargetPath)
 }
 
 type softwareResult struct {
@@ -622,9 +1170,6 @@ func softwareSearchQueries(query string) []string {
 	trimmed := strings.TrimSpace(query)
 	queries := []string{trimmed}
 	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "lark") || strings.Contains(lower, "飞书") {
-		queries = append([]string{"larksuite cli", "feishu lark cli", trimmed}, queries...)
-	}
 	if !strings.Contains(lower, "cli") {
 		queries = append(queries, trimmed+" cli")
 	}
@@ -680,6 +1225,198 @@ func uniqueNonEmptyStrings(values []string) []string {
 	return out
 }
 
+func defaultVerifyCommand(executable string) string {
+	key := strings.TrimSpace(executable)
+	if key == "" {
+		key = "software"
+	}
+	return "command -v " + shellQuote(key) + " && " + shellQuote(key) + " --version"
+}
+
+func renderSoftwareInstallPreview(name, method, installCommand, verifyCommand, sourceURL string) string {
+	lines := []string{
+		"software.install requires confirmation before installing.",
+		"",
+		"Software: " + firstNonEmpty(name, "software"),
+	}
+	if strings.TrimSpace(method) != "" {
+		lines = append(lines, "Method: "+method)
+	}
+	if strings.TrimSpace(sourceURL) != "" {
+		lines = append(lines, "Source: "+sourceURL)
+	}
+	lines = append(lines,
+		"Install command: `"+installCommand+"`",
+		"Verify command: `"+verifyCommand+"`",
+		"",
+		"Confirm once to install and verify.",
+	)
+	return strings.Join(lines, "\n")
+}
+
+func renderSoftwareInstallResult(name, executable, installCommand string, ok bool, exitCode int, output string, verifyCommand string, verifyOK bool, verifyExit int, verifyOutput string) string {
+	commandName := firstNonEmpty(executable, canonicalCommandName(name))
+	if ok && verifyOK {
+		return fmt.Sprintf("安装完成：%s\n\n执行的安装命令：`%s`\n验证命令：`%s`\n验证结果：%s\n\n现在可以试试：\n- `%s --version`\n- `%s --help`", displaySoftwareName(name), installCommand, verifyCommand, oneLine(verifyOutput), commandName, commandName)
+	}
+	lines := []string{fmt.Sprintf("安装未完成：%s", displaySoftwareName(name))}
+	lines = append(lines, fmt.Sprintf("安装命令：`%s` exit=%d\n%s", installCommand, exitCode, strings.TrimSpace(output)))
+	lines = append(lines, fmt.Sprintf("验证命令：`%s` exit=%d\n%s", verifyCommand, verifyExit, strings.TrimSpace(verifyOutput)))
+	if strings.Contains(strings.ToLower(output+verifyOutput), "device not configured") || strings.Contains(strings.ToLower(output+verifyOutput), "authentication") {
+		lines = append(lines, "看起来是 Git/GitHub 认证问题。可以先检查本机的 `gh auth status`、`git config --global --get credential.helper`，或按 GitHub 提示完成浏览器/令牌认证。")
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func softwareInstallError(installOK, verifyOK bool, output, verifyOutput string) string {
+	if installOK && verifyOK {
+		return ""
+	}
+	return strings.TrimSpace(firstNonEmpty(output, verifyOutput, "software install failed"))
+}
+
+func displaySoftwareName(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return "software"
+	}
+	return name
+}
+
+func canonicalCommandName(name string) string {
+	key := strings.ToLower(strings.TrimSpace(name))
+	return key
+}
+
+func executableFromInstallCommand(command string) string {
+	return ""
+}
+
+func runReadOnlyCommand(ctx context.Context, command, workdir string) (bool, int, string) {
+	runCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, "sh", "-lc", command)
+	if strings.TrimSpace(workdir) != "" {
+		cmd.Dir = workdir
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	output := strings.TrimSpace(stdout.String())
+	errText := strings.TrimSpace(stderr.String())
+	if errText != "" {
+		output = strings.TrimSpace(output + "\n" + errText)
+	}
+	if output == "" {
+		output = fmt.Sprintf("command exited with code %d", exitCode)
+	}
+	return err == nil, exitCode, output
+}
+
+type localCommandRun struct {
+	Command  string
+	Workdir  string
+	Stdout   string
+	Stderr   string
+	ExitCode int
+	Err      error
+	TimedOut bool
+}
+
+func executeLocalCommand(ctx context.Context, command string, toolCtx Context, rawWorkdir string, timeout time.Duration) (localCommandRun, error) {
+	workdir := toolCtx.ProjectRoot
+	if raw := strings.TrimSpace(rawWorkdir); raw != "" {
+		resolved, err := ResolveAllowedPath(raw, toolCtx)
+		if err != nil {
+			return localCommandRun{}, err
+		}
+		workdir = resolved
+	}
+	if strings.TrimSpace(workdir) == "" {
+		workdir = "."
+	}
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, "sh", "-lc", command)
+	cmd.Dir = workdir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	return localCommandRun{
+		Command:  command,
+		Workdir:  workdir,
+		Stdout:   strings.TrimSpace(stdout.String()),
+		Stderr:   strings.TrimSpace(stderr.String()),
+		ExitCode: exitCode,
+		Err:      err,
+		TimedOut: runCtx.Err() == context.DeadlineExceeded,
+	}, nil
+}
+
+func (r localCommandRun) toResult(kind string) Result {
+	combined := strings.TrimSpace(r.Stdout)
+	if r.Stderr != "" {
+		combined = strings.TrimSpace(combined + "\n\nstderr:\n" + r.Stderr)
+	}
+	if combined == "" {
+		combined = fmt.Sprintf("command exited with code %d", r.ExitCode)
+	}
+	if r.TimedOut {
+		combined = strings.TrimSpace(combined + "\n\ncommand timed out")
+	}
+	evidence := map[string]any{
+		"kind":      kind,
+		"command":   r.Command,
+		"workdir":   r.Workdir,
+		"exit_code": r.ExitCode,
+		"stdout":    Truncate(r.Stdout, 20000),
+		"stderr":    Truncate(r.Stderr, 20000),
+		"timed_out": r.TimedOut,
+	}
+	return Result{OK: r.Err == nil, Output: Truncate(combined, DefaultOutputLimit), Error: errorString(r.Err), Evidence: evidence}
+}
+
+func parseTerminalTimeout(raw string, fallback time.Duration) time.Duration {
+	value := parsePositiveArg(raw, int(fallback/time.Second))
+	if value <= 0 {
+		value = int(fallback / time.Second)
+	}
+	if value > 300 {
+		value = 300
+	}
+	return time.Duration(value) * time.Second
+}
+
+func shellQuote(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func oneLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
 func tavilySearch(ctx context.Context, cfg SearchConfig, query string) Result {
 	maxResults := cfg.TavilyMaxResults
 	if maxResults <= 0 {
@@ -700,7 +1437,8 @@ func tavilySearch(ctx context.Context, cfg SearchConfig, query string) Result {
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("authorization", "Bearer "+cfg.TavilyAPIKey)
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: searchTimeout(cfg.TavilyTimeoutSeconds, 8)}
+	resp, err := client.Do(req)
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
@@ -727,6 +1465,108 @@ func tavilySearch(ctx context.Context, cfg SearchConfig, query string) Result {
 	return Result{OK: true, Output: Truncate(strings.Join(lines, "\n\n"), DefaultOutputLimit), Evidence: map[string]any{"kind": "web_search", "provider": "tavily", "query": query, "result_count": len(parsed.Results)}}
 }
 
+func runWebSearch(ctx context.Context, cfg SearchConfig, query string, args map[string]string) Result {
+	order := providerOrderForSearch(cfg, args)
+	var errors []string
+	for _, provider := range order {
+		switch provider {
+		case "cache":
+			if cache, ok := readWebSearchCache(cfg, query, searchFreshness(args)); ok {
+				return cache
+			}
+		case "duckduckgo":
+			if !cfg.DuckDuckGoEnabled {
+				errors = append(errors, "duckduckgo disabled")
+				continue
+			}
+			result := duckDuckGoSearch(ctx, cfg, query)
+			if result.OK {
+				writeWebSearchCache(cfg, query, result)
+				return result
+			}
+			errors = append(errors, "duckduckgo: "+firstNonEmpty(result.Error, result.Output))
+		case "tavily":
+			if !cfg.TavilyEnabled || strings.TrimSpace(cfg.TavilyAPIKey) == "" {
+				errors = append(errors, "tavily disabled")
+				continue
+			}
+			if !tavilyBudgetAvailable(cfg) {
+				errors = append(errors, "tavily budget exhausted")
+				continue
+			}
+			result := tavilySearch(ctx, cfg, query)
+			if result.OK {
+				recordTavilyUsage(cfg)
+				writeWebSearchCache(cfg, query, result)
+				return result
+			}
+			errors = append(errors, "tavily: "+firstNonEmpty(result.Error, result.Output))
+		}
+	}
+	if len(errors) == 0 {
+		return ErrorResult("web.search has no enabled provider")
+	}
+	return ErrorResult("web.search failed: " + strings.Join(errors, "; "))
+}
+
+func providerOrderForSearch(cfg SearchConfig, args map[string]string) []string {
+	override := strings.ToLower(strings.TrimSpace(args["provider"]))
+	if override != "" {
+		return appendMissingFallbackProviders([]string{override}, cfg.ProviderOrder)
+	}
+	order := append([]string(nil), cfg.ProviderOrder...)
+	if len(order) == 0 {
+		order = []string{"cache", "duckduckgo", "tavily"}
+	}
+	if searchFreshness(args) {
+		var fresh []string
+		for _, item := range order {
+			if strings.TrimSpace(strings.ToLower(item)) != "cache" {
+				fresh = append(fresh, strings.TrimSpace(strings.ToLower(item)))
+			}
+		}
+		fresh = append(fresh, "cache")
+		return dedupeProviderOrder(fresh)
+	}
+	for i := range order {
+		order[i] = strings.TrimSpace(strings.ToLower(order[i]))
+	}
+	return dedupeProviderOrder(order)
+}
+
+func appendMissingFallbackProviders(primary, configured []string) []string {
+	order := append([]string(nil), primary...)
+	if len(configured) == 0 {
+		configured = []string{"cache", "duckduckgo", "tavily"}
+	}
+	for _, provider := range configured {
+		order = append(order, provider)
+	}
+	return dedupeProviderOrder(order)
+}
+
+func dedupeProviderOrder(order []string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, item := range order {
+		item = strings.TrimSpace(strings.ToLower(item))
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func searchFreshness(args map[string]string) bool {
+	text := strings.ToLower(strings.TrimSpace(firstNonEmpty(args["freshness"], args["fresh"])))
+	return text == "fresh" || text == "current" || text == "latest" || text == "true" || text == "1"
+}
+
 func duckDuckGoSearch(ctx context.Context, cfg SearchConfig, query string) Result {
 	maxResults := cfg.DuckDuckGoMaxResults
 	if maxResults <= 0 {
@@ -742,13 +1582,15 @@ func duckDuckGoSearch(ctx context.Context, cfg SearchConfig, query string) Resul
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: searchTimeout(cfg.DuckDuckGoTimeoutSeconds, 4)}
 	resp, err := client.Do(req)
 	if err != nil {
-		if fallback := duckDuckGoHTMLSearch(ctx, query, maxResults); fallback.OK {
+		fallbackCtx, cancel := context.WithTimeout(context.Background(), searchTimeout(cfg.DuckDuckGoTimeoutSeconds, 4))
+		defer cancel()
+		if fallback := duckDuckGoHTMLSearch(fallbackCtx, query, maxResults); fallback.OK {
 			return fallback
 		}
-		if github := githubSoftwareSearchFallback(ctx, query, maxResults); github.OK {
+		if github := githubSoftwareSearchFallback(fallbackCtx, query, maxResults); github.OK {
 			return github
 		}
 		return ErrorResult(err.Error())
@@ -791,7 +1633,7 @@ func duckDuckGoHTMLSearch(ctx context.Context, query string, maxResults int) Res
 		return ErrorResult(err.Error())
 	}
 	req.Header.Set("user-agent", "mateway-web-search/1.0")
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return ErrorResult(err.Error())
@@ -807,6 +1649,214 @@ func duckDuckGoHTMLSearch(ctx context.Context, query string, maxResults int) Res
 		lines = append(lines, fmt.Sprintf("%d. %s\n%s", i+1, item.Title, item.URL))
 	}
 	return Result{OK: true, Output: Truncate(strings.Join(lines, "\n\n"), DefaultOutputLimit), Evidence: map[string]any{"kind": "web_search", "provider": "duckduckgo_html", "query": query, "result_count": len(links)}}
+}
+
+type webSearchCacheEntry struct {
+	Query     string         `json:"query"`
+	Output    string         `json:"output"`
+	Evidence  map[string]any `json:"evidence"`
+	FetchedAt time.Time      `json:"fetched_at"`
+}
+
+func readWebSearchCache(cfg SearchConfig, query string, fresh bool) (Result, bool) {
+	if !cfg.CacheEnabled || strings.TrimSpace(cfg.CacheDir) == "" {
+		return Result{}, false
+	}
+	path := webSearchCachePath(cfg, query)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Result{}, false
+	}
+	var entry webSearchCacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return Result{}, false
+	}
+	ttl := cfg.CacheTTLHours
+	if fresh {
+		ttl = cfg.FreshCacheTTLHours
+	}
+	if ttl <= 0 {
+		ttl = 168
+	}
+	if time.Since(entry.FetchedAt) > time.Duration(ttl)*time.Hour {
+		return Result{}, false
+	}
+	evidence := copyEvidence(entry.Evidence)
+	if evidence == nil {
+		evidence = map[string]any{}
+	}
+	evidence["cache_hit"] = true
+	evidence["cache_path"] = path
+	evidence["provider"] = firstNonEmpty(fmt.Sprint(evidence["provider"]), "cache")
+	return Result{OK: true, Output: entry.Output, Evidence: evidence}, true
+}
+
+func writeWebSearchCache(cfg SearchConfig, query string, result Result) {
+	if !cfg.CacheEnabled || strings.TrimSpace(cfg.CacheDir) == "" || !result.OK {
+		return
+	}
+	entry := webSearchCacheEntry{
+		Query:     query,
+		Output:    result.Output,
+		Evidence:  result.Evidence,
+		FetchedAt: time.Now(),
+	}
+	data, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return
+	}
+	path := webSearchCachePath(cfg, query)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+func webSearchCachePath(cfg SearchConfig, query string) string {
+	return filepath.Join(cfg.CacheDir, "search", hashString(strings.ToLower(strings.TrimSpace(query)))+".json")
+}
+
+func hashString(value string) string {
+	sum := sha1.Sum([]byte(value))
+	return fmt.Sprintf("%x", sum)
+}
+
+func copyEvidence(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func searchTimeout(seconds int, fallback int) time.Duration {
+	if seconds <= 0 {
+		seconds = fallback
+	}
+	if seconds > 60 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func tavilyBudgetAvailable(cfg SearchConfig) bool {
+	if cfg.TavilyDailyBudget <= 0 && cfg.TavilyMonthlyBudget <= 0 {
+		return true
+	}
+	usage := readProviderUsage(cfg, "tavily")
+	now := time.Now()
+	if cfg.TavilyDailyBudget > 0 && usage.Day == now.Format("2006-01-02") && usage.DayCount >= cfg.TavilyDailyBudget {
+		return false
+	}
+	if cfg.TavilyMonthlyBudget > 0 && usage.Month == now.Format("2006-01") && usage.MonthCount >= cfg.TavilyMonthlyBudget {
+		return false
+	}
+	return true
+}
+
+func recordTavilyUsage(cfg SearchConfig) {
+	if strings.TrimSpace(cfg.CacheDir) == "" {
+		return
+	}
+	usage := readProviderUsage(cfg, "tavily")
+	now := time.Now()
+	day := now.Format("2006-01-02")
+	month := now.Format("2006-01")
+	if usage.Day != day {
+		usage.Day = day
+		usage.DayCount = 0
+	}
+	if usage.Month != month {
+		usage.Month = month
+		usage.MonthCount = 0
+	}
+	usage.DayCount++
+	usage.MonthCount++
+	writeProviderUsage(cfg, "tavily", usage)
+}
+
+type providerUsage struct {
+	Day        string `json:"day"`
+	DayCount   int    `json:"day_count"`
+	Month      string `json:"month"`
+	MonthCount int    `json:"month_count"`
+}
+
+func readProviderUsage(cfg SearchConfig, provider string) providerUsage {
+	var usage providerUsage
+	data, err := os.ReadFile(providerUsagePath(cfg, provider))
+	if err != nil {
+		return usage
+	}
+	_ = json.Unmarshal(data, &usage)
+	return usage
+}
+
+func writeProviderUsage(cfg SearchConfig, provider string, usage providerUsage) {
+	path := providerUsagePath(cfg, provider)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(usage, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+func providerUsagePath(cfg SearchConfig, provider string) string {
+	return filepath.Join(cfg.CacheDir, "usage", provider+".json")
+}
+
+func webFetchURL(ctx context.Context, rawURL string, timeout time.Duration) Result {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return ErrorResult("unsupported url scheme: " + parsed.Scheme)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	req.Header.Set("user-agent", "mateway-web-fetch/1.0")
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ErrorResult(fmt.Sprintf("web.fetch status=%d url=%s", resp.StatusCode, rawURL))
+	}
+	raw := string(data)
+	title := htmlTitle(raw)
+	text := htmlToText(raw)
+	output := strings.TrimSpace(strings.Join([]string{
+		"Fetched URL: " + rawURL,
+		"Title: " + title,
+		"Preview:\n" + Truncate(text, 3000),
+	}, "\n\n"))
+	return Result{OK: true, Output: Truncate(output, DefaultOutputLimit), Evidence: map[string]any{"kind": "web_fetch", "url": rawURL, "status": resp.StatusCode, "title": title, "bytes": len(data)}}
+}
+
+func htmlTitle(raw string) string {
+	match := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`).FindStringSubmatch(raw)
+	if len(match) < 2 {
+		return ""
+	}
+	return stripHTML(match[1])
+}
+
+func htmlToText(raw string) string {
+	raw = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`).ReplaceAllString(raw, " ")
+	raw = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`).ReplaceAllString(raw, " ")
+	return stripHTML(raw)
 }
 
 type simpleSearchResult struct {

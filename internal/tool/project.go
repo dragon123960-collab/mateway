@@ -14,6 +14,17 @@ func ProjectIndex() Definition {
 	return Definition{
 		Name:        "project.index",
 		Description: "Index a project or directory and return a concise structural summary.",
+		Metadata: Metadata{
+			Purpose:        "inspect repository or directory structure",
+			WhenToUse:      []string{"project overview", "repository map", "file tree", "package distribution"},
+			WhenNotToUse:   []string{"reading one file", "editing files"},
+			RequiredArgs:   []string{},
+			OutputContract: []string{"directory path", "file count", "extension summary"},
+			AcceptanceSpecRef: "project.index/default",
+			AcceptanceMode: AcceptanceCodeOnly,
+			ParallelMode:   ParallelReadOnlyOK,
+			ResourceScope:  "project:index",
+		},
 		Risk:        RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"path":      "optional project or directory path, defaults to project root",
@@ -40,6 +51,18 @@ func FileSummary() Definition {
 	return Definition{
 		Name:        "file.summary",
 		Description: "Summarize one text file with metadata, headings, and a short content preview.",
+		Metadata: Metadata{
+			Purpose:            "summarize a single text file",
+			WhenToUse:          []string{"need concise file summary", "before reading full file"},
+			WhenNotToUse:       []string{"editing files", "directory overview"},
+			RequiredArgs:       []string{"path"},
+			OutputContract:     []string{"file path", "headings", "preview lines"},
+			AcceptanceSpecRef:  "file.summary/default",
+			AcceptanceMode:     AcceptanceCodeLLM,
+			SoftFailureSignals: []string{"requires a file path"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "filesystem:path",
+		},
 		Risk:        RiskSafeRead,
 		ArgsSchema: map[string]string{
 			"path":      "file path",

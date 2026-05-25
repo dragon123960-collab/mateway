@@ -22,20 +22,32 @@ import (
 type fakePlanner struct {
 	plan                      model.Plan
 	repairPlan                model.Plan
+	synthesizeText            string
+	stepAcceptText            string
+	finalAcceptText           string
 	planCalls                 int
+	lastPlanTools             []string
 	repairCalls               int
+	finalAcceptCalls          int
 	lastPlanSkillPrompt       string
 	lastSynthesizeSkillPrompt string
 	lastPlanUser              string
+	lastStepAcceptUser        string
 	followupDecision          model.FollowupDecision
 	followupErr               error
 	followupCalls             int
+}
+
+type finalSequencePlanner struct {
+	*fakePlanner
+	responses []string
 }
 
 func (f *fakePlanner) PlanJSON(ctx context.Context, user string, tools []tool.Definition, skillPrompt string) (model.Plan, error) {
 	f.planCalls++
 	f.lastPlanUser = user
 	f.lastPlanSkillPrompt = skillPrompt
+	f.lastPlanTools = toolNames(tools)
 	return f.plan, nil
 }
 
@@ -50,7 +62,39 @@ func (f *fakePlanner) RepairPlanJSON(ctx context.Context, user string, plan mode
 
 func (f *fakePlanner) Synthesize(ctx context.Context, user string, plan model.Plan, results []model.ToolResult, skillPrompt string) (string, error) {
 	f.lastSynthesizeSkillPrompt = skillPrompt
+	if strings.TrimSpace(f.synthesizeText) != "" {
+		return f.synthesizeText, nil
+	}
 	return "done", nil
+}
+
+func (f *fakePlanner) AcceptStepJSON(ctx context.Context, user string, step model.PlanStep, result model.ToolResult) (string, error) {
+	f.lastStepAcceptUser = user
+	if strings.TrimSpace(f.stepAcceptText) != "" {
+		return f.stepAcceptText, nil
+	}
+	return `{"status":"pass","reason":"ok"}`, nil
+}
+
+func (f *fakePlanner) AcceptFinalJSON(ctx context.Context, user string, plan model.Plan, results []model.ToolResult) (string, error) {
+	f.finalAcceptCalls++
+	if strings.TrimSpace(f.finalAcceptText) != "" {
+		return f.finalAcceptText, nil
+	}
+	if anyFailed(results) {
+		return `{"status":"rejected","reason":"step failed"}`, nil
+	}
+	return `{"status":"accepted","reason":"looks complete"}`, nil
+}
+
+func (f *finalSequencePlanner) AcceptFinalJSON(ctx context.Context, user string, plan model.Plan, results []model.ToolResult) (string, error) {
+	f.finalAcceptCalls++
+	if len(f.responses) == 0 {
+		return `{"status":"accepted","reason":"looks complete"}`, nil
+	}
+	next := f.responses[0]
+	f.responses = f.responses[1:]
+	return next, nil
 }
 
 func (f *fakePlanner) ResolveFollowupJSON(ctx context.Context, prompt string) (model.FollowupDecision, error) {
@@ -79,6 +123,428 @@ func TestRuntimeRepairsOnce(t *testing.T) {
 	}
 	if resp.Failed {
 		t.Fatalf("expected repaired response")
+	}
+}
+
+func TestRuntimeRepairPromptIncludesVerifierGuidance(t *testing.T) {
+	fp := &fakePlanner{plan: model.Plan{Summary: "bad", Steps: []model.PlanStep{{ID: "s1", Tool: "file.read", Args: map[string]string{}}}}}
+	reg := tool.NewRegistry()
+	reg.Register(tool.FileRead())
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请读取 README"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "Repair guidance:") || !strings.Contains(fp.lastPlanSkillPrompt, "missing required arg path") {
+		t.Fatalf("expected repair guidance in repair prompt, got %q", fp.lastPlanSkillPrompt)
+	}
+}
+
+func TestStepAcceptanceTaskLoadsToolSpecificAcceptanceSpec(t *testing.T) {
+	def := tool.FilePatch()
+	task := buildStepAcceptanceTask("编辑 README", model.PlanStep{
+		ID:   "s1",
+		Tool: "file.patch",
+		Goal: "Patch README title",
+	}, def, NewAcceptanceRegistry())
+	for _, want := range []string{
+		"Pass criteria:",
+		"Tool acceptance prompt:",
+		"replace-style patch result",
+	} {
+		if !strings.Contains(strings.ToLower(task), strings.ToLower(want)) {
+			t.Fatalf("expected step acceptance task to contain %q, got %q", want, task)
+		}
+	}
+}
+
+func TestDerivedAcceptanceSpecRefSelectsPatchScenes(t *testing.T) {
+	def := tool.FilePatch()
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "file.patch", Args: map[string]string{"append": "hello"}}, def); got != "file.patch/append" {
+		t.Fatalf("expected append scene, got %q", got)
+	}
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "file.patch", Args: map[string]string{"old": "a", "new": "b"}}, def); got != "file.patch/replace" {
+		t.Fatalf("expected replace scene, got %q", got)
+	}
+}
+
+func TestDerivedAcceptanceSpecRefSelectsTerminalScenes(t *testing.T) {
+	def := tool.TerminalRun()
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "terminal.run", Goal: "run tests", Args: map[string]string{"command": "go test ./..."}}, def); got != "terminal.run/test" {
+		t.Fatalf("expected test scene, got %q", got)
+	}
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "terminal.run", Goal: "build app", Args: map[string]string{"command": "go build ./..."}}, def); got != "terminal.run/build" {
+		t.Fatalf("expected build scene, got %q", got)
+	}
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "terminal.run", Goal: "check status", Args: map[string]string{"command": "ps aux"}}, def); got != "terminal.run/diagnostic" {
+		t.Fatalf("expected diagnostic scene, got %q", got)
+	}
+}
+
+func TestDerivedAcceptanceSpecRefSelectsWebSearchScenes(t *testing.T) {
+	def := tool.WebSearch()
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "web.search", Goal: "latest AI news"}, def); got != "web.search/fresh_info" {
+		t.Fatalf("expected fresh scene, got %q", got)
+	}
+	if got := derivedAcceptanceSpecRef(model.PlanStep{Tool: "web.search", Goal: "background on AI agents"}, def); got != "web.search/background_info" {
+		t.Fatalf("expected background scene, got %q", got)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForFileSummaryEvidence(t *testing.T) {
+	def := tool.FileSummary()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:               "s1",
+		Tool:             "file.summary",
+		ExpectedEvidence: []string{"file path"},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "file.summary",
+		OK:     true,
+		Output: "File summary\n\n- path: README.md",
+		Evidence: map[string]any{
+			"kind": "file_summary",
+			"path": "README.md",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing preview or headings evidence") {
+		t.Fatalf("expected registry-based suspect acceptance, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForProjectIndexEvidence(t *testing.T) {
+	def := tool.ProjectIndex()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "project.index",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "project.index",
+		OK:     true,
+		Output: "Project index",
+		Evidence: map[string]any{
+			"kind": "project_index",
+			"path": "/tmp/project",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing project structure count evidence") {
+		t.Fatalf("expected registry-based suspect for project.index, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForTerminalEvidence(t *testing.T) {
+	def := tool.TerminalRun()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:               "s1",
+		Tool:             "terminal.run",
+		ExpectedEvidence: []string{"exit code"},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "terminal.run",
+		OK:     true,
+		Output: "process seems fine",
+		Evidence: map[string]any{
+			"kind": "terminal",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing terminal execution evidence") {
+		t.Fatalf("expected registry-based hard fail, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForFileReadLineEvidence(t *testing.T) {
+	def := tool.FileRead()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:               "s1",
+		Tool:             "file.read",
+		ExpectedEvidence: []string{"file path"},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "file.read",
+		OK:     true,
+		Output: "hello",
+		Evidence: map[string]any{
+			"kind": "file_read",
+			"path": "README.md",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing line range evidence") {
+		t.Fatalf("expected registry-based suspect for file.read, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForFileWriteBytesEvidence(t *testing.T) {
+	def := tool.FileWrite()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:               "s1",
+		Tool:             "file.write",
+		ExpectedEvidence: []string{"file path"},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "file.write",
+		OK:     true,
+		Output: "wrote README.md",
+		Evidence: map[string]any{
+			"kind": "file_write",
+			"path": "README.md",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing bytes written evidence") {
+		t.Fatalf("expected registry-based suspect for file.write, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForWebSearchEvidence(t *testing.T) {
+	def := tool.WebSearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:               "s1",
+		Tool:             "web.search",
+		ExpectedEvidence: []string{"query"},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "web.search",
+		OK:     true,
+		Output: "Search results",
+		Evidence: map[string]any{
+			"kind": "web_search",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing web search execution evidence") {
+		t.Fatalf("expected registry-based hard fail for web.search, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForSoftwareInstallEvidence(t *testing.T) {
+	def := tool.SoftwareInstall()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "software.install",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "software.install",
+		OK:     true,
+		Output: "installed",
+		Evidence: map[string]any{
+			"kind": "software_install",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing software install verification evidence") {
+		t.Fatalf("expected registry-based hard fail for software.install, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForSoftwareSearchEvidence(t *testing.T) {
+	def := tool.SoftwareSearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "software.search",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "software.search",
+		OK:     true,
+		Output: "results",
+		Evidence: map[string]any{
+			"kind": "software_search",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing web search execution evidence") {
+		t.Fatalf("expected registry-based hard fail for software.search, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForSkillSearchEvidence(t *testing.T) {
+	def := tool.SkillSearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "skill.search",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "skill.search",
+		OK:     true,
+		Output: "results",
+		Evidence: map[string]any{
+			"kind": "skill_search",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing skill search evidence") {
+		t.Fatalf("expected registry-based hard fail for skill.search, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForSkillInstallEvidence(t *testing.T) {
+	def := tool.SkillInstall()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "skill.install",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "skill.install",
+		OK:     true,
+		Output: "installed",
+		Evidence: map[string]any{
+			"kind": "skill_install",
+			"name": "browser-helper",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing skill install evidence") {
+		t.Fatalf("expected registry-based hard fail for skill.install, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForMemorySearchEvidence(t *testing.T) {
+	def := tool.MemorySearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "memory.search",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "memory.search",
+		OK:     true,
+		Output: "memory result",
+		Evidence: map[string]any{
+			"kind": "memory_search",
+			"path": "memory.md",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing line range evidence") {
+		t.Fatalf("expected registry-based suspect for memory.search, got %#v", accept)
+	}
+}
+
+func TestMemorySearchNoMatchIsUsable(t *testing.T) {
+	def := tool.MemorySearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "memory.search",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "memory.search",
+		OK:     false,
+		Error:  "no matching long memory found",
+		Output: "Memory search results for: schedule\nNo matching long memory found.",
+		Evidence: map[string]any{
+			"kind":         "memory_search",
+			"result_count": 0,
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable {
+		t.Fatalf("expected no-match memory search to be usable, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForMemoryIndexEvidence(t *testing.T) {
+	def := tool.MemoryIndex()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "memory.index",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "memory.index",
+		OK:     true,
+		Output: "Memory index",
+		Evidence: map[string]any{
+			"kind": "memory_index",
+			"path": "index.json",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing entry count evidence") {
+		t.Fatalf("expected registry-based suspect for memory.index, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForScheduleCreateEvidence(t *testing.T) {
+	def := tool.ScheduleCreate()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "schedule.create",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "schedule.create",
+		OK:     true,
+		Output: "created",
+		Evidence: map[string]any{
+			"kind":    "schedule_create",
+			"task_id": "daily-report",
+			"status":  "active",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing schedule task evidence") {
+		t.Fatalf("expected registry-based hard fail for schedule.create, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForScheduleListEvidence(t *testing.T) {
+	def := tool.ScheduleList()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "schedule.list",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "schedule.list",
+		OK:     true,
+		Output: "Schedule tasks",
+		Evidence: map[string]any{
+			"kind": "schedule_list",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "missing task count evidence") {
+		t.Fatalf("expected registry-based suspect for schedule.list, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForScheduleDeleteEvidence(t *testing.T) {
+	def := tool.ScheduleDelete()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "schedule.delete",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "schedule.delete",
+		OK:     true,
+		Output: "Deleted schedule task",
+		Evidence: map[string]any{
+			"kind":    "schedule_delete",
+			"task_id": "daily-report",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing delete evidence") {
+		t.Fatalf("expected registry-based hard fail for schedule.delete, got %#v", accept)
+	}
+}
+
+func TestRuntimeLLMStepAcceptanceUsesToolSpecificSpec(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "summarize file", Understanding: model.UnderstandingJSON{RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "file.summary", Args: map[string]string{"path": "README.md"}, ExpectedEvidence: []string{"file path"},
+		}}},
+		stepAcceptText: `{"status":"pass","reason":"ok"}`,
+	}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:        "file.summary",
+		Description: "Summarize file",
+		Metadata: tool.Metadata{
+			AcceptanceMode:    tool.AcceptanceCodeLLM,
+			AcceptanceSpecRef: "file.summary/default",
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{OK: true, Output: "No results found for README.md", Evidence: map[string]any{"kind": "file_summary", "path": "README.md", "headings": []string{"README"}}}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "总结 README"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Pass criteria:",
+		"Tool acceptance prompt:",
+		"summary reflects the requested file",
+	} {
+		if !strings.Contains(strings.ToLower(fp.lastStepAcceptUser), strings.ToLower(want)) {
+			t.Fatalf("expected step acceptance user text to contain %q, got %q", want, fp.lastStepAcceptUser)
+		}
 	}
 }
 
@@ -243,7 +709,7 @@ func TestRuntimeAppendsInboxReminderForPendingItems(t *testing.T) {
 	}
 }
 
-func TestRuntimeDoesNotAppendInboxReminderToControlReply(t *testing.T) {
+func TestRuntimeAppendsInboxReminderToNormalMutationReply(t *testing.T) {
 	workspace := t.TempDir()
 	mem := memory.NewStore(workspace)
 	if _, err := mem.Propose(memory.ProposalInput{
@@ -275,8 +741,48 @@ func TestRuntimeDoesNotAppendInboxReminderToControlReply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.AwaitConfirm {
-		t.Fatalf("expected confirmation")
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected normal mutation reply, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "Inbox 提醒：") {
+		t.Fatalf("expected inbox reminder on normal reply, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDoesNotAppendInboxReminderToControlReply(t *testing.T) {
+	workspace := t.TempDir()
+	mem := memory.NewStore(workspace)
+	if _, err := mem.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Title:   "Pending Memory",
+		Body:    "This proposal is waiting for review.",
+		Sources: []string{"manual"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "ask", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "user.ask", Args: map[string]string{"question": "Need input"},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   mem,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:inbox-control-ask", Text: "Ask"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitUserInput {
+		t.Fatalf("expected user input control reply, got %#v", resp)
 	}
 	if strings.Contains(resp.Reply.Text, "Inbox 提醒：") {
 		t.Fatalf("expected no inbox reminder on control reply, got %q", resp.Reply.Text)
@@ -337,22 +843,60 @@ func TestRuntimeBlocksUngroundedProjectSummaryAfterRepair(t *testing.T) {
 	}
 }
 
-func TestRuntimeStopsForConfirmation(t *testing.T) {
+func TestRuntimeFileWriteRunsWithoutConfirmation(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "out.txt")
 	fp := &fakePlanner{plan: model.Plan{Summary: "write", Steps: []model.PlanStep{{ID: "s1", Tool: "file.write", Args: map[string]string{"path": "README.md", "content": "x"}}}}}
+	fp.plan.Steps[0].Args["path"] = target
 	reg := tool.NewRegistry()
 	tool.RegisterBuiltins(reg)
-	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6}
 	rt.Logger.Quiet = true
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "write"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.AwaitConfirm {
-		t.Fatalf("expected await confirm")
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected write without confirmation, got %#v", resp)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "x" {
+		t.Fatalf("expected written file, data=%q err=%v", data, err)
 	}
 }
 
-func TestRuntimeIgnoresModelConfirmedArgForGuardedTool(t *testing.T) {
+func TestRuntimeSkillInstallReturnsCompletionWithoutConfirmation(t *testing.T) {
+	fp := &fakePlanner{plan: model.Plan{Summary: "install skill", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "skill.install", Args: map[string]string{"name": "agent browser"},
+	}}}, synthesizeText: "Skill installed: agent browser"}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:        "skill.install",
+		Description: "fake skill installer",
+		Risk:        tool.RiskGuardedMutation,
+		ArgsSchema:  map[string]string{"name": "skill name"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{
+				OK:       true,
+				Output:   "Skill installed: agent browser",
+				Evidence: map[string]any{"kind": "skill_install", "name": call.Args["name"], "target_path": filepath.Join(call.Context.Workspace, "skills", "agent-browser", "SKILL.md")},
+			}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: ".", Workspace: t.TempDir()}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "安装一下 agent browser 这个技能并测试使用"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected skill install without confirmation, got %#v", resp)
+	}
+	if len(resp.Results) != 1 || !resp.Results[0].OK || resp.Results[0].Tool != "skill.install" {
+		t.Fatalf("expected skill install result, got %#v", resp.Results)
+	}
+}
+
+func TestRuntimeIgnoresModelConfirmedArgForFileWritePolicy(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "out.txt")
 	fp := &fakePlanner{plan: model.Plan{Summary: "write", Steps: []model.PlanStep{{
@@ -364,19 +908,22 @@ func TestRuntimeIgnoresModelConfirmedArgForGuardedTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.AwaitConfirm {
-		t.Fatalf("expected await confirm despite model confirmed arg, got %#v", resp)
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected file write without confirmation, got %#v", resp)
 	}
-	if _, err := os.Stat(target); !os.IsNotExist(err) {
-		t.Fatalf("expected file not to be written before user approval, stat err=%v", err)
+	if data, err := os.ReadFile(target); err != nil || string(data) != "x" {
+		t.Fatalf("expected file to be written by policy, data=%q err=%v", data, err)
 	}
 }
 
-func TestRuntimeIgnoresModelConfirmedArgForDangerousCommand(t *testing.T) {
+func TestRuntimeIgnoresModelConfirmedArgForDestructiveCommand(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "out.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	fp := &fakePlanner{plan: model.Plan{Summary: "shell", Steps: []model.PlanStep{{
-		ID: "s1", Tool: "shell.run", Args: map[string]string{"command": "echo x > out.txt", "confirmed": "true"},
+		ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "rm out.txt", "confirmed": "true"},
 	}}}}
 	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6}
 	rt.Logger.Quiet = true
@@ -387,14 +934,14 @@ func TestRuntimeIgnoresModelConfirmedArgForDangerousCommand(t *testing.T) {
 	if !resp.AwaitConfirm {
 		t.Fatalf("expected await confirm despite model confirmed arg, got %#v", resp)
 	}
-	if _, err := os.Stat(target); !os.IsNotExist(err) {
-		t.Fatalf("expected command not to write before user approval, stat err=%v", err)
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("expected file not to be deleted before user approval, stat err=%v", err)
 	}
 }
 
 func TestRuntimeIgnoresModelRequiresConfirmForSafeCommand(t *testing.T) {
 	fp := &fakePlanner{plan: model.Plan{Summary: "pwd", Steps: []model.PlanStep{{
-		ID: "s1", Tool: "shell.run", Args: map[string]string{"command": "pwd"}, RequiresConfirm: true,
+		ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "pwd"}, RequiresConfirm: true,
 	}}}}
 	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
 	rt.Logger.Quiet = true
@@ -407,28 +954,28 @@ func TestRuntimeIgnoresModelRequiresConfirmForSafeCommand(t *testing.T) {
 	}
 }
 
-func TestRuntimeRewritesProjectOverviewShellPlanToProjectIndex(t *testing.T) {
+func TestRuntimeDoesNotRewriteShellPlanByKeyword(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# Mateway"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	fp := &fakePlanner{plan: model.Plan{Summary: "project overview", Steps: []model.PlanStep{{
-		ID: "s1", Goal: "概览项目目录结构", Tool: "shell.run", Args: map[string]string{"command": "find . -maxdepth 2 -type f"}, RequiresConfirm: true,
+		ID: "s1", Goal: "run find command for directory structure", Tool: "terminal.run", Args: map[string]string{"command": "find . -maxdepth 2 -type f"}, RequiresConfirm: false,
 	}}}}
 	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6}
 	rt.Logger.Quiet = true
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请概览当前项目的目录结构和核心包"})
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请运行 find . -maxdepth 2 -type f"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.AwaitConfirm {
 		t.Fatalf("expected project overview to avoid shell confirmation, got %#v", resp)
 	}
-	if len(resp.Plan.Steps) != 1 || resp.Plan.Steps[0].Tool != "project.index" {
-		t.Fatalf("expected project.index plan, got %#v", resp.Plan)
+	if len(resp.Plan.Steps) != 1 || resp.Plan.Steps[0].Tool != "terminal.run" {
+		t.Fatalf("expected original model-planned terminal.run to remain, got %#v", resp.Plan)
 	}
-	if len(resp.Results) != 1 || !resp.Results[0].OK || resp.Results[0].Tool != "project.index" {
-		t.Fatalf("expected project.index result, got %#v", resp.Results)
+	if len(resp.Results) != 1 || !resp.Results[0].OK || resp.Results[0].Tool != "terminal.run" {
+		t.Fatalf("expected terminal.run result, got %#v", resp.Results)
 	}
 }
 
@@ -479,9 +1026,67 @@ func TestRuntimeApprovalReplyExecutesConfirmedMutation(t *testing.T) {
 	}
 }
 
+func TestRuntimeApprovalReplyOnlyApprovesCurrentDestructiveStep(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "out.txt")
+	second := filepath.Join(root, "second.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "delete twice", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "rm " + shellQuoteForTest(target)}},
+			{ID: "s2", Tool: "terminal.run", Args: map[string]string{"command": "rm " + shellQuoteForTest(second)}},
+		}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-write",
+		TaskOrder:    []string{"task-write"},
+		Tasks: map[string]session.TaskState{
+			"task-write": {
+				ID:            "task-write",
+				Status:        session.TaskAwaitConfirm,
+				UserText:      "删除两个文件",
+				ResolvedQuery: "删除两个文件",
+				PendingApproval: &session.PendingApproval{
+					ApprovalType:    "boolean_confirm",
+					Prompt:          "是否删除第一个文件？",
+					RequestedAction: "step:s1",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root, Workspace: root, AllowedRoots: []string{root}}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm {
+		t.Fatalf("expected second destructive step to require confirmation, got %#v", resp)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected first file to be deleted, err=%v", err)
+	}
+	if _, err := os.Stat(second); err != nil {
+		t.Fatalf("expected second file not deleted yet, err=%v", err)
+	}
+}
+
 type fakeGeneratorPlanner struct {
 	fakePlanner
 	text string
+}
+
+func shellQuoteForTest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func (f *fakeGeneratorPlanner) Generate(ctx context.Context, system string, messages []model.Message) (string, error) {
@@ -564,6 +1169,276 @@ func TestBuildModelContextPromptIncludesUserButNotHeartbeat(t *testing.T) {
 	}
 	if strings.Contains(prompt, "Heartbeat content") || strings.Contains(prompt, "heartbeat.md") {
 		t.Fatalf("expected heartbeat to stay out of normal prompt, got %q", prompt)
+	}
+}
+
+func TestBuildModelContextPromptIncludesStructuredToolAndSkillMetadata(t *testing.T) {
+	prompt := buildModelContextPrompt(
+		"请总结 README 并告诉我什么时候用 file.summary",
+		"planning",
+		[]skill.Match{{
+			Definition: skill.Definition{
+				Name:           "doc-review",
+				Description:    "Review docs",
+				UseFor:         []string{"documentation review"},
+				Produces:       []string{"review summary"},
+				AcceptanceMode: "llm_default",
+				ParallelMode:   "forbid",
+			},
+			Reason: "when_contains",
+		}},
+		[]tool.Definition{{
+			Name:        "file.summary",
+			Description: "Summarize one file",
+			Metadata: tool.Metadata{
+				WhenToUse:      []string{"before reading full file"},
+				WhenNotToUse:   []string{"editing files"},
+				OutputContract: []string{"file path", "preview lines"},
+				AcceptanceMode: tool.AcceptanceCodeLLM,
+				ParallelMode:   tool.ParallelReadOnlyOK,
+				ResourceScope:  "filesystem:path",
+			},
+		}},
+		tool.Context{},
+		promptContextOptions{
+			Understanding: taskUnderstanding{
+				Goal:            "请总结 README 并告诉我什么时候用 file.summary",
+				Capabilities:    []string{"inspect_file"},
+				CompletionDraft: []string{"summarize the relevant file content"},
+				EvidenceHints:   []string{"file path, headings, preview lines"},
+				RiskLevel:       "safe_read",
+				NeedsGrounding:  true,
+			},
+		},
+	)
+	for _, want := range []string{
+		"use_for: documentation review",
+		"produces: review summary",
+		"when_to_use: before reading full file",
+		"acceptance_mode: code_then_llm",
+		"parallel_mode: read_only_ok",
+		"resource_scope: filesystem:path",
+		"Task understanding:",
+		"completion_draft: summarize the relevant file content",
+		"evidence_hints: file path, headings, preview lines",
+		"risk_level: safe_read",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected prompt to contain %q, got:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestComposeCandidateToolsPrefersInstallAndSearchMatches(t *testing.T) {
+	candidates := composeCandidateTools([]tool.Definition{
+		{Name: "web.search", Description: "web", Metadata: tool.Metadata{WhenToUse: []string{"latest information"}}},
+		{Name: "software.search", Description: "software", Metadata: tool.Metadata{WhenToUse: []string{"find install command"}}},
+		{Name: "software.install", Description: "install", Metadata: tool.Metadata{WhenToUse: []string{"install cli software"}}},
+		{Name: "project.index", Description: "project", Metadata: tool.Metadata{WhenToUse: []string{"repository map"}}},
+	}, taskUnderstanding{
+		Goal:         "帮我安装 lark cli，先找安装命令再安装",
+		Capabilities: []string{"install_software", "search_web"},
+	})
+	if len(candidates) == 0 {
+		t.Fatal("expected candidates")
+	}
+	names := []string{candidates[0].Name}
+	for _, def := range candidates[1:] {
+		names = append(names, def.Name)
+	}
+	if !containsAll(names, []string{"software.search", "software.install"}) {
+		t.Fatalf("expected install-related candidates, got %v", names)
+	}
+}
+
+func TestUnderstandInfersCapabilitiesAndGrounding(t *testing.T) {
+	fp := &fakePlanner{plan: model.Plan{Summary: "noop", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	loop := NewAgentLoop(rt, channel.InboundMessage{Text: "请搜索最新的 lark cli 安装方式并帮我安装"})
+	loop.state.resolvedQuery = "请搜索最新的 lark cli 安装方式并帮我安装"
+	loop.state.understanding = loop.fallbackUnderstanding()
+	if !containsAll(loop.state.understanding.Capabilities, []string{"install_software", "search_web"}) {
+		t.Fatalf("expected install and search capabilities, got %v", loop.state.understanding.Capabilities)
+	}
+	if !loop.state.understanding.NeedsGrounding {
+		t.Fatalf("expected grounding requirement")
+	}
+	if !loop.state.understanding.NeedsMutation {
+		t.Fatalf("expected mutation requirement")
+	}
+	if len(loop.state.understanding.CompletionDraft) == 0 || len(loop.state.understanding.EvidenceHints) == 0 {
+		t.Fatalf("expected completion draft and evidence hints, got %#v", loop.state.understanding)
+	}
+	if loop.state.understanding.RiskLevel != "guarded_mutation" {
+		t.Fatalf("expected guarded mutation risk, got %q", loop.state.understanding.RiskLevel)
+	}
+}
+
+func TestMergeUnderstandingFromPlanPrefersModelOutput(t *testing.T) {
+	got := mergeUnderstandingFromPlan(model.UnderstandingJSON{
+		Goal:                 "install lark cli",
+		Subtasks:             []string{"find install method"},
+		Constraints:          []string{"latest stable"},
+		CompletionCriteria:   []string{"installed cli is verified"},
+		EvidenceExpectations: []string{"install command", "verify command"},
+		RiskLevel:            "guarded_mutation",
+		ToolNeeds:            []string{"software.search", "software.install"},
+	}, taskUnderstanding{
+		Goal:            "fallback goal",
+		Capabilities:    []string{"search_web"},
+		EvidenceHints:   []string{"query"},
+		CompletionDraft: []string{"fallback completion"},
+		RiskLevel:       "safe_read",
+	})
+	if got.Goal != "install lark cli" || got.RiskLevel != "guarded_mutation" {
+		t.Fatalf("expected model output to win, got %#v", got)
+	}
+	if len(got.Capabilities) != 2 || got.Capabilities[0] != "software.search" {
+		t.Fatalf("expected tool needs to map into capabilities, got %#v", got)
+	}
+}
+
+func TestComposeCandidateToolsPrefersProjectInspectionFromUnderstanding(t *testing.T) {
+	candidates := composeCandidateTools([]tool.Definition{
+		{Name: "web.search", Description: "web", Metadata: tool.Metadata{WhenToUse: []string{"latest information"}}},
+		{Name: "project.index", Description: "project", Metadata: tool.Metadata{WhenToUse: []string{"repository map"}}},
+		{Name: "file.summary", Description: "summary", Metadata: tool.Metadata{WhenToUse: []string{"summarize one file"}}},
+		{Name: "terminal.run", Description: "terminal", Metadata: tool.Metadata{WhenToUse: []string{"run diagnostics"}}},
+	}, taskUnderstanding{
+		Goal:           "请概览这个仓库的结构，再看看 README",
+		Capabilities:   []string{"inspect_project", "inspect_file"},
+		NeedsGrounding: true,
+	})
+	names := []string{}
+	for _, def := range candidates {
+		names = append(names, def.Name)
+	}
+	if !containsAll(names, []string{"project.index", "file.summary"}) {
+		t.Fatalf("expected project/file candidates, got %v", names)
+	}
+}
+
+func TestPlanningOrdersRecommendedToolsWithoutDroppingOthers(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "project overview", Understanding: model.UnderstandingJSON{Goal: "inspect project", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "project.index", Args: map[string]string{},
+		}}},
+	}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{Name: "web.search", Description: "web", Metadata: tool.Metadata{WhenToUse: []string{"latest information"}}, Risk: tool.RiskSafeRead, Run: func(ctx context.Context, call tool.Call) tool.Result {
+		return tool.Result{OK: true, Output: "web", Evidence: map[string]any{"kind": "web_search"}}
+	}})
+	reg.Register(tool.Definition{Name: "project.index", Description: "project", Metadata: tool.Metadata{WhenToUse: []string{"repository map"}}, Risk: tool.RiskSafeRead, Run: func(ctx context.Context, call tool.Call) tool.Result {
+		return tool.Result{OK: true, Output: "project", Evidence: map[string]any{"kind": "project_index"}}
+	}})
+	reg.Register(tool.Definition{Name: "terminal.run", Description: "terminal", Metadata: tool.Metadata{WhenToUse: []string{"diagnostics"}}, Risk: tool.RiskSafeRead, Run: func(ctx context.Context, call tool.Call) tool.Result {
+		return tool.Result{OK: true, Output: "terminal", Evidence: map[string]any{"kind": "terminal"}}
+	}})
+	reg.Register(tool.Definition{Name: "memory.search", Description: "memory", Metadata: tool.Metadata{WhenToUse: []string{"long memory"}}, Risk: tool.RiskSafeRead, Run: func(ctx context.Context, call tool.Call) tool.Result {
+		return tool.Result{OK: true, Output: "memory", Evidence: map[string]any{"kind": "memory_search"}}
+	}})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请概览这个项目结构"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.lastPlanTools) != len(reg.Definitions()) {
+		t.Fatalf("expected all tools to remain visible, got %v", fp.lastPlanTools)
+	}
+	if fp.lastPlanTools[0] != "project.index" {
+		t.Fatalf("expected project.index to be recommended first, got %v", fp.lastPlanTools)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "Recommended tools for this request") {
+		t.Fatalf("expected recommendation guidance in prompt, got %q", fp.lastPlanSkillPrompt)
+	}
+}
+
+func TestBuildFinalAcceptanceTaskIncludesUnderstandingContext(t *testing.T) {
+	text := buildFinalAcceptanceTask("请安装 lark cli", taskUnderstanding{
+		CompletionDraft: []string{"identify the install method and verify the install result"},
+		EvidenceHints:   []string{"install command and verify command output"},
+		RiskLevel:       "guarded_mutation",
+	})
+	for _, want := range []string{
+		"Completion draft: identify the install method and verify the install result",
+		"Evidence hints: install command and verify command output",
+		"Risk level: guarded_mutation",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected final acceptance task to contain %q, got %q", want, text)
+		}
+	}
+}
+
+func TestRuntimeSkipsFinalLLMAcceptanceForSimpleCodeAcceptedRead(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "time", Understanding: model.UnderstandingJSON{Goal: "get time", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "time.now", Args: map[string]string{},
+		}}},
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "现在几点"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected success, got %#v", resp)
+	}
+	if fp.finalAcceptCalls != 0 {
+		t.Fatalf("expected no final llm acceptance for simple read, got %d", fp.finalAcceptCalls)
+	}
+}
+
+func TestRuntimeUsesFinalLLMAcceptanceForMutation(t *testing.T) {
+	root := t.TempDir()
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "write", Understanding: model.UnderstandingJSON{Goal: "write file", RiskLevel: "guarded_mutation"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "file.write", Args: map[string]string{"path": filepath.Join(root, "out.txt"), "content": "ok"}, Risk: string(tool.RiskGuardedMutation),
+		}}},
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root, Workspace: root, AllowedRoots: []string{root}}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "写一个文件"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected success, got %#v", resp)
+	}
+	if fp.finalAcceptCalls != 1 {
+		t.Fatalf("expected final llm acceptance for mutation, got %d", fp.finalAcceptCalls)
+	}
+}
+
+func TestRuntimeRechecksFinalAcceptanceAfterRepair(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "first", Understanding: model.UnderstandingJSON{Goal: "write file", RiskLevel: "guarded_mutation"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "time.now", Args: map[string]string{}, Risk: string(tool.RiskGuardedMutation),
+		}}},
+		repairPlan: model.Plan{Summary: "repaired", Understanding: model.UnderstandingJSON{Goal: "write file", RiskLevel: "guarded_mutation"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "time.now", Args: map[string]string{}, Risk: string(tool.RiskGuardedMutation),
+		}}},
+	}
+	fp2 := &finalSequencePlanner{fakePlanner: fp, responses: []string{
+		`{"status":"rejected","reason":"needs repair"}`,
+		`{"status":"accepted","reason":"repair completed"}`,
+	}}
+	rt := Runtime{Model: fp2, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "执行并验收"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected repaired final acceptance to succeed, got %#v", resp)
+	}
+	if fp2.repairCalls != 1 {
+		t.Fatalf("expected one repair, got %d", fp2.repairCalls)
+	}
+	if fp2.finalAcceptCalls != 2 {
+		t.Fatalf("expected final acceptance before and after repair, got %d", fp2.finalAcceptCalls)
 	}
 }
 
@@ -742,11 +1617,281 @@ func TestRuntimePersistsSessionAndTaskState(t *testing.T) {
 	if st.LastTask.Status != "completed" || st.LastTask.PlanSummary != "say hi" {
 		t.Fatalf("unexpected last task %#v", st.LastTask)
 	}
+	if len(st.LastTask.StepOrder) != 1 || st.LastTask.StepOrder[0] != "s1" {
+		t.Fatalf("expected step order persisted, got %#v", st.LastTask.StepOrder)
+	}
+	if len(st.LastTask.StepStates) != 1 || st.LastTask.StepStates["s1"].Status != "passed" {
+		t.Fatalf("expected step states persisted, got %#v", st.LastTask.StepStates)
+	}
 	if st.LastTask.ResolvedQuery != "现在几点" {
 		t.Fatalf("expected resolved query persisted, got %#v", st.LastTask)
 	}
 	if len(st.RecentTurns) != 2 {
 		t.Fatalf("expected user and assistant turns, got %#v", st.RecentTurns)
+	}
+}
+
+func TestRuntimeReusesPassedStepResults(t *testing.T) {
+	calls := 0
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "fake.read",
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			calls++
+			return tool.Result{OK: true, Output: "fresh output", Evidence: map[string]any{"kind": "file_read", "path": "README.md"}}
+		},
+	})
+	rt := Runtime{Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	plan := model.Plan{Summary: "reuse", Steps: []model.PlanStep{{ID: "s1", Tool: "fake.read", Args: map[string]string{}}}}
+	results, control := rt.executePlan(context.Background(), "trace", plan, false, "", map[string]session.StepState{
+		"s1": {
+			ID:            "s1",
+			Tool:          "fake.read",
+			Status:        "passed",
+			ResultOK:      true,
+			ResultSummary: "cached output",
+			Evidence:      map[string]any{"kind": "file_read", "path": "README.md"},
+		},
+	}, nil)
+	if control != "" {
+		t.Fatalf("expected no control, got %q", control)
+	}
+	if calls != 0 {
+		t.Fatalf("expected tool not to rerun, got %d calls", calls)
+	}
+	if len(results) != 1 || results[0].Output != "cached output" {
+		t.Fatalf("expected cached result reuse, got %#v", results)
+	}
+}
+
+func TestRuntimeReusesUsableStepResults(t *testing.T) {
+	calls := 0
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "fake.read",
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			calls++
+			return tool.Result{OK: true, Output: "fresh output", Evidence: map[string]any{"kind": "file_read", "path": "README.md"}}
+		},
+	})
+	rt := Runtime{Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	plan := model.Plan{Summary: "reuse", Steps: []model.PlanStep{{ID: "s1", Tool: "fake.read", Args: map[string]string{}}}}
+	results, control := rt.executePlan(context.Background(), "trace", plan, false, "", map[string]session.StepState{
+		"s1": {
+			ID:            "s1",
+			Tool:          "fake.read",
+			Status:        "usable",
+			ResultOK:      true,
+			ResultSummary: "usable output",
+			Evidence:      map[string]any{"kind": "file_read", "path": "README.md"},
+		},
+	}, nil)
+	if control != "" {
+		t.Fatalf("expected no control, got %q", control)
+	}
+	if calls != 0 {
+		t.Fatalf("expected tool not to rerun, got %d calls", calls)
+	}
+	if len(results) != 1 || results[0].Output != "usable output" {
+		t.Fatalf("expected usable result reuse, got %#v", results)
+	}
+}
+
+func TestRuntimeSkipsStepWhenDependencyFailed(t *testing.T) {
+	patchCalls := 0
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "web.search",
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{OK: false, Error: "timeout", Output: "timeout"}
+		},
+	})
+	reg.Register(tool.Definition{
+		Name: "file.patch",
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			patchCalls++
+			return tool.Result{OK: true, Output: "patched", Evidence: map[string]any{"kind": "file_patch", "path": "ai-courses.md"}}
+		},
+	})
+	rt := Runtime{Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	plan := model.Plan{Summary: "search then patch", Steps: []model.PlanStep{
+		{ID: "s1", Tool: "web.search", Args: map[string]string{"query": "AI courses"}},
+		{ID: "s2", Tool: "file.patch", Args: map[string]string{"path": "ai-courses.md", "append": "x"}, DependsOn: []string{"s1"}},
+	}}
+	results, control := rt.executePlan(context.Background(), "trace", plan, false, "", nil, nil)
+	if control != "" {
+		t.Fatalf("expected no control, got %q", control)
+	}
+	if patchCalls != 0 {
+		t.Fatalf("expected dependent patch not to run, got %d calls", patchCalls)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected search failure and skipped patch, got %#v", results)
+	}
+	if results[1].Error != "dependency_failed" || results[1].OK {
+		t.Fatalf("expected dependency_failed result, got %#v", results[1])
+	}
+}
+
+func TestRuntimeFollowupResumesTaskWithExistingStepStates(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "followup", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "time.now", Args: map[string]string{}},
+			{ID: "s2", Tool: "time.now", Args: map[string]string{}},
+		}},
+		followupDecision: model.FollowupDecision{
+			Kind:          "active_followup",
+			TargetTaskID:  "task-ai",
+			ResolvedQuery: "继续当前 AI 任务",
+			Reason:        "继续当前任务",
+			Confidence:    0.91,
+		},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-ai",
+		TaskOrder:    []string{"task-ai"},
+		Tasks: map[string]session.TaskState{
+			"task-ai": {
+				ID:              "task-ai",
+				UserText:        "当前 AI 任务",
+				ResolvedQuery:   "当前 AI 任务",
+				Topic:           "AI 任务",
+				Status:          session.TaskOpen,
+				ExecutionStatus: "executing",
+				StepOrder:       []string{"s1", "s2"},
+				StepStates: map[string]session.StepState{
+					"s1": {ID: "s1", Tool: "time.now", Status: "passed", ResultOK: true, ResultSummary: "cached", Evidence: map[string]any{"kind": "time"}},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:cli",
+		Text:       "继续",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Load("cli:cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTask == nil || len(st.LastTask.StepStates) != 2 {
+		t.Fatalf("expected resumed task step states, got %#v", st.LastTask)
+	}
+}
+
+func TestRuntimeEmptySessionTreatsDiagnoseRequestAsNewTask(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "diagnose", Steps: []model.PlanStep{{ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "pwd"}}}},
+		followupDecision: model.FollowupDecision{
+			Kind:       "ambiguous",
+			Reason:     "would otherwise be ambiguous",
+			Confidence: 0,
+		},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:openclaw-diagnose",
+		Text:       "帮我看看 openclaw 是不是卡住了",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput {
+		t.Fatalf("expected empty-session diagnose request to be treated as new task, got %#v", resp)
+	}
+	if fp.followupCalls != 0 {
+		t.Fatalf("expected no model followup call on empty session, got %d", fp.followupCalls)
+	}
+}
+
+func TestBuildModelContextPromptIncludesCurrentExecutionProgress(t *testing.T) {
+	task := &session.TaskState{
+		ExecutionStatus: "executing",
+		StepOrder:       []string{"s1", "s2"},
+		StepStates: map[string]session.StepState{
+			"s1": {ID: "s1", Tool: "file.read", Status: "passed", AcceptanceStatus: "passed", ResultSummary: "read README"},
+			"s2": {ID: "s2", Tool: "terminal.run", Status: "pending"},
+		},
+	}
+	prompt := buildModelContextPrompt("继续当前任务", "planning", nil, nil, tool.Context{}, promptContextOptions{
+		CurrentTask: task,
+	})
+	for _, want := range []string{
+		"Current execution progress:",
+		"execution_status: executing",
+		"completed_steps should not be repeated",
+		"s1 status=passed tool=file.read",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected prompt to contain %q, got %q", want, prompt)
+		}
+	}
+}
+
+func TestRuntimeRepairKeepsSuccessfulPriorResults(t *testing.T) {
+	callsA := 0
+	callsB := 0
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "fake.a",
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			callsA++
+			return tool.Result{OK: true, Output: "result-a", Evidence: map[string]any{"kind": "file_read", "path": "a.txt"}}
+		},
+	})
+	reg.Register(tool.Definition{
+		Name: "fake.b",
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			callsB++
+			if callsB == 1 {
+				return tool.Result{OK: false, Output: "failed", Error: "boom"}
+			}
+			return tool.Result{OK: true, Output: "result-b", Evidence: map[string]any{"kind": "file_read", "path": "b.txt"}}
+		},
+	})
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "two steps", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "fake.a", Args: map[string]string{}},
+			{ID: "s2", Tool: "fake.b", Args: map[string]string{}},
+		}},
+		repairPlan: model.Plan{Summary: "repair second step", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "fake.a", Args: map[string]string{}},
+			{ID: "s2", Tool: "fake.b", Args: map[string]string{}},
+		}},
+	}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "run two-step task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callsA != 1 {
+		t.Fatalf("expected first step not to rerun during repair, got %d calls", callsA)
+	}
+	if callsB != 2 {
+		t.Fatalf("expected second step to rerun once, got %d calls", callsB)
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("expected merged results for both steps, got %#v", resp.Results)
+	}
+	if resp.Results[0].StepID != "s1" || resp.Results[1].StepID != "s2" {
+		t.Fatalf("expected both step results preserved, got %#v", resp.Results)
 	}
 }
 
@@ -1171,11 +2316,151 @@ func TestRuntimePendingConfirmCanBeReplacedByNewInstallMethod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Tasks["task-install-go"].Status != session.TaskAbandoned {
-		t.Fatalf("expected old pending task abandoned, got %#v", st.Tasks["task-install-go"])
+	if st.Tasks["task-install-go"].Status != session.TaskAwaitConfirm {
+		t.Fatalf("expected old pending task suspended, got %#v", st.Tasks["task-install-go"])
 	}
 	if st.ActiveTaskID == "task-install-go" {
 		t.Fatalf("expected active task to move to replacement task")
+	}
+}
+
+func TestRuntimePendingConfirmAuthQuestionDoesNotReplaceByKeyword(t *testing.T) {
+	fp := &fakePlanner{}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-install-go",
+		TaskOrder:    []string{"task-install-go"},
+		Tasks: map[string]session.TaskState{
+			"task-install-go": {
+				ID:            "task-install-go",
+				Status:        session.TaskAwaitConfirm,
+				UserText:      "安装 larkcli",
+				ResolvedQuery: "安装 larkcli",
+				PendingApproval: &session.PendingApproval{
+					ApprovalType:    "boolean_confirm",
+					Prompt:          "go install github.com/larksuite/cli/cmd/lark@latest",
+					RequestedAction: "go install github.com/larksuite/cli/cmd/lark@latest",
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: "git 认证失败是怎么回事"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitUserInput || fp.planCalls != 0 {
+		t.Fatalf("expected pending approval clarification without replanning, resp=%#v calls=%d", resp, fp.planCalls)
+	}
+}
+
+func containsAll(items []string, want []string) bool {
+	set := map[string]struct{}{}
+	for _, item := range items {
+		set[item] = struct{}{}
+	}
+	for _, target := range want {
+		if _, ok := set[target]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func TestRuntimeCanResumeSuspendedPendingApproval(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "install lark", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:cli",
+		ActiveTaskID: "task-auth",
+		TaskOrder:    []string{"task-install", "task-auth"},
+		Tasks: map[string]session.TaskState{
+			"task-install": {
+				ID:            "task-install",
+				Status:        session.TaskAwaitConfirm,
+				UserText:      "安装 larkcli",
+				ResolvedQuery: "安装 larkcli",
+				PendingApproval: &session.PendingApproval{
+					ApprovalType:    "boolean_confirm",
+					Prompt:          "go install github.com/larksuite/cli/cmd/lark@latest",
+					RequestedAction: "go install github.com/larksuite/cli/cmd/lark@latest",
+				},
+			},
+			"task-auth": {
+				ID:            "task-auth",
+				Status:        session.TaskCompleted,
+				UserText:      "诊断 git 认证",
+				ResolvedQuery: "诊断 git 认证",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: "继续刚才安装，确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 1 || !strings.Contains(fp.lastPlanUser, "安装 larkcli") {
+		t.Fatalf("expected suspended install task to resume, calls=%d user=%q", fp.planCalls, fp.lastPlanUser)
+	}
+}
+
+func TestRuntimeSoftwareInstallRunsWhenPlannerSelectsInstallTool(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "install lark", Steps: []model.PlanStep{{
+			ID:   "s1",
+			Tool: "software.install",
+			Args: map[string]string{
+				"name":       "larksuite/cli",
+				"method":     "npx",
+				"command":    "npx @larksuite/cli@latest install",
+				"executable": "lark-cli",
+				"source_url": "https://github.com/larksuite/cli",
+			},
+		}}},
+	}
+	registry := tool.NewBuiltinRegistry()
+	registry.Register(tool.Definition{
+		Name: "software.install",
+		Metadata: tool.Metadata{
+			AcceptanceMode: tool.AcceptanceCodeOnly,
+			ResourceScope:  "software:install",
+		},
+		ArgsSchema: map[string]string{"command": "install command"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{
+				OK:     true,
+				Output: "installed lark-cli",
+				Evidence: map[string]any{
+					"kind":           "software_install",
+					"verified":       true,
+					"verify_command": "command -v lark-cli",
+				},
+			}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: registry, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "安装 lark cli"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected install execution without confirmation, got %#v", resp)
+	}
+	if len(resp.Plan.Steps) != 1 || resp.Plan.Steps[0].Tool != "software.install" {
+		t.Fatalf("expected software.install normalization, got %#v", resp.Plan.Steps)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Tool != "software.install" {
+		t.Fatalf("expected software.install result, got %#v", resp.Results)
 	}
 }
 
@@ -1251,35 +2536,6 @@ func TestRuntimeHistoricalContinuationClarifiesMissingSourceTask(t *testing.T) {
 	}
 	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
 		t.Fatalf("expected clarification for missing source task, got %#v", resp)
-	}
-}
-
-func TestRuntimeOpenFollowupClarifiesMissingTargetTask(t *testing.T) {
-	fp := &fakePlanner{
-		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
-		followupDecision: model.FollowupDecision{
-			Kind:          "open_task_followup",
-			TargetTaskID:  "missing",
-			ResolvedQuery: "继续安装任务",
-			Reason:        "命中 open task",
-			Confidence:    0.93,
-		},
-	}
-	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
-	if err := store.Save(session.State{SessionKey: "cli:cli", Tasks: map[string]session.TaskState{}}); err != nil {
-		t.Fatal(err)
-	}
-	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
-	rt.Logger.Quiet = true
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli", Text: "继续安装"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fp.planCalls != 0 {
-		t.Fatalf("expected missing target task to clarify before planning, got %d", fp.planCalls)
-	}
-	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
-		t.Fatalf("expected clarification for missing target task, got %#v", resp)
 	}
 }
 
@@ -1523,7 +2779,9 @@ func TestRuntimeArtifactLookupDoesNotInterceptGenericDocumentRequest(t *testing.
 
 func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
 	home := t.TempDir()
-	fp := &fakePlanner{}
+	fp := &fakePlanner{plan: model.Plan{Summary: "ask schedule fields", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "user.ask", Args: map[string]string{"question": "这个任务每天几点运行？"},
+	}}}}
 	rt := Runtime{
 		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
 		Model:    fp,
@@ -1541,8 +2799,8 @@ func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
 	if !resp.AwaitUserInput || resp.Reply.Style != "input_required" {
 		t.Fatalf("expected input_required, got %#v", resp)
 	}
-	if fp.planCalls != 0 {
-		t.Fatalf("expected schedule request handled before planning, got %d calls", fp.planCalls)
+	if fp.planCalls != 1 {
+		t.Fatalf("expected schedule request to go through planning, got %d calls", fp.planCalls)
 	}
 	st, err := rt.Sessions.Load("cli:schedule")
 	if err != nil {
@@ -1552,14 +2810,24 @@ func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
 	if task == nil || task.Status != session.TaskAwaitUserInput {
 		t.Fatalf("expected awaiting schedule task, got %#v", st)
 	}
-	if _, ok := task.PendingFields["daily_at"]; !ok {
-		t.Fatalf("expected daily_at pending, got %#v", task.PendingFields)
+	if task.PendingApproval != nil {
+		t.Fatalf("expected planner-first user input, got pending approval %#v", task.PendingApproval)
 	}
 }
 
-func TestRuntimeScheduleRequestCreatesProposal(t *testing.T) {
+func TestRuntimeScheduleRequestUsesPlannerToolToCreateTask(t *testing.T) {
 	home := t.TempDir()
-	fp := &fakePlanner{}
+	fp := &fakePlanner{plan: model.Plan{Summary: "create schedule", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "schedule.create",
+		Args: map[string]string{
+			"id":       "ai-trends",
+			"title":    "AI Trends",
+			"prompt":   "Collect AI trend articles.",
+			"daily_at": "09:00",
+		},
+		ExpectedEvidence: []string{"schedule task id and path"},
+	}}}}
 	rt := Runtime{
 		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
 		Model:    fp,
@@ -1574,182 +2842,21 @@ func TestRuntimeScheduleRequestCreatesProposal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "请确认是否启用这个定时任务") {
-		t.Fatalf("expected schedule proposal reply, got %#v", resp)
+	if resp.AwaitUserInput || resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected schedule create through planner tool, got %#v", resp)
 	}
-	if !strings.Contains(resp.Reply.Text, "执行内容：每天 9点 帮我收集 AI 最新趋势文章") || !strings.Contains(resp.Reply.Text, "时间：每天 09:00") || !strings.Contains(resp.Reply.Text, "交付：写入任务产物文件") {
-		t.Fatalf("expected user-friendly schedule summary, got %q", resp.Reply.Text)
-	}
-	if fp.planCalls != 0 {
-		t.Fatalf("expected schedule request handled before planning, got %d calls", fp.planCalls)
-	}
-	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusProposed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 1 || items[0].Schedule != "daily@09:00" {
-		t.Fatalf("expected one 09:00 proposal, got %#v", items)
-	}
-}
-
-func TestRuntimeScheduleProposalApprovalEnablesTask(t *testing.T) {
-	home := t.TempDir()
-	fp := &fakePlanner{}
-	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    fp,
-		Tools:    tool.NewBuiltinRegistry(),
-		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
-		MaxSteps: 6,
-		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
-		Memory:   memory.NewStore(home),
-	}
-	rt.Logger.Quiet = true
-	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-confirm", Text: "每天 9点 帮我收集 AI 最新趋势文章"}
-	resp, err := rt.Handle(context.Background(), msg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !resp.AwaitConfirm || resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected approval pending, got %#v", resp)
-	}
-	confirm := msg
-	confirm.ID = "confirm"
-	confirm.Text = "好"
-	resp, err = rt.Handle(context.Background(), confirm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(resp.Reply.Text, "定时任务已启用") {
-		t.Fatalf("expected enabled reply, got %q", resp.Reply.Text)
+	if fp.planCalls != 1 {
+		t.Fatalf("expected schedule request to go through planning, got %d calls", fp.planCalls)
 	}
 	tasks, err := schedule.NewStore(home).List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tasks) != 1 || tasks[0].Status != schedule.StatusActive {
+	if len(tasks) != 1 || tasks[0].ID != "ai-trends" || tasks[0].Status != schedule.StatusActive {
 		t.Fatalf("expected active schedule task, got %#v", tasks)
 	}
-}
-
-func TestRuntimeScheduleProposalRejectionRejectsProposal(t *testing.T) {
-	home := t.TempDir()
-	fp := &fakePlanner{}
-	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    fp,
-		Tools:    tool.NewBuiltinRegistry(),
-		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
-		MaxSteps: 6,
-		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
-		Memory:   memory.NewStore(home),
-	}
-	rt.Logger.Quiet = true
-	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-reject", Text: "每天 9点 帮我收集 AI 最新趋势文章"}
-	if _, err := rt.Handle(context.Background(), msg); err != nil {
-		t.Fatal(err)
-	}
-	reject := msg
-	reject.ID = "reject"
-	reject.Text = "不要"
-	resp, err := rt.Handle(context.Background(), reject)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(resp.Reply.Text, "已拒绝") {
-		t.Fatalf("expected rejected reply, got %q", resp.Reply.Text)
-	}
-	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusRejected)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 1 {
-		t.Fatalf("expected rejected proposal, got %#v", items)
-	}
-	tasks, err := schedule.NewStore(home).List()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(tasks) != 0 {
-		t.Fatalf("expected no active task, got %#v", tasks)
-	}
-}
-
-func TestRuntimeScheduleRequestCreatesWeeklyAndIntervalProposals(t *testing.T) {
-	home := t.TempDir()
-	fp := &fakePlanner{}
-	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    fp,
-		Tools:    tool.NewBuiltinRegistry(),
-		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
-		MaxSteps: 6,
-		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
-		Memory:   memory.NewStore(home),
-	}
-	rt.Logger.Quiet = true
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-weekly", Text: "每周五 9点 帮我汇总 open issues"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-interval", Text: "每隔2小时 帮我检查接口状态"}); err != nil {
-		t.Fatal(err)
-	}
-	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusProposed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 2 {
-		t.Fatalf("expected two proposals, got %#v", items)
-	}
-	foundWeekly := false
-	foundInterval := false
-	for _, item := range items {
-		if item.Schedule == "weekly:friday@09:00" {
-			foundWeekly = true
-		}
-		if item.Schedule == "interval:2h" {
-			foundInterval = true
-		}
-	}
-	if !foundWeekly || !foundInterval {
-		t.Fatalf("expected weekly and interval proposals, got %#v", items)
-	}
-}
-
-func TestRuntimeScheduleRequestCreatesWorkdayAndMonthlyProposals(t *testing.T) {
-	home := t.TempDir()
-	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    &fakePlanner{},
-		Tools:    tool.NewBuiltinRegistry(),
-		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
-		MaxSteps: 6,
-		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
-		Memory:   memory.NewStore(home),
-	}
-	rt.Logger.Quiet = true
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-workday", Text: "工作日 9点 帮我检查 AI 趋势"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-monthly", Text: "每月15号 9点 帮我整理账单"}); err != nil {
-		t.Fatal(err)
-	}
-	items, err := schedule.NewStore(home).ListProposals(schedule.ProposalStatusProposed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundWorkday := false
-	foundMonthly := false
-	for _, item := range items {
-		if item.Schedule == "weekly:monday,tuesday,wednesday,thursday,friday@09:00" {
-			foundWorkday = true
-		}
-		if item.Schedule == "monthly:15@09:00" {
-			foundMonthly = true
-		}
-	}
-	if !foundWorkday || !foundMonthly {
-		t.Fatalf("expected workday and monthly proposals, got %#v", items)
+	if len(resp.Results) != 1 || resp.Results[0].Tool != "schedule.create" || !resp.Results[0].OK {
+		t.Fatalf("expected schedule.create result, got %#v", resp.Results)
 	}
 }
 
@@ -1759,9 +2866,12 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
 		t.Fatal(err)
 	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "delete schedule", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "schedule.delete", Args: map[string]string{"id": "ai-trends"},
+	}}}}
 	rt := Runtime{
 		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    &fakePlanner{},
+		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
 		MaxSteps: 6,
@@ -1777,6 +2887,9 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 	if !resp.AwaitConfirm || resp.Reply.Style != "approval_pending" {
 		t.Fatalf("expected approval pending, got %#v", resp)
 	}
+	if fp.planCalls != 1 {
+		t.Fatalf("expected delete request to go through planning, got %d calls", fp.planCalls)
+	}
 	if tasks, err := store.List(); err != nil || len(tasks) != 1 {
 		t.Fatalf("expected task still present before confirmation, tasks=%#v err=%v", tasks, err)
 	}
@@ -1787,8 +2900,8 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Reply.Text, "已删除") {
-		t.Fatalf("expected deleted reply, got %q", resp.Reply.Text)
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected confirmed delete to complete, got %#v", resp)
 	}
 	tasks, err := store.List()
 	if err != nil {
@@ -1799,15 +2912,18 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 	}
 }
 
-func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
+func TestRuntimeSchedulePauseAndResumeUsePlannerToolsWithoutConfirmation(t *testing.T) {
 	home := t.TempDir()
 	store := schedule.NewStore(home)
 	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
 		t.Fatal(err)
 	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "pause schedule", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "schedule.pause", Args: map[string]string{"id": "ai-trends"},
+	}}}}
 	rt := Runtime{
 		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    &fakePlanner{},
+		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
 		MaxSteps: 6,
@@ -1816,14 +2932,12 @@ func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
 	}
 	rt.Logger.Quiet = true
 	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-pause", Text: "暂停 ai-trends 定时任务"}
-	if _, err := rt.Handle(context.Background(), msg); err != nil {
+	resp, err := rt.Handle(context.Background(), msg)
+	if err != nil {
 		t.Fatal(err)
 	}
-	confirm := msg
-	confirm.ID = "confirm-pause"
-	confirm.Text = "好"
-	if _, err := rt.Handle(context.Background(), confirm); err != nil {
-		t.Fatal(err)
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected pause without confirmation, got %#v", resp)
 	}
 	task, _, err := store.Show("ai-trends")
 	if err != nil {
@@ -1832,18 +2946,19 @@ func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
 	if task.Status != schedule.StatusPaused {
 		t.Fatalf("expected paused, got %#v", task)
 	}
+	fp.plan = model.Plan{Summary: "resume schedule", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "schedule.resume", Args: map[string]string{"id": "ai-trends"},
+	}}}
 	resume := msg
 	resume.SessionKey = "cli:schedule-resume"
 	resume.ID = "resume"
 	resume.Text = "恢复 ai-trends 定时任务"
-	if _, err := rt.Handle(context.Background(), resume); err != nil {
+	resp, err = rt.Handle(context.Background(), resume)
+	if err != nil {
 		t.Fatal(err)
 	}
-	confirmResume := resume
-	confirmResume.ID = "confirm-resume"
-	confirmResume.Text = "好"
-	if _, err := rt.Handle(context.Background(), confirmResume); err != nil {
-		t.Fatal(err)
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected resume without confirmation, got %#v", resp)
 	}
 	task, _, err = store.Show("ai-trends")
 	if err != nil {
@@ -1854,15 +2969,18 @@ func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
 	}
 }
 
-func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
+func TestRuntimeScheduleUpdateUsesPlannerToolWithoutConfirmation(t *testing.T) {
 	home := t.TempDir()
 	store := schedule.NewStore(home)
 	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
 		t.Fatal(err)
 	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "update schedule", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "schedule.update", Args: map[string]string{"id": "ai-trends", "daily_at": "10:00"},
+	}}}}
 	rt := Runtime{
 		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
-		Model:    &fakePlanner{},
+		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
 		MaxSteps: 6,
@@ -1875,27 +2993,10 @@ func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.AwaitConfirm || !strings.Contains(resp.Reply.Text, "daily@10:00") {
-		t.Fatalf("expected update confirmation, got %#v", resp)
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected update without confirmation, got %#v", resp)
 	}
 	task, _, err := store.Show("ai-trends")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if schedule.Summary(task.Schedule) != "daily@09:00" {
-		t.Fatalf("expected unchanged before confirmation, got %#v", task)
-	}
-	confirm := msg
-	confirm.ID = "confirm-update"
-	confirm.Text = "确认"
-	resp, err = rt.Handle(context.Background(), confirm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(resp.Reply.Text, "已更新") {
-		t.Fatalf("expected updated reply, got %q", resp.Reply.Text)
-	}
-	task, _, err = store.Show("ai-trends")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2021,6 +3122,34 @@ func TestDefaultSanitizerStripsBareJSONToolPlan(t *testing.T) {
 	}
 	if reply.Text != "完成。" {
 		t.Fatalf("unexpected fallback %q", reply.Text)
+	}
+}
+
+func TestDefaultSanitizerStripsToolDebugBlocks(t *testing.T) {
+	s := DefaultSanitizer{}
+	reply := s.Sanitize(channel.OutboundMessage{
+		Style: "reply",
+		Text:  "没找到结果，换个关键词再试试。\n\nTool: skill.search (step-2)\n\n---\n\n```json\n{\"query\":\"text humanizer\"}\n```\n\n---\n\n```\n[{\"step_id\":\"step-2\",\"tool\":\"skill.search\"}]\n```\n\n可以再试这些关键词：rewriting、tone、copy editing。",
+	})
+	if strings.Contains(reply.Text, "Tool:") || strings.Contains(reply.Text, "step-2") || strings.Contains(reply.Text, "skill.search") || strings.Contains(reply.Text, "```") {
+		t.Fatalf("expected tool debug block stripped, got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "可以再试这些关键词") {
+		t.Fatalf("expected user-facing guidance preserved, got %q", reply.Text)
+	}
+}
+
+func TestDefaultSanitizerStripsToolCodeBlocks(t *testing.T) {
+	s := DefaultSanitizer{}
+	reply := s.Sanitize(channel.OutboundMessage{
+		Style: "reply",
+		Text:  "搜索超时失败了，文档内容还是空的占位符。让我重新搜索 AI 开源课程，并更新文档内容。\n\n1. **重新搜索最新 AI 开源课程：**\n<tool_code>\ntool: web.search\nargs: {\n  --query: \"2025 2026 best free AI machine learning courses GitHub fast.ai DeepLearning.AI popular\"\n}\n</tool_code>\n\n接下来我会继续整理一版更干净的结果。",
+	})
+	if strings.Contains(reply.Text, "<tool_code>") || strings.Contains(reply.Text, "tool: web.search") || strings.Contains(reply.Text, "--query") {
+		t.Fatalf("expected tool_code block stripped, got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "搜索超时失败了") || !strings.Contains(reply.Text, "接下来我会继续整理一版更干净的结果。") {
+		t.Fatalf("expected user-facing narrative preserved, got %q", reply.Text)
 	}
 }
 

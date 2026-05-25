@@ -147,6 +147,26 @@ func TestSelectKeepsOnlyHighestPriorityPerScope(t *testing.T) {
 	}
 }
 
+func TestSelectDoesNotTreatCurrentProjectAsFreshSearch(t *testing.T) {
+	defs := []Definition{
+		{Name: "fresh-search", Stage: StagePlanning, Scope: "search-planning", Priority: 8, WhenContains: []string{"当前", "最新"}},
+	}
+	got := Select(defs, StagePlanning, Context{UserText: "请概览当前项目结构，并总结 README.md 的主要内容"})
+	if len(got) != 0 {
+		t.Fatalf("expected no fresh-search for local project context, got %#v", got)
+	}
+}
+
+func TestSelectKeepsFreshSearchForFreshWebContext(t *testing.T) {
+	defs := []Definition{
+		{Name: "fresh-search", Stage: StagePlanning, Scope: "search-planning", Priority: 8, WhenContains: []string{"当前", "最新"}},
+	}
+	got := Select(defs, StagePlanning, Context{UserText: "搜索当前 AI 应用趋势"})
+	if len(got) != 1 || got[0].Name != "fresh-search" {
+		t.Fatalf("expected fresh-search for fresh web context, got %#v", got)
+	}
+}
+
 func TestLoadRegistryParsesScope(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")

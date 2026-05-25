@@ -13,7 +13,9 @@ const defaultReplyLimit = 4000
 var multiBlankLines = regexp.MustCompile(`\n{3,}`)
 var toolCallBlock = regexp.MustCompile(`(?is)\[TOOL_CALL\].*?(?:\[/TOOL_CALL\]|$)`)
 var minimaxToolCallBlock = regexp.MustCompile(`(?is)<minimax:tool_call\b[^>]*>.*?(?:</minimax:tool_call>|$)`)
+var toolCodeBlock = regexp.MustCompile(`(?is)<tool_code>.*?</tool_code>`)
 var jsonToolPlanBlock = regexp.MustCompile(`(?is)^\s*\[\s*\{.*"(?:tool|args|risk|requires_confirm|expected_evidence)".*\}\s*\]\s*$`)
+var markdownFenceStart = regexp.MustCompile("^```[A-Za-z0-9_-]*\\s*$")
 
 type ResponseSanitizer interface {
 	Sanitize(reply channel.OutboundMessage) channel.OutboundMessage
@@ -54,13 +56,43 @@ func stripJSONToolPlanEcho(text string) string {
 func stripToolCallEcho(text string) string {
 	text = toolCallBlock.ReplaceAllString(text, "")
 	text = minimaxToolCallBlock.ReplaceAllString(text, "")
+	text = toolCodeBlock.ReplaceAllString(text, "")
 	lines := strings.Split(text, "\n")
 	out := make([]string, 0, len(lines))
 	skipJSONish := false
+	skipToolDebug := false
+	skipFence := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		lower := strings.ToLower(trimmed)
 		switch {
+		case trimmed == "</tool_code>" || trimmed == "<tool_code>":
+			continue
+		case strings.HasPrefix(lower, "tool: ") && strings.Contains(lower, "("):
+			skipToolDebug = true
+			continue
+		case strings.HasPrefix(lower, "tool: "):
+			skipToolDebug = true
+			continue
+		case strings.HasPrefix(lower, "args:"):
+			skipToolDebug = true
+			continue
+		case skipToolDebug && skipFence && strings.HasPrefix(trimmed, "```"):
+			skipFence = false
+			continue
+		case skipToolDebug && !skipFence && markdownFenceStart.MatchString(trimmed):
+			skipFence = true
+			continue
+		case skipToolDebug && (trimmed == "" || trimmed == "---"):
+			continue
+		case skipToolDebug && skipFence:
+			continue
+		case skipToolDebug && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") || strings.Contains(lower, `"tool"`) || strings.Contains(lower, `"args"`) || strings.Contains(lower, `"step_id"`)):
+			continue
+		case skipToolDebug:
+			skipToolDebug = false
+			out = append(out, line)
+			continue
 		case strings.Contains(lower, "[tool_call]"):
 			skipJSONish = true
 			continue

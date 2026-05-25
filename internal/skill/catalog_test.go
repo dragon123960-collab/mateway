@@ -80,6 +80,20 @@ func TestInstallCatalogSkillWritesOnlyWorkspaceSkill(t *testing.T) {
 	}
 }
 
+func TestSkillMarkdownCandidatesUseRawGitHubForRepoSkillPath(t *testing.T) {
+	candidates := skillMarkdownCandidates(CatalogItem{
+		Name:    "agent-browser",
+		RepoURL: "https://github.com/vercel-labs/agent-browser",
+	})
+	want := "https://raw.githubusercontent.com/vercel-labs/agent-browser/main/skills/agent-browser/SKILL.md"
+	for _, candidate := range candidates {
+		if candidate == want {
+			return
+		}
+	}
+	t.Fatalf("expected raw GitHub candidate %s, got %#v", want, candidates)
+}
+
 func TestInstalledInWorkspaceIgnoresNonMatewayHomes(t *testing.T) {
 	workspace := t.TempDir()
 	other := t.TempDir()
@@ -93,5 +107,29 @@ func TestInstalledInWorkspaceIgnoresNonMatewayHomes(t *testing.T) {
 	installed, path := InstalledInWorkspace(workspace, "browser-helper")
 	if installed || path != "" {
 		t.Fatalf("expected non-workspace skill to be ignored, installed=%v path=%s", installed, path)
+	}
+}
+
+func TestPromptBlockIncludesSkillAcceptanceMetadata(t *testing.T) {
+	block := PromptBlock([]Definition{{
+		Name:             "browser-helper",
+		Description:      "Browser helper",
+		UseFor:           []string{"page inspection"},
+		Produces:         []string{"inspection summary"},
+		AcceptanceMode:   "llm_default",
+		ParallelMode:     "forbid",
+		AcceptancePrompt: "Check whether the page summary matches the requested area.",
+		Instruction:      "Use browser tools carefully.",
+	}})
+	for _, want := range []string{
+		"use_for: page inspection",
+		"produces: inspection summary",
+		"acceptance_mode: llm_default",
+		"parallel_mode: forbid",
+		"acceptance_prompt: Check whether the page summary matches the requested area.",
+	} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("expected block to contain %q, got %q", want, block)
+		}
 	}
 }

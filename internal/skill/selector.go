@@ -110,7 +110,7 @@ func matchReason(def Definition, ctx Context) (string, bool) {
 		}
 		reasons = append(reasons, "user_language="+lang)
 	}
-	if len(def.WhenContains) > 0 && !containsAny(ctx.UserText, def.WhenContains) {
+	if len(def.WhenContains) > 0 && !containsAnyForDefinition(ctx.UserText, def.WhenContains, def) {
 		return "", false
 	} else if len(def.WhenContains) > 0 {
 		reasons = append(reasons, "when_contains")
@@ -131,6 +131,67 @@ func containsAny(text string, patterns []string) bool {
 	for _, pattern := range patterns {
 		pattern = strings.ToLower(strings.TrimSpace(pattern))
 		if pattern != "" && strings.Contains(text, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyForDefinition(text string, patterns []string, def Definition) bool {
+	for _, pattern := range patterns {
+		if !containsAny(text, []string{pattern}) {
+			continue
+		}
+		if suppressFreshSearchMatch(text, pattern, def) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func suppressFreshSearchMatch(text, pattern string, def Definition) bool {
+	if !isFreshSearchDefinition(def) {
+		return false
+	}
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	switch pattern {
+	case "当前", "current", "now":
+	default:
+		return false
+	}
+	return mentionsLocalContext(text) && !mentionsFreshWebContext(text)
+}
+
+func isFreshSearchDefinition(def Definition) bool {
+	name := strings.ToLower(strings.TrimSpace(def.Name))
+	scope := strings.ToLower(strings.TrimSpace(def.Scope))
+	return name == "fresh-search" || scope == "search-planning"
+}
+
+func mentionsLocalContext(text string) bool {
+	text = strings.ToLower(text)
+	phrases := []string{
+		"当前项目", "当前仓库", "当前目录", "当前文件", "当前代码", "当前工程",
+		"本项目", "本仓库", "这个项目", "这个仓库",
+		"current project", "current repo", "current repository", "current directory", "current file", "current codebase",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func mentionsFreshWebContext(text string) bool {
+	text = strings.ToLower(text)
+	phrases := []string{
+		"最新", "最近", "今日", "今天", "实时", "官方", "版本", "发布", "更新", "趋势", "价格", "政策",
+		"latest", "recent", "today", "official", "version", "release", "changelog", "pricing", "policy", "trend",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(text, phrase) {
 			return true
 		}
 	}
@@ -170,6 +231,31 @@ func PromptBlock(defs []Definition) string {
 			b.WriteString(def.Description)
 		}
 		b.WriteString("\n")
+		if len(def.UseFor) > 0 {
+			b.WriteString("  use_for: ")
+			b.WriteString(strings.Join(def.UseFor, ", "))
+			b.WriteString("\n")
+		}
+		if len(def.Produces) > 0 {
+			b.WriteString("  produces: ")
+			b.WriteString(strings.Join(def.Produces, ", "))
+			b.WriteString("\n")
+		}
+		if strings.TrimSpace(def.AcceptanceMode) != "" {
+			b.WriteString("  acceptance_mode: ")
+			b.WriteString(def.AcceptanceMode)
+			b.WriteString("\n")
+		}
+		if strings.TrimSpace(def.ParallelMode) != "" {
+			b.WriteString("  parallel_mode: ")
+			b.WriteString(def.ParallelMode)
+			b.WriteString("\n")
+		}
+		if strings.TrimSpace(def.AcceptancePrompt) != "" {
+			b.WriteString("  acceptance_prompt: ")
+			b.WriteString(def.AcceptancePrompt)
+			b.WriteString("\n")
+		}
 		if strings.TrimSpace(def.Instruction) != "" {
 			b.WriteString(def.Instruction)
 			b.WriteString("\n\n")

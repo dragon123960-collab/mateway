@@ -17,6 +17,7 @@ import (
 	"github.com/dongping/mateway/internal/app"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	evalpkg "github.com/dongping/mateway/internal/eval"
 	"github.com/dongping/mateway/internal/gateway"
 	"github.com/dongping/mateway/internal/heartbeat"
 	"github.com/dongping/mateway/internal/memory"
@@ -68,6 +69,8 @@ func run() error {
 		return nil
 	case "test":
 		return runTest(args[1:])
+	case "eval":
+		return runEval(args[1:], os.Stdout)
 	case "feishu":
 		return runFeishu()
 	case "init":
@@ -1060,6 +1063,8 @@ type taskReport struct {
 	Failed         bool
 	AwaitConfirm   bool
 	AwaitUserInput bool
+	FinalAcceptStatus string
+	FinalAcceptReason string
 	TraceID        string
 	TraceFile      string
 	SessionKey     string
@@ -1152,6 +1157,88 @@ func runSkill(args []string, out io.Writer) error {
 		return nil
 	default:
 		return fmt.Errorf("usage: mateway skill <search|install|list>")
+	}
+}
+
+func runEval(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway eval <routing>")
+	}
+	switch args[0] {
+	case "routing":
+		outDir := ""
+		focus := false
+		ultraFocus := false
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "--out":
+				if i+1 >= len(args) {
+					return fmt.Errorf("--out requires a value")
+				}
+				outDir = args[i+1]
+				i++
+			case "--focus":
+				focus = true
+			case "--ultra-focus":
+				ultraFocus = true
+			default:
+				return fmt.Errorf("usage: mateway eval routing [--out <dir>] [--focus] [--ultra-focus]")
+			}
+		}
+		a, err := app.Build("", true)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		var cases []evalpkg.RoutingCase
+		if ultraFocus {
+			cases = evalpkg.FirstStageUltraFocusCases()
+		} else if focus {
+			cases = evalpkg.FirstStageFocusCases()
+		}
+		summary, err := evalpkg.RunRouting(ctx, a.Model, a.Tools, "", cases)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Routing eval: %d/%d passed\n", summary.Passed, summary.Total)
+		for _, result := range summary.Results {
+			status := "PASS"
+			if !result.Passed {
+				status = "FAIL"
+			}
+			fmt.Fprintf(out, "%s\t%s\ttools=%s\n", status, result.Name, strings.Join(result.Tools, ","))
+			for _, errText := range result.Errors {
+				fmt.Fprintf(out, "  error: %s\n", errText)
+			}
+			for _, warning := range result.Warnings {
+				fmt.Fprintf(out, "  warning: %s\n", warning)
+			}
+		}
+		if strings.TrimSpace(outDir) != "" {
+			now := time.Now().Format("2006-01-02")
+			dir := filepath.Join(outDir, now)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return err
+			}
+			name := "routing-eval.md"
+			if ultraFocus {
+				name = "routing-eval-first-stage-ultra.md"
+			} else if focus {
+				name = "routing-eval-first-stage.md"
+			}
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, []byte(evalpkg.RenderRoutingMarkdown(summary)), 0o644); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "Routing report written: %s\n", path)
+		}
+		if summary.Passed != summary.Total {
+			return fmt.Errorf("routing eval failed: %d/%d passed", summary.Passed, summary.Total)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway eval <routing>")
 	}
 }
 
@@ -1277,6 +1364,8 @@ func buildTaskReport(a *app.App, opts testCommandOptions, msg channel.InboundMes
 		Failed:         resp.Failed,
 		AwaitConfirm:   resp.AwaitConfirm,
 		AwaitUserInput: resp.AwaitUserInput,
+		FinalAcceptStatus: resp.FinalAcceptStatus,
+		FinalAcceptReason: resp.FinalAcceptReason,
 		TraceID:        traceID,
 		SessionKey:     msg.SessionKey,
 		Channel:        msg.Channel,
@@ -1330,15 +1419,31 @@ func writeTaskReportMarkdown(b *strings.Builder, report taskReport) {
 	fmt.Fprintln(b)
 	fmt.Fprintln(b, "## Conclusion")
 	if report.Failed {
-		fmt.Fprintln(b, "The task did not complete successfully.")
+		if report.FinalAcceptStatus == "partial" {
+			fmt.Fprintln(b, "The task completed partially with useful output and remaining gaps.")
+		} else {
+			fmt.Fprintln(b, "The task did not complete successfully.")
+		}
 	} else if report.AwaitConfirm {
 		fmt.Fprintln(b, "The task is waiting for confirmation.")
 	} else if report.AwaitUserInput {
 		fmt.Fprintln(b, "The task is waiting for additional user input.")
+	} else if report.FinalAcceptStatus == "partial" {
+		fmt.Fprintln(b, "The task completed partially with useful output and remaining gaps.")
 	} else if len(report.QualityNotes) > 0 {
 		fmt.Fprintln(b, "The task mechanism completed, but the answer quality needs human review.")
 	} else {
 		fmt.Fprintln(b, "The task completed.")
+	}
+	if strings.TrimSpace(report.FinalAcceptStatus) != "" || strings.TrimSpace(report.FinalAcceptReason) != "" {
+		fmt.Fprintln(b)
+		fmt.Fprintln(b, "## Final Acceptance")
+		if strings.TrimSpace(report.FinalAcceptStatus) != "" {
+			fmt.Fprintf(b, "- status: %s\n", report.FinalAcceptStatus)
+		}
+		if strings.TrimSpace(report.FinalAcceptReason) != "" {
+			fmt.Fprintf(b, "- reason: %s\n", report.FinalAcceptReason)
+		}
 	}
 	if len(report.QualityNotes) > 0 {
 		fmt.Fprintln(b)
@@ -1702,6 +1807,7 @@ func printHelp() {
 Commands:
   init                   initialize ~/.mateway config, samples, docs, and default skills
   doctor                 validate config and list tools
+  eval routing           run real-model planner/tool routing evaluation
   ask <message>          run one CLI task
   gateway serve          run the configured gateway in foreground
   gateway start          start OS-managed gateway service

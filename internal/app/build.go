@@ -103,6 +103,6 @@ func Doctor(home string) (string, error) {
 		"workspace: " + app.Config.App.Workspace,
 		"model: " + app.Model.Config.Name + " / " + app.Model.Config.Model,
 		fmt.Sprintf("feishu enabled: %t websocket: %t", app.Config.Channels.Feishu.Enabled, app.Config.Channels.Feishu.WebSocket.Enabled),
-		"tools: " + strings.Join(app.Tools.Names(), ", "),
+		"tools: " + strings.Join(app.Tools.VisibleNames(), ", "),
 	}, "\n"), nil
 }

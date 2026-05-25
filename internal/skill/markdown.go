@@ -15,6 +15,11 @@ type Metadata struct {
 	WhenContains     []string
 	WhenResultKinds  []string
 	WhenUserLanguage string
+	UseFor           []string
+	Produces         []string
+	AcceptanceMode   string
+	ParallelMode     string
+	AcceptancePrompt string
 }
 
 func parseSkillMarkdown(raw string) (Metadata, string) {
@@ -59,6 +64,16 @@ func parseSkillMarkdown(raw string) (Metadata, string) {
 			meta.WhenResultKinds = parseTags(value)
 		case "when_user_language":
 			meta.WhenUserLanguage = value
+		case "use_for":
+			meta.UseFor = parseTags(value)
+		case "produces":
+			meta.Produces = parseTags(value)
+		case "acceptance_mode":
+			meta.AcceptanceMode = value
+		case "parallel_mode":
+			meta.ParallelMode = value
+		case "acceptance_prompt":
+			meta.AcceptancePrompt = value
 		}
 	}
 	return meta, body

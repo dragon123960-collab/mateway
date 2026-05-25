@@ -69,10 +69,83 @@ func TestSourceQualityHintForFreshSearch(t *testing.T) {
 	}
 }
 
-func TestSoftwareSearchQueriesPreferOfficialLarkCLI(t *testing.T) {
+func TestSoftwareSearchQueriesStayGeneric(t *testing.T) {
 	got := softwareSearchQueries("飞书的cli")
-	if len(got) == 0 || got[0] != "larksuite cli" {
-		t.Fatalf("expected larksuite cli first, got %#v", got)
+	if len(got) != 1 || got[0] != "飞书的cli" {
+		t.Fatalf("expected generic query without product-specific rewrite, got %#v", got)
+	}
+}
+
+func TestSkillSearchNoResultSuggestsBroaderCapabilityPhrases(t *testing.T) {
+	output := renderSkillSearchOutput("text humanizer rewriting assistant AI text", nil)
+	if !strings.Contains(output, "Searched priority catalogs") || !strings.Contains(output, "broader capability phrases") {
+		t.Fatalf("expected helpful no-result guidance, got %q", output)
+	}
+}
+
+func TestSoftwareInstallPreviewAndResult(t *testing.T) {
+	preview := SoftwareInstall().Run(context.Background(), Call{
+		Args: map[string]string{"name": "ripgrep"},
+	})
+	if preview.OK || !strings.Contains(preview.Error, "install command is required") {
+		t.Fatalf("expected missing command error, got %#v", preview)
+	}
+
+	preview = SoftwareInstall().Run(context.Background(), Call{
+		Args: map[string]string{
+			"name":           "larksuite/cli",
+			"method":         "npx",
+			"command":        "true",
+			"executable":     "lark-cli",
+			"verify_command": "true",
+			"source_url":     "https://github.com/larksuite/cli",
+			"source_name":    "upstream",
+		},
+	})
+	if !preview.OK || preview.RequiresConfirm {
+		t.Fatalf("expected direct install execution without confirmation, got %#v", preview)
+	}
+
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, "lark-cli")
+	mustWriteFile(t, binPath, "#!/bin/sh\nprintf 'lark version test\\n'\n")
+	if err := os.Chmod(binPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := SoftwareInstall().Run(context.Background(), Call{
+		Args: map[string]string{
+			"name":           "lark",
+			"command":        "true",
+			"executable":     "lark-cli",
+			"verify_command": shellQuote(binPath) + " --version",
+		},
+		Confirmed: true,
+	})
+	if !result.OK {
+		t.Fatalf("expected install success, got %#v", result)
+	}
+	if !strings.Contains(result.Output, "安装完成") || !strings.Contains(result.Output, "lark-cli --help") {
+		t.Fatalf("expected completion and next commands, got %q", result.Output)
+	}
+}
+
+func TestTerminalRunReturnsCommandEvidence(t *testing.T) {
+	root := t.TempDir()
+	result := TerminalRun().Run(context.Background(), Call{
+		Args:    map[string]string{"command": "printf hello", "timeout": "5", "purpose": "diagnose local cli"},
+		Context: Context{ProjectRoot: root, Workspace: root},
+	})
+	if !result.OK {
+		t.Fatalf("expected terminal success, got %#v", result)
+	}
+	if !strings.Contains(result.Output, "hello") {
+		t.Fatalf("expected stdout in output, got %q", result.Output)
+	}
+	if result.Evidence["kind"] != "terminal" || result.Evidence["command"] != "printf hello" || result.Evidence["exit_code"] != 0 {
+		t.Fatalf("unexpected terminal evidence %#v", result.Evidence)
+	}
+	if result.Evidence["stdout"] != "hello" || result.Evidence["purpose"] != "diagnose local cli" {
+		t.Fatalf("expected stdout and purpose evidence, got %#v", result.Evidence)
 	}
 }
 
@@ -110,6 +183,36 @@ func TestMemoryToolsSearchAndIndex(t *testing.T) {
 	}
 	if !strings.Contains(index.Output, "entries=") || !strings.Contains(index.Output, "parsed_sources=") || !strings.Contains(index.Output, "long:") {
 		t.Fatalf("unexpected index output %q", index.Output)
+	}
+}
+
+func TestScheduleToolsConfirmationBoundary(t *testing.T) {
+	home := t.TempDir()
+	ctx := Context{Home: home, ProjectRoot: home, Workspace: home}
+	create := ScheduleCreate().Run(context.Background(), Call{
+		Args: map[string]string{
+			"id":       "ai-trends",
+			"title":    "AI Trends",
+			"prompt":   "Collect AI trends.",
+			"daily_at": "09:00",
+		},
+		Context: ctx,
+	})
+	if !create.OK || create.RequiresConfirm {
+		t.Fatalf("expected schedule create without confirmation, got %#v", create)
+	}
+	update := ScheduleUpdate().Run(context.Background(), Call{
+		Args:    map[string]string{"id": "ai-trends", "daily_at": "10:00"},
+		Context: ctx,
+	})
+	if !update.OK || update.RequiresConfirm {
+		t.Fatalf("expected schedule update without confirmation, got %#v", update)
+	}
+	if !RequireConfirmForTool("schedule.delete", map[string]string{"id": "ai-trends"}) {
+		t.Fatalf("expected schedule.delete to require confirmation")
+	}
+	if RequireConfirmForTool("schedule.update", map[string]string{"id": "ai-trends"}) {
+		t.Fatalf("expected schedule.update not to require confirmation")
 	}
 }
 

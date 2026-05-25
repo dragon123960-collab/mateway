@@ -8,25 +8,21 @@ import (
 	"strings"
 )
 
-var destructiveCommandPattern = regexp.MustCompile(`(?i)(^|\s|&&|\|\||;|` + "`" + `)(rm(\s|$)|rmdir(\s|$)|mv(\s|$)|sed\s+-i|truncate(\s|$)|dd(\s|$)|shred(\s|$)|git\s+(reset|clean|checkout)(\s|$)|git\s+push(\s|$)|docker\s+compose\s+(up|down)(\s|$)|brew\s+install(\s|$)|npm\s+(install|i)(\s|$)|pnpm\s+(install|add)(\s|$)|pip\s+install(\s|$)|go\s+install(\s|$))`)
-var overwriteRedirectPattern = regexp.MustCompile(`(^|[^>])>($|[^>])`)
+var destructiveCommandPattern = regexp.MustCompile(`(?i)(^|\s|&&|\|\||;|` + "`" + `)(rm(\s|$)|rmdir(\s|$)|shred(\s|$)|git\s+(reset|clean)(\s|$))`)
 
 func IsDangerousCommand(cmd string) bool {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return false
 	}
-	if destructiveCommandPattern.MatchString(cmd) {
-		return true
-	}
-	return overwriteRedirectPattern.MatchString(cmd)
+	return destructiveCommandPattern.MatchString(cmd)
 }
 
 func RequireConfirmForTool(name string, args map[string]string) bool {
 	switch name {
-	case "file.write", "file.patch", "skill.install":
+	case "schedule.delete":
 		return true
-	case "shell.run":
+	case "shell.run", "terminal.run":
 		return IsDangerousCommand(args["command"])
 	default:
 		return false

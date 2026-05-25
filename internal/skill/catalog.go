@@ -27,6 +27,7 @@ type CatalogSearchOptions struct {
 	Sources []CatalogSource
 	Client  *http.Client
 	Limit   int
+	Timeout time.Duration
 }
 
 type CatalogItem struct {
@@ -71,15 +72,23 @@ func DefaultCatalogSources() []CatalogSource {
 	return append([]CatalogSource(nil), defaultCatalogSources...)
 }
 
+func catalogHTTPClient(opts CatalogSearchOptions, fallback time.Duration) *http.Client {
+	if opts.Client != nil {
+		return opts.Client
+	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = fallback
+	}
+	return &http.Client{Timeout: timeout}
+}
+
 func SearchCatalog(ctx context.Context, workspace, query string, opts CatalogSearchOptions) ([]CatalogItem, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, fmt.Errorf("query is required")
 	}
-	client := opts.Client
-	if client == nil {
-		client = &http.Client{Timeout: 12 * time.Second}
-	}
+	client := catalogHTTPClient(opts, 12*time.Second)
 	sources := opts.Sources
 	if len(sources) == 0 {
 		sources = DefaultCatalogSources()
@@ -151,10 +160,7 @@ func InstallCatalogSkill(ctx context.Context, workspace, ref string, opts Catalo
 	if ref == "" {
 		return InstallResult{}, fmt.Errorf("skill name or URL is required")
 	}
-	client := opts.Client
-	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
-	}
+	client := catalogHTTPClient(opts, 8*time.Second)
 	item, err := resolveInstallItem(ctx, client, workspace, ref, opts)
 	if err != nil {
 		return InstallResult{}, err
@@ -409,9 +415,12 @@ func skillMarkdownCandidates(item CatalogItem) []string {
 			}
 			for _, branch := range []string{"main", "master"} {
 				if item.Name != "" {
+					out = append(out, githubRepoRawURL(raw, branch, "skills/"+item.Name+"/SKILL.md"))
+					out = append(out, githubRepoRawURL(raw, branch, "skill-data/"+item.Name+"/SKILL.md"))
 					out = append(out, fmt.Sprintf("%s/raw/%s/skills/%s/SKILL.md", raw, branch, item.Name))
 					out = append(out, fmt.Sprintf("%s/raw/%s/skill-data/%s/SKILL.md", raw, branch, item.Name))
 				}
+				out = append(out, githubRepoRawURL(raw, branch, "SKILL.md"))
 				out = append(out, fmt.Sprintf("%s/raw/%s/SKILL.md", raw, branch))
 			}
 		}
@@ -420,6 +429,18 @@ func skillMarkdownCandidates(item CatalogItem) []string {
 		}
 	}
 	return dedupeStrings(out)
+}
+
+func githubRepoRawURL(repoURL, branch, filePath string) string {
+	u, err := url.Parse(strings.TrimSpace(repoURL))
+	if err != nil || u.Host != "github.com" {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return "https://raw.githubusercontent.com/" + parts[0] + "/" + parts[1] + "/" + branch + "/" + strings.TrimLeft(filePath, "/")
 }
 
 func extractSkillMarkdownFromSkillsPage(raw, fallbackName string) (string, bool) {

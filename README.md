@@ -31,16 +31,17 @@ Mateway is early but usable as a first-version single-agent runtime.
 
 Implemented:
 
-- CLI commands: `init`, `doctor`, `ask`, `test`, `trace`, `memory`, `heartbeat`, `schedule`, `gateway`
+- CLI commands: `init`, `doctor`, `ask`, `test`, `eval`, `trace`, `memory`, `heartbeat`, `schedule`, `gateway`
 - Feishu WebSocket receive/reply/reaction
 - Anthropic-compatible and OpenAI-compatible model clients
 - configurable model and agent profiles
-- built-in tools: time, config summary, web search, file read/write/patch, shell run, project index, file summary, memory search/index, user ask
+- built-in tools: time, config summary, web search, file read/write/patch, terminal run, project index, file summary, memory search/index, user ask
 - path guards, dangerous command guards, output truncation, and response sanitization
 - persistent session/task state and follow-up resolution
 - Markdown memory proposal, commit, reject, lint, index, and search
 - heartbeat maintenance jobs for memory lint/review/compact/index rebuild
-- natural-language user scheduled tasks with proposal, confirmation, mutation, due detection, and runtime execution
+- planner-selected user scheduled task tools with due detection and runtime execution
+- real-model planner routing evaluation with `mateway eval routing`
 - workspace skill discovery and default skills
 
 Still evolving:
@@ -195,13 +196,13 @@ mateway schedule due
 mateway schedule run-due
 ```
 
-Natural-language schedule creation is also supported through the runtime:
+Natural-language schedule creation is handled by the normal runtime planning loop. The planner should select `schedule.create` with complete fields, or ask for missing information:
 
 ```text
 Every day at 9:00, collect recent AI trend articles and write a short sourced report.
 ```
 
-Mateway will write a proposal first and ask for confirmation before enabling the task.
+The schedule CLI still supports proposal/review commands for manual workflows, but runtime schedule creation uses tools directly.
 
 ## Feishu
 
@@ -259,7 +260,7 @@ User scheduled tasks run through the same runtime path as normal user requests, 
 The lifecycle is:
 
 ```text
-draft -> fill missing info -> proposal -> user confirmation -> active task -> due run -> artifact
+user request -> planner selects schedule tool -> task YAML -> due run -> runtime invocation -> artifact
 ```
 
 ## Skills And Connectors

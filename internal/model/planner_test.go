@@ -3,6 +3,8 @@ package model
 import (
 	"strings"
 	"testing"
+
+	"github.com/dongping/mateway/internal/tool"
 )
 
 func TestParsePlanRepairsUnescapedChineseQuotes(t *testing.T) {
@@ -70,7 +72,7 @@ func TestPlanCheckerRejectsMissingTool(t *testing.T) {
 }
 
 func TestPlanCheckerNormalizesMissingIDAndArgs(t *testing.T) {
-	result, err := CheckAndRepairPlanJSON(`{"summary":"","steps":[{"tool":"time.now"}]}`)
+	result, err := CheckAndRepairPlanJSON(`{"summary":"","understanding":{"goal":"check time"},"steps":[{"tool":"time.now"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +81,133 @@ func TestPlanCheckerNormalizesMissingIDAndArgs(t *testing.T) {
 	}
 	if !result.Fixed {
 		t.Fatalf("expected normalization to mark result fixed")
+	}
+}
+
+func TestPlanCheckerParsesUnderstandingBlock(t *testing.T) {
+	result, err := CheckAndRepairPlanJSON(`{"summary":"install tool","understanding":{"goal":"install lark cli","subtasks":["find install method","run install"],"tool_needs":["software.search","software.install"],"completion_criteria":["installed cli is verified"],"evidence_expectations":["install command","verify command"],"risk_level":"guarded_mutation"},"steps":[{"id":"s1","tool":"software.search","args":{"query":"lark cli install"}}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Plan.Understanding.Goal != "install lark cli" {
+		t.Fatalf("expected understanding goal, got %#v", result.Plan.Understanding)
+	}
+	if len(result.Plan.Understanding.Subtasks) != 2 || len(result.Plan.Understanding.ToolNeeds) != 2 {
+		t.Fatalf("expected understanding arrays parsed, got %#v", result.Plan.Understanding)
+	}
+}
+
+func TestPlanCheckerAcceptsSingleStringEvidenceAndCriteria(t *testing.T) {
+	result, err := CheckAndRepairPlanJSON(`{"summary":"search","steps":[{"id":"s1","tool":"web.search","args":{"query":"AI trends"},"expected_evidence":"search results with URLs","success_criteria":"results are returned"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := result.Plan.Steps[0]
+	if len(step.ExpectedEvidence) != 1 || step.ExpectedEvidence[0] != "search results with URLs" {
+		t.Fatalf("expected single evidence string to normalize, got %#v", step.ExpectedEvidence)
+	}
+	if len(step.SuccessCriteria) != 1 || step.SuccessCriteria[0] != "results are returned" {
+		t.Fatalf("expected single success criteria string to normalize, got %#v", step.SuccessCriteria)
+	}
+}
+
+func TestPlanCheckerRepairsStrayBracketAfterStringValue(t *testing.T) {
+	result, err := CheckAndRepairPlanJSON(`{"summary":"diagnose","steps":[{"id":"s1","tool":"terminal.run","args":{"command":"ps aux","purpose":"check local status"],"risk":"safe_read","expected_evidence":["process output"],"success_criteria":["output collected"]}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Plan.Steps[0].Args["purpose"]; got != "check local status" {
+		t.Fatalf("expected repaired purpose, got %q", got)
+	}
+	if !result.Fixed || !containsString(result.Warnings, "repaired_stray_string_value_bracket") {
+		t.Fatalf("expected repair warning, got fixed=%t warnings=%v", result.Fixed, result.Warnings)
+	}
+}
+
+func TestPlanCheckerRepairsMissingStringArrayClosure(t *testing.T) {
+	result, err := CheckAndRepairPlanJSON(`{"summary":"test","steps":[{"id":"s1","tool":"terminal.run","args":{"command":"go test ./..."},"expected_evidence":["测试输出结果"],"success_criteria":["测试执行完成，返回明确状态"},"on_failure":"repair"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Plan.Steps[0].SuccessCriteria[0]; got != "测试执行完成，返回明确状态" {
+		t.Fatalf("expected repaired success criteria, got %#v", result.Plan.Steps[0].SuccessCriteria)
+	}
+	if !result.Fixed || !containsString(result.Warnings, "repaired_missing_string_array_closures") {
+		t.Fatalf("expected repair warning, got fixed=%t warnings=%v", result.Fixed, result.Warnings)
+	}
+}
+
+func TestSynthesisResultViewHidesStepIDsAndTruncatesOutput(t *testing.T) {
+	results := []ToolResult{{
+		StepID: "step-2",
+		Tool:   "skill.search",
+		OK:     true,
+		Output: strings.Repeat("x", 1200),
+		Evidence: map[string]any{
+			"kind":         "skill_search",
+			"query":        "text humanizer",
+			"result_count": 0,
+		},
+	}}
+	view := synthesisResultView(results)
+	if len(view) != 1 {
+		t.Fatalf("expected one view item, got %#v", view)
+	}
+	if _, ok := view[0]["step_id"]; ok {
+		t.Fatalf("expected step id to be hidden, got %#v", view[0])
+	}
+	summary, _ := view[0]["summary"].(string)
+	if len([]rune(summary)) > 910 || !strings.HasSuffix(summary, "...") {
+		t.Fatalf("expected truncated summary, got len=%d summary=%q", len([]rune(summary)), summary)
+	}
+}
+
+func TestPlannerPromptKeepsSkillSearchCapabilityDriven(t *testing.T) {
+	prompt := plannerSystemPrompt("")
+	if !strings.Contains(prompt, "first understand the capability") || !strings.Contains(prompt, "concise capability keywords") {
+		t.Fatalf("expected capability-driven skill search instruction, got %q", prompt)
+	}
+}
+
+func TestPlannerPromptPutsCriticalRulesAtBeginningAndEnd(t *testing.T) {
+	prompt := plannerSystemPrompt("")
+	if !strings.Contains(prompt, "Most important rules:") || !strings.Contains(prompt, "Final reminders:") {
+		t.Fatalf("expected prompt to have emphasized beginning/end sections, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "Return ONLY strict JSON.") || !strings.Contains(prompt, "Do not invent unavailable tools") {
+		t.Fatalf("expected critical reminder text, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "understanding.tool_needs to capture the concrete tools") {
+		t.Fatalf("expected tool_needs contract to mention concrete tools, got %q", prompt)
+	}
+}
+
+func TestToolListForPromptIncludesStructuredMetadata(t *testing.T) {
+	text := toolListForPrompt([]tool.Definition{{
+		Name:        "file.summary",
+		Description: "Summarize one file",
+		Risk:        tool.RiskSafeRead,
+		ArgsSchema:  map[string]string{"path": "file path"},
+		Metadata: tool.Metadata{
+			WhenToUse:      []string{"before reading full file"},
+			WhenNotToUse:   []string{"editing files"},
+			OutputContract: []string{"preview lines"},
+			AcceptanceMode: tool.AcceptanceCodeLLM,
+			ParallelMode:   tool.ParallelReadOnlyOK,
+			ResourceScope:  "filesystem:path",
+		},
+	}})
+	for _, want := range []string{
+		"when_to_use=[before reading full file]",
+		"when_not_to_use=[editing files]",
+		"output_contract=[preview lines]",
+		"acceptance_mode=code_then_llm",
+		"parallel_mode=read_only_ok",
+		"resource_scope=filesystem:path",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected prompt tool list to contain %q, got %q", want, text)
+		}
 	}
 }
 
