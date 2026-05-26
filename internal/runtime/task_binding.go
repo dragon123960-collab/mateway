@@ -134,6 +134,14 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 		l.saveConversationOnly(resp)
 		return &resp
 	case bindingReplacePendingApproval:
+		if source, ok := l.state.session.Tasks[decision.SourceTaskID]; ok {
+			source.Status = session.TaskAbandoned
+			source.PendingApproval = nil
+			source.PendingQuestions = nil
+			source.PendingFields = nil
+			source.UpdatedAt = l.state.startedAt
+			l.state.session.Tasks[decision.SourceTaskID] = source
+		}
 		task := session.TaskState{
 			ID:            decision.TargetTaskID,
 			TraceID:       l.state.traceID,
@@ -373,6 +381,16 @@ func (l *AgentLoop) resolvePendingApprovalBlock() (taskBindingDecision, bool) {
 	if task == nil || task.PendingApproval == nil || task.Status != session.TaskAwaitConfirm {
 		return taskBindingDecision{}, false
 	}
+	if pendingApprovalLooksInvalid(task.PendingApproval) {
+		return taskBindingDecision{
+			Kind:          bindingReplacePendingApproval,
+			TargetTaskID:  l.state.traceID,
+			SourceTaskID:  task.ID,
+			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
+			Reason:        "pending approval contains placeholder command details; start a fresh plan instead",
+			Confidence:    0.95,
+		}, true
+	}
 	if isPendingApprovalReplacementRequest(l.state.message.Text) {
 		return taskBindingDecision{
 			Kind:          bindingReplacePendingApproval,
@@ -393,8 +411,42 @@ func (l *AgentLoop) resolvePendingApprovalBlock() (taskBindingDecision, bool) {
 		ResolvedQuery: strings.TrimSpace(l.state.message.Text),
 		Reason:        "blocked non-approval message while a confirmation is pending",
 		Confidence:    0.95,
-		ClarifyPrompt: "当前还有一个操作等待确认：\n\n" + prompt + "\n\n请先回复“确认”继续，或回复“取消”放弃。处理完以后再发送新的任务。",
+		ClarifyPrompt: "当前还有一个操作等待确认：\n\n" + compactPendingApprovalPrompt(prompt) + "\n\n请回复“确认”继续，或回复“取消”放弃。处理完以后再发送新的任务。",
 	}, true
+}
+
+func compactPendingApprovalPrompt(prompt string) string {
+	lines := strings.Split(strings.TrimSpace(prompt), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out = append(out, line)
+			continue
+		}
+		if strings.Contains(trimmed, "回复“确认”") ||
+			strings.Contains(trimmed, "回复\"确认\"") ||
+			strings.Contains(trimmed, "直接回复“确认”") ||
+			strings.Contains(trimmed, "直接回复\"确认\"") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func pendingApprovalLooksInvalid(approval *session.PendingApproval) bool {
+	if approval == nil {
+		return false
+	}
+	text := strings.TrimSpace(approval.Prompt + "\n" + approval.RequestedAction)
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "根据 step-") ||
+		strings.Contains(text, "根据官方") ||
+		strings.Contains(text, "官方说明填写") ||
+		strings.Contains(text, "待填写")
 }
 
 func suspendedApprovalTasks(st session.State) []session.TaskState {

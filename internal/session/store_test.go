@@ -96,10 +96,29 @@ func TestNormalizeMigratesLegacyLastTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.ActiveTaskID != "legacy" {
-		t.Fatalf("expected active task migrated, got %q", loaded.ActiveTaskID)
+	if loaded.ActiveTaskID != "" {
+		t.Fatalf("expected completed legacy task not to become active, got %q", loaded.ActiveTaskID)
 	}
 	if _, ok := loaded.Tasks["legacy"]; !ok {
 		t.Fatalf("expected migrated task in map, got %#v", loaded.Tasks)
+	}
+}
+
+func TestApplyTaskDoesNotKeepFailedTaskActive(t *testing.T) {
+	now := time.Now()
+	state := ApplyTask(State{SessionKey: "cli:cli", CreatedAt: now, Tasks: map[string]TaskState{}}, StateMeta{SessionKey: "cli:cli", Channel: "cli"}, AppendTaskInput{
+		Task: TaskState{
+			ID:        "failed-task",
+			UserText:  "run command",
+			Status:    TaskFailed,
+			Failed:    true,
+			StartedAt: now,
+		},
+		AssistantReply: "failed",
+		At:             now,
+		Activate:       true,
+	})
+	if state.ActiveTaskID != "" {
+		t.Fatalf("expected failed task not to remain active, got %q", state.ActiveTaskID)
 	}
 }

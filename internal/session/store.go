@@ -65,31 +65,31 @@ type StepState struct {
 }
 
 type TaskState struct {
-	ID                   string            `json:"id"`
-	TraceID              string            `json:"trace_id"`
-	ParentTaskID         string            `json:"parent_task_id,omitempty"`
-	ContinuationOfTaskID string            `json:"continuation_of_task_id,omitempty"`
-	Topic                string            `json:"topic"`
-	UserText             string            `json:"user_text"`
-	ResolvedQuery        string            `json:"resolved_query"`
-	PlanSummary          string            `json:"plan_summary"`
-	ToolNames            []string          `json:"tool_names"`
-	SelectedSkills       []string          `json:"selected_skills,omitempty"`
-	Status               string            `json:"status"`
-	Failed               bool              `json:"failed"`
-	ResultCount          int               `json:"result_count"`
-	ReplyPreview         string            `json:"reply_preview"`
-	LastAnswer           string            `json:"last_answer,omitempty"`
-	PendingFields        map[string]string `json:"pending_fields,omitempty"`
-	PendingQuestions     []string          `json:"pending_questions,omitempty"`
-	PendingApproval      *PendingApproval  `json:"pending_approval,omitempty"`
-	ExecutionStatus      string            `json:"execution_status,omitempty"`
-	StepOrder            []string          `json:"step_order,omitempty"`
+	ID                   string               `json:"id"`
+	TraceID              string               `json:"trace_id"`
+	ParentTaskID         string               `json:"parent_task_id,omitempty"`
+	ContinuationOfTaskID string               `json:"continuation_of_task_id,omitempty"`
+	Topic                string               `json:"topic"`
+	UserText             string               `json:"user_text"`
+	ResolvedQuery        string               `json:"resolved_query"`
+	PlanSummary          string               `json:"plan_summary"`
+	ToolNames            []string             `json:"tool_names"`
+	SelectedSkills       []string             `json:"selected_skills,omitempty"`
+	Status               string               `json:"status"`
+	Failed               bool                 `json:"failed"`
+	ResultCount          int                  `json:"result_count"`
+	ReplyPreview         string               `json:"reply_preview"`
+	LastAnswer           string               `json:"last_answer,omitempty"`
+	PendingFields        map[string]string    `json:"pending_fields,omitempty"`
+	PendingQuestions     []string             `json:"pending_questions,omitempty"`
+	PendingApproval      *PendingApproval     `json:"pending_approval,omitempty"`
+	ExecutionStatus      string               `json:"execution_status,omitempty"`
+	StepOrder            []string             `json:"step_order,omitempty"`
 	StepStates           map[string]StepState `json:"step_states,omitempty"`
-	Artifacts            []Artifact        `json:"artifacts,omitempty"`
-	StartedAt            time.Time         `json:"started_at"`
-	FinishedAt           time.Time         `json:"finished_at"`
-	UpdatedAt            time.Time         `json:"updated_at"`
+	Artifacts            []Artifact           `json:"artifacts,omitempty"`
+	StartedAt            time.Time            `json:"started_at"`
+	FinishedAt           time.Time            `json:"finished_at"`
+	UpdatedAt            time.Time            `json:"updated_at"`
 }
 
 func (t TaskState) AwaitConfirm() bool {
@@ -223,6 +223,9 @@ func ApplyTask(existing State, meta StateMeta, in AppendTaskInput) State {
 	st.TaskOrder = upsertTaskOrder(st.TaskOrder, task.ID)
 	if in.Activate {
 		st.ActiveTaskID = task.ID
+		if !task.IsOpenLike() {
+			st.ActiveTaskID = ""
+		}
 	}
 	if strings.TrimSpace(task.UserText) != "" {
 		st.RecentTurns = append(st.RecentTurns, Turn{Role: "user", Text: strings.TrimSpace(task.UserText), At: firstNonZero(task.StartedAt, now)})
@@ -301,7 +304,7 @@ func normalizeState(st State) State {
 			st.Tasks[st.LastTask.ID] = *st.LastTask
 			st.TaskOrder = upsertTaskOrder(st.TaskOrder, st.LastTask.ID)
 		}
-		if strings.TrimSpace(st.ActiveTaskID) == "" {
+		if strings.TrimSpace(st.ActiveTaskID) == "" && st.LastTask.IsOpenLike() {
 			st.ActiveTaskID = st.LastTask.ID
 		}
 	}
@@ -320,8 +323,14 @@ func normalizeState(st State) State {
 			st.ActiveTaskID = ""
 		}
 	}
-	if strings.TrimSpace(st.ActiveTaskID) == "" && len(st.TaskOrder) > 0 {
-		st.ActiveTaskID = st.TaskOrder[len(st.TaskOrder)-1]
+	if strings.TrimSpace(st.ActiveTaskID) == "" {
+		for i := len(st.TaskOrder) - 1; i >= 0; i-- {
+			task, ok := st.Tasks[st.TaskOrder[i]]
+			if ok && task.IsOpenLike() {
+				st.ActiveTaskID = st.TaskOrder[i]
+				break
+			}
+		}
 	}
 	st.TaskOrder = dedupeStrings(st.TaskOrder)
 	refreshLastTask(&st)

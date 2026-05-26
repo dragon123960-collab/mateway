@@ -44,6 +44,7 @@ type loopState struct {
 	inboxReminder       inboxReminder
 	repairReason        string
 	repairAttempted     bool
+	deferredResults     []model.ToolResult
 	finalAccept         FinalAcceptance
 }
 
@@ -183,6 +184,29 @@ func (l *AgentLoop) verifyPlan(ctx context.Context) {
 		l.state.repairReason = guidance
 	}
 	if second.Blocking() {
+		if diagnosticPlan, ok := safeDiagnosticPrefixForBlockedPlan(l.state.plan, l.state.resolvedRequest()); ok {
+			originalStepCount := len(l.state.plan.Steps)
+			l.state.plan = diagnosticPlan
+			l.state.deferredResults = append(l.state.deferredResults, model.ToolResult{
+				StepID: "plan",
+				Tool:   "plan.verify",
+				OK:     false,
+				Error:  "plan_contract_invalid_after_repair",
+				Output: strings.Join(second.Errors, "\n"),
+				Evidence: map[string]any{
+					"kind":                "plan_verification",
+					"warnings":            second.Warnings,
+					"repairable_warnings": second.RepairableWarnings,
+					"errors":              second.Errors,
+				},
+			})
+			l.runtime.Logger.Event("runtime.plan_trimmed_to_safe_diagnostic_prefix", map[string]any{
+				"trace_id":       l.state.traceID,
+				"original_steps": originalStepCount,
+				"prefix_steps":   len(diagnosticPlan.Steps),
+			})
+			return
+		}
 		l.state.failed = true
 		l.state.results = append(l.state.results, model.ToolResult{
 			StepID: "plan",
@@ -357,6 +381,10 @@ func (l *AgentLoop) act(ctx context.Context, plan model.Plan) {
 	results, control := l.runtime.executePlan(ctx, l.state.traceID, plan, l.state.binding.ApprovalGranted, l.state.binding.ApprovalStepID, previous, previousResults)
 	l.state.plan = plan
 	l.state.results = results
+	if len(l.state.deferredResults) > 0 {
+		l.state.results = append(l.state.results, l.state.deferredResults...)
+		l.state.deferredResults = nil
+	}
 	l.state.control = control
 }
 
@@ -369,6 +397,9 @@ func (l *AgentLoop) shouldRepairBeforeSynthesis() bool {
 
 func (l *AgentLoop) shouldBlockUnsupportedSynthesis() bool {
 	if l.state.control != "" {
+		return false
+	}
+	if hasGroundingEvidence(l.state.results) {
 		return false
 	}
 	return needsGroundingEvidence(l.state.resolvedRequest(), l.state.results)
@@ -386,7 +417,11 @@ func (l *AgentLoop) repair(ctx context.Context) {
 			priorResults = l.state.results
 		}
 	}
-	results, control := l.runtime.executePlan(ctx, l.state.traceID, l.state.plan, l.state.binding.ApprovalGranted, l.state.binding.ApprovalStepID, previous, priorResults)
+	approvedStepID := l.state.binding.ApprovalStepID
+	if repairedStepID := repairedTerminalWriteStepCoveredByApproval(l.state.results, l.state.plan, l.state.binding.ApprovalGranted); repairedStepID != "" {
+		approvedStepID = repairedStepID
+	}
+	results, control := l.runtime.executePlan(ctx, l.state.traceID, l.state.plan, l.state.binding.ApprovalGranted, approvedStepID, previous, priorResults)
 	l.state.results = mergeToolResultsForPlan(l.state.plan, l.state.results, results)
 	l.state.control = control
 }
@@ -419,6 +454,9 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 	}
 	if installGuidance := softwareInstallRepairGuidance(l.state.results); installGuidance != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nSoftware install repair guidance:\n" + installGuidance)
+	}
+	if cliGuidance := terminalFailureRepairGuidance(l.state.results); cliGuidance != "" {
+		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nLocal CLI failure repair guidance:\n" + cliGuidance)
 	}
 	if preserve := preserveSuccessfulEvidenceGuidance(l.state.results); preserve != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nPreserve successful evidence:\n" + preserve)
@@ -787,6 +825,11 @@ func (l *AgentLoop) controlReply() Response {
 
 func (l *AgentLoop) finalReply() Response {
 	l.state.failed = anyFailed(l.state.results)
+	if l.state.failed {
+		if text := userFacingTerminalPreconditionMessage(l.state.results); text != "" {
+			l.state.replyText = text
+		}
+	}
 	resp := Response{
 		Reply: l.runtime.sanitizeReply(channel.OutboundMessage{
 			Channel:  l.state.message.Channel,
@@ -814,7 +857,7 @@ func (l *AgentLoop) finalReply() Response {
 	if learning.CandidateGenerated {
 		resp.Reply.Text = strings.TrimSpace(resp.Reply.Text + "\n\n" + skillCandidatePrompt(learning))
 	}
-	if !resp.Failed && !resp.AwaitConfirm && !resp.AwaitUserInput && !learning.CandidateGenerated {
+	if resp.Reply.Style == "reply" && !resp.Failed && !resp.AwaitConfirm && !resp.AwaitUserInput && !learning.CandidateGenerated {
 		resp.Reply.Text = appendInboxReminder(resp.Reply.Text, l.state.inboxReminder)
 	}
 	return resp

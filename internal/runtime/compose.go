@@ -149,6 +149,7 @@ func inferCapabilities(user string) []string {
 	maybeAdd("inspect_file", "文件", "readme", "文档", "总结", "读取", "内容")
 	maybeAdd("write_file", "写", "修改", "patch", "编辑")
 	maybeAdd("run_terminal", "命令", "终端", "日志", "测试", "build", "状态")
+	maybeAdd("run_terminal", "本机", "cli", "dry run", "dry-run", "auth", "profile", "发送消息", "command")
 	maybeAdd("schedule_task", "定时", "每天", "每周", "schedule", "提醒")
 	if len(caps) == 0 {
 		caps = append(caps, "generic_lookup")

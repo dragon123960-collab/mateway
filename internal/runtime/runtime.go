@@ -299,7 +299,7 @@ func executableBatch(steps []model.PlanStep, start int, completed map[string]mod
 func stepDependenciesSatisfied(step model.PlanStep, completed map[string]model.ToolResult) bool {
 	for _, dep := range step.DependsOn {
 		result, ok := completed[strings.TrimSpace(dep)]
-		if !ok || !result.OK {
+		if !ok || !dependencyResultSatisfied(result) {
 			return false
 		}
 	}
@@ -313,11 +313,18 @@ func firstFailedDependency(step model.PlanStep, completed map[string]model.ToolR
 			continue
 		}
 		result, ok := completed[dep]
-		if ok && !result.OK {
+		if ok && !dependencyResultSatisfied(result) {
 			return dep
 		}
 	}
 	return ""
+}
+
+func dependencyResultSatisfied(result model.ToolResult) bool {
+	if result.OK {
+		return true
+	}
+	return strings.TrimSpace(result.Error) == "" && len(result.Evidence) > 0
 }
 
 func dependencyFailedResult(step model.PlanStep, dep string) model.ToolResult {
@@ -452,7 +459,7 @@ func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step mod
 	args := copyArgs(step.Args)
 	delete(args, "confirmed")
 	delete(args, "confirm")
-	needsConfirm := tool.RequireConfirmForTool(step.Tool, args)
+	needsConfirm := tool.RequireConfirmForTool(step.Tool, args) || terminalStepRequiresExternalWriteConfirm(step.Tool, args)
 	stepApproved := false
 	if approvalGranted {
 		switch {
@@ -647,8 +654,14 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 	if plan != nil {
 		p = *plan
 	}
+	text := userFacingError(err)
+	if preflight := userFacingTerminalPreconditionMessage(results); preflight != "" {
+		text = preflight
+	} else if planVerification := userFacingPlanVerificationMessage(results); planVerification != "" {
+		text = planVerification
+	}
 	return Response{
-		Reply:   r.sanitizeReply(channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: userFacingError(err), Style: "error"}),
+		Reply:   r.sanitizeReply(channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: "error"}),
 		TraceID: traceIDForMessage(msg),
 		Plan:    p, Results: results, Failed: true,
 		FinalAcceptStatus: string(AcceptanceRejected),
@@ -680,11 +693,169 @@ func userFacingError(err error) string {
 	return "任务失败了，我已经停在安全位置。可以查看报告或 trace 了解细节。"
 }
 
+func userFacingPlanVerificationMessage(results []model.ToolResult) string {
+	var errors []string
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "plan.verify" {
+			continue
+		}
+		errors = append(errors, stringListValue(result.Evidence["errors"])...)
+		if strings.TrimSpace(result.Output) != "" && len(errors) == 0 {
+			errors = append(errors, strings.Split(strings.TrimSpace(result.Output), "\n")...)
+		}
+	}
+	if len(errors) == 0 {
+		return ""
+	}
+	diagnostics := planVerificationDiagnostics(results)
+	if len(diagnostics) == 0 && hasToolResult(results, "terminal.run") {
+		diagnostics = append(diagnostics, "已有本地命令步骤尝试过，但没有得到足够明确的命令诊断输出。")
+	}
+	if len(diagnostics) == 0 {
+		diagnostics = append(diagnostics, "还没执行到本地命令，所以目前不能判断是命令不存在、参数错误，还是认证未配置。")
+	}
+	reasons := planVerificationReasons(errors)
+	if len(reasons) == 0 && len(diagnostics) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("这次还没有执行发送命令，失败点在执行前的计划检查。")
+	if len(diagnostics) > 0 {
+		b.WriteString("\n\n已确认的情况：")
+		for _, item := range diagnostics {
+			b.WriteString("\n- " + item)
+		}
+	}
+	if len(reasons) > 0 {
+		b.WriteString("\n\n还缺：")
+	}
+	for _, reason := range reasons {
+		b.WriteString("\n- " + reason)
+	}
+	b.WriteString("\n\n所以我停下了，避免用没确认过的命令或缺参数的命令去真实发送。")
+	return b.String()
+}
+
+func hasToolResult(results []model.ToolResult, toolName string) bool {
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) == toolName {
+			return true
+		}
+	}
+	return false
+}
+
+func planVerificationDiagnostics(results []model.ToolResult) []string {
+	var diagnostics []string
+	add := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		for _, existing := range diagnostics {
+			if existing == text {
+				return
+			}
+		}
+		diagnostics = append(diagnostics, text)
+	}
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.TrimSpace(stringValue(result.Evidence["command"]))
+		output := strings.TrimSpace(result.Output)
+		lowerOutput := strings.ToLower(output)
+		executable := commandVDiagnosticExecutable(command)
+		displayName := "`" + firstNonEmpty(executable, commandRoot(command), "CLI") + "`"
+		switch {
+		case executable != "" && (strings.Contains(lowerOutput, "not_found") || strings.Contains(lowerOutput, "not found") || commandVDiagnosticLooksMissing(command, result)):
+			add("本机没有找到用户写的 " + displayName + " 命令。")
+		case executable != "" && output != "":
+			add("已检查用户写的 " + displayName + " 命令，路径/版本输出：" + compactText(output, 120))
+		case command != "" && strings.Contains(strings.ToLower(result.Error+"\n"+result.Output), "not configured"):
+			add(displayName + " 返回未配置/未认证。")
+		case command != "" && (strings.Contains(strings.ToLower(result.Error), "exit status 127") || strings.Contains(lowerOutput, "command not found")):
+			add("命令执行返回 127，通常表示命令不存在或 PATH 找不到。")
+		}
+	}
+	if len(diagnostics) > 3 {
+		return diagnostics[:3]
+	}
+	return diagnostics
+}
+
+func planVerificationReasons(errors []string) []string {
+	var reasons []string
+	add := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		for _, existing := range reasons {
+			if existing == text {
+				return
+			}
+		}
+		reasons = append(reasons, text)
+	}
+	for _, item := range errors {
+		lower := strings.ToLower(strings.TrimSpace(item))
+		switch {
+		case strings.Contains(lower, "first inspect the exact help or usage"):
+			add("还没有拿到“发送消息”子命令的精确 help / usage，所以不知道正确子命令和参数名。")
+		case strings.Contains(lower, "without an earlier read-only preflight"):
+			add("真实发送前还缺只读预检，例如 auth/profile/status/whoami 或 dry-run。")
+		case strings.Contains(lower, "rewritten executable name before evidence") || strings.Contains(lower, "different executable name than the user provided"):
+			add("计划里曾尝试把用户写的命令名改成另一个命令名，但还没有足够证据允许这样切换。")
+		case strings.Contains(lower, "first check the exact user-provided executable"):
+			add("需要先检查用户写的原始命令名是否存在；如果不存在，要明确告诉用户。")
+		case strings.Contains(lower, "missing chat/user id"):
+			add("还缺接收人或 chat/user id。")
+		case strings.Contains(lower, "explicit message content"):
+			add("还缺要发送的消息内容。")
+		case strings.Contains(lower, "auth/config preflight"):
+			add("还缺认证/配置预检。建议先执行 `<cli> auth list`、`<cli> profile list`、`<cli> status`、`<cli> whoami` 中该工具支持的一条；不确定哪条可用时，先执行 `<cli> --help` 或 `<cli> auth --help`。")
+		case strings.Contains(lower, "unresolved placeholder"):
+			add("计划里还有占位参数，必须替换成真实命令、真实参数或先向用户确认。")
+		}
+	}
+	if len(reasons) > 4 {
+		return reasons[:4]
+	}
+	return reasons
+}
+
+func stringListValue(v any) []string {
+	switch values := v.(type) {
+	case []string:
+		return values
+	case []any:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			if text := strings.TrimSpace(fmt.Sprint(item)); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case string:
+		if strings.TrimSpace(values) == "" {
+			return nil
+		}
+		return strings.Split(strings.TrimSpace(values), "\n")
+	default:
+		return nil
+	}
+}
+
 func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
 	switch step.Tool {
 	case "shell.run", "terminal.run":
 		command := strings.TrimSpace(args["command"])
 		if command != "" {
+			if terminalStepRequiresExternalWriteConfirm(step.Tool, args) && !tool.IsDangerousCommand(command) {
+				return "这个命令可能会修改外部系统或发送消息，执行前需要你确认。\n\n命令：`" + command + "`\n\n回复“确认”继续执行，或回复“取消”放弃。"
+			}
 			return "这个命令可能会修改或删除本地内容，执行前需要你确认。\n\n命令：`" + command + "`\n\n回复“确认”继续执行，或回复“取消”放弃。"
 		}
 	case "file.write", "file.patch":
@@ -861,6 +1032,229 @@ func fallbackSynthesis(results []model.ToolResult) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func userFacingTerminalPreconditionMessage(results []model.ToolResult) string {
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.TrimSpace(stringValue(result.Evidence["command"]))
+		executable := commandRoot(command)
+		if executable == "" {
+			executable = "CLI"
+		}
+		displayName := "`" + executable + "`"
+		text := strings.ToLower(strings.TrimSpace(result.Output + "\n" + result.Error))
+		if strings.Contains(text, "command not found") || strings.Contains(text, "executable file not found") || strings.Contains(text, "no such file or directory") || strings.Contains(text, "exit status 127") || terminalOutputLooksNotFound(result.Output) || commandVDiagnosticLooksMissing(command, result) {
+			return "我先做了命令前置检查，结果发现本机找不到 " + displayName + " 这个命令。\n\n下一步应该主动查官方/可信来源，确认正确的 canonical executable；确认后再检查本机是否安装。"
+		}
+		if strings.Contains(text, "not configured") {
+			message := "我先做了命令前置检查，结果发现当前 " + displayName + " 还没有完成配置/认证，所以现在不适合继续执行真实操作。"
+			if hint := terminalPreconditionHint(result.Output); hint != "" {
+				return message + "\n\n工具输出提示：" + hint + "\n\n请先完成认证/配置，完成后我再继续测试。"
+			}
+			return message + "\n\n可以先执行这些只读命令确认该工具支持哪种认证方式：\n- `" + executable + " --help`\n- `" + executable + " auth --help`\n- `" + executable + " auth list`\n- `" + executable + " profile list`\n\n如果你愿意，我也可以先帮你执行 help/auth 预检，再根据输出继续。"
+		}
+		if strings.Contains(text, "unauthorized") || strings.Contains(text, "authentication") || strings.Contains(text, "permission denied") {
+			return "我先做了命令前置检查，结果显示当前 " + displayName + " 认证或权限还没准备好，所以现在不适合继续执行真实操作。\n\n可以先执行：\n- `" + executable + " --help`\n- `" + executable + " auth --help`\n- `" + executable + " auth list`\n\n确认登录/授权命令后，我可以继续帮你跑只读预检。"
+		}
+	}
+	return ""
+}
+
+func terminalFailureRepairGuidance(results []model.ToolResult) string {
+	var parts []string
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "terminal.run" || result.OK {
+			continue
+		}
+		command := strings.TrimSpace(stringValue(result.Evidence["command"]))
+		executable := firstNonEmpty(commandRoot(command), "the CLI")
+		text := strings.ToLower(strings.TrimSpace(result.Output + "\n" + result.Error))
+		switch {
+		case strings.Contains(text, "command not found") ||
+			strings.Contains(text, "executable file not found") ||
+			strings.Contains(text, "no such file or directory") ||
+			strings.Contains(text, "exit status 127") ||
+			terminalOutputLooksNotFound(result.Output) ||
+			commandVDiagnosticLooksMissing(command, result):
+			parts = append(parts, "The local executable `"+executable+"` appears missing. Do not stop at asking the user to spell it; use software.search or official web evidence to find the canonical executable name, then check command -v for the confirmed name. Installing still requires confirmation.")
+		case strings.Contains(text, "unknown command") ||
+			strings.Contains(text, "unknown subcommand") ||
+			strings.Contains(text, "unknown flag") ||
+			strings.Contains(text, "invalid option") ||
+			strings.Contains(text, "unrecognized option"):
+			parts = append(parts, "The CLI syntax appears wrong. First use read-only parent help such as `"+executable+" --help` or the nearest subcommand help to correct the command/flag. If local help conflicts with the task or is insufficient, fetch official docs/README before trying another write command.")
+		case strings.Contains(text, "missing required") ||
+			strings.Contains(text, "required flag") ||
+			strings.Contains(text, "requires an argument") ||
+			strings.Contains(text, "missing argument"):
+			parts = append(parts, "The CLI is missing required arguments. Use local help to identify the exact required target/content flags, then use user.ask for facts only the user can provide. Do not invent IDs, tokens, recipients, or message content.")
+		case strings.Contains(text, "unauthorized") ||
+			strings.Contains(text, "authentication") ||
+			strings.Contains(text, "not logged in") ||
+			strings.Contains(text, "token expired") ||
+			strings.Contains(text, "not configured"):
+			parts = append(parts, "The command failed on authentication/configuration. Prefer local read-only diagnostics first, such as `"+executable+" auth --help`, `"+executable+" status`, or `"+executable+" whoami` if supported. If the login/config flow is unclear, use official docs/README. Do not run login, write config, or create tokens without user confirmation.")
+		case strings.Contains(text, "permission denied") ||
+			strings.Contains(text, "forbidden") ||
+			strings.Contains(text, "insufficient scope") ||
+			strings.Contains(text, "missing scope"):
+			parts = append(parts, "The command failed on permissions. Explain that the app/bot/user may lack scope or target access. If the required scope is unclear, consult official permission docs. Do not attempt admin, permission, or token changes without user confirmation.")
+		case strings.Contains(text, "version") ||
+			strings.Contains(text, "deprecated") ||
+			strings.Contains(text, "unsupported"):
+			parts = append(parts, "The failure may be version-related. Run read-only `"+executable+" --version` and compare with official README/release notes if needed. Upgrades or installs require confirmation.")
+		case strings.Contains(text, "timeout") ||
+			strings.Contains(text, "timed out") ||
+			strings.Contains(text, "network") ||
+			strings.Contains(text, "connection refused") ||
+			strings.Contains(text, "connection reset"):
+			parts = append(parts, "The failure looks network or service related. Give the user the exact error summary, then use only read-only retry/status diagnostics unless a write retry is explicitly confirmed.")
+		default:
+			parts = append(parts, "The terminal failure is not locally classifiable from stdout/stderr. Use software.search/web.fetch against official docs, README, issues, or release notes to identify the error before proposing another write command.")
+		}
+	}
+	return strings.Join(dedupeStrings(parts), "\n")
+}
+
+func terminalStepRequiresExternalWriteConfirm(toolName string, args map[string]string) bool {
+	if strings.TrimSpace(toolName) != "terminal.run" && strings.TrimSpace(toolName) != "shell.run" {
+		return false
+	}
+	command := strings.TrimSpace(args["command"])
+	if terminalCommandLooksCLIReadinessPreflight(command) {
+		return false
+	}
+	return terminalCommandLooksExternalWriteAction(command)
+}
+
+func repairedTerminalWriteStepCoveredByApproval(results []model.ToolResult, plan model.Plan, approvalGranted bool) string {
+	if !approvalGranted {
+		return ""
+	}
+	var approvedFailedCommands []string
+	for _, result := range results {
+		if result.OK || strings.TrimSpace(result.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.TrimSpace(stringValue(result.Evidence["command"]))
+		if terminalCommandLooksExternalWriteAction(command) {
+			approvedFailedCommands = append(approvedFailedCommands, command)
+		}
+	}
+	if len(approvedFailedCommands) == 0 {
+		return ""
+	}
+	for _, step := range plan.Steps {
+		if strings.TrimSpace(step.Tool) != "terminal.run" {
+			continue
+		}
+		next := strings.TrimSpace(step.Args["command"])
+		if !terminalCommandLooksExternalWriteAction(next) {
+			continue
+		}
+		for _, prev := range approvedFailedCommands {
+			if terminalWriteCommandsShareApprovalBoundary(prev, next) {
+				return strings.TrimSpace(step.ID)
+			}
+		}
+	}
+	return ""
+}
+
+func terminalWriteCommandsShareApprovalBoundary(prev, next string) bool {
+	prev = strings.TrimSpace(prev)
+	next = strings.TrimSpace(next)
+	if prev == "" || next == "" || commandRoot(prev) != commandRoot(next) {
+		return false
+	}
+	if terminalWriteActionKind(prev) == "" || terminalWriteActionKind(prev) != terminalWriteActionKind(next) {
+		return false
+	}
+	for _, flag := range []string{"chat-id", "chat_id", "receive-id", "receive_id", "user-id", "user_id", "open-id", "open_id"} {
+		prevValue := commandFlagValue(prev, flag)
+		nextValue := commandFlagValue(next, flag)
+		if prevValue == "" || nextValue == "" {
+			continue
+		}
+		return prevValue == nextValue
+	}
+	return false
+}
+
+func terminalWriteActionKind(command string) string {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	for _, kind := range []string{"send", "reply", "create", "update", "delete", "remove", "install", "publish", "deploy", "upload", "apply", "write", "patch", "commit"} {
+		if strings.Contains(lower, " "+kind) || strings.Contains(lower, "-"+kind) || strings.Contains(lower, "+"+kind) {
+			return kind
+		}
+	}
+	return ""
+}
+
+func commandFlagValue(command, flag string) string {
+	pattern := regexp.MustCompile(`(?:^|\s)--` + regexp.QuoteMeta(flag) + `(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))`)
+	match := pattern.FindStringSubmatch(command)
+	if len(match) == 0 {
+		return ""
+	}
+	for _, value := range match[1:] {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func commandVDiagnosticExecutable(command string) string {
+	if !strings.HasPrefix(strings.TrimSpace(command), "command -v ") {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) < 3 {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(fields[2]), `'"`)
+}
+
+func terminalOutputLooksNotFound(output string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(output))
+	return normalized == "not_found" ||
+		normalized == "not found" ||
+		normalized == "not-found" ||
+		normalized == "notfound"
+}
+
+func commandVDiagnosticLooksMissing(command string, result model.ToolResult) bool {
+	if !strings.HasPrefix(strings.TrimSpace(command), "command -v ") {
+		return false
+	}
+	stdout := strings.TrimSpace(stringValue(result.Evidence["stdout"]))
+	if stdout != "" {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(result.Output + "\n" + result.Error))
+	if strings.Contains(text, "exit status") {
+		return true
+	}
+	exitCode := strings.TrimSpace(fmt.Sprint(result.Evidence["exit_code"]))
+	return exitCode != "" && exitCode != "0" && exitCode != "<nil>"
+}
+
+func terminalPreconditionHint(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "hint:") || strings.Contains(lower, "run `") || strings.Contains(lower, "please run") {
+			return line
+		}
+	}
+	return ""
 }
 
 func styleForFailed(failed bool) string {

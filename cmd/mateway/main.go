@@ -1494,6 +1494,12 @@ func builtinTestCase(name string) (testCommandOptions, bool) {
 			Message: "请直接读取这个已知页面并总结关键信息：https://example.com",
 			Channel: "cli",
 		}, true
+	case "tool-boundary-cli-message":
+		return testCommandOptions{
+			Title:   "tool-boundary-cli-message",
+			Message: "用本机的 larkcli 给飞书发送一条消息",
+			Channel: "cli",
+		}, true
 	default:
 		return testCommandOptions{}, false
 	}
@@ -1842,6 +1848,7 @@ Built-in cases:
   tool-boundary-install   software.search/install and verification path
   tool-boundary-schedule  verify-before-schedule-create boundary
   tool-boundary-url       known URL should bias toward web.fetch
+  tool-boundary-cli-message  local CLI send flow: help -> ask missing args -> auth preflight -> send
 `
 }
 

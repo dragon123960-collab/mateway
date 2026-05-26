@@ -1,12 +1,12 @@
 # Chinese matching terms used by runtime intent heuristics.
 fresh_search_cues: 最新|当前|最近|官方|发布|版本|趋势|走向|课程|最热|权威
 explicit_new_topic: 换个话题|新问题|另一个问题|另外一个问题|重新问|顺便问个新问题
-continue_exact: 继续|继续吧|接着|接着做|继续刚才的|继续刚才那个|继续上一个|继续上一轮|继续处理
-continue_contains: 继续刚才|继续上一轮|接着刚才
+continue_exact: 继续|继续吧|接着|接着做|继续刚才的|继续刚才那个|继续上一个|继续上一轮|继续处理|已经授权了|授权好了|已经登录了|登录好了|配置好了|认证好了
+continue_contains: 继续刚才|继续上一轮|接着刚才|已经授权|授权好了|已经登录|登录好了|配置好了|认证好了
 retry_contains: 再试一次|重试|重新执行刚才
 expand_cues: 展开|详细|细说|具体一点|展开讲|再多说|深入一点
 reference_edit_cues: 按刚才|按上面|基于刚才|这个文件|那个文件|这个结果|那个结果|刚才那个文件|前面那个
-short_context_cues: 这个|那个|它|继续|接着|展开|重试|再来|按这个|按那个
+short_context_cues: 这个|那个|它|继续|接着|展开|重试|再来|按这个|按那个|已授权|已登录
 context_contains: 刚才|上一个|前面
 structural_followup: 拆成|拆分|三条|3条|三个|3个|步骤|检查项|清单|列表|可执行|验收标准|压缩成|改成
 history_defer: 昨天|前天|上次|之前|历史

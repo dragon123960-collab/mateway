@@ -2034,8 +2034,10 @@ func displaySoftwareName(name string) string {
 
 func canonicalCommandName(name string) string {
 	key := strings.ToLower(strings.TrimSpace(name))
-	if alias := normalizedSoftwareAlias(key); alias != "" {
-		return alias
+	key = strings.ReplaceAll(key, "_", "-")
+	key = strings.Join(strings.Fields(key), " ")
+	if strings.Contains(key, " cli") {
+		key = strings.ReplaceAll(key, " cli", "-cli")
 	}
 	return key
 }
@@ -2048,12 +2050,13 @@ func normalizedSoftwareAlias(value string) string {
 	key := strings.ToLower(strings.TrimSpace(value))
 	key = strings.ReplaceAll(key, "_", "-")
 	key = strings.Join(strings.Fields(key), " ")
-	switch key {
-	case "larkcli", "lark cli", "lark-cli", "@larksuite/cli", "larksuite/cli":
-		return "lark-cli"
-	default:
+	if key == "" {
 		return ""
 	}
+	if strings.Contains(key, " cli") {
+		return strings.ReplaceAll(key, " cli", "-cli")
+	}
+	return ""
 }
 
 func softwareNameVariants(value string) []string {
@@ -2213,7 +2216,7 @@ type localCommandRun struct {
 }
 
 func executeLocalCommand(ctx context.Context, command string, toolCtx Context, rawWorkdir string, timeout time.Duration) (localCommandRun, error) {
-	workdir := toolCtx.ProjectRoot
+	workdir := preferredCommandWorkdir(toolCtx)
 	if raw := strings.TrimSpace(rawWorkdir); raw != "" {
 		resolved, err := ResolveAllowedPath(raw, toolCtx)
 		if err != nil {
@@ -2231,6 +2234,7 @@ func executeLocalCommand(ctx context.Context, command string, toolCtx Context, r
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "sh", "-lc", command)
 	cmd.Dir = workdir
+	cmd.Env = mergedCommandEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -2251,6 +2255,45 @@ func executeLocalCommand(ctx context.Context, command string, toolCtx Context, r
 		Err:      err,
 		TimedOut: runCtx.Err() == context.DeadlineExceeded,
 	}, nil
+}
+
+func preferredCommandWorkdir(toolCtx Context) string {
+	for _, candidate := range []string{toolCtx.ProjectRoot, toolCtx.Workspace, toolCtx.Home} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "."
+}
+
+var mergedCommandEnv = func() []string {
+	env := os.Environ()
+	current := os.Getenv("PATH")
+	additions := []string{"/opt/homebrew/bin", "/usr/local/bin", "/opt/homebrew/sbin", "/usr/local/sbin"}
+	parts := []string{}
+	seen := map[string]bool{}
+	for _, item := range append(additions, strings.Split(current, ":")...) {
+		item = strings.TrimSpace(item)
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		parts = append(parts, item)
+	}
+	pathValue := "PATH=" + strings.Join(parts, ":")
+	filtered := make([]string, 0, len(env)+1)
+	for _, item := range env {
+		if strings.HasPrefix(item, "PATH=") {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	filtered = append(filtered, pathValue)
+	return filtered
 }
 
 func (r localCommandRun) toResult(kind string) Result {

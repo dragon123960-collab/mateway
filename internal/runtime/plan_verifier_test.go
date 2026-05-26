@@ -79,6 +79,32 @@ func TestPlanVerifierWarnsWhenTerminalRunLooksLikeSingleFileRead(t *testing.T) {
 	}
 }
 
+func TestPlanVerifierWarnsWhenTerminalHelpLooksLikeGuessedSubcommand(t *testing.T) {
+	plan := model.Plan{Summary: "help", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "check lark-cli send help",
+		Args: map[string]string{"command": "lark-cli totally-made-up-send --help"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "你直接用larkcli的命令发送消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "prefer the exact user-mentioned command, or inspect the parent CLI help before drilling into a subcommand") {
+		t.Fatalf("expected guessed subcommand warning, got %#v", got)
+	}
+}
+
+func TestPlanVerifierAllowsTerminalHelpWhenSubcommandMatchesUserIntent(t *testing.T) {
+	plan := model.Plan{Summary: "help", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "check lark-cli message send help",
+		Args: map[string]string{"command": "lark-cli im +messages-send --help"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机的larkcli给飞书发送一条消息，先看怎么用", taskUnderstanding{})
+	if containsVerificationError(got.RepairableWarnings, "guessed subcommand path") {
+		t.Fatalf("expected legitimate help path not to be warned, got %#v", got)
+	}
+}
+
 func TestPlanVerifierWarnsWhenFileReadLooksLikeSummaryOnlyWork(t *testing.T) {
 	plan := model.Plan{Summary: "summary", Steps: []model.PlanStep{{
 		ID:   "s1",
@@ -157,6 +183,170 @@ func TestPlanVerifierWarnsWhenSoftwareInstallLooksSpeculative(t *testing.T) {
 	}
 }
 
+func TestPlanVerifierAllowsExternalCLIWriteWithoutMandatoryAuthPreflight(t *testing.T) {
+	plan := model.Plan{Summary: "send message", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "send a message with chatctl",
+		Args: map[string]string{"command": `chatctl messages send --chat-id oc_xxx --text "test"`},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用 chatctl 发一条消息", taskUnderstanding{})
+	if containsVerificationError(got.RepairableWarnings, "without an earlier read-only preflight") {
+		t.Fatalf("expected auth/config preflight to be optional, got %#v", got)
+	}
+	if got.Blocking() {
+		t.Fatalf("expected direct confirmed CLI write plan not to be blocked by missing auth preflight, got %#v", got)
+	}
+}
+
+func TestPlanVerifierStillAllowsExternalCLIWriteAfterOptionalPreflight(t *testing.T) {
+	plan := model.Plan{Summary: "send message", Steps: []model.PlanStep{
+		{
+			ID:   "s1",
+			Tool: "terminal.run",
+			Goal: "check chatctl auth status",
+			Args: map[string]string{"command": "chatctl auth list"},
+		},
+		{
+			ID:        "s2",
+			Tool:      "terminal.run",
+			Goal:      "send a message with chatctl",
+			Args:      map[string]string{"command": `chatctl messages send --chat-id oc_xxx --text "test"`},
+			DependsOn: []string{"s1"},
+		},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用 chatctl 发一条消息", taskUnderstanding{})
+	if containsVerificationError(got.RepairableWarnings, "without an earlier read-only preflight") {
+		t.Fatalf("expected preflight warning to clear after auth check, got %#v", got)
+	}
+}
+
+func TestPlanVerifierWarnsWhenCLIMessageSendLacksExplicitContent(t *testing.T) {
+	plan := model.Plan{Summary: "send message", Steps: []model.PlanStep{
+		{
+			ID:   "s1",
+			Tool: "terminal.run",
+			Goal: "send a message with chatctl",
+			Args: map[string]string{"command": `chatctl messages send --chat-id oc_xxx --text "test"`},
+		},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机的 chatctl 发送一条消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "first inspect the exact help or usage for the send command") {
+		t.Fatalf("expected help-first warning, got %#v", got)
+	}
+	if got.Blocking() {
+		t.Fatalf("expected missing help warning not to block execution, got %#v", got)
+	}
+}
+
+func TestPlanVerifierWarnsToAskUserAfterHelpWhenCLIMessageContentIsStillMissing(t *testing.T) {
+	plan := model.Plan{Summary: "send message", Steps: []model.PlanStep{
+		{
+			ID:   "s1",
+			Tool: "terminal.run",
+			Goal: "inspect chatctl send help",
+			Args: map[string]string{"command": "chatctl messages send --help"},
+		},
+		{
+			ID:        "s2",
+			Tool:      "terminal.run",
+			Goal:      "send a message with chatctl",
+			Args:      map[string]string{"command": `chatctl messages send --chat-id oc_xxx --text "test"`},
+			DependsOn: []string{"s1"},
+		},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机的 chatctl 给 chat_id 为 oc_xxx 的群发送一条消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "should ask the user for missing parameters before executing") {
+		t.Fatalf("expected ask-user warning after help, got %#v", got)
+	}
+	if got.Blocking() {
+		t.Fatalf("expected missing message content warning not to block execution, got %#v", got)
+	}
+}
+
+func TestPlanVerifierWarnsWhenLocalCLINameIsRewrittenBeforeEvidence(t *testing.T) {
+	plan := model.Plan{Summary: "check cli", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "check canonical executable",
+		Args: map[string]string{"command": "command -v lark-cli && lark-cli --help"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机的 larkcli 发送消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "different executable name than the user provided") {
+		t.Fatalf("expected rewritten executable warning, got %#v", got)
+	}
+	if got.Blocking() {
+		t.Fatalf("expected rewritten executable warning not to block execution, got %#v", got)
+	}
+}
+
+func TestPlanVerifierWarnsWhenLocalCLIUseInstallsBeforeExactCommandCheck(t *testing.T) {
+	plan := model.Plan{Summary: "install cli", Steps: []model.PlanStep{
+		{
+			ID:   "s1",
+			Tool: "software.search",
+			Goal: "find official CLI",
+			Args: map[string]string{"query": "larkcli feishu cli tool"},
+		},
+		{
+			ID:        "s2",
+			Tool:      "software.install",
+			Goal:      "install canonical executable",
+			Args:      map[string]string{"command": "npm i -g @larksuite/cli", "verify_command": "command -v lark-cli && lark-cli --version"},
+			DependsOn: []string{"s1"},
+		},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机的 larkcli 给飞书发送一条消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "first check the exact user-provided executable with command -v") {
+		t.Fatalf("expected local exact command check warning, got %#v", got)
+	}
+	if !containsVerificationError(got.RepairableWarnings, "should not install before checking") {
+		t.Fatalf("expected install-before-check warning, got %#v", got)
+	}
+	if got.Blocking() {
+		t.Fatalf("expected local exact command warnings not to block execution, got %#v", got)
+	}
+}
+
+func TestPlanVerifierAllowsCanonicalCLINameAfterSourceDiscovery(t *testing.T) {
+	plan := model.Plan{Summary: "discover and check cli", Steps: []model.PlanStep{
+		{
+			ID:   "s1",
+			Tool: "software.search",
+			Goal: "find official CLI executable name",
+			Args: map[string]string{"query": "larkcli official executable name"},
+		},
+		{
+			ID:        "s2",
+			Tool:      "terminal.run",
+			Goal:      "check canonical executable",
+			Args:      map[string]string{"command": "command -v lark-cli && lark-cli --help"},
+			DependsOn: []string{"s1"},
+		},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机的 larkcli 发送消息", taskUnderstanding{})
+	if containsVerificationError(got.RepairableWarnings, "different executable name than the user provided") ||
+		containsVerificationError(got.RepairableWarnings, "uses a rewritten executable name before evidence") {
+		t.Fatalf("expected canonical name after source discovery to pass rewrite gate, got %#v", got)
+	}
+}
+
+func TestPlanVerifierWarnsWhenLocalCLIHelpRunsBeforeCommandExistsCheck(t *testing.T) {
+	plan := model.Plan{Summary: "help first", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "inspect chatctl message help",
+		Args: map[string]string{"command": "chatctl messages send --help"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "本地执行命令，先看 chatctl 怎么发消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "first verify the executable exists with command -v") {
+		t.Fatalf("expected command existence warning, got %#v", got)
+	}
+	if got.Blocking() {
+		t.Fatalf("expected command existence warning not to block execution, got %#v", got)
+	}
+}
+
 func TestPlanVerifierRejectsPlaceholderArgs(t *testing.T) {
 	plan := model.Plan{Summary: "install", Steps: []model.PlanStep{{
 		ID:   "s1",
@@ -166,6 +356,21 @@ func TestPlanVerifierRejectsPlaceholderArgs(t *testing.T) {
 	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "安装 example cli", taskUnderstanding{})
 	if !got.Blocking() || !containsVerificationError(got.Errors, "args contain unresolved placeholder values") {
 		t.Fatalf("expected placeholder arg error, got %#v", got)
+	}
+}
+
+func TestPlanVerifierRejectsNaturalLanguagePlaceholderInstallArgs(t *testing.T) {
+	plan := model.Plan{Summary: "install", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "software.install",
+		Args: map[string]string{
+			"command":        "根据 step-2 官方说明填写",
+			"verify_command": "根据 step-2 官方说明填写",
+		},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "本机 larkcli 不存在，查官方安装方式", taskUnderstanding{})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "args contain unresolved placeholder values") {
+		t.Fatalf("expected natural-language placeholder args to be blocked, got %#v", got)
 	}
 }
 

@@ -77,27 +77,27 @@ func TestSoftwareSearchQueriesStayGeneric(t *testing.T) {
 	}
 }
 
-func TestSoftwareSearchQueriesIncludeCanonicalLarkCLIAlias(t *testing.T) {
+func TestSoftwareSearchQueriesKeepCompactCLINameAndGenerateVariants(t *testing.T) {
 	got := softwareSearchQueries("larkcli")
-	found := false
-	for _, item := range got {
-		if item == "lark-cli" {
-			found = true
-			break
-		}
+	if len(got) == 0 || got[0] != "larkcli" {
+		t.Fatalf("expected original compact cli name to stay first, got %#v", got)
 	}
-	if !found {
-		t.Fatalf("expected canonical lark-cli alias in queries, got %#v", got)
-	}
-	if len(got) == 0 || got[0] != "lark-cli" {
-		t.Fatalf("expected canonical lark-cli alias to be prioritized first, got %#v", got)
+	if !containsQuery(got, "lark cli") || !containsQuery(got, "lark-cli") {
+		t.Fatalf("expected generic cli variants for compact name, got %#v", got)
 	}
 }
 
-func TestCanonicalCommandNameNormalizesLarkCLIAliases(t *testing.T) {
-	for _, input := range []string{"larkcli", "lark cli", "lark-cli", "@larksuite/cli"} {
-		if got := canonicalCommandName(input); got != "lark-cli" {
-			t.Fatalf("expected %q to normalize to lark-cli, got %q", input, got)
+func TestCanonicalCommandNameNormalizesGenericCLISpacing(t *testing.T) {
+	cases := map[string]string{
+		"lark cli":       "lark-cli",
+		"aws cli":        "aws-cli",
+		"agent_browser":  "agent-browser",
+		"already-good":   "already-good",
+		"@larksuite/cli": "@larksuite/cli",
+	}
+	for input, want := range cases {
+		if got := canonicalCommandName(input); got != want {
+			t.Fatalf("expected %q to normalize to %q, got %q", input, want, got)
 		}
 	}
 }
@@ -231,6 +231,36 @@ func TestTerminalRunReturnsCommandEvidence(t *testing.T) {
 	}
 	if result.Evidence["stdout"] != "hello" || result.Evidence["purpose"] != "diagnose local cli" {
 		t.Fatalf("expected stdout and purpose evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestTerminalRunUsesMergedPATHForCommonCLILocations(t *testing.T) {
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(binDir, "demo-cli")
+	mustWriteFile(t, script, "#!/bin/sh\nprintf 'demo ok\\n'\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "/usr/bin:/bin")
+	original := mergedCommandEnv
+	mergedCommandEnv = func() []string {
+		return []string{"PATH=" + binDir + ":/usr/bin:/bin"}
+	}
+	defer func() { mergedCommandEnv = original }()
+
+	result := TerminalRun().Run(context.Background(), Call{
+		Args:    map[string]string{"command": "command -v demo-cli && demo-cli"},
+		Context: Context{ProjectRoot: root, Workspace: root},
+	})
+	if !result.OK {
+		t.Fatalf("expected command to resolve from merged PATH, got %#v", result)
+	}
+	if !strings.Contains(result.Output, "demo ok") {
+		t.Fatalf("expected CLI output, got %q", result.Output)
 	}
 }
 

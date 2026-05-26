@@ -73,23 +73,32 @@ func (g Gateway) processInbound(ctx context.Context, msg channel.InboundMessage)
 	defer g.inflight.Done(msg.ID)
 	unlock := g.sessions.Lock(msg.SessionKey)
 	defer unlock()
-	_ = g.Sender.React(ctx, msg.ID, "SMILE")
+	cardAction := msg.Metadata["message_type"] == "interactive" && msg.Metadata["card_action"] != ""
+	if !cardAction {
+		_ = g.Sender.React(ctx, msg.ID, "SMILE")
+	}
 	rt := g.App.Runtime
 	rt.Observer = nil
 	resp, err := rt.Handle(ctx, msg)
 	if err != nil {
-		_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
+		if !cardAction {
+			_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
+		}
 		_ = g.Sender.Reply(ctx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
 		return
 	}
 	if err := g.Sender.Reply(ctx, msg, resp.Reply); err != nil {
-		_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
+		if !cardAction {
+			_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
+		}
 		return
 	}
-	if strings.TrimSpace(resp.Reply.Style) == "approval_pending" || strings.TrimSpace(resp.Reply.Style) == "input_required" {
-		_ = g.Sender.React(ctx, msg.ID, "EYES")
-	} else {
-		_ = g.Sender.React(ctx, msg.ID, "DONE")
+	if !cardAction {
+		if strings.TrimSpace(resp.Reply.Style) == "approval_pending" || strings.TrimSpace(resp.Reply.Style) == "input_required" {
+			_ = g.Sender.React(ctx, msg.ID, "EYES")
+		} else {
+			_ = g.Sender.React(ctx, msg.ID, "DONE")
+		}
 	}
 }
 

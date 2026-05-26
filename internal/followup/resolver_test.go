@@ -41,6 +41,23 @@ func TestResolverDetectsReferenceEdit(t *testing.T) {
 	}
 }
 
+func TestResolverTreatsManualAuthDoneAsContinuation(t *testing.T) {
+	r := Resolver{}
+	decision := r.Resolve(Input{
+		CurrentMessage: "已经授权了",
+		LastTask: &session.TaskState{
+			ResolvedQuery: "用本机的 lark-cli 给飞书发送一条消息",
+			Topic:         "飞书消息发送",
+		},
+	})
+	if !decision.IsFollowup {
+		t.Fatalf("expected manual auth completion to continue previous task, got %#v", decision)
+	}
+	if decision.ResolvedQuery != "用本机的 lark-cli 给飞书发送一条消息" {
+		t.Fatalf("unexpected resolved query %q", decision.ResolvedQuery)
+	}
+}
+
 func TestResolverLeavesIndependentRequestAlone(t *testing.T) {
 	r := Resolver{}
 	decision := r.Resolve(Input{

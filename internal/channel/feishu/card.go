@@ -45,7 +45,7 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			},
 		},
 	}
-	if actions := approvalActions(reply.Style); len(actions) > 0 {
+	if actions := approvalActions(reply); len(actions) > 0 {
 		elements = append(elements, map[string]any{
 			"tag":     "action",
 			"actions": actions,
@@ -65,9 +65,21 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 	return elements
 }
 
-func approvalActions(style string) []map[string]any {
-	if strings.TrimSpace(style) != "approval_pending" {
+func approvalActions(reply channel.OutboundMessage) []map[string]any {
+	if strings.TrimSpace(reply.Style) != "approval_pending" {
 		return nil
+	}
+	value := func(decision, text string) map[string]any {
+		out := map[string]any{
+			"mateway_action": "approval",
+			"decision":       decision,
+			"mateway_text":   text,
+		}
+		if threadID := strings.TrimSpace(reply.ThreadID); threadID != "" {
+			out["mateway_thread_id"] = threadID
+			out["mateway_session_key"] = firstNonEmpty(strings.TrimSpace(reply.Channel), "feishu") + ":" + threadID
+		}
+		return out
 	}
 	return []map[string]any{
 		{
@@ -77,11 +89,7 @@ func approvalActions(style string) []map[string]any {
 				"tag":     "plain_text",
 				"content": "同意",
 			},
-			"value": map[string]any{
-				"mateway_action": "approval",
-				"decision":       "confirm",
-				"mateway_text":   "确认",
-			},
+			"value": value("confirm", "确认"),
 		},
 		{
 			"tag":  "button",
@@ -90,11 +98,7 @@ func approvalActions(style string) []map[string]any {
 				"tag":     "plain_text",
 				"content": "拒绝",
 			},
-			"value": map[string]any{
-				"mateway_action": "approval",
-				"decision":       "cancel",
-				"mateway_text":   "取消",
-			},
+			"value": value("cancel", "取消"),
 		},
 	}
 }

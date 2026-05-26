@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/dongping/mateway/internal/model"
@@ -67,7 +68,7 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 			if placeholderArgs(step.Tool, step.Args) {
 				out.Errors = append(out.Errors, label+": args contain unresolved placeholder values")
 			}
-			for _, warning := range toolBoundaryWarnings(step, def) {
+			for _, warning := range toolBoundaryWarnings(step, def, user) {
 				out.RepairableWarnings = append(out.RepairableWarnings, label+": "+warning)
 			}
 		}
@@ -97,6 +98,12 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 	for _, warning := range toolNeedsCoverageWarnings(understanding.Capabilities, usedTools) {
 		out.RepairableWarnings = append(out.RepairableWarnings, warning)
 	}
+	for _, warning := range localCLIExecutableValidationWarnings(plan, user) {
+		out.RepairableWarnings = append(out.RepairableWarnings, warning)
+	}
+	for _, warning := range cliMessageParameterWarnings(plan, user) {
+		out.RepairableWarnings = append(out.RepairableWarnings, warning)
+	}
 	if len(understanding.CompletionDraft) > 0 && !successCriteriaMatchUnderstanding(understanding.CompletionDraft, plan.Steps) {
 		out.RepairableWarnings = append(out.RepairableWarnings, "plan success_criteria do not clearly align with understanding completion criteria")
 	}
@@ -122,6 +129,9 @@ func placeholderArgs(toolName string, args map[string]string) bool {
 		if strings.Contains(value, "<需从") || strings.Contains(value, "<从 step-") || strings.Contains(lower, "<download_url>") || strings.Contains(lower, "<url>") || strings.Contains(lower, "<todo>") {
 			return true
 		}
+		if strings.Contains(value, "根据 step-") || strings.Contains(value, "根据官方") || strings.Contains(value, "官方说明填写") || strings.Contains(value, "待填写") {
+			return true
+		}
 		if strings.TrimSpace(toolName) == "web.fetch" && key == "url" && !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
 			return true
 		}
@@ -129,7 +139,7 @@ func placeholderArgs(toolName string, args map[string]string) bool {
 	return false
 }
 
-func toolBoundaryWarnings(step model.PlanStep, def tool.Definition) []string {
+func toolBoundaryWarnings(step model.PlanStep, def tool.Definition, user string) []string {
 	var warnings []string
 	switch strings.TrimSpace(def.Name) {
 	case "terminal.run":
@@ -138,6 +148,9 @@ func toolBoundaryWarnings(step model.PlanStep, def tool.Definition) []string {
 		}
 		if terminalLooksLikeSingleFileRead(step) {
 			warnings = append(warnings, "terminal.run looks like one-file reading; prefer file.read or file.summary")
+		}
+		if terminalHelpLooksLikeGuessedSubcommand(step, user) {
+			warnings = append(warnings, "terminal.run help command looks like a guessed subcommand path; prefer the exact user-mentioned command, or inspect the parent CLI help before drilling into a subcommand")
 		}
 	case "file.read":
 		if fileReadLooksLikeSummary(step) {
@@ -197,6 +210,67 @@ func terminalLooksLikeSingleFileRead(step model.PlanStep) bool {
 	return strings.Contains(goal, "read ") || strings.Contains(goal, "读取") || strings.Contains(goal, "查看文件")
 }
 
+func terminalHelpLooksLikeGuessedSubcommand(step model.PlanStep, user string) bool {
+	command := strings.TrimSpace(step.Args["command"])
+	if !strings.HasSuffix(command, " --help") {
+		return false
+	}
+	fields := strings.Fields(command)
+	if len(fields) < 3 {
+		return false
+	}
+	userText := normalizeIntentText(user)
+	if userText == "" {
+		return false
+	}
+	root := strings.ToLower(strings.TrimSpace(fields[0]))
+	normalizedRoot := strings.ReplaceAll(strings.ReplaceAll(root, "-", ""), "_", "")
+	if root == "" || (!strings.Contains(userText, root) && !strings.Contains(userText, normalizedRoot)) {
+		return false
+	}
+	for _, token := range fields[1 : len(fields)-1] {
+		normalized := strings.ToLower(strings.TrimSpace(token))
+		if normalized == "" || normalized == "--help" {
+			continue
+		}
+		if strings.HasPrefix(normalized, "+") {
+			normalized = strings.TrimPrefix(normalized, "+")
+		}
+		normalized = strings.ReplaceAll(normalized, "_", "")
+		normalized = strings.ReplaceAll(normalized, "-", "")
+		if normalized == "" {
+			continue
+		}
+		if strings.Contains(userText, normalized) {
+			return false
+		}
+		if terminalHelpTokenMatchesUserIntent(normalized, userText) {
+			return false
+		}
+	}
+	return true
+}
+
+func terminalHelpTokenMatchesUserIntent(token, userText string) bool {
+	if token == "" || userText == "" {
+		return false
+	}
+	switch {
+	case token == "im" || token == "message" || token == "messages" || token == "messagessend":
+		return strings.Contains(userText, "发消息") ||
+			strings.Contains(userText, "发送消息") ||
+			strings.Contains(userText, "消息") ||
+			strings.Contains(userText, "sendmessage") ||
+			strings.Contains(userText, "send")
+	case strings.Contains(token, "reply"):
+		return strings.Contains(userText, "回复") || strings.Contains(userText, "reply")
+	case strings.Contains(token, "chat"):
+		return strings.Contains(userText, "聊天") || strings.Contains(userText, "会话") || strings.Contains(userText, "chat")
+	default:
+		return false
+	}
+}
+
 func fileReadLooksLikeSummary(step model.PlanStep) bool {
 	goal := strings.ToLower(strings.TrimSpace(step.Goal))
 	if goal == "" {
@@ -247,6 +321,300 @@ func softwareInstallLooksSpeculative(step model.PlanStep) bool {
 	command := strings.TrimSpace(step.Args["command"])
 	verify := strings.TrimSpace(step.Args["verify_command"])
 	return command == "" || strings.Contains(command, "<") || strings.Contains(command, "TODO") || verify == ""
+}
+
+func localCLIExecutableValidationWarnings(plan model.Plan, user string) []string {
+	userText := strings.ToLower(strings.TrimSpace(user))
+	if !textLooksLikeLocalCLIRequest(userText) {
+		return nil
+	}
+	explicitNames := explicitCLIExecutableNames(user)
+	seenCommandVByRoot := map[string]bool{}
+	seenSourceDiscovery := false
+	requiresExactLocalCheck := len(explicitNames) > 0 && textLooksLikeLocalCLIUseRequest(userText) && !textLooksLikeInstallIntent(userText)
+	var warnings []string
+	for i, step := range plan.Steps {
+		switch strings.TrimSpace(step.Tool) {
+		case "software.search", "web.search", "web.fetch":
+			if requiresExactLocalCheck && !anyExplicitCommandVSeen(seenCommandVByRoot, explicitNames) {
+				warnings = append(warnings, planStepLabel(step, i)+": local CLI use request should first check the exact user-provided executable with command -v before searching, installing, or switching to a canonical name")
+			}
+			seenSourceDiscovery = true
+			continue
+		case "software.install":
+			if requiresExactLocalCheck && !anyExplicitCommandVSeen(seenCommandVByRoot, explicitNames) {
+				warnings = append(warnings, planStepLabel(step, i)+": local CLI use request should not install before checking whether the exact user-provided executable already exists with command -v")
+			}
+			continue
+		}
+		if strings.TrimSpace(step.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.TrimSpace(step.Args["command"])
+		root := commandRoot(command)
+		if root == "" || rootLooksLikeLocalProjectCommand(root) {
+			continue
+		}
+		if terminalCommandLooksCommandVForRoot(command, root) {
+			seenCommandVByRoot[root] = true
+			if len(explicitNames) > 0 && !explicitNames[root] && !seenSourceDiscovery {
+				warnings = append(warnings, planStepLabel(step, i)+": command existence check uses a different executable name than the user provided; first check the exact user-provided name before trying aliases or canonical names")
+			}
+			continue
+		}
+		if seenCommandVByRoot[root] {
+			continue
+		}
+		if len(explicitNames) > 0 && !explicitNames[root] && !seenSourceDiscovery {
+			warnings = append(warnings, planStepLabel(step, i)+": terminal.run uses a rewritten executable name before evidence; first check the exact user-provided CLI name, and only switch names after local or upstream evidence confirms the canonical executable")
+			continue
+		}
+		if terminalCommandLooksCLIReadinessPreflight(command) || terminalCommandLooksExternalWriteAction(command) {
+			warnings = append(warnings, planStepLabel(step, i)+": before using a local CLI, first verify the executable exists with command -v for that exact command name; if it is missing, stop and tell the user or use software.search/web evidence to find the canonical command")
+		}
+	}
+	return warnings
+}
+
+func textLooksLikeLocalCLIRequest(text string) bool {
+	return strings.Contains(text, "cli") ||
+		strings.Contains(text, "命令") ||
+		strings.Contains(text, "本机") ||
+		strings.Contains(text, "本地执行") ||
+		strings.Contains(text, "command")
+}
+
+func textLooksLikeLocalCLIUseRequest(text string) bool {
+	return strings.Contains(text, "本机") ||
+		strings.Contains(text, "本地执行") ||
+		strings.Contains(text, "local") ||
+		strings.Contains(text, "用本机")
+}
+
+func textLooksLikeInstallIntent(text string) bool {
+	return strings.Contains(text, "安装") ||
+		strings.Contains(text, "装一下") ||
+		strings.Contains(text, "install")
+}
+
+func anyExplicitCommandVSeen(seen map[string]bool, explicit map[string]bool) bool {
+	for name := range explicit {
+		if seen[name] {
+			return true
+		}
+	}
+	return false
+}
+
+func explicitCLIExecutableNames(user string) map[string]bool {
+	out := map[string]bool{}
+	matches := cliExecutableNamePattern.FindAllString(user, -1)
+	for _, match := range matches {
+		name := strings.ToLower(strings.TrimSpace(match))
+		if name == "" || strings.HasPrefix(name, "-") {
+			continue
+		}
+		if strings.Contains(name, "/") {
+			continue
+		}
+		if strings.Contains(name, "cli") || strings.Contains(name, "ctl") {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+var cliExecutableNamePattern = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*(?:cli|ctl)(?:[A-Za-z0-9._-]*)?`)
+
+func terminalCommandLooksCommandVForRoot(command, root string) bool {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) < 3 {
+		return false
+	}
+	if fields[0] != "command" || fields[1] != "-v" {
+		return false
+	}
+	checked := strings.Trim(strings.TrimSpace(fields[2]), `'"`)
+	return strings.EqualFold(checked, root)
+}
+
+func rootLooksLikeLocalProjectCommand(root string) bool {
+	switch strings.ToLower(strings.TrimSpace(root)) {
+	case "go", "git", "make", "npm", "pnpm", "yarn", "node", "python", "python3", "ruby", "cargo", "mateway", "./mateway", "./build/mateway":
+		return true
+	default:
+		return false
+	}
+}
+
+func commandRoot(command string) string {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return ""
+	}
+	if len(fields) >= 3 && fields[0] == "command" && fields[1] == "-v" {
+		return strings.ToLower(strings.Trim(strings.TrimSpace(fields[2]), `'"`))
+	}
+	return strings.ToLower(strings.Trim(strings.TrimSpace(fields[0]), `'"`))
+}
+
+func planStepLabel(step model.PlanStep, index int) string {
+	label := strings.TrimSpace(step.ID)
+	if label == "" {
+		label = fmt.Sprintf("step-%d", index+1)
+	}
+	return label
+}
+
+func terminalCommandLooksCLIReadinessPreflight(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "--dry-run") ||
+		strings.HasSuffix(lower, " --help") ||
+		strings.HasSuffix(lower, " -h") ||
+		strings.HasSuffix(lower, " --version") ||
+		strings.Contains(lower, " auth list") ||
+		strings.Contains(lower, " profile list") ||
+		strings.Contains(lower, " config show") ||
+		strings.Contains(lower, " config current") ||
+		strings.Contains(lower, " status") ||
+		strings.Contains(lower, " doctor") ||
+		strings.Contains(lower, " whoami")
+}
+
+func terminalCommandLooksExternalWriteAction(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "--dry-run") {
+		return false
+	}
+	writeHints := []string{
+		" send", "-send", "+send",
+		" reply", "-reply", "+reply",
+		" create", "-create", "+create",
+		" update", "-update", "+update",
+		" delete", "-delete", "+delete",
+		" remove", "-remove", "+remove",
+		" rm ",
+		" install ", " install",
+		" publish", "-publish", "+publish",
+		" deploy", "-deploy", "+deploy",
+		" upload", "-upload", "+upload",
+		" apply", "-apply", "+apply",
+		" write", "-write", "+write",
+		" patch", "-patch", "+patch",
+		" commit", "-commit", "+commit",
+		" resume", "-resume", "+resume",
+		" pause", "-pause", "+pause",
+	}
+	for _, hint := range writeHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func cliMessageParameterWarnings(plan model.Plan, user string) []string {
+	userText := normalizeIntentText(user)
+	if !strings.Contains(userText, "消息") && !strings.Contains(userText, "send") && !strings.Contains(userText, "chatid") && !strings.Contains(userText, "chat_id") {
+		return nil
+	}
+	allowImplicitBody := strings.Contains(userText, "发一条测试消息") || strings.Contains(userText, "测试消息")
+	hasTarget := strings.Contains(userText, "oc_") || strings.Contains(userText, "ou_") || strings.Contains(userText, "chatid") || strings.Contains(userText, "chat_id") || strings.Contains(userText, "userid") || strings.Contains(userText, "user_id")
+	hasBody := strings.Contains(userText, "内容") || strings.Contains(userText, "正文") || strings.Contains(userText, "text") || strings.Contains(userText, "markdown") || strings.Contains(userText, "测试消息") || strings.Contains(userText, "消息是")
+	wantSend := false
+	hasHelpStep := false
+	hasAskStep := false
+	for i, step := range plan.Steps {
+		if strings.TrimSpace(step.Tool) == "user.ask" {
+			hasAskStep = true
+			continue
+		}
+		if strings.TrimSpace(step.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.ToLower(strings.TrimSpace(step.Args["command"]))
+		if !terminalCommandLooksMessageSend(command) {
+			continue
+		}
+		if terminalCommandLooksHelp(command) {
+			hasHelpStep = true
+			continue
+		}
+		wantSend = true
+		label := strings.TrimSpace(step.ID)
+		if label == "" {
+			label = fmt.Sprintf("step-%d", i+1)
+		}
+		if !hasHelpStep {
+			return []string{label + ": before executing CLI message send, first inspect the exact help or usage for the send command"}
+		}
+		if !hasTarget && !hasAskStep {
+			return []string{label + ": sending a CLI message without an explicit target should ask the user for the missing chat/user id before executing"}
+		}
+		if !hasBody && !allowImplicitBody && !hasAskStep {
+			return []string{label + ": sending a CLI message without explicit message content should ask the user for missing parameters before executing"}
+		}
+		return nil
+	}
+	if !wantSend {
+		return nil
+	}
+	if hasTarget && (hasBody || allowImplicitBody) {
+		return nil
+	}
+	return nil
+}
+
+func safeDiagnosticPrefixForBlockedPlan(plan model.Plan, user string) (model.Plan, bool) {
+	userText := strings.ToLower(strings.TrimSpace(user))
+	if !textLooksLikeLocalCLIUseRequest(userText) {
+		return model.Plan{}, false
+	}
+	explicitNames := explicitCLIExecutableNames(user)
+	if len(explicitNames) == 0 || len(plan.Steps) == 0 {
+		return model.Plan{}, false
+	}
+	var prefix []model.PlanStep
+	for _, step := range plan.Steps {
+		if !isSafeExactCommandVDiagnosticStep(step, explicitNames) {
+			break
+		}
+		prefix = append(prefix, step)
+	}
+	if len(prefix) == 0 || len(prefix) == len(plan.Steps) {
+		return model.Plan{}, false
+	}
+	out := plan
+	out.Steps = append([]model.PlanStep(nil), prefix...)
+	return out, true
+}
+
+func isSafeExactCommandVDiagnosticStep(step model.PlanStep, explicitNames map[string]bool) bool {
+	if strings.TrimSpace(step.Tool) != "terminal.run" {
+		return false
+	}
+	command := strings.TrimSpace(step.Args["command"])
+	root := commandRoot(command)
+	if root == "" || !explicitNames[root] {
+		return false
+	}
+	return terminalCommandLooksCommandVForRoot(command, root) && !terminalCommandLooksExternalWriteAction(command)
+}
+
+func terminalCommandLooksMessageSend(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	return strings.Contains(lower, "send") || strings.Contains(lower, "message")
+}
+
+func terminalCommandLooksHelp(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	return strings.HasSuffix(lower, " --help") || strings.HasSuffix(lower, " -h") || strings.Contains(lower, " help")
 }
 
 func scheduleCreateMissingSafeVerificationBoundary(step model.PlanStep, steps []model.PlanStep) bool {
