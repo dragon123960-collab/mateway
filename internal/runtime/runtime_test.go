@@ -1105,8 +1105,19 @@ func TestRuntimeAppendsInboxReminderToNormalMutationReply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected mutation confirmation, got %#v", resp)
+	}
+	if strings.Contains(resp.Reply.Text, "Inbox 提醒：") {
+		t.Fatalf("expected no inbox reminder on control reply, got %q", resp.Reply.Text)
+	}
+	confirm := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:inbox-control", Text: "确认"}
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected normal mutation reply, got %#v", resp)
+		t.Fatalf("expected normal mutation reply after confirmation, got %#v", resp)
 	}
 	if !strings.Contains(resp.Reply.Text, "Inbox 提醒：") {
 		t.Fatalf("expected inbox reminder on normal reply, got %q", resp.Reply.Text)
@@ -1207,7 +1218,7 @@ func TestRuntimeBlocksUngroundedProjectSummaryAfterRepair(t *testing.T) {
 	}
 }
 
-func TestRuntimeFileWriteRunsWithoutConfirmation(t *testing.T) {
+func TestRuntimeFileWriteRequiresConfirmation(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "out.txt")
 	fp := &fakePlanner{plan: model.Plan{Summary: "write", Steps: []model.PlanStep{{ID: "s1", Tool: "file.write", Args: map[string]string{"path": "README.md", "content": "x"}}}}}
@@ -1220,15 +1231,15 @@ func TestRuntimeFileWriteRunsWithoutConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected write without confirmation, got %#v", resp)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected write confirmation, got %#v", resp)
 	}
-	if data, err := os.ReadFile(target); err != nil || string(data) != "x" {
-		t.Fatalf("expected written file, data=%q err=%v", data, err)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected file not to be written before confirmation, err=%v", err)
 	}
 }
 
-func TestRuntimeSkillInstallReturnsCompletionWithoutConfirmation(t *testing.T) {
+func TestRuntimeSkillInstallRequiresConfirmation(t *testing.T) {
 	fp := &fakePlanner{plan: model.Plan{Summary: "install skill", Steps: []model.PlanStep{{
 		ID: "s1", Tool: "skill.install", Args: map[string]string{"name": "agent browser"},
 	}}}, synthesizeText: "Skill installed: agent browser"}
@@ -1252,11 +1263,8 @@ func TestRuntimeSkillInstallReturnsCompletionWithoutConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected skill install without confirmation, got %#v", resp)
-	}
-	if len(resp.Results) != 1 || !resp.Results[0].OK || resp.Results[0].Tool != "skill.install" {
-		t.Fatalf("expected skill install result, got %#v", resp.Results)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected skill install confirmation, got %#v", resp)
 	}
 }
 
@@ -1272,11 +1280,42 @@ func TestRuntimeIgnoresModelConfirmedArgForFileWritePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected file write without confirmation, got %#v", resp)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected file write confirmation despite model confirmed arg, got %#v", resp)
 	}
-	if data, err := os.ReadFile(target); err != nil || string(data) != "x" {
-		t.Fatalf("expected file to be written by policy, data=%q err=%v", data, err)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected file not to be written before policy approval, err=%v", err)
+	}
+}
+
+func TestRuntimeAllowedToolsHidesAndRejectsDisallowedTools(t *testing.T) {
+	fp := &fakePlanner{plan: model.Plan{Summary: "blocked write", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.write", Args: map[string]string{"path": "out.txt", "content": "x"},
+	}}}, repairPlan: model.Plan{Summary: "still blocked", Steps: []model.PlanStep{{
+		ID: "r1", Tool: "file.write", Args: map[string]string{"path": "out.txt", "content": "x"},
+	}}}}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: t.TempDir()},
+		MaxSteps: 6,
+	}.WithAllowedTools([]string{"time.now"})
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "write", SessionKey: "cli:allowed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm {
+		t.Fatalf("expected disallowed tool to fail before confirmation, got %#v", resp)
+	}
+	if len(fp.lastPlanTools) != 1 || fp.lastPlanTools[0] != "time.now" {
+		t.Fatalf("expected planner to see only allowed tools, got %#v", fp.lastPlanTools)
+	}
+	if len(fp.lastRepairTools) != 1 || fp.lastRepairTools[0] != "time.now" {
+		t.Fatalf("expected repair planner to see only allowed tools, got %#v", fp.lastRepairTools)
+	}
+	if len(resp.Results) == 0 || resp.Results[len(resp.Results)-1].Error != "tool_not_allowed" {
+		t.Fatalf("expected tool_not_allowed result, got %#v", resp.Results)
 	}
 }
 
@@ -1900,14 +1939,32 @@ func TestRuntimeUsesFinalLLMAcceptanceForMutation(t *testing.T) {
 			ID: "s1", Tool: "file.write", Args: map[string]string{"path": filepath.Join(root, "out.txt"), "content": "ok"}, Risk: string(tool.RiskGuardedMutation),
 		}}},
 	}
-	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root, Workspace: root, AllowedRoots: []string{root}}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt := Runtime{
+		Model:     fp,
+		Tools:     tool.NewBuiltinRegistry(),
+		ToolCtx:   tool.Context{ProjectRoot: root, Workspace: root, AllowedRoots: []string{root}},
+		MaxSteps:  6,
+		Acceptors: NewAcceptanceRegistry(),
+		Sessions:  session.NewFileStore(filepath.Join(root, "sessions")),
+	}
 	rt.Logger.Quiet = true
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "写一个文件"})
+	msg := channel.InboundMessage{SessionKey: "cli:mutation", Text: "写一个文件"}
+	resp, err := rt.Handle(context.Background(), msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Failed {
-		t.Fatalf("expected success, got %#v", resp)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected file write confirmation, got %#v", resp)
+	}
+	confirm := msg
+	confirm.ID = "confirm-mutation"
+	confirm.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected success after confirmation, got %#v", resp)
 	}
 	if fp.finalAcceptCalls != 1 {
 		t.Fatalf("expected final llm acceptance for mutation, got %d", fp.finalAcceptCalls)
@@ -3679,7 +3736,7 @@ func TestRuntimeCanResumeSuspendedPendingApproval(t *testing.T) {
 	}
 }
 
-func TestRuntimeSoftwareInstallRunsWhenPlannerSelectsInstallTool(t *testing.T) {
+func TestRuntimeSoftwareInstallRequiresConfirmationWhenPlannerSelectsInstallTool(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "install lark", Steps: []model.PlanStep{{
 			ID:   "s1",
@@ -3719,14 +3776,14 @@ func TestRuntimeSoftwareInstallRunsWhenPlannerSelectsInstallTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected install execution without confirmation, got %#v", resp)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected install confirmation, got %#v", resp)
 	}
 	if len(resp.Plan.Steps) != 1 || resp.Plan.Steps[0].Tool != "software.install" {
 		t.Fatalf("expected software.install normalization, got %#v", resp.Plan.Steps)
 	}
-	if len(resp.Results) != 1 || resp.Results[0].Tool != "software.install" {
-		t.Fatalf("expected software.install result, got %#v", resp.Results)
+	if len(resp.Results) != 1 || resp.Results[0].Tool != "software.install" || resp.Results[0].Error != "await_confirm" {
+		t.Fatalf("expected software.install confirmation result, got %#v", resp.Results)
 	}
 }
 
@@ -4806,6 +4863,7 @@ func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
 
 func TestRuntimeScheduleRequestUsesPlannerToolToCreateTask(t *testing.T) {
 	home := t.TempDir()
+	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-ready", Text: "每天 9点 帮我收集 AI 最新趋势文章"}
 	fp := &fakePlanner{plan: model.Plan{Summary: "create schedule", Steps: []model.PlanStep{{
 		ID:   "s1",
 		Tool: "schedule.create",
@@ -4827,17 +4885,34 @@ func TestRuntimeScheduleRequestUsesPlannerToolToCreateTask(t *testing.T) {
 		Memory:   memory.NewStore(home),
 	}
 	rt.Logger.Quiet = true
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-ready", Text: "每天 9点 帮我收集 AI 最新趋势文章"})
+	resp, err := rt.Handle(context.Background(), msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitUserInput || resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected schedule create through planner tool, got %#v", resp)
+	if !resp.AwaitConfirm || resp.AwaitUserInput || resp.Failed {
+		t.Fatalf("expected schedule create confirmation, got %#v", resp)
 	}
 	if fp.planCalls != 1 {
 		t.Fatalf("expected schedule request to go through planning, got %d calls", fp.planCalls)
 	}
 	tasks, err := schedule.NewStore(home).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected no schedule task before confirmation, got %#v", tasks)
+	}
+	confirm := msg
+	confirm.ID = "confirm-create"
+	confirm.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput || resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected confirmed schedule create through planner tool, got %#v", resp)
+	}
+	tasks, err = schedule.NewStore(home).List()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4901,7 +4976,7 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 	}
 }
 
-func TestRuntimeSchedulePauseAndResumeUsePlannerToolsWithoutConfirmation(t *testing.T) {
+func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
 	home := t.TempDir()
 	store := schedule.NewStore(home)
 	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
@@ -4925,10 +5000,27 @@ func TestRuntimeSchedulePauseAndResumeUsePlannerToolsWithoutConfirmation(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected pause without confirmation, got %#v", resp)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected pause confirmation, got %#v", resp)
 	}
 	task, _, err := store.Show("ai-trends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != schedule.StatusActive {
+		t.Fatalf("expected task to remain active before confirmation, got %#v", task)
+	}
+	confirm := msg
+	confirm.ID = "confirm-pause"
+	confirm.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected confirmed pause to complete, got %#v", resp)
+	}
+	task, _, err = store.Show("ai-trends")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4946,8 +5038,18 @@ func TestRuntimeSchedulePauseAndResumeUsePlannerToolsWithoutConfirmation(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected resume confirmation, got %#v", resp)
+	}
+	confirmResume := resume
+	confirmResume.ID = "confirm-resume"
+	confirmResume.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirmResume)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected resume without confirmation, got %#v", resp)
+		t.Fatalf("expected confirmed resume to complete, got %#v", resp)
 	}
 	task, _, err = store.Show("ai-trends")
 	if err != nil {
@@ -4958,7 +5060,7 @@ func TestRuntimeSchedulePauseAndResumeUsePlannerToolsWithoutConfirmation(t *test
 	}
 }
 
-func TestRuntimeScheduleUpdateUsesPlannerToolWithoutConfirmation(t *testing.T) {
+func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
 	home := t.TempDir()
 	store := schedule.NewStore(home)
 	if _, _, err := store.Create(schedule.CreateInput{ID: "ai-trends", Title: "AI Trends", Prompt: "Collect AI trends.", DailyAt: "09:00"}); err != nil {
@@ -4982,10 +5084,27 @@ func TestRuntimeScheduleUpdateUsesPlannerToolWithoutConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.AwaitConfirm || resp.Failed {
-		t.Fatalf("expected update without confirmation, got %#v", resp)
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected update confirmation, got %#v", resp)
 	}
 	task, _, err := store.Show("ai-trends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.Summary(task.Schedule) != "daily@09:00" {
+		t.Fatalf("expected schedule unchanged before confirmation, got %#v", task)
+	}
+	confirm := msg
+	confirm.ID = "confirm-update"
+	confirm.Text = "确认"
+	resp, err = rt.Handle(context.Background(), confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected confirmed update to complete, got %#v", resp)
+	}
+	task, _, err = store.Show("ai-trends")
 	if err != nil {
 		t.Fatal(err)
 	}

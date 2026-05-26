@@ -15,14 +15,18 @@ type Scheduler struct {
 	Interval time.Duration
 }
 
-func NewScheduler(cfg *config.Root, handler Handler) Scheduler {
+func NewScheduler(cfg *config.Root, handler Handler, policyHandlers ...PolicyHandler) Scheduler {
 	home := ""
 	if cfg != nil {
 		home = cfg.App.Home
 	}
+	var policyHandler PolicyHandler
+	if len(policyHandlers) > 0 {
+		policyHandler = policyHandlers[0]
+	}
 	return Scheduler{
 		Config:   cfg,
-		Runner:   Runner{Store: NewStore(home), Handle: handler},
+		Runner:   Runner{Store: NewStore(home), Handle: handler, PolicyHandler: policyHandler},
 		Interval: defaultSchedulerInterval,
 	}
 }

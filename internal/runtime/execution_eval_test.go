@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/model"
+	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
 
@@ -56,9 +57,9 @@ func TestExecutionEvalTerminalSoftFailureBecomesSuspect(t *testing.T) {
 		},
 	})
 	rt := Runtime{
-		Model:   &fakePlanner{stepAcceptText: `{"status":"suspect","reason":"soft failure output"}`},
-		Tools:   registry,
-		ToolCtx: tool.Context{ProjectRoot: t.TempDir()},
+		Model:    &fakePlanner{stepAcceptText: `{"status":"suspect","reason":"soft failure output"}`},
+		Tools:    registry,
+		ToolCtx:  tool.Context{ProjectRoot: t.TempDir()},
 		MaxSteps: 6,
 	}
 	results, control := rt.ExecutePlanForEval(context.Background(), "trace", model.Plan{Summary: "soft fail", Steps: []model.PlanStep{{
@@ -113,7 +114,7 @@ func TestExecutionEvalParallelReadOnlyBatch(t *testing.T) {
 	}
 }
 
-func TestExecutionEvalFileWriteAndScheduleCreateProduceEvidence(t *testing.T) {
+func TestExecutionEvalFileWriteAndScheduleCreateRequireConfirmation(t *testing.T) {
 	root := t.TempDir()
 	rt := Runtime{Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{Home: root, ProjectRoot: root, Workspace: root}, MaxSteps: 6}
 	target := filepath.Join(root, "out.txt")
@@ -122,11 +123,42 @@ func TestExecutionEvalFileWriteAndScheduleCreateProduceEvidence(t *testing.T) {
 		{ID: "s2", Tool: "schedule.create", Args: map[string]string{"id": "ai-trends", "title": "AI Trends", "prompt": "Collect AI trends.", "daily_at": "09:00"}, ExpectedEvidence: []string{"schedule task id and path"}},
 	}}
 	results, control := rt.ExecutePlanForEval(context.Background(), "trace", plan, false, "")
-	if control != "" {
-		t.Fatalf("expected no control, got %q", control)
+	if control != "await_confirm" || len(results) != 1 || results[0].Error != "await_confirm" {
+		t.Fatalf("expected file write confirmation, control=%q results=%#v", control, results)
 	}
-	if len(results) != 2 || !results[0].OK || !results[1].OK {
-		t.Fatalf("expected successful execution, got %#v", results)
+	results, control = rt.ExecutePlanForEval(context.Background(), "trace", plan, true, "s1")
+	if control != "await_confirm" || len(results) != 2 || !results[0].OK || results[1].Error != "await_confirm" {
+		t.Fatalf("expected schedule create confirmation after approved file write, control=%q results=%#v", control, results)
+	}
+	results, control = rt.ExecutePlanForEval(context.Background(), "trace", plan, true, "s2")
+	if control != "await_confirm" || len(results) != 1 || results[0].Error != "await_confirm" {
+		t.Fatalf("expected file write confirmation on fresh execution, control=%q results=%#v", control, results)
+	}
+	results, control = rt.ExecutePlanForEval(context.Background(), "trace", plan, true, "s2")
+	if control != "await_confirm" || len(results) != 1 || results[0].Error != "await_confirm" {
+		t.Fatalf("expected approval to be step-specific, control=%q results=%#v", control, results)
+	}
+	previous := map[string]session.StepState{
+		"s1": {
+			ID:            "s1",
+			Tool:          "file.write",
+			Status:        "passed",
+			ResultOK:      true,
+			ResultSummary: "wrote file",
+			Evidence:      map[string]any{"kind": "file_write", "path": target, "bytes": 2},
+		},
+		"s2": {
+			ID:               "s2",
+			Tool:             "schedule.create",
+			Status:           "blocked",
+			ResultOK:         false,
+			ResultError:      "await_confirm",
+			AcceptanceStatus: "await_confirm",
+		},
+	}
+	results, control = rt.executePlan(context.Background(), "trace", plan, true, "s2", previous, nil)
+	if control != "" || len(results) != 2 || !results[0].OK || !results[1].OK {
+		t.Fatalf("expected successful execution after preserving approved step state, control=%q results=%#v", control, results)
 	}
 	if kind, _ := results[0].Evidence["kind"].(string); kind != "file_write" {
 		t.Fatalf("expected file evidence, got %#v", results[0].Evidence)
@@ -142,7 +174,7 @@ func TestExecutionEvalScheduleDeleteRequiresConfirmation(t *testing.T) {
 	create := model.Plan{Summary: "create", Steps: []model.PlanStep{{
 		ID: "s1", Tool: "schedule.create", Args: map[string]string{"id": "ai-trends", "title": "AI Trends", "prompt": "Collect AI trends.", "daily_at": "09:00"},
 	}}}
-	if results, _ := rt.ExecutePlanForEval(context.Background(), "trace", create, false, ""); len(results) != 1 || !results[0].OK {
+	if results, _ := rt.ExecutePlanForEval(context.Background(), "trace", create, true, "s1"); len(results) != 1 || !results[0].OK {
 		t.Fatalf("expected setup schedule create, got %#v", results)
 	}
 	deletePlan := model.Plan{Summary: "delete", Steps: []model.PlanStep{{

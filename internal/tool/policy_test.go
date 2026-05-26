@@ -55,10 +55,24 @@ func TestDangerousCommandGuard(t *testing.T) {
 	if !RequireConfirmForTool("terminal.run", map[string]string{"command": "rm -rf tmp"}) {
 		t.Fatalf("expected terminal.run dangerous command to require confirmation")
 	}
+	for _, name := range []string{"file.write", "file.patch", "skill.install", "skill.promote", "software.install", "schedule.create", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "memory.reject"} {
+		if !RequireConfirmForTool(name, map[string]string{}) {
+			t.Fatalf("expected %s to require confirmation", name)
+		}
+	}
+	if !RequireConfirmForTool("memory.commit", map[string]string{"type": "decision"}) {
+		t.Fatalf("expected high-impact memory.commit to require confirmation")
+	}
 	for _, cmd := range []string{"pwd", "ls -la", "git status", "go test ./...", "echo hi > file.txt", "npm install"} {
 		if IsDangerousCommand(cmd) {
 			t.Fatalf("expected safe: %s", cmd)
 		}
+	}
+	if RequireConfirmForTool("terminal.run", map[string]string{"command": "pwd"}) {
+		t.Fatalf("expected safe terminal command not to require confirmation")
+	}
+	if RequireConfirmForTool("memory.commit", map[string]string{"type": "project"}) {
+		t.Fatalf("expected low-impact project memory commit not to require confirmation")
 	}
 }
 

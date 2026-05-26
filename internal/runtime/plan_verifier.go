@@ -80,8 +80,8 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 				out.Errors = append(out.Errors, label+": dependency "+dep+" does not reference an earlier step")
 			}
 		}
-		if scheduleCreateDependsOnFailedVerification(step, plan.Steps) {
-			out.Errors = append(out.Errors, label+": schedule.create depends on a verification step that must stop or ask_user on failure")
+		if scheduleCreateMissingSafeVerificationBoundary(step, plan.Steps) {
+			out.Errors = append(out.Errors, label+": schedule.create must depend on a verification step whose on_failure is stop or ask_user")
 		}
 		if step.Tool != "user.ask" && len(step.ExpectedEvidence) == 0 && requiresStepEvidence(user, step) {
 			out.Warnings = append(out.Warnings, label+": expected_evidence is empty")
@@ -249,7 +249,7 @@ func softwareInstallLooksSpeculative(step model.PlanStep) bool {
 	return command == "" || strings.Contains(command, "<") || strings.Contains(command, "TODO") || verify == ""
 }
 
-func scheduleCreateDependsOnFailedVerification(step model.PlanStep, steps []model.PlanStep) bool {
+func scheduleCreateMissingSafeVerificationBoundary(step model.PlanStep, steps []model.PlanStep) bool {
 	if strings.TrimSpace(step.Tool) != "schedule.create" || len(step.DependsOn) == 0 {
 		return false
 	}
@@ -267,6 +267,8 @@ func scheduleCreateDependsOnFailedVerification(step model.PlanStep, steps []mode
 		}
 		switch strings.TrimSpace(item.OnFailure) {
 		case "stop", "ask_user":
+			return false
+		default:
 			return true
 		}
 	}

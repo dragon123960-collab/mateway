@@ -16,6 +16,7 @@ import (
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/observer"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
 	"github.com/dongping/mateway/internal/textmatch"
@@ -23,18 +24,19 @@ import (
 )
 
 type Runtime struct {
-	Config    *config.Root
-	Model     model.Planner
-	Tools     *tool.Registry
-	Skills    *skill.Registry
-	Sanitizer ResponseSanitizer
-	Logger    observer.Logger
-	ToolCtx   tool.Context
-	MaxSteps  int
-	Observer  Observer
-	Sessions  session.Store
-	Memory    memory.Store
-	Acceptors *AcceptanceRegistry
+	Config       *config.Root
+	Model        model.Planner
+	Tools        *tool.Registry
+	Skills       *skill.Registry
+	Sanitizer    ResponseSanitizer
+	Logger       observer.Logger
+	ToolCtx      tool.Context
+	MaxSteps     int
+	Observer     Observer
+	Sessions     session.Store
+	Memory       memory.Store
+	Acceptors    *AcceptanceRegistry
+	AllowedTools map[string]bool
 }
 
 type Observer interface {
@@ -148,6 +150,37 @@ func (r Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respon
 	return loop.Run(ctx)
 }
 
+func (r Runtime) WithAllowedTools(names []string) Runtime {
+	allowed := map[string]bool{}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			allowed[name] = true
+		}
+	}
+	if len(allowed) == 0 {
+		r.AllowedTools = nil
+		return r
+	}
+	r.AllowedTools = allowed
+	return r
+}
+
+func (r Runtime) WithSchedulePolicy(task schedule.Task) schedule.Handler {
+	return func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
+		resp, err := r.WithAllowedTools(task.AllowedTools).Handle(ctx, msg)
+		return schedule.Response{
+			Reply:             resp.Reply,
+			TraceID:           resp.TraceID,
+			Failed:            resp.Failed,
+			AwaitConfirm:      resp.AwaitConfirm,
+			AwaitUserInput:    resp.AwaitUserInput,
+			FinalAcceptStatus: resp.FinalAcceptStatus,
+			FinalAcceptReason: resp.FinalAcceptReason,
+		}, err
+	}
+}
+
 func (r Runtime) currentSkills() *skill.Registry {
 	if strings.TrimSpace(r.ToolCtx.Workspace) != "" {
 		if reg, err := skill.LoadRegistry(r.ToolCtx.Workspace, "main"); err == nil && reg != nil {
@@ -155,6 +188,27 @@ func (r Runtime) currentSkills() *skill.Registry {
 		}
 	}
 	return r.Skills
+}
+
+func (r Runtime) availableToolDefinitions() []tool.Definition {
+	defs := r.Tools.Definitions()
+	if len(r.AllowedTools) == 0 {
+		return defs
+	}
+	out := make([]tool.Definition, 0, len(defs))
+	for _, def := range defs {
+		if r.AllowedTools[def.Name] {
+			out = append(out, def)
+		}
+	}
+	return out
+}
+
+func (r Runtime) toolAllowed(name string) bool {
+	if len(r.AllowedTools) == 0 {
+		return true
+	}
+	return r.AllowedTools[strings.TrimSpace(name)]
 }
 
 func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string, previousSteps map[string]session.StepState, previousResults []model.ToolResult) ([]model.ToolResult, string) {
@@ -377,6 +431,24 @@ func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step mod
 		}
 		return tr, "", consumed
 	}
+	if !r.toolAllowed(step.Tool) {
+		tr := model.ToolResult{
+			StepID: step.ID,
+			Tool:   step.Tool,
+			OK:     false,
+			Error:  "tool_not_allowed",
+			Output: "tool is not allowed for this scheduled task: " + step.Tool,
+			Evidence: map[string]any{
+				"kind": "tool_policy",
+				"tool": step.Tool,
+			},
+		}
+		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "error": tr.Error})
+		if r.Observer != nil {
+			r.Observer.ToolDone(traceID, tr)
+		}
+		return tr, "", consumed
+	}
 	args := copyArgs(step.Args)
 	delete(args, "confirmed")
 	delete(args, "confirm")
@@ -475,8 +547,12 @@ func reusableResultsMap(previousSteps map[string]session.StepState, previousResu
 	if !allowReuse {
 		return out
 	}
+	allowConfirmedMutationReuse := hasPendingConfirmationStep(previousSteps)
 	for id, prev := range previousSteps {
 		if prev.Status != "passed" && prev.Status != "usable" {
+			continue
+		}
+		if confirmedMutationReusable(prev.Tool) && !allowConfirmedMutationReuse {
 			continue
 		}
 		out[id] = model.ToolResult{
@@ -495,6 +571,18 @@ func reusableResultsMap(previousSteps map[string]session.StepState, previousResu
 		out[strings.TrimSpace(prev.StepID)] = prev
 	}
 	return out
+}
+
+func hasPendingConfirmationStep(steps map[string]session.StepState) bool {
+	for _, step := range steps {
+		if strings.TrimSpace(step.Status) == "blocked" && strings.TrimSpace(step.ResultError) == "await_confirm" {
+			return true
+		}
+		if strings.TrimSpace(step.AcceptanceStatus) == "await_confirm" {
+			return true
+		}
+	}
+	return false
 }
 
 func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult, registry *tool.Registry) (model.ToolResult, bool) {
@@ -519,6 +607,9 @@ func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult, 
 }
 
 func stepReusable(step model.PlanStep, result model.ToolResult, registry *tool.Registry) bool {
+	if confirmedMutationReusable(result.Tool) {
+		return result.OK && len(result.Evidence) > 0
+	}
 	if registry != nil {
 		if def, ok := registry.Get(strings.TrimSpace(step.Tool)); ok {
 			if def.Metadata.ReusePolicy == tool.ReuseStableRead {
@@ -531,6 +622,11 @@ func stepReusable(step model.PlanStep, result model.ToolResult, registry *tool.R
 		}
 	}
 	return stableReadEvidence(result.Evidence)
+}
+
+func confirmedMutationReusable(toolName string) bool {
+	toolName = strings.TrimSpace(toolName)
+	return toolName == "file.write" || strings.HasPrefix(toolName, "schedule.")
 }
 
 func stableReadEvidence(evidence map[string]any) bool {

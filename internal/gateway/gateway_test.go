@@ -4,6 +4,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/config"
 )
 
 func TestSessionLocksSerializeSameSession(t *testing.T) {
@@ -55,5 +58,19 @@ func TestSessionLocksAllowDifferentSessions(t *testing.T) {
 	case <-entered:
 	case <-time.After(time.Second):
 		t.Fatalf("expected different session lock to enter immediately")
+	}
+}
+
+func TestShouldIgnoreAllowsFeishuCardAction(t *testing.T) {
+	msg := channel.InboundMessage{
+		Channel: "feishu",
+		Text:    "确认",
+		Metadata: map[string]string{
+			"message_type": "interactive",
+			"card_action":  "confirm",
+		},
+	}
+	if shouldIgnore(config.FeishuConfig{}, msg) {
+		t.Fatalf("expected card action to reach runtime")
 	}
 }

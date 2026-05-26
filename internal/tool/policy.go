@@ -20,6 +20,8 @@ func IsDangerousCommand(cmd string) bool {
 
 func RequireConfirmForTool(name string, args map[string]string) bool {
 	switch name {
+	case "file.write", "file.patch", "skill.install", "skill.promote", "software.install", "schedule.create", "schedule.update", "schedule.pause", "schedule.resume", "memory.reject":
+		return true
 	case "schedule.delete":
 		return true
 	case "shell.run", "terminal.run":

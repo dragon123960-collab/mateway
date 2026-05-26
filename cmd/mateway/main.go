@@ -316,7 +316,7 @@ func runSchedule(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "id=%s status=%s\n", proposal.Task.ID, proposal.ProposalStatus)
 		return nil
 	case "run-due":
-		results, err := schedule.Runner{Store: store, Handle: scheduleHandler(a.Runtime.Handle)}.RunDue(context.Background(), time.Now())
+		results, err := schedule.Runner{Store: store, Handle: scheduleHandler(a.Runtime.Handle), PolicyHandler: a.Runtime}.RunDue(context.Background(), time.Now())
 		if err != nil {
 			return err
 		}
@@ -600,6 +600,8 @@ func scheduleHandler(handle func(context.Context, channel.InboundMessage) (runti
 			Reply:             resp.Reply,
 			TraceID:           resp.TraceID,
 			Failed:            resp.Failed,
+			AwaitConfirm:      resp.AwaitConfirm,
+			AwaitUserInput:    resp.AwaitUserInput,
 			FinalAcceptStatus: resp.FinalAcceptStatus,
 			FinalAcceptReason: resp.FinalAcceptReason,
 		}, err

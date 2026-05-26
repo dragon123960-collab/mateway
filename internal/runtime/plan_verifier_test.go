@@ -181,7 +181,7 @@ func TestPlanVerifierDoesNotTreatTodoInRealFilePathAsPlaceholder(t *testing.T) {
 	}
 }
 
-func TestPlanVerifierRejectsScheduleCreateAfterStopStyleVerification(t *testing.T) {
+func TestPlanVerifierAllowsScheduleCreateAfterStopStyleVerification(t *testing.T) {
 	plan := model.Plan{Summary: "schedule", Steps: []model.PlanStep{
 		{
 			ID:        "s1",
@@ -198,7 +198,29 @@ func TestPlanVerifierRejectsScheduleCreateAfterStopStyleVerification(t *testing.
 		},
 	}}
 	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "创建定时任务", taskUnderstanding{})
-	if !got.Blocking() || !containsVerificationError(got.Errors, "schedule.create depends on a verification step") {
+	if got.Blocking() {
+		t.Fatalf("expected safe verification boundary to pass, got %#v", got)
+	}
+}
+
+func TestPlanVerifierRejectsScheduleCreateAfterRepairStyleVerification(t *testing.T) {
+	plan := model.Plan{Summary: "schedule", Steps: []model.PlanStep{
+		{
+			ID:        "s1",
+			Tool:      "terminal.run",
+			Goal:      "验证任务能否稳定执行",
+			Args:      map[string]string{"command": "mateway run \"AI趋势收集\""},
+			OnFailure: "repair",
+		},
+		{
+			ID:        "s2",
+			Tool:      "schedule.create",
+			Args:      map[string]string{"title": "每日AI趋势收集", "prompt": "执行AI趋势收集任务", "daily_at": "09:00"},
+			DependsOn: []string{"s1"},
+		},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "创建定时任务", taskUnderstanding{})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "must depend on a verification step") {
 		t.Fatalf("expected schedule verification boundary error, got %#v", got)
 	}
 }

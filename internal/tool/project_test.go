@@ -160,7 +160,7 @@ func TestSoftwareInstallPreviewAndResult(t *testing.T) {
 		},
 	})
 	if !preview.OK || preview.RequiresConfirm {
-		t.Fatalf("expected direct install execution without confirmation, got %#v", preview)
+		t.Fatalf("expected tool-level install execution when called directly, got %#v", preview)
 	}
 
 	binDir := t.TempDir()
@@ -556,20 +556,20 @@ func TestScheduleToolsConfirmationBoundary(t *testing.T) {
 		Context: ctx,
 	})
 	if !create.OK || create.RequiresConfirm {
-		t.Fatalf("expected schedule create without confirmation, got %#v", create)
+		t.Fatalf("expected direct schedule create tool execution, got %#v", create)
 	}
 	update := ScheduleUpdate().Run(context.Background(), Call{
 		Args:    map[string]string{"id": "ai-trends", "daily_at": "10:00"},
 		Context: ctx,
 	})
 	if !update.OK || update.RequiresConfirm {
-		t.Fatalf("expected schedule update without confirmation, got %#v", update)
+		t.Fatalf("expected direct schedule update tool execution, got %#v", update)
 	}
 	if !RequireConfirmForTool("schedule.delete", map[string]string{"id": "ai-trends"}) {
 		t.Fatalf("expected schedule.delete to require confirmation")
 	}
-	if RequireConfirmForTool("schedule.update", map[string]string{"id": "ai-trends"}) {
-		t.Fatalf("expected schedule.update not to require confirmation")
+	if !RequireConfirmForTool("schedule.update", map[string]string{"id": "ai-trends"}) {
+		t.Fatalf("expected schedule.update to require runtime confirmation")
 	}
 }
 
@@ -623,7 +623,7 @@ func TestScheduleCreateSupportsOneShotRunAt(t *testing.T) {
 		Context: ctx,
 	})
 	if !create.OK || create.RequiresConfirm {
-		t.Fatalf("expected one-shot schedule create without confirmation, got %#v", create)
+		t.Fatalf("expected direct one-shot schedule create tool execution, got %#v", create)
 	}
 	if got, _ := create.Evidence["schedule"].(string); got != "once@2026-05-25T10:30:00+08:00" {
 		t.Fatalf("expected one-shot schedule evidence, got %#v", create.Evidence)

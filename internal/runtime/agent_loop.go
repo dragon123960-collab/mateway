@@ -290,7 +290,7 @@ func (l *AgentLoop) loadSession() {
 
 func (l *AgentLoop) plan(ctx context.Context) error {
 	fallbackUnderstanding := l.fallbackUnderstanding()
-	allTools := l.runtime.Tools.Definitions()
+	allTools := l.runtime.availableToolDefinitions()
 	candidateTools := composeCandidateTools(allTools, fallbackUnderstanding, planningCandidateBudget)
 	planMatches := skill.SelectMatches(l.skillDefinitions(), skill.StagePlanning, l.skillContext())
 	planSkills := make([]skill.Definition, 0, len(planMatches))
@@ -396,7 +396,7 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 		return false
 	}
 	l.state.repairAttempted = true
-	allTools := l.runtime.Tools.Definitions()
+	allTools := l.runtime.availableToolDefinitions()
 	candidateTools := composeCandidateTools(allTools, l.state.understanding, repairCandidateBudget, repairCandidateHints(l.state.results, l.state.repairReason)...)
 	planMatches := skill.SelectMatches(l.skillDefinitions(), skill.StagePlanningRepair, l.skillContext())
 	planSkills := make([]skill.Definition, 0, len(planMatches))
@@ -735,7 +735,7 @@ func (l *AgentLoop) buildContextPrompt(stage string, matches []skill.Match) stri
 	if l.state.shortMemory.SessionPresent {
 		shortMemory = buildShortMemorySummaryForStage(l.state.session, stage).Text
 	}
-	return buildModelContextPrompt(l.state.resolvedRequest(), stage, matches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx, promptContextOptions{
+	return buildModelContextPrompt(l.state.resolvedRequest(), stage, matches, l.runtime.availableToolDefinitions(), l.runtime.ToolCtx, promptContextOptions{
 		ShortMemory:   shortMemory,
 		LongMemory:    l.state.longMemory.Text,
 		Understanding: l.state.understanding,
@@ -880,30 +880,30 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 				"task_id":  task.ID,
 			})
 		} else {
-		pendingAction := firstNonEmpty(task.PlanSummary, task.ResolvedQuery)
-		for i := len(resp.Results) - 1; i >= 0; i-- {
-			result := resp.Results[i]
-			if result.Error != "await_confirm" {
-				continue
+			pendingAction := firstNonEmpty(task.PlanSummary, task.ResolvedQuery)
+			for i := len(resp.Results) - 1; i >= 0; i-- {
+				result := resp.Results[i]
+				if result.Error != "await_confirm" {
+					continue
+				}
+				if stepID := strings.TrimSpace(result.StepID); stepID != "" {
+					pendingAction = "step:" + stepID
+				}
+				break
 			}
-			if stepID := strings.TrimSpace(result.StepID); stepID != "" {
-				pendingAction = "step:" + stepID
+			task.PendingApproval = &session.PendingApproval{
+				ApprovalType:    "boolean_confirm",
+				Prompt:          strings.TrimSpace(resp.Reply.Text),
+				RequestedAction: pendingAction,
 			}
-			break
-		}
-		task.PendingApproval = &session.PendingApproval{
-			ApprovalType:    "boolean_confirm",
-			Prompt:          strings.TrimSpace(resp.Reply.Text),
-			RequestedAction: pendingAction,
-		}
-		if approvedStepID != "" && pendingAction == "step:"+approvedStepID {
-			task.PendingApproval = nil
-		}
-		task.PendingQuestions = nil
-		l.runtime.Logger.Event("runtime.task_pending_approval", map[string]any{
-			"trace_id": l.state.traceID,
-			"task_id":  task.ID,
-		})
+			if approvedStepID != "" && pendingAction == "step:"+approvedStepID {
+				task.PendingApproval = nil
+			}
+			task.PendingQuestions = nil
+			l.runtime.Logger.Event("runtime.task_pending_approval", map[string]any{
+				"trace_id": l.state.traceID,
+				"task_id":  task.ID,
+			})
 		}
 	} else if resp.AwaitUserInput {
 		task.PendingQuestions = []string{strings.TrimSpace(resp.Reply.Text)}

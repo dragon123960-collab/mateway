@@ -11,6 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/heartbeat"
+	runtimepkg "github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
 )
 
@@ -30,17 +31,23 @@ func New(a *app.App) Gateway {
 func (g Gateway) Serve(ctx context.Context) error {
 	g.workerCtx = ctx
 	heartbeat.NewScheduler(g.App.Config).Start(ctx)
-	schedule.NewScheduler(g.App.Config, func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
-		resp, err := g.App.Runtime.Handle(ctx, msg)
+	schedule.NewScheduler(g.App.Config, scheduleHandler(g.App.Runtime), g.App.Runtime).Start(ctx)
+	return feishu.StartWebSocket(ctx, g.App.Config.Channels.Feishu, g.HandleInbound)
+}
+
+func scheduleHandler(rt runtimepkg.Runtime) schedule.Handler {
+	return func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
+		resp, err := rt.Handle(ctx, msg)
 		return schedule.Response{
 			Reply:             resp.Reply,
 			TraceID:           resp.TraceID,
 			Failed:            resp.Failed,
+			AwaitConfirm:      resp.AwaitConfirm,
+			AwaitUserInput:    resp.AwaitUserInput,
 			FinalAcceptStatus: resp.FinalAcceptStatus,
 			FinalAcceptReason: resp.FinalAcceptReason,
 		}, err
-	}).Start(ctx)
-	return feishu.StartWebSocket(ctx, g.App.Config.Channels.Feishu, g.HandleInbound)
+	}
 }
 
 func (g Gateway) HandleInbound(ctx context.Context, msg channel.InboundMessage) error {
@@ -90,7 +97,7 @@ func shouldIgnore(cfg config.FeishuConfig, msg channel.InboundMessage) bool {
 	if strings.TrimSpace(msg.Text) == "" {
 		return true
 	}
-	if msg.Metadata["message_type"] != "" && msg.Metadata["message_type"] != "text" {
+	if msg.Metadata["message_type"] != "" && msg.Metadata["message_type"] != "text" && msg.Metadata["card_action"] == "" {
 		return true
 	}
 	if strings.EqualFold(msg.Metadata["sender_type"], "app") {

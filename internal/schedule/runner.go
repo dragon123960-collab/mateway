@@ -12,30 +12,39 @@ import (
 )
 
 type Runner struct {
-	Store  Store
-	Handle Handler
+	Store         Store
+	Handle        Handler
+	PolicyHandler PolicyHandler
 }
 
 type Handler func(context.Context, channel.InboundMessage) (Response, error)
+
+type PolicyHandler interface {
+	WithSchedulePolicy(Task) Handler
+}
 
 type Response struct {
 	Reply             channel.OutboundMessage
 	TraceID           string
 	Failed            bool
+	AwaitConfirm      bool
+	AwaitUserInput    bool
 	FinalAcceptStatus string
 	FinalAcceptReason string
 }
 
 type RunResult struct {
-	Task                    Task
-	TraceID                 string
-	OutputPath              string
-	Failed                  bool
-	Error                   string
-	RuntimeAcceptStatus     string
-	RuntimeAcceptReason     string
-	DeliveryAcceptStatus    string
-	DeliveryAcceptReason    string
+	Task                 Task
+	TraceID              string
+	OutputPath           string
+	Failed               bool
+	Error                string
+	AwaitConfirm         bool
+	AwaitUserInput       bool
+	RuntimeAcceptStatus  string
+	RuntimeAcceptReason  string
+	DeliveryAcceptStatus string
+	DeliveryAcceptReason string
 }
 
 type RunAcceptance struct {
@@ -64,7 +73,18 @@ func (r Runner) RunTask(ctx context.Context, task Task, now time.Time) RunResult
 	if r.Handle == nil {
 		return RunResult{Task: task, Failed: true, Error: "schedule runtime handler is required"}
 	}
-	resp, err := r.Handle(ctx, msg)
+	handler := r.Handle
+	if r.PolicyHandler != nil {
+		handler = r.PolicyHandler.WithSchedulePolicy(task)
+	} else if policyHandler, ok := any(r.Handle).(PolicyHandler); ok {
+		handler = policyHandler.WithSchedulePolicy(task)
+	}
+	if limit := task.Limits.MaxRuntimeSeconds; limit > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(limit)*time.Second)
+		defer cancel()
+	}
+	resp, err := handler(ctx, msg)
 	result := RunResult{Task: task}
 	state := RunState{TaskID: task.ID, LastRunAt: now}
 	if err != nil {
@@ -77,24 +97,38 @@ func (r Runner) RunTask(ctx context.Context, task Task, now time.Time) RunResult
 	}
 	result.TraceID = resp.TraceID
 	result.Failed = resp.Failed
+	result.AwaitConfirm = resp.AwaitConfirm
+	result.AwaitUserInput = resp.AwaitUserInput
 	result.RuntimeAcceptStatus = strings.TrimSpace(resp.FinalAcceptStatus)
 	result.RuntimeAcceptReason = strings.TrimSpace(resp.FinalAcceptReason)
 	state.TraceID = resp.TraceID
 	if resp.Failed {
 		state.Status = "failed"
 		state.LastError = strings.TrimSpace(resp.Reply.Text)
+	} else if resp.AwaitConfirm {
+		result.Failed = true
+		result.Error = "scheduled run is waiting for confirmation"
+		state.Status = "blocked"
+		state.LastError = strings.TrimSpace(resp.Reply.Text)
+	} else if resp.AwaitUserInput {
+		result.Failed = true
+		result.Error = "scheduled run is waiting for user input"
+		state.Status = "blocked"
+		state.LastError = strings.TrimSpace(resp.Reply.Text)
 	} else {
 		state.Status = "ok"
 	}
-	outputPath, writeErr := r.writeOutput(task, now, resp.Reply.Text)
-	if writeErr != nil {
-		result.Failed = true
-		result.Error = writeErr.Error()
-		state.Status = "failed"
-		state.LastError = writeErr.Error()
-	} else {
-		result.OutputPath = outputPath
-		state.Output = outputPath
+	if !result.Failed {
+		outputPath, writeErr := r.writeOutput(task, now, resp.Reply.Text)
+		if writeErr != nil {
+			result.Failed = true
+			result.Error = writeErr.Error()
+			state.Status = "failed"
+			state.LastError = writeErr.Error()
+		} else {
+			result.OutputPath = outputPath
+			state.Output = outputPath
+		}
 	}
 	accept := AcceptRunResult(task, result)
 	result.DeliveryAcceptStatus = accept.Status
@@ -169,6 +203,7 @@ func (r Runner) writeOutput(task Task, now time.Time, text string) (string, erro
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return "", err
 		}
+		text = limitOutputChars(text, task.Limits.MaxOutputChars)
 		content := fmt.Sprintf("# %s\n\n- task: %s\n- run_at: %s\n\n%s\n", task.Title, task.ID, now.Format(time.RFC3339), strings.TrimSpace(text))
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return "", err
@@ -176,4 +211,15 @@ func (r Runner) writeOutput(task Task, now time.Time, text string) (string, erro
 		return path, nil
 	}
 	return "", fmt.Errorf("unsupported schedule delivery mode: %s", mode)
+}
+
+func limitOutputChars(text string, max int) string {
+	if max <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max]) + "\n\n[output truncated to " + fmt.Sprint(max) + " chars]"
 }
