@@ -10,11 +10,20 @@ import (
 type AcceptanceSpec struct {
 	Ref                string
 	CodeChecks         []string
+	EvidenceRules      []AcceptanceEvidenceRule
 	SoftFailureSignals []string
 	PassCriteria       []string
 	SuspectCriteria    []string
 	FailCriteria       []string
+	AllowExplicitNoResult bool
 	LLMReviewPrompt    string
+}
+
+type AcceptanceEvidenceRule struct {
+	Keys   []string
+	Match  string
+	Status AcceptanceStatus
+	Reason string
 }
 
 type AcceptanceRegistry struct {
@@ -34,10 +43,14 @@ func NewAcceptanceRegistry() *AcceptanceRegistry {
 	r.Register(AcceptanceSpec{
 		Ref:                "skill.search/default",
 		CodeChecks:         []string{"output must not be empty", "evidence should include query and result count"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"query", "result_count"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing skill search evidence"},
+		},
 		SoftFailureSignals: []string{"no matching skills found"},
 		PassCriteria:       []string{"skill search output includes result count and relevant skill information or explicit no-result evidence"},
 		SuspectCriteria:    []string{"skill search output is present but relevance to the requested capability is weak"},
 		FailCriteria:       []string{"missing skill search evidence", "empty skill search output"},
+		AllowExplicitNoResult: true,
 		LLMReviewPrompt:    "Review whether the skill search results are relevant to the requested capability and whether the output clearly communicates useful matches or an explicit no-result outcome.",
 	})
 	r.Register(AcceptanceSpec{
@@ -52,10 +65,14 @@ func NewAcceptanceRegistry() *AcceptanceRegistry {
 	r.Register(AcceptanceSpec{
 		Ref:                "software.search/default",
 		CodeChecks:         []string{"output must not be empty", "evidence should include query, provider, and result count"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"query", "provider", "result_count"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing software search evidence"},
+		},
 		SoftFailureSignals: []string{"no software results found"},
 		PassCriteria:       []string{"search output includes concrete software results or explicit no-result evidence", "query/provider context is present"},
 		SuspectCriteria:    []string{"software search returns weak or ambiguous results for the requested capability"},
 		FailCriteria:       []string{"missing software search evidence", "empty output"},
+		AllowExplicitNoResult: true,
 		LLMReviewPrompt:    "Review whether the software search results are relevant to the requested software or installation need. Distinguish useful no-result evidence from weak or off-topic results.",
 	})
 	r.Register(AcceptanceSpec{
@@ -133,33 +150,61 @@ func NewAcceptanceRegistry() *AcceptanceRegistry {
 	r.Register(AcceptanceSpec{
 		Ref:                "web.search/default",
 		CodeChecks:         []string{"output must not be empty", "evidence should include query, provider, and result count"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"query", "provider", "result_count"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing web search execution evidence"},
+		},
 		SoftFailureSignals: []string{"no results", "has no enabled provider"},
 		PassCriteria:       []string{"search output includes concrete results or explicit no-result evidence", "query/provider context is present"},
 		SuspectCriteria:    []string{"search output is present but weakly grounded or does not clearly answer the goal"},
 		FailCriteria:       []string{"missing search execution evidence", "empty search output"},
+		AllowExplicitNoResult: true,
 		LLMReviewPrompt:    "Review whether the search output actually addresses the step goal. Distinguish between valid no-result outcomes with clear evidence and weak or irrelevant search output.",
 	})
 	r.Register(AcceptanceSpec{
 		Ref:                "web.search/fresh_info",
 		CodeChecks:         []string{"output must not be empty", "evidence should include query, provider, and result count"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"query", "provider", "result_count"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing web search execution evidence"},
+		},
 		SoftFailureSignals: []string{"no results", "has no enabled provider"},
 		PassCriteria:       []string{"search output includes current or latest evidence", "query/provider context is present"},
 		SuspectCriteria:    []string{"search output is present but freshness or relevance to latest information is weak"},
 		FailCriteria:       []string{"missing search execution evidence", "empty search output"},
+		AllowExplicitNoResult: true,
 		LLMReviewPrompt:    "Review whether the search results actually support a latest/current/fresh answer. Prefer outputs with concrete recency cues and treat stale or weak freshness evidence as suspect.",
 	})
 	r.Register(AcceptanceSpec{
 		Ref:                "web.search/background_info",
 		CodeChecks:         []string{"output must not be empty", "evidence should include query, provider, and result count"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"query", "provider", "result_count"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing web search execution evidence"},
+		},
 		SoftFailureSignals: []string{"no results", "has no enabled provider"},
 		PassCriteria:       []string{"search output includes useful background information", "query/provider context is present"},
 		SuspectCriteria:    []string{"search output is present but does not clearly support background understanding"},
 		FailCriteria:       []string{"missing search execution evidence", "empty search output"},
+		AllowExplicitNoResult: true,
 		LLMReviewPrompt:    "Review whether the search results provide useful background context for the step goal, even when the task is not freshness-sensitive.",
+	})
+	r.Register(AcceptanceSpec{
+		Ref:                "web.fetch/default",
+		CodeChecks:         []string{"output must not be empty"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"url", "status"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing web fetch evidence"},
+			{Keys: []string{"title", "bytes"}, Match: "any", Status: AcceptanceUsable, Reason: "missing title or body size evidence"},
+		},
+		SoftFailureSignals: []string{"unsupported url scheme", "status="},
+		PassCriteria:       []string{"fetched url and status are present", "title or fetched content size gives concrete source evidence"},
+		SuspectCriteria:    []string{"page was fetched but source evidence is thin"},
+		FailCriteria:       []string{"missing web fetch evidence", "empty fetch output"},
+		LLMReviewPrompt:    "Review whether the fetched page result clearly corresponds to the requested URL and includes enough concrete source evidence to trust the read.",
 	})
 	r.Register(AcceptanceSpec{
 		Ref:                "terminal.run/diagnostic",
 		CodeChecks:         []string{"output must not be empty", "evidence should include exit code, stdout, stderr, and timed_out"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"exit_code", "stdout", "stderr", "timed_out"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing terminal execution evidence"},
+		},
 		SoftFailureSignals: []string{"not found", "data not found", "no results", "permission denied", "unauthorized", "timed out"},
 		PassCriteria:       []string{"command output answers the diagnostic goal", "output and exit code are consistent"},
 		SuspectCriteria:    []string{"exit code is zero but output indicates missing data or weak evidence", "output is present but does not clearly answer the goal"},
@@ -169,6 +214,9 @@ func NewAcceptanceRegistry() *AcceptanceRegistry {
 	r.Register(AcceptanceSpec{
 		Ref:                "terminal.run/build",
 		CodeChecks:         []string{"output must not be empty", "evidence should include exit code, stdout, stderr, and timed_out"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"exit_code", "stdout", "stderr", "timed_out"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing terminal execution evidence"},
+		},
 		SoftFailureSignals: []string{"build failed", "compilation failed", "timed out"},
 		PassCriteria:       []string{"build command completed with consistent output and exit code", "output clearly indicates build success or actionable build failure"},
 		SuspectCriteria:    []string{"build output is present but success or failure is ambiguous"},
@@ -178,6 +226,9 @@ func NewAcceptanceRegistry() *AcceptanceRegistry {
 	r.Register(AcceptanceSpec{
 		Ref:                "terminal.run/test",
 		CodeChecks:         []string{"output must not be empty", "evidence should include exit code, stdout, stderr, and timed_out"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"exit_code", "stdout", "stderr", "timed_out"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing terminal execution evidence"},
+		},
 		SoftFailureSignals: []string{"test failed", "failing test", "timed out"},
 		PassCriteria:       []string{"test command output clearly indicates pass or fail", "exit code and output are consistent"},
 		SuspectCriteria:    []string{"test output is present but pass/fail state is ambiguous"},
@@ -187,6 +238,9 @@ func NewAcceptanceRegistry() *AcceptanceRegistry {
 	r.Register(AcceptanceSpec{
 		Ref:                "software.install/default",
 		CodeChecks:         []string{"output must not be empty", "evidence should include install command, verify command, and verified status"},
+		EvidenceRules: []AcceptanceEvidenceRule{
+			{Keys: []string{"command", "verify_command", "verified"}, Match: "all", Status: AcceptanceHardFail, Reason: "missing software install verification evidence"},
+		},
 		SoftFailureSignals: []string{"install command is required", "not found", "permission denied", "timed out"},
 		PassCriteria:       []string{"install command is explicit", "verify command is recorded", "verified is true when installation succeeds"},
 		SuspectCriteria:    []string{"install appears to run but verification is weak or ambiguous"},

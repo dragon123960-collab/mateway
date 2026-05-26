@@ -64,6 +64,12 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 			if placeholderCommand(step.Tool, step.Args) {
 				out.Errors = append(out.Errors, label+": command contains unresolved download placeholder")
 			}
+			if placeholderArgs(step.Tool, step.Args) {
+				out.Errors = append(out.Errors, label+": args contain unresolved placeholder values")
+			}
+			for _, warning := range toolBoundaryWarnings(step, def) {
+				out.RepairableWarnings = append(out.RepairableWarnings, label+": "+warning)
+			}
 		}
 		for _, dep := range step.DependsOn {
 			dep = strings.TrimSpace(dep)
@@ -73,6 +79,9 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 			if !seen[dep] {
 				out.Errors = append(out.Errors, label+": dependency "+dep+" does not reference an earlier step")
 			}
+		}
+		if scheduleCreateDependsOnFailedVerification(step, plan.Steps) {
+			out.Errors = append(out.Errors, label+": schedule.create depends on a verification step that must stop or ask_user on failure")
 		}
 		if step.Tool != "user.ask" && len(step.ExpectedEvidence) == 0 && requiresStepEvidence(user, step) {
 			out.Warnings = append(out.Warnings, label+": expected_evidence is empty")
@@ -103,6 +112,60 @@ func placeholderCommand(toolName string, args map[string]string) bool {
 	}
 }
 
+func placeholderArgs(toolName string, args map[string]string) bool {
+	for key, value := range args {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		lower := strings.ToLower(value)
+		if strings.Contains(value, "<需从") || strings.Contains(value, "<从 step-") || strings.Contains(lower, "<download_url>") || strings.Contains(lower, "<url>") || strings.Contains(lower, "<todo>") {
+			return true
+		}
+		if strings.TrimSpace(toolName) == "web.fetch" && key == "url" && !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+			return true
+		}
+	}
+	return false
+}
+
+func toolBoundaryWarnings(step model.PlanStep, def tool.Definition) []string {
+	var warnings []string
+	switch strings.TrimSpace(def.Name) {
+	case "terminal.run":
+		if terminalLooksLikeProjectIndex(step) {
+			warnings = append(warnings, "terminal.run looks like repository or directory overview work; prefer project.index")
+		}
+		if terminalLooksLikeSingleFileRead(step) {
+			warnings = append(warnings, "terminal.run looks like one-file reading; prefer file.read or file.summary")
+		}
+	case "file.read":
+		if fileReadLooksLikeSummary(step) {
+			warnings = append(warnings, "file.read looks like summary-only work; prefer file.summary unless exact full content is needed")
+		}
+	case "web.search":
+		if webSearchLooksLikeKnownURLRead(step) {
+			warnings = append(warnings, "web.search looks like reading a known URL; prefer web.fetch")
+		}
+		if webSearchLooksLikeSoftwareDiscovery(step) {
+			warnings = append(warnings, "web.search looks like public software or install-source discovery; prefer software.search before generic web.search")
+		}
+	case "web.fetch":
+		if webFetchLooksLikeSourceDiscovery(step) {
+			warnings = append(warnings, "web.fetch looks like source discovery without a known URL; prefer web.search or software.search first")
+		}
+	case "software.search":
+		if softwareSearchLooksLikeKnownURLRead(step) {
+			warnings = append(warnings, "software.search looks like reading a known upstream page; prefer web.fetch")
+		}
+	case "software.install":
+		if softwareInstallLooksSpeculative(step) {
+			warnings = append(warnings, "software.install looks speculative; include explicit upstream install command and verify_command before installing")
+		}
+	}
+	return warnings
+}
+
 func toolNeedsCoverageWarnings(toolNeeds []string, tools []string) []string {
 	var warnings []string
 	for _, need := range toolNeeds {
@@ -112,6 +175,111 @@ func toolNeedsCoverageWarnings(toolNeeds []string, tools []string) []string {
 		warnings = append(warnings, "plan tools do not clearly cover tool_need "+need)
 	}
 	return warnings
+}
+
+func terminalLooksLikeProjectIndex(step model.PlanStep) bool {
+	command := strings.ToLower(strings.TrimSpace(step.Args["command"]))
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	text := command + " " + goal
+	if !(strings.Contains(text, "tree") || strings.Contains(text, "rg --files") || strings.Contains(text, "find ") || strings.Contains(text, "ls -r") || strings.Contains(text, "file tree") || strings.Contains(text, "project overview") || strings.Contains(text, "repository map") || strings.Contains(text, "目录结构")) {
+		return false
+	}
+	return !terminalLooksLikeSingleFileRead(step)
+}
+
+func terminalLooksLikeSingleFileRead(step model.PlanStep) bool {
+	command := strings.ToLower(strings.TrimSpace(step.Args["command"]))
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	text := command + " " + goal
+	if strings.Contains(text, "cat ") || strings.Contains(text, "sed -n") || strings.Contains(text, "head ") || strings.Contains(text, "tail ") {
+		return true
+	}
+	return strings.Contains(goal, "read ") || strings.Contains(goal, "读取") || strings.Contains(goal, "查看文件")
+}
+
+func fileReadLooksLikeSummary(step model.PlanStep) bool {
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	if goal == "" {
+		return false
+	}
+	if strings.Contains(goal, "line") || strings.Contains(goal, "exact") || strings.Contains(goal, "full content") || strings.Contains(goal, "原文") || strings.Contains(goal, "逐行") {
+		return false
+	}
+	return strings.Contains(goal, "summary") || strings.Contains(goal, "summarize") || strings.Contains(goal, "概览") || strings.Contains(goal, "摘要") || strings.Contains(goal, "快速了解")
+}
+
+func webSearchLooksLikeKnownURLRead(step model.PlanStep) bool {
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	query := strings.ToLower(strings.TrimSpace(step.Args["query"]))
+	text := goal + " " + query
+	return strings.Contains(query, "http://") || strings.Contains(query, "https://") ||
+		strings.Contains(text, "known url") || strings.Contains(text, "read this page") || strings.Contains(text, "读取这个链接") || strings.Contains(text, "这个 url")
+}
+
+func webSearchLooksLikeSoftwareDiscovery(step model.PlanStep) bool {
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	query := strings.ToLower(strings.TrimSpace(step.Args["query"]))
+	text := goal + " " + query
+	return strings.Contains(text, "install") || strings.Contains(text, "brew ") || strings.Contains(text, "npm ") || strings.Contains(text, "pip ") ||
+		strings.Contains(text, "cargo ") || strings.Contains(text, "github") || strings.Contains(text, "repo") || strings.Contains(text, "repository") ||
+		strings.Contains(text, "cli") || strings.Contains(text, "命令行") || strings.Contains(text, "安装")
+}
+
+func webFetchLooksLikeSourceDiscovery(step model.PlanStep) bool {
+	url := strings.TrimSpace(step.Args["url"])
+	if url != "" {
+		return false
+	}
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	return strings.Contains(goal, "find") || strings.Contains(goal, "search") || strings.Contains(goal, "discover") ||
+		strings.Contains(goal, "查找") || strings.Contains(goal, "搜索") || strings.Contains(goal, "找一下")
+}
+
+func softwareSearchLooksLikeKnownURLRead(step model.PlanStep) bool {
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	query := strings.ToLower(strings.TrimSpace(step.Args["query"]))
+	text := goal + " " + query
+	return strings.Contains(query, "http://") || strings.Contains(query, "https://") ||
+		strings.Contains(text, "readme") || strings.Contains(text, "official docs") || strings.Contains(text, "文档内容") || strings.Contains(text, "读取页面")
+}
+
+func softwareInstallLooksSpeculative(step model.PlanStep) bool {
+	command := strings.TrimSpace(step.Args["command"])
+	verify := strings.TrimSpace(step.Args["verify_command"])
+	return command == "" || strings.Contains(command, "<") || strings.Contains(command, "TODO") || verify == ""
+}
+
+func scheduleCreateDependsOnFailedVerification(step model.PlanStep, steps []model.PlanStep) bool {
+	if strings.TrimSpace(step.Tool) != "schedule.create" || len(step.DependsOn) == 0 {
+		return false
+	}
+	byID := map[string]model.PlanStep{}
+	for _, item := range steps {
+		byID[strings.TrimSpace(item.ID)] = item
+	}
+	for _, dep := range step.DependsOn {
+		item, ok := byID[strings.TrimSpace(dep)]
+		if !ok {
+			continue
+		}
+		if !isVerificationLikeStep(item) {
+			continue
+		}
+		switch strings.TrimSpace(item.OnFailure) {
+		case "stop", "ask_user":
+			return true
+		}
+	}
+	return false
+}
+
+func isVerificationLikeStep(step model.PlanStep) bool {
+	toolName := strings.TrimSpace(step.Tool)
+	if toolName == "terminal.run" || toolName == "web.fetch" || toolName == "software.install" {
+		return true
+	}
+	goal := strings.ToLower(strings.TrimSpace(step.Goal))
+	return strings.Contains(goal, "验证") || strings.Contains(goal, "verify") || strings.Contains(goal, "确认是否可执行")
 }
 
 func toolNeedSatisfiedByTools(need string, tools []string) bool {

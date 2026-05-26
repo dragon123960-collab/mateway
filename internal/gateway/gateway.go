@@ -32,7 +32,13 @@ func (g Gateway) Serve(ctx context.Context) error {
 	heartbeat.NewScheduler(g.App.Config).Start(ctx)
 	schedule.NewScheduler(g.App.Config, func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
 		resp, err := g.App.Runtime.Handle(ctx, msg)
-		return schedule.Response{Reply: resp.Reply, TraceID: resp.TraceID, Failed: resp.Failed}, err
+		return schedule.Response{
+			Reply:             resp.Reply,
+			TraceID:           resp.TraceID,
+			Failed:            resp.Failed,
+			FinalAcceptStatus: resp.FinalAcceptStatus,
+			FinalAcceptReason: resp.FinalAcceptReason,
+		}, err
 	}).Start(ctx)
 	return feishu.StartWebSocket(ctx, g.App.Config.Channels.Feishu, g.HandleInbound)
 }

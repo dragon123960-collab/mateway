@@ -57,6 +57,7 @@ type taskUnderstanding struct {
 	RiskLevel       string
 	NeedsGrounding  bool
 	NeedsMutation   bool
+	IsScheduledRun  bool
 }
 
 type toolComposition struct {
@@ -313,6 +314,7 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 	plan = l.normalizePlanForRuntime(plan)
 	l.state.plan = plan
 	l.state.understanding = mergeUnderstandingFromPlan(plan.Understanding, fallbackUnderstanding)
+	l.state.understanding.IsScheduledRun = fallbackUnderstanding.IsScheduledRun
 	l.runtime.Logger.Event("runtime.plan", map[string]any{
 		"trace_id":       l.state.traceID,
 		"summary":        plan.Summary,
@@ -415,6 +417,12 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 	if repairGuidance != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nRepair guidance:\n" + repairGuidance)
 	}
+	if installGuidance := softwareInstallRepairGuidance(l.state.results); installGuidance != "" {
+		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nSoftware install repair guidance:\n" + installGuidance)
+	}
+	if preserve := preserveSuccessfulEvidenceGuidance(l.state.results); preserve != "" {
+		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nPreserve successful evidence:\n" + preserve)
+	}
 	l.state.previousPlanSummary = strings.TrimSpace(l.state.plan.Summary)
 	repaired, check, err := l.repairPlanJSON(ctx, buildStageModelPrompt(contextPrompt, planSkills), candidateTools)
 	if err != nil {
@@ -465,6 +473,7 @@ func (l *AgentLoop) fallbackUnderstanding() taskUnderstanding {
 		RiskLevel:       inferRiskLevel(capabilities, req),
 		NeedsGrounding:  requiresGroundingEvidence(req),
 		NeedsMutation:   requiresMutationCapability(capabilities),
+		IsScheduledRun:  isScheduledInvocation(l.state.message),
 	}
 	l.runtime.Logger.Event("runtime.understand_fallback", map[string]any{
 		"trace_id":        l.state.traceID,
@@ -519,6 +528,56 @@ func mergeUnderstandingFromPlan(raw model.UnderstandingJSON, fallback taskUnders
 	out.NeedsGrounding = out.NeedsGrounding || len(out.EvidenceHints) > 0
 	out.NeedsMutation = out.NeedsMutation || strings.TrimSpace(out.RiskLevel) == "guarded_mutation" || strings.TrimSpace(out.RiskLevel) == "dangerous_execute"
 	return out
+}
+
+func preserveSuccessfulEvidenceGuidance(results []model.ToolResult) string {
+	var keep []string
+	for _, result := range results {
+		if !result.OK {
+			continue
+		}
+		switch strings.TrimSpace(result.Tool) {
+		case "project.index", "file.read", "file.summary", "web.fetch", "web.search", "software.search", "skill.search", "memory.search":
+			keep = append(keep, strings.TrimSpace(result.StepID)+" via "+strings.TrimSpace(result.Tool))
+		}
+	}
+	if len(keep) == 0 {
+		return ""
+	}
+	return "Do not discard already successful read evidence unless it is clearly irrelevant. Prefer continuing from these completed steps: " + strings.Join(keep, ", ")
+}
+
+func softwareInstallRepairGuidance(results []model.ToolResult) string {
+	hasSoftwareSearch := false
+	hasWeakSearch := false
+	hasFetchFailure := false
+	for _, result := range results {
+		switch strings.TrimSpace(result.Tool) {
+		case "software.search":
+			hasSoftwareSearch = true
+			if softwareSearchResultLooksWeak(model.PlanStep{Tool: "software.search"}, result) {
+				hasWeakSearch = true
+			}
+		case "web.fetch":
+			if !result.OK {
+				hasFetchFailure = true
+			}
+		}
+	}
+	if !hasSoftwareSearch && !hasFetchFailure {
+		return ""
+	}
+	parts := []string{
+		"Do not emit web.fetch until the upstream URL is explicit and credible.",
+		"Do not emit software.install until install_command, verify_command, and executable_name are concrete.",
+	}
+	if hasWeakSearch {
+		parts = append(parts, "If software.search returns weak or mismatched results, do not guess a repository, README URL, npm package, or install command. Prefer user.ask or stop with a clear no-reliable-source explanation.")
+	}
+	if hasFetchFailure {
+		parts = append(parts, "If web.fetch failed because the URL was guessed or invalid, repair by narrowing the source-finding step first instead of emitting another guessed URL.")
+	}
+	return strings.Join(parts, " ")
 }
 
 func planStepOrder(plan model.Plan) []string {

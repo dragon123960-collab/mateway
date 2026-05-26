@@ -49,6 +49,15 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 		"session_key": l.state.message.SessionKey,
 		"active_task": l.state.session.ActiveTaskID,
 	})
+	if isScheduledInvocation(l.state.message) {
+		return taskBindingDecision{
+			Kind:          bindingNewTask,
+			TargetTaskID:  l.state.traceID,
+			ResolvedQuery: strings.TrimSpace(l.state.message.Text),
+			Reason:        "scheduled invocation always starts a fresh task run",
+			Confidence:    0.99,
+		}
+	}
 	if len(l.state.session.Tasks) == 0 && shouldTreatEmptySessionAsNewTask(l.state.message.Text) {
 		return taskBindingDecision{
 			Kind:          bindingNewTask,
@@ -100,6 +109,10 @@ func shouldTreatEmptySessionAsNewTask(text string) bool {
 		}
 	}
 	return false
+}
+
+func isScheduledInvocation(msg channel.InboundMessage) bool {
+	return strings.EqualFold(strings.TrimSpace(msg.Metadata["source"]), "schedule")
 }
 
 func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
@@ -242,9 +255,9 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 		})
 		if len(l.state.currentTask.StepStates) > 0 && decision.Kind != bindingNewTask && decision.Kind != bindingHistoricalContinuation {
 			l.runtime.Logger.Event("runtime.task_resume_execution", map[string]any{
-				"trace_id":       l.state.traceID,
-				"task_id":        l.state.currentTask.ID,
-				"execution":      l.state.currentTask.ExecutionStatus,
+				"trace_id":        l.state.traceID,
+				"task_id":         l.state.currentTask.ID,
+				"execution":       l.state.currentTask.ExecutionStatus,
 				"completed_steps": completedStepCount(l.state.currentTask.StepStates),
 			})
 		}

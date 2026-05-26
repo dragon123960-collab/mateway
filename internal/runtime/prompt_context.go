@@ -339,10 +339,14 @@ func renderUnderstanding(understanding taskUnderstanding) string {
 }
 
 func renderUnderstandingForStage(stage string, understanding taskUnderstanding) string {
-	if strings.TrimSpace(stage) == skill.StagePlanningRepair {
+	switch strings.TrimSpace(stage) {
+	case skill.StagePlanningRepair:
 		return renderRepairUnderstanding(understanding)
+	case promptStageFinalAcceptance:
+		return renderFinalAcceptanceUnderstanding(understanding)
+	default:
+		return renderUnderstanding(understanding)
 	}
-	return renderUnderstanding(understanding)
 }
 
 func renderRepairUnderstanding(understanding taskUnderstanding) string {
@@ -358,6 +362,23 @@ func renderRepairUnderstanding(understanding taskUnderstanding) string {
 	}
 	if risk := strings.TrimSpace(understanding.RiskLevel); risk != "" {
 		lines = append(lines, "- risk_level: "+risk)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderFinalAcceptanceUnderstanding(understanding taskUnderstanding) string {
+	lines := []string{}
+	if goal := strings.TrimSpace(understanding.Goal); goal != "" {
+		lines = append(lines, "- goal: "+goal)
+	}
+	if len(understanding.CompletionDraft) > 0 {
+		lines = append(lines, "- completion_draft: "+strings.Join(understanding.CompletionDraft, " | "))
+	}
+	if strings.TrimSpace(understanding.RiskLevel) != "" {
+		lines = append(lines, "- risk_level: "+understanding.RiskLevel)
+	}
+	if understanding.IsScheduledRun {
+		lines = append(lines, "- scheduled_run: true")
 	}
 	return strings.Join(lines, "\n")
 }

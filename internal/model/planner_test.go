@@ -199,7 +199,7 @@ func TestPlannerPromptKeepsSkillSearchCapabilityDriven(t *testing.T) {
 
 func TestPlannerPromptPutsCriticalRulesAtBeginningAndEnd(t *testing.T) {
 	prompt := plannerSystemPrompt()
-	if !strings.Contains(prompt, "Most important rules:") || !strings.Contains(prompt, "Final reminders:") {
+	if !strings.Contains(prompt, "Hard rules:") || !strings.Contains(prompt, "Final reminders:") {
 		t.Fatalf("expected prompt to have emphasized beginning/end sections, got %q", prompt)
 	}
 	if !strings.Contains(prompt, "Return ONLY strict JSON.") || !strings.Contains(prompt, "Do not invent unavailable tools") {

@@ -19,17 +19,28 @@ type Runner struct {
 type Handler func(context.Context, channel.InboundMessage) (Response, error)
 
 type Response struct {
-	Reply   channel.OutboundMessage
-	TraceID string
-	Failed  bool
+	Reply             channel.OutboundMessage
+	TraceID           string
+	Failed            bool
+	FinalAcceptStatus string
+	FinalAcceptReason string
 }
 
 type RunResult struct {
-	Task       Task
-	TraceID    string
-	OutputPath string
-	Failed     bool
-	Error      string
+	Task                    Task
+	TraceID                 string
+	OutputPath              string
+	Failed                  bool
+	Error                   string
+	RuntimeAcceptStatus     string
+	RuntimeAcceptReason     string
+	DeliveryAcceptStatus    string
+	DeliveryAcceptReason    string
+}
+
+type RunAcceptance struct {
+	Status string
+	Reason string
 }
 
 func (r Runner) RunDue(ctx context.Context, now time.Time) ([]RunResult, error) {
@@ -66,6 +77,8 @@ func (r Runner) RunTask(ctx context.Context, task Task, now time.Time) RunResult
 	}
 	result.TraceID = resp.TraceID
 	result.Failed = resp.Failed
+	result.RuntimeAcceptStatus = strings.TrimSpace(resp.FinalAcceptStatus)
+	result.RuntimeAcceptReason = strings.TrimSpace(resp.FinalAcceptReason)
 	state.TraceID = resp.TraceID
 	if resp.Failed {
 		state.Status = "failed"
@@ -83,8 +96,36 @@ func (r Runner) RunTask(ctx context.Context, task Task, now time.Time) RunResult
 		result.OutputPath = outputPath
 		state.Output = outputPath
 	}
+	accept := AcceptRunResult(task, result)
+	result.DeliveryAcceptStatus = accept.Status
+	result.DeliveryAcceptReason = accept.Reason
 	_ = r.Store.WriteRunState(state)
 	return result
+}
+
+func AcceptRunResult(task Task, result RunResult) RunAcceptance {
+	if result.Failed {
+		return RunAcceptance{Status: "hard_fail", Reason: firstNonEmpty(result.Error, "scheduled run failed")}
+	}
+	mode := strings.TrimSpace(task.Delivery.Mode)
+	if mode == "" || mode == "artifact" {
+		path := strings.TrimSpace(result.OutputPath)
+		if path == "" {
+			return RunAcceptance{Status: "hard_fail", Reason: "scheduled run did not produce an output artifact path"}
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return RunAcceptance{Status: "hard_fail", Reason: "scheduled run output artifact is missing"}
+		}
+		if strings.TrimSpace(result.TraceID) == "" {
+			return RunAcceptance{Status: "usable", Reason: "scheduled run wrote an artifact but trace id is missing"}
+		}
+		return RunAcceptance{Status: "pass", Reason: "scheduled run produced an artifact and trace id"}
+	}
+	if strings.TrimSpace(result.TraceID) == "" {
+		return RunAcceptance{Status: "usable", Reason: "scheduled run completed but trace id is missing"}
+	}
+	return RunAcceptance{Status: "pass", Reason: "scheduled run completed with trace id"}
 }
 
 func scheduledMessage(task Task, now time.Time) channel.InboundMessage {
@@ -97,12 +138,22 @@ func scheduledMessage(task Task, now time.Time) channel.InboundMessage {
 		ThreadID:   threadID,
 		UserID:     userID,
 		SessionKey: "schedule:" + task.ID,
-		Text:       task.Prompt,
+		Text:       scheduledExecutionPrompt(task),
 		Metadata: map[string]string{
 			"source":      "schedule",
 			"schedule_id": task.ID,
 		},
 	}
+}
+
+func scheduledExecutionPrompt(task Task) string {
+	var b strings.Builder
+	b.WriteString("这是一次已经触发的定时执行，不是在创建或修改定时任务。\n")
+	b.WriteString("现在请直接完成本次任务内容，并输出本次执行结果。\n")
+	b.WriteString("除非下面的任务说明明确要求，否则不要再次创建、修改、暂停、恢复或删除任何定时任务。\n\n")
+	b.WriteString("任务说明：\n")
+	b.WriteString(strings.TrimSpace(task.Prompt))
+	return b.String()
 }
 
 func (r Runner) writeOutput(task Task, now time.Time, text string) (string, error) {

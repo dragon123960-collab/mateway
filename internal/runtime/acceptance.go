@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/dongping/mateway/internal/model"
@@ -47,16 +49,27 @@ type stepAcceptancePayload struct {
 }
 
 func codeAcceptStep(step model.PlanStep, result model.ToolResult, def tool.Definition, registry *AcceptanceRegistry) StepAcceptance {
+	var spec AcceptanceSpec
+	var hasSpec bool
+	if registry != nil {
+		spec, hasSpec = acceptanceSpecForStep(registry, step, def)
+	}
 	if !result.OK {
 		if strings.TrimSpace(step.Tool) == "memory.search" && memorySearchNoMatch(result) {
 			return StepAcceptance{Status: AcceptanceUsable, Reason: "memory search returned no durable match but produced a valid no-result observation", Source: "code"}
+		}
+		if terminalDiagnosticFailureIsUsable(step, result, def, registry) {
+			return StepAcceptance{Status: AcceptanceUsable, Reason: "terminal diagnostic returned usable stdout despite non-zero exit", Source: "code"}
 		}
 		return StepAcceptance{Status: AcceptanceHardFail, Reason: firstNonEmpty(result.Error, "tool execution failed"), Source: "code"}
 	}
 	if verification := verifyStepResult(step, result); verification.Blocking() {
 		return StepAcceptance{Status: AcceptanceHardFail, Reason: strings.Join(verification.Errors, "; "), Warnings: verification.Warnings, Source: "code"}
 	}
-	if spec, ok := acceptanceSpecForStep(registry, step, def); ok {
+	if softwareSearchResultLooksWeak(step, result) {
+		return StepAcceptance{Status: AcceptanceSuspect, Reason: "software search top result does not clearly match the requested software", Source: "code"}
+	}
+	if hasSpec {
 		if accept := codeAcceptWithSpec(spec, result); accept != nil {
 			return *accept
 		}
@@ -66,13 +79,50 @@ func codeAcceptStep(step model.PlanStep, result model.ToolResult, def tool.Defin
 	}
 	text := strings.ToLower(strings.TrimSpace(result.Output))
 	extraSignals := def.Metadata.SoftFailureSignals
+	if hasSpec {
+		extraSignals = append(extraSignals, spec.SoftFailureSignals...)
+	}
+	if reason := softFailureReason(text, result.Evidence, extraSignals); reason != "" {
+		if hasSpec && explicitNoResultIsUsable(spec, result) {
+			return StepAcceptance{Status: AcceptanceUsable, Reason: "tool returned a valid explicit no-result outcome", Source: "code"}
+		}
+		return StepAcceptance{Status: AcceptanceSuspect, Reason: reason, Source: "code"}
+	}
+	return StepAcceptance{Status: AcceptancePass, Source: "code"}
+}
+
+func terminalDiagnosticFailureIsUsable(step model.PlanStep, result model.ToolResult, def tool.Definition, registry *AcceptanceRegistry) bool {
+	if strings.TrimSpace(step.Tool) != "terminal.run" && strings.TrimSpace(def.Name) != "terminal.run" {
+		return false
+	}
+	if derivedAcceptanceSpecRef(step, def) != "terminal.run/diagnostic" {
+		return false
+	}
+	if timedOut, _ := result.Evidence["timed_out"].(bool); timedOut {
+		return false
+	}
+	exitCode := 0
+	switch v := result.Evidence["exit_code"].(type) {
+	case int:
+		exitCode = v
+	case float64:
+		exitCode = int(v)
+	default:
+		return false
+	}
+	if exitCode == 0 {
+		return false
+	}
+	stdout, _ := result.Evidence["stdout"].(string)
+	if strings.TrimSpace(stdout) == "" {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(result.Output))
+	extraSignals := def.Metadata.SoftFailureSignals
 	if spec, ok := acceptanceSpecForStep(registry, step, def); ok {
 		extraSignals = append(extraSignals, spec.SoftFailureSignals...)
 	}
-	if softFailureReason(text, result.Evidence, extraSignals) != "" {
-		return StepAcceptance{Status: AcceptanceSuspect, Reason: softFailureReason(text, result.Evidence, extraSignals), Source: "code"}
-	}
-	return StepAcceptance{Status: AcceptancePass, Source: "code"}
+	return softFailureReason(text, result.Evidence, extraSignals) == ""
 }
 
 func memorySearchNoMatch(result model.ToolResult) bool {
@@ -89,7 +139,81 @@ func memorySearchNoMatch(result model.ToolResult) bool {
 	return strings.Contains(text, "no matching long memory found")
 }
 
+func softwareSearchResultLooksWeak(step model.PlanStep, result model.ToolResult) bool {
+	if strings.TrimSpace(step.Tool) != "software.search" || strings.TrimSpace(result.Tool) != "software.search" {
+		return false
+	}
+	count, ok := evidenceInt(result.Evidence, "result_count")
+	if ok && count == 0 {
+		return false
+	}
+	query := strings.TrimSpace(firstNonEmpty(stringValue(result.Evidence["query"]), step.Args["query"], step.Args["q"]))
+	name := strings.TrimSpace(stringValue(result.Evidence["name"]))
+	if query == "" || name == "" {
+		return false
+	}
+	queryTokens := stableSearchNameTokens(query)
+	nameTokens := stableSearchNameTokens(name)
+	if len(queryTokens) == 0 || len(nameTokens) == 0 {
+		return false
+	}
+	matches := 0
+	for _, token := range queryTokens {
+		if token == "" {
+			continue
+		}
+		for _, actual := range nameTokens {
+			if actual == token {
+				matches++
+				break
+			}
+		}
+	}
+	if len(queryTokens) >= 2 && matches < 2 {
+		return true
+	}
+	if len(queryTokens) == 1 && matches == 0 {
+		return true
+	}
+	return false
+}
+
+func stableSearchNameTokens(text string) []string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	replacer := strings.NewReplacer("/", " ", "-", " ", "_", " ", ".", " ", ":", " ")
+	text = replacer.Replace(text)
+	raw := strings.Fields(text)
+	out := make([]string, 0, len(raw))
+	for _, token := range raw {
+		token = strings.TrimSpace(token)
+		if len([]rune(token)) < 3 {
+			continue
+		}
+		if token == "install" || token == "package" || token == "tool" || token == "official" || token == "github" || token == "repo" || token == "repository" || token == "npm" || token == "cli" {
+			if token != "cli" {
+				continue
+			}
+		}
+		if strings.HasSuffix(token, "s") && len(token) > 4 {
+			token = strings.TrimSuffix(token, "s")
+		}
+		out = append(out, token)
+	}
+	return out
+}
+
 func codeAcceptWithSpec(spec AcceptanceSpec, result model.ToolResult) *StepAcceptance {
+	for _, rule := range spec.EvidenceRules {
+		if acceptanceEvidenceRuleSatisfied(rule, result.Evidence) {
+			continue
+		}
+		accept := StepAcceptance{
+			Status: firstNonEmptyAcceptanceStatus(rule.Status, AcceptanceHardFail),
+			Reason: firstNonEmpty(rule.Reason, "missing required evidence"),
+			Source: "code",
+		}
+		return &accept
+	}
 	for _, check := range spec.CodeChecks {
 		switch strings.TrimSpace(strings.ToLower(check)) {
 		case "output must not be empty":
@@ -180,6 +304,52 @@ func codeAcceptWithSpec(spec AcceptanceSpec, result model.ToolResult) *StepAccep
 		}
 	}
 	return nil
+}
+
+func acceptanceEvidenceRuleSatisfied(rule AcceptanceEvidenceRule, evidence map[string]any) bool {
+	match := strings.ToLower(strings.TrimSpace(rule.Match))
+	switch match {
+	case "all":
+		return evidenceHasAll(evidence, rule.Keys...)
+	case "any":
+		return evidenceHasAny(evidence, rule.Keys...)
+	default:
+		return evidenceHasAll(evidence, rule.Keys...)
+	}
+}
+
+func explicitNoResultIsUsable(spec AcceptanceSpec, result model.ToolResult) bool {
+	if !spec.AllowExplicitNoResult {
+		return false
+	}
+	if strings.TrimSpace(result.Output) == "" {
+		return false
+	}
+	count, ok := evidenceInt(result.Evidence, "result_count")
+	return ok && count == 0
+}
+
+func evidenceInt(evidence map[string]any, key string) (int, bool) {
+	if evidence == nil {
+		return 0, false
+	}
+	switch v := evidence[key].(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+func firstNonEmptyAcceptanceStatus(primary, fallback AcceptanceStatus) AcceptanceStatus {
+	if strings.TrimSpace(string(primary)) != "" {
+		return primary
+	}
+	return fallback
 }
 
 func shouldLLMAcceptStep(step model.PlanStep, def tool.Definition, accept StepAcceptance, skills []skill.Definition) bool {
@@ -345,7 +515,10 @@ func llmAcceptFinal(ctx context.Context, planner model.Planner, user string, und
 		}
 		return FinalAcceptance{Status: AcceptanceAccepted, Reason: "all steps completed"}
 	}
-	user = buildFinalAcceptancePrompt(user, understanding)
+	user = buildFinalAcceptancePrompt(user, understanding, finalAcceptanceContext{
+		Results:       results,
+		ScheduledRun:  understanding.IsScheduledRun,
+	})
 	raw, err := reviewer.AcceptFinalJSON(ctx, user, plan, results)
 	if err != nil {
 		if anyFailed(results) {
@@ -370,20 +543,77 @@ func llmAcceptFinal(ctx context.Context, planner model.Planner, user string, und
 	}
 }
 
-func buildFinalAcceptanceTask(user string, understanding taskUnderstanding) string {
+type finalAcceptanceContext struct {
+	Results      []model.ToolResult
+	ScheduledRun bool
+}
+
+func buildFinalAcceptanceTask(user string, understanding taskUnderstanding, ctx ...finalAcceptanceContext) string {
 	parts := []string{"User task: " + strings.TrimSpace(user)}
+	var extra finalAcceptanceContext
+	if len(ctx) > 0 {
+		extra = ctx[0]
+	}
 	if len(understanding.CompletionDraft) > 0 {
 		parts = append(parts, "Completion criteria: "+strings.Join(understanding.CompletionDraft, " | "))
+	}
+	if extra.ScheduledRun {
+		parts = append(parts, "Scheduled run context: This is an already-triggered schedule execution. Judge whether the requested task work completed this run; do not reinterpret success as schedule creation or schedule update success.")
+	}
+	if summary := renderFinalAcceptanceExecutionSummary(extra.Results); summary != "" {
+		parts = append(parts, "Execution summary: "+summary)
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
 
-func buildFinalAcceptancePrompt(user string, understanding taskUnderstanding) string {
+func buildFinalAcceptancePrompt(user string, understanding taskUnderstanding, ctx ...finalAcceptanceContext) string {
 	contextPrompt := buildModelContextPrompt("", promptStageFinalAcceptance, nil, nil, tool.Context{}, promptContextOptions{
 		Understanding: understanding,
 	})
-	taskPrompt := buildFinalAcceptanceTask(user, understanding)
+	taskPrompt := buildFinalAcceptanceTask(user, understanding, ctx...)
 	return strings.TrimSpace(contextPrompt + "\n\nAcceptance task:\n" + taskPrompt)
+}
+
+func renderFinalAcceptanceExecutionSummary(results []model.ToolResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	passed := 0
+	failed := 0
+	artifacts := 0
+	toolNames := map[string]struct{}{}
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "" {
+			toolNames[strings.TrimSpace(result.Tool)] = struct{}{}
+		}
+		if result.OK {
+			passed++
+		} else if strings.TrimSpace(result.Error) == "step_acceptance_suspect" || strings.TrimSpace(result.Error) == "step_verification_failed" || strings.TrimSpace(result.Error) == "dependency_failed" || strings.TrimSpace(result.Error) == "await_confirm" {
+			failed++
+		} else {
+			failed++
+		}
+		if len(collectArtifacts([]model.ToolResult{result})) > 0 {
+			artifacts++
+		}
+	}
+	if passed == 0 && failed == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(toolNames))
+	for name := range toolNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := []string{
+		"passed=" + fmt.Sprint(passed),
+		"failed=" + fmt.Sprint(failed),
+		"artifact_evidence_steps=" + fmt.Sprint(artifacts),
+	}
+	if len(names) > 0 {
+		parts = append(parts, "tools="+strings.Join(names, ","))
+	}
+	return strings.Join(parts, " | ")
 }
 
 func extractAcceptanceJSONObject(text string) string {

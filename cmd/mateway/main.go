@@ -329,7 +329,20 @@ func runSchedule(args []string, out io.Writer) error {
 			if result.Failed {
 				status = "failed"
 			}
-			fmt.Fprintf(out, "%s\t%s\ttrace=%s\toutput=%s\n", result.Task.ID, status, result.TraceID, result.OutputPath)
+			fmt.Fprintf(out, "%s\t%s\truntime=%s\tdelivery=%s\ttrace=%s\toutput=%s\n",
+				result.Task.ID,
+				status,
+				firstNonEmptyLocal(result.RuntimeAcceptStatus, "-"),
+				firstNonEmptyLocal(result.DeliveryAcceptStatus, "-"),
+				result.TraceID,
+				result.OutputPath,
+			)
+			if strings.TrimSpace(result.RuntimeAcceptReason) != "" {
+				fmt.Fprintf(out, "  runtime_reason=%s\n", result.RuntimeAcceptReason)
+			}
+			if strings.TrimSpace(result.DeliveryAcceptReason) != "" {
+				fmt.Fprintf(out, "  delivery_reason=%s\n", result.DeliveryAcceptReason)
+			}
 			if strings.TrimSpace(result.Error) != "" {
 				fmt.Fprintf(out, "  error=%s\n", result.Error)
 			}
@@ -583,7 +596,13 @@ func oneIDArg(args []string, usage string) (string, error) {
 func scheduleHandler(handle func(context.Context, channel.InboundMessage) (runtimepkg.Response, error)) schedule.Handler {
 	return func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
 		resp, err := handle(ctx, msg)
-		return schedule.Response{Reply: resp.Reply, TraceID: resp.TraceID, Failed: resp.Failed}, err
+		return schedule.Response{
+			Reply:             resp.Reply,
+			TraceID:           resp.TraceID,
+			Failed:            resp.Failed,
+			FinalAcceptStatus: resp.FinalAcceptStatus,
+			FinalAcceptReason: resp.FinalAcceptReason,
+		}, err
 	}
 }
 
@@ -1069,6 +1088,7 @@ func optionValue(args []string, i int) (string, int, error) {
 type testCommandOptions struct {
 	Title       string
 	Message     string
+	UseCase     string
 	Channel     string
 	SessionKey  string
 	UserID      string
@@ -1371,6 +1391,18 @@ func parseTestOptions(args []string) (testCommandOptions, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
+		case "--case":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("%s requires a value", arg)
+			}
+			preset, ok := builtinTestCase(args[i+1])
+			if !ok {
+				return opts, fmt.Errorf("unknown test case %q", args[i+1])
+			}
+			opts.UseCase = args[i+1]
+			opts.Title = preset.Title
+			opts.Message = preset.Message
+			i++
 		case "--title":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("%s requires a value", arg)
@@ -1432,6 +1464,37 @@ func parseTestOptions(args []string) (testCommandOptions, error) {
 		}
 	}
 	return opts, nil
+}
+
+func builtinTestCase(name string) (testCommandOptions, bool) {
+	switch strings.TrimSpace(strings.ToLower(name)) {
+	case "tool-boundary-project":
+		return testCommandOptions{
+			Title:   "tool-boundary-project",
+			Message: "先概览当前仓库结构，再重点总结 README.md 和 docs/开发TODO.md，最后如果有测试命令的话跑一下最小测试确认项目状态。",
+			Channel: "cli",
+		}, true
+	case "tool-boundary-install":
+		return testCommandOptions{
+			Title:   "tool-boundary-install",
+			Message: "帮我安装一个叫 example-cli 的 CLI，如果安装方式不明确先查官方安装方法，装完后验证可执行文件是否能正常输出版本信息。",
+			Channel: "cli",
+		}, true
+	case "tool-boundary-schedule":
+		return testCommandOptions{
+			Title:   "tool-boundary-schedule",
+			Message: "如果 AI 趋势收集这个任务现在可以稳定执行，就帮我设计一个每天 9 点执行的定时任务；如果当前动作无法验证，就先说明缺什么，不要直接创建。",
+			Channel: "cli",
+		}, true
+	case "tool-boundary-url":
+		return testCommandOptions{
+			Title:   "tool-boundary-url",
+			Message: "请直接读取这个已知页面并总结关键信息：https://example.com",
+			Channel: "cli",
+		}, true
+	default:
+		return testCommandOptions{}, false
+	}
 }
 
 func buildTaskReport(a *app.App, opts testCommandOptions, msg channel.InboundMessage, resp runtimepkg.Response) (taskReport, error) {
@@ -1703,6 +1766,11 @@ func qualityNotesForReport(question string, resp runtimepkg.Response) []string {
 	if looksAnalyticalTestQuestion(question) && len(resp.Results) <= 1 {
 		notes = append(notes, "The question appears to require analysis or cross-checking, but tool evidence is limited.")
 	}
+	if strings.Contains(strings.ToLower(question), "https://") || strings.Contains(strings.ToLower(question), "http://") {
+		if len(resp.Results) > 0 && strings.TrimSpace(resp.Results[0].Tool) == "web.search" {
+			notes = append(notes, "This task provided a known URL, but the first tool result used web.search. Review whether web.fetch should have been preferred.")
+		}
+	}
 	lower := strings.ToLower(reply)
 	if strings.Contains(lower, "echo") || strings.Contains(lower, "tool call") && len([]rune(reply)) < 300 {
 		notes = append(notes, "The reply may contain tool-call residue or an overly formal summary; confirm it answered the original question.")
@@ -1755,6 +1823,7 @@ func testHelpText() string {
 Run one real-model end-to-end test and write a markdown report under testdata/YYYY-MM-DD/.
 
 Options:
+  --case <name>         run a built-in real-model regression case
   --title <name>        task title used as the markdown heading and file name
   --question <text>     task question / problem statement
   --message <text>      alias of --question
@@ -1765,6 +1834,12 @@ Options:
   --out <dir>           output root, default ./testdata
   --home <dir>          mateway home, default ~/.mateway
   --project-root <dir>  project root used by runtime
+
+Built-in cases:
+  tool-boundary-project   project.index vs file.summary vs terminal.run
+  tool-boundary-install   software.search/install and verification path
+  tool-boundary-schedule  verify-before-schedule-create boundary
+  tool-boundary-url       known URL should bias toward web.fetch
 `
 }
 

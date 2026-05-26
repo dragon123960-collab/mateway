@@ -171,6 +171,34 @@ func TestRuntimeRepairPromptIncludesVerifierGuidance(t *testing.T) {
 	}
 }
 
+func TestRuntimeRepairPromptIncludesSoftwareInstallRepairGuidance(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "install", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "software.search", Args: map[string]string{"query": "example-cli"}},
+			{ID: "s2", Tool: "web.fetch", Args: map[string]string{"url": "https://raw.githubusercontent.com/example-cli/example-cli/main/README.md"}},
+		}},
+		repairPlan: model.Plan{Summary: "repair", Steps: []model.PlanStep{{ID: "r1", Tool: "user.ask", Args: map[string]string{"question": "请提供 example-cli 的官方链接或包地址"}}}},
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "帮我安装 example-cli"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitUserInput && !resp.Failed && fp.repairCalls == 0 {
+		t.Fatalf("expected repair path to run, got %#v", resp)
+	}
+	for _, want := range []string{
+		"Software install repair guidance:",
+		"Do not emit web.fetch until the upstream URL is explicit and credible.",
+		"Do not emit software.install until install_command, verify_command, and executable_name are concrete.",
+	} {
+		if !strings.Contains(fp.lastPlanSkillPrompt, want) {
+			t.Fatalf("expected repair prompt to contain %q, got %q", want, fp.lastPlanSkillPrompt)
+		}
+	}
+}
+
 func TestStepAcceptanceTaskLoadsToolSpecificAcceptanceSpec(t *testing.T) {
 	def := tool.FilePatch()
 	task := buildStepAcceptanceTask("编辑 README", model.PlanStep{
@@ -283,6 +311,34 @@ func TestCodeAcceptanceUsesRegistryForTerminalEvidence(t *testing.T) {
 	}
 }
 
+func TestCodeAcceptanceAllowsUsableTerminalDiagnosticWithNonZeroExitAndStdout(t *testing.T) {
+	def := tool.TerminalRun()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "检查 lark-cli 和 larkcli 的安装路径及版本",
+		Args: map[string]string{
+			"command": "command -v lark-cli && lark-cli --version; echo \"---\"; command -v larkcli && larkcli --version",
+		},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "terminal.run",
+		OK:     false,
+		Error:  "exit status 1",
+		Output: "/opt/homebrew/bin/lark-cli\nlark-cli version 1.0.39\n---",
+		Evidence: map[string]any{
+			"kind":      "terminal",
+			"exit_code": 1,
+			"stdout":    "/opt/homebrew/bin/lark-cli\nlark-cli version 1.0.39\n---",
+			"stderr":    "",
+			"timed_out": false,
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "usable stdout") {
+		t.Fatalf("expected non-zero diagnostic with useful stdout to be usable, got %#v", accept)
+	}
+}
+
 func TestCodeAcceptanceUsesRegistryForFileReadLineEvidence(t *testing.T) {
 	def := tool.FileRead()
 	accept := codeAcceptStep(model.PlanStep{
@@ -378,8 +434,76 @@ func TestCodeAcceptanceUsesRegistryForSoftwareSearchEvidence(t *testing.T) {
 			"kind": "software_search",
 		},
 	}, def, NewAcceptanceRegistry())
-	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing web search execution evidence") {
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing software search evidence") {
 		t.Fatalf("expected registry-based hard fail for software.search, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceMarksWeakSoftwareSearchMatchAsSuspect(t *testing.T) {
+	def := tool.SoftwareSearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "software.search",
+		Args: map[string]string{"query": "example-cli"},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "software.search",
+		OK:     true,
+		Output: "Software search results",
+		Evidence: map[string]any{
+			"kind":         "software_search",
+			"provider":     "github",
+			"query":        "example-cli",
+			"result_count": 5,
+			"name":         "iximiuz/client-go-examples",
+			"url":          "https://github.com/iximiuz/client-go-examples",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceSuspect || !strings.Contains(accept.Reason, "does not clearly match") {
+		t.Fatalf("expected weak software search match to be suspect, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceAllowsUsableSkillSearchNoResult(t *testing.T) {
+	def := tool.SkillSearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "skill.search",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "skill.search",
+		OK:     true,
+		Output: "No matching skills found for: browser agent",
+		Evidence: map[string]any{
+			"kind":         "skill_search",
+			"query":        "browser agent",
+			"result_count": 0,
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "valid explicit no-result") {
+		t.Fatalf("expected no-result skill search to be usable, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceAllowsUsableSoftwareSearchNoResult(t *testing.T) {
+	def := tool.SoftwareSearch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "software.search",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "software.search",
+		OK:     true,
+		Output: "No software results found for: unknown-cli",
+		Evidence: map[string]any{
+			"kind":         "software_search",
+			"provider":     "github",
+			"query":        "unknown-cli",
+			"result_count": 0,
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceUsable || !strings.Contains(accept.Reason, "valid explicit no-result") {
+		t.Fatalf("expected no-result software search to be usable, got %#v", accept)
 	}
 }
 
@@ -540,6 +664,26 @@ func TestCodeAcceptanceUsesRegistryForScheduleDeleteEvidence(t *testing.T) {
 	}, def, NewAcceptanceRegistry())
 	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing delete evidence") {
 		t.Fatalf("expected registry-based hard fail for schedule.delete, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceUsesRegistryForWebFetchEvidence(t *testing.T) {
+	def := tool.WebFetch()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "web.fetch",
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "web.fetch",
+		OK:     true,
+		Output: "Fetched URL: https://example.com",
+		Evidence: map[string]any{
+			"kind": "web_fetch",
+			"url":  "https://example.com",
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing web fetch evidence") {
+		t.Fatalf("expected registry-based hard fail for web.fetch, got %#v", accept)
 	}
 }
 
@@ -1199,6 +1343,51 @@ func TestRuntimeDoesNotRewriteShellPlanByKeyword(t *testing.T) {
 	}
 }
 
+func TestRuntimeAllowsUsableTerminalDiagnosticWithNonZeroExit(t *testing.T) {
+	fp := &fakePlanner{plan: model.Plan{Summary: "diagnose lark cli", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Goal: "检查 lark-cli 和 larkcli 的安装路径及版本",
+		Tool: "terminal.run",
+		Args: map[string]string{
+			"command": "command -v lark-cli && lark-cli --version; echo \"---\"; command -v larkcli && larkcli --version",
+		},
+	}}}}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "terminal.run",
+		Metadata: tool.Metadata{
+			AcceptanceSpecRef: "terminal.run/diagnostic",
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{
+				OK:     false,
+				Error:  "exit status 1",
+				Output: "/opt/homebrew/bin/lark-cli\nlark-cli version 1.0.39\n---",
+				Evidence: map[string]any{
+					"kind":      "terminal",
+					"command":   call.Args["command"],
+					"exit_code": 1,
+					"stdout":    "/opt/homebrew/bin/lark-cli\nlark-cli version 1.0.39\n---",
+					"stderr":    "",
+					"timed_out": false,
+				},
+			}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "看看本机有没有lark-cli命令"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected usable diagnostic to avoid task failure, got %#v", resp)
+	}
+	if len(resp.Results) != 1 || !resp.Results[0].OK {
+		t.Fatalf("expected runtime to keep usable diagnostic result, got %#v", resp.Results)
+	}
+}
+
 func TestRuntimeApprovalReplyExecutesConfirmedMutation(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "out.txt")
@@ -1607,6 +1796,7 @@ func TestBuildFinalAcceptanceTaskStaysMinimal(t *testing.T) {
 	for _, banned := range []string{
 		"Evidence hints:",
 		"Risk level:",
+		"Scheduled run context:",
 	} {
 		if strings.Contains(text, banned) {
 			t.Fatalf("expected final acceptance task to stay minimal, got %q", text)
@@ -1633,6 +1823,31 @@ func TestBuildFinalAcceptancePromptUsesStageContext(t *testing.T) {
 	}
 	if strings.Contains(text, "Current environment:") {
 		t.Fatalf("expected final acceptance prompt to omit environment, got %q", text)
+	}
+}
+
+func TestBuildFinalAcceptancePromptIncludesScheduledRunExecutionContext(t *testing.T) {
+	text := buildFinalAcceptancePrompt("请执行今天的 AI 趋势收集", taskUnderstanding{
+		Goal:            "execute scheduled AI trend collection",
+		CompletionDraft: []string{"complete the requested task work for this run"},
+		IsScheduledRun:  true,
+	}, finalAcceptanceContext{
+		ScheduledRun: true,
+		Results: []model.ToolResult{
+			{StepID: "s1", Tool: "web.search", OK: true, Output: "results", Evidence: map[string]any{"kind": "web_search", "query": "ai trends", "provider": "duckduckgo", "result_count": 3}},
+			{StepID: "s2", Tool: "file.write", OK: true, Output: "wrote report", Evidence: map[string]any{"kind": "file_write", "path": "/tmp/report.md", "bytes": 120}},
+		},
+	})
+	for _, want := range []string{
+		"Scheduled run context:",
+		"already-triggered schedule execution",
+		"Execution summary:",
+		"tools=file.write,web.search",
+		"artifact_evidence_steps=1",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected final acceptance prompt to contain %q, got %q", want, text)
+		}
 	}
 }
 
@@ -3848,6 +4063,62 @@ func TestRuntimeHistoricalContinuationClarifiesMissingSourceTask(t *testing.T) {
 	}
 	if !resp.AwaitUserInput || !strings.Contains(resp.Reply.Text, "没找到") {
 		t.Fatalf("expected clarification for missing source task, got %#v", resp)
+	}
+}
+
+func TestRuntimeScheduledInvocationAlwaysStartsFreshTask(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "scheduled run", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
+		followupDecision: model.FollowupDecision{
+			Kind:          "historical_continuation",
+			SourceTaskID:  "task-old",
+			ResolvedQuery: "继续昨天的 AI 趋势讨论",
+			Reason:        "命中历史任务",
+			Confidence:    0.93,
+		},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "schedule:ai-agent",
+		ActiveTaskID: "task-old",
+		TaskOrder:    []string{"task-old"},
+		Tasks: map[string]session.TaskState{
+			"task-old": {
+				ID:            "task-old",
+				Status:        session.TaskFailed,
+				Topic:         "AI 趋势",
+				ResolvedQuery: "昨天的 AI 趋势讨论",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "schedule:ai-agent",
+		UserID:     "schedule",
+		SessionKey: "schedule:ai-agent",
+		Text:       "这是一次已经触发的定时执行，请直接完成任务内容。",
+		Metadata:   map[string]string{"source": "schedule", "schedule_id": "ai-agent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.followupCalls != 0 {
+		t.Fatalf("expected scheduled invocation to bypass followup resolution, got %d calls", fp.followupCalls)
+	}
+	st, err := store.Load("schedule:ai-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ActiveTaskID == "task-old" {
+		t.Fatalf("expected a fresh scheduled task, got active old task")
+	}
+	task := st.Tasks[st.ActiveTaskID]
+	if task.ContinuationOfTaskID != "" {
+		t.Fatalf("expected scheduled run not to continue old task, got %#v", task)
 	}
 }
 
