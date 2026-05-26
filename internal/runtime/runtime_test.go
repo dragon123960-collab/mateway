@@ -28,8 +28,11 @@ type fakePlanner struct {
 	planCalls                 int
 	lastPlanTools             []string
 	repairCalls               int
+	lastRepairTools           []string
 	finalAcceptCalls          int
+	firstPlanSkillPrompt      string
 	lastPlanSkillPrompt       string
+	lastRepairSkillPrompt     string
 	lastSynthesizeSkillPrompt string
 	lastPlanUser              string
 	lastStepAcceptUser        string
@@ -43,9 +46,34 @@ type finalSequencePlanner struct {
 	responses []string
 }
 
+func resolveDownloadPlaceholderCommand(command, sourceURL string, ctx tool.Context) string {
+	command = strings.TrimSpace(command)
+	if !strings.Contains(command, "<下载URL>") {
+		return command
+	}
+	releaseURL := strings.TrimRight(strings.TrimSpace(sourceURL), "/") + "/releases/download/v0.0.0/lark-cli_darwin-arm64.tar.gz"
+	installScript := "tmpdir=$(mktemp -d) && curl -L -o \"$tmpdir/lark-cli.tar.gz\" '" + releaseURL + "' && tar -xzf \"$tmpdir/lark-cli.tar.gz\" -C \"$tmpdir\" && install \"$tmpdir/lark-cli\" '/usr/local/bin/lark'"
+	return installScript
+}
+
+func TestPlanVerifierRejectsTerminalCommandWithPlaceholder(t *testing.T) {
+	plan := model.Plan{Summary: "download cli", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Args: map[string]string{"command": "curl -L -o /usr/local/bin/lark '<下载URL>'"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "安装 lark cli", taskUnderstanding{})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "unresolved download placeholder") {
+		t.Fatalf("expected placeholder command error, got %#v", got)
+	}
+}
+
 func (f *fakePlanner) PlanJSON(ctx context.Context, user string, tools []tool.Definition, skillPrompt string) (model.Plan, error) {
 	f.planCalls++
 	f.lastPlanUser = user
+	if f.planCalls == 1 {
+		f.firstPlanSkillPrompt = skillPrompt
+	}
 	f.lastPlanSkillPrompt = skillPrompt
 	f.lastPlanTools = toolNames(tools)
 	return f.plan, nil
@@ -54,6 +82,8 @@ func (f *fakePlanner) PlanJSON(ctx context.Context, user string, tools []tool.De
 func (f *fakePlanner) RepairPlanJSON(ctx context.Context, user string, plan model.Plan, results []model.ToolResult, tools []tool.Definition, skillPrompt string) (model.Plan, error) {
 	f.repairCalls++
 	f.lastPlanSkillPrompt = skillPrompt
+	f.lastRepairSkillPrompt = skillPrompt
+	f.lastRepairTools = toolNames(tools)
 	if strings.TrimSpace(f.repairPlan.Summary) != "" || len(f.repairPlan.Steps) > 0 {
 		return f.repairPlan, nil
 	}
@@ -643,6 +673,145 @@ func TestRuntimeCreatesMemoryProposalAfterGroundedSuccessfulTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeSkipsTaskMemoryProposalForPlainFileSummaryRead(t *testing.T) {
+	workspace := t.TempDir()
+	doc := filepath.Join(workspace, "project.md")
+	if err := os.WriteFile(doc, []byte("# README\n\nThis is a simple project overview."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "read readme", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.summary", Args: map[string]string{"path": doc},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{
+				Default:  "main",
+				Profiles: []config.AgentProfileConfig{{ID: "main"}},
+			},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:no-memory-proposal-file-summary", Text: "Summarize the README"}); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "memory-proposal-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no memory proposal for plain file summary read, got %v", matches)
+	}
+}
+
+func TestRuntimeSkipsTaskMemoryProposalForPlainFileReadSummary(t *testing.T) {
+	workspace := t.TempDir()
+	doc := filepath.Join(workspace, "README.md")
+	if err := os.WriteFile(doc, []byte("# README\n\nThis is a simple project overview."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "read readme", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.read", Args: map[string]string{"path": doc},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{
+				Default:  "main",
+				Profiles: []config.AgentProfileConfig{{ID: "main"}},
+			},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:no-memory-proposal-file-read", Text: "Read README.md and summarize what this project can do right now."}); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "memory-proposal-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no memory proposal for plain file read summary, got %v", matches)
+	}
+}
+
+func TestRuntimeSkipsTaskMemoryProposalWhenSkillCandidateGenerated(t *testing.T) {
+	workspace := t.TempDir()
+	doc := filepath.Join(workspace, "project.md")
+	if err := os.WriteFile(doc, []byte("# Project\n\nlearning input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "read project memory", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "file.summary", Args: map[string]string{"path": doc},
+	}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{
+				Default:  "main",
+				Profiles: []config.AgentProfileConfig{{ID: "main"}},
+			},
+			Learning: config.LearningConfig{
+				Enabled: true,
+				SkillCrystallization: config.SkillCrystallizationConfig{
+					Enabled:            true,
+					SuccessThreshold:   1,
+					RequireUserConfirm: true,
+				},
+			},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:learning-over-memory-proposal",
+		Text:       "review release notes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "proposed skill candidate") {
+		t.Fatalf("expected learning prompt in reply, got %q", resp.Reply.Text)
+	}
+	skillMatches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "skill-candidate-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skillMatches) != 1 {
+		t.Fatalf("expected one skill candidate, got %v", skillMatches)
+	}
+	memoryMatches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "inbox", "memory-proposal-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(memoryMatches) != 0 {
+		t.Fatalf("expected no task memory proposal when skill candidate is generated, got %v", memoryMatches)
+	}
+}
+
 func TestRuntimeSkipsLearningForTestLikeSession(t *testing.T) {
 	workspace := t.TempDir()
 	reg := tool.NewBuiltinRegistry()
@@ -1189,6 +1358,9 @@ func TestRuntimeInjectsChineseSummarySkill(t *testing.T) {
 	if !strings.Contains(fp.lastSynthesizeSkillPrompt, "chinese-summary") {
 		t.Fatalf("expected chinese-summary to be injected, got %q", fp.lastSynthesizeSkillPrompt)
 	}
+	if !strings.Contains(fp.lastSynthesizeSkillPrompt, "Skills context:") {
+		t.Fatalf("expected structured skills context in synth prompt, got %q", fp.lastSynthesizeSkillPrompt)
+	}
 	if !strings.Contains(fp.lastSynthesizeSkillPrompt, "请输出自然中文总结") {
 		t.Fatalf("expected chinese summary instruction in synth prompt, got %q", fp.lastSynthesizeSkillPrompt)
 	}
@@ -1223,7 +1395,7 @@ func TestBuildModelContextPromptIncludesUserButNotHeartbeat(t *testing.T) {
 	}
 }
 
-func TestBuildModelContextPromptIncludesStructuredToolAndSkillMetadata(t *testing.T) {
+func TestBuildModelContextPromptKeepsOnlyNonDuplicatedPlanningContext(t *testing.T) {
 	prompt := buildModelContextPrompt(
 		"请总结 README 并告诉我什么时候用 file.summary",
 		"planning",
@@ -1263,12 +1435,6 @@ func TestBuildModelContextPromptIncludesStructuredToolAndSkillMetadata(t *testin
 		},
 	)
 	for _, want := range []string{
-		"use_for: documentation review",
-		"produces: review summary",
-		"when_to_use: before reading full file",
-		"acceptance_mode: code_then_llm",
-		"parallel_mode: read_only_ok",
-		"resource_scope: filesystem:path",
 		"Task understanding:",
 		"completion_draft: summarize the relevant file content",
 		"evidence_hints: file path, headings, preview lines",
@@ -1276,6 +1442,25 @@ func TestBuildModelContextPromptIncludesStructuredToolAndSkillMetadata(t *testin
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected prompt to contain %q, got:\n%s", want, prompt)
+		}
+	}
+	for _, banned := range []string{
+		"Selected skills:",
+		"Available tools:",
+		"use_for: documentation review",
+		"when_to_use: before reading full file",
+		"Current user request:",
+	} {
+		if strings.Contains(prompt, banned) {
+			t.Fatalf("expected prompt to omit duplicated prompt layer %q, got:\n%s", banned, prompt)
+		}
+	}
+	for _, want := range []string{
+		"package_managers:",
+		"key_tooling:",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected planning environment summary to contain %q, got:\n%s", want, prompt)
 		}
 	}
 }
@@ -1289,7 +1474,7 @@ func TestComposeCandidateToolsPrefersInstallAndSearchMatches(t *testing.T) {
 	}, taskUnderstanding{
 		Goal:         "帮我安装 lark cli，先找安装命令再安装",
 		Capabilities: []string{"install_software", "search_web"},
-	})
+	}, planningCandidateBudget)
 	if len(candidates) == 0 {
 		t.Fatal("expected candidates")
 	}
@@ -1360,7 +1545,7 @@ func TestComposeCandidateToolsPrefersProjectInspectionFromUnderstanding(t *testi
 		Goal:           "请概览这个仓库的结构，再看看 README",
 		Capabilities:   []string{"inspect_project", "inspect_file"},
 		NeedsGrounding: true,
-	})
+	}, planningCandidateBudget)
 	names := []string{}
 	for _, def := range candidates {
 		names = append(names, def.Name)
@@ -1370,7 +1555,7 @@ func TestComposeCandidateToolsPrefersProjectInspectionFromUnderstanding(t *testi
 	}
 }
 
-func TestPlanningOrdersRecommendedToolsWithoutDroppingOthers(t *testing.T) {
+func TestPlanningUsesCandidateToolSubset(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "project overview", Understanding: model.UnderstandingJSON{Goal: "inspect project", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
 			ID: "s1", Tool: "project.index", Args: map[string]string{},
@@ -1394,31 +1579,82 @@ func TestPlanningOrdersRecommendedToolsWithoutDroppingOthers(t *testing.T) {
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请概览这个项目结构"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(fp.lastPlanTools) != len(reg.Definitions()) {
-		t.Fatalf("expected all tools to remain visible, got %v", fp.lastPlanTools)
+	if len(fp.lastPlanTools) == 0 || len(fp.lastPlanTools) > planningCandidateBudget {
+		t.Fatalf("expected planning candidate subset, got %v", fp.lastPlanTools)
 	}
-	if fp.lastPlanTools[0] != "project.index" {
-		t.Fatalf("expected project.index to be recommended first, got %v", fp.lastPlanTools)
+	if !containsAll(fp.lastPlanTools, []string{"project.index"}) {
+		t.Fatalf("expected project.index in planning candidates, got %v", fp.lastPlanTools)
 	}
-	if !strings.Contains(fp.lastPlanSkillPrompt, "Recommended tools for this request") {
+	if !strings.Contains(fp.lastPlanSkillPrompt, "Candidate tools for this request") {
 		t.Fatalf("expected recommendation guidance in prompt, got %q", fp.lastPlanSkillPrompt)
 	}
 }
 
-func TestBuildFinalAcceptanceTaskIncludesUnderstandingContext(t *testing.T) {
+func TestBuildFinalAcceptanceTaskStaysMinimal(t *testing.T) {
 	text := buildFinalAcceptanceTask("请安装 lark cli", taskUnderstanding{
 		CompletionDraft: []string{"identify the install method and verify the install result"},
 		EvidenceHints:   []string{"install command and verify command output"},
 		RiskLevel:       "guarded_mutation",
 	})
 	for _, want := range []string{
-		"Completion draft: identify the install method and verify the install result",
-		"Evidence hints: install command and verify command output",
-		"Risk level: guarded_mutation",
+		"User task: 请安装 lark cli",
+		"Completion criteria: identify the install method and verify the install result",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected final acceptance task to contain %q, got %q", want, text)
 		}
+	}
+	for _, banned := range []string{
+		"Evidence hints:",
+		"Risk level:",
+	} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("expected final acceptance task to stay minimal, got %q", text)
+		}
+	}
+}
+
+func TestBuildFinalAcceptancePromptUsesStageContext(t *testing.T) {
+	text := buildFinalAcceptancePrompt("请安装 lark cli", taskUnderstanding{
+		Goal:            "install lark cli safely",
+		CompletionDraft: []string{"identify the install method and verify the install result"},
+		RiskLevel:       "guarded_mutation",
+	})
+	for _, want := range []string{
+		"Current stage:",
+		promptStageFinalAcceptance,
+		"Task understanding:",
+		"Acceptance task:",
+		"User task: 请安装 lark cli",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected final acceptance prompt to contain %q, got %q", want, text)
+		}
+	}
+	if strings.Contains(text, "Current environment:") {
+		t.Fatalf("expected final acceptance prompt to omit environment, got %q", text)
+	}
+}
+
+func TestBuildStepAcceptancePromptUsesStageContext(t *testing.T) {
+	text := buildStepAcceptancePrompt("编辑 README", model.PlanStep{
+		ID:   "s1",
+		Tool: "file.patch",
+		Goal: "Patch README title",
+	}, tool.FilePatch(), NewAcceptanceRegistry())
+	for _, want := range []string{
+		"Current stage:",
+		promptStageStepAcceptance,
+		"Acceptance task:",
+		"User task: 编辑 README",
+		"Step goal: Patch README title",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected step acceptance prompt to contain %q, got %q", want, text)
+		}
+	}
+	if strings.Contains(text, "Current environment:") {
+		t.Fatalf("expected step acceptance prompt to omit environment, got %q", text)
 	}
 }
 
@@ -1460,6 +1696,459 @@ func TestRuntimeUsesFinalLLMAcceptanceForMutation(t *testing.T) {
 	}
 	if fp.finalAcceptCalls != 1 {
 		t.Fatalf("expected final llm acceptance for mutation, got %d", fp.finalAcceptCalls)
+	}
+}
+
+func TestRuntimeProposesSkillImprovementAfterSuccessfulRepair(t *testing.T) {
+	root := t.TempDir()
+	doc := filepath.Join(root, "docs", "memory.md")
+	if err := os.MkdirAll(filepath.Dir(doc), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(doc, []byte("# Memory\n\nMateway keeps proposals review-only before commit.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(root, "skills", "doc-review")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skillText := `---
+name: doc-review
+description: Review docs
+stage: planning
+when_contains: [总结, 文档, memory]
+---
+
+Check doc evidence before summarizing.
+`
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		plan: model.Plan{
+			Summary: "generic",
+			Steps: []model.PlanStep{{
+				ID:   "s1",
+				Tool: "time.now",
+				Args: map[string]string{},
+			}},
+		},
+		repairPlan: model.Plan{
+			Summary: "read doc, verify evidence, then summarize",
+			Steps: []model.PlanStep{{
+				ID:   "s1",
+				Tool: "file.summary",
+				Args: map[string]string{"path": doc},
+			}},
+		},
+		synthesizeText: "done",
+	}
+	rt := Runtime{
+		Model:     fp,
+		Tools:     tool.NewBuiltinRegistry(),
+		Skills:    skill.NewBuiltinRegistry(),
+		ToolCtx:   tool.Context{ProjectRoot: root, Workspace: root, AllowedRoots: []string{root}},
+		MaxSteps:  6,
+		Acceptors: NewAcceptanceRegistry(),
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: root},
+			Agents: config.AgentsConfig{Default: "main"},
+			Learning: config.LearningConfig{
+				Enabled:              true,
+				SkillCrystallization: config.SkillCrystallizationConfig{Enabled: true, SuccessThreshold: 3, RequireUserConfirm: true},
+			},
+		},
+		Sessions: session.NewFileStore(filepath.Join(root, "run", "sessions")),
+		Memory:   memory.NewStore(root),
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:skill-improve",
+		Channel:    "cli",
+		Text:       "请总结当前 memory 设计，控制在两句话",
+	})
+	if err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected successful repaired response, got %#v", resp)
+	}
+	matches, err := filepath.Glob(filepath.Join(root, "memory", "agents", "main", "inbox", "skill-improvement-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one skill improvement proposal, got %v", matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"type: skill_improvement",
+		"# Proposed Skill Improvement: doc-review",
+		"Repair reason:",
+		"Previous plan summary: generic",
+		"Repaired plan summary: read doc, verify evidence, then summarize",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected skill improvement proposal to contain %q, got:\n%s", want, text)
+		}
+	}
+}
+
+func TestDirectSkillPromoteCommand(t *testing.T) {
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	cfg := memory.LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	path, err := store.ProcessTask(memory.TaskOutcome{
+		AgentID:     "main",
+		TraceID:     "trace-1",
+		TaskID:      "task-1",
+		Intent:      "review latest release notes",
+		PlanSummary: "review release notes",
+		Tools:       []string{"web.search", "file.summary"},
+		Success:     true,
+		FinishedAt:  time.Now(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:skill-promote",
+		Channel:    "cli",
+		Text:       "mateway skill promote --proposal " + path.CandidatePath + " --name release-review",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "Skill promoted:") || !strings.Contains(resp.Reply.Text, "next planning turn") {
+		t.Fatalf("expected direct skill promote success, got %#v", resp)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "skills", "release-review", "SKILL.md")); err != nil {
+		t.Fatalf("expected promoted skill file: %v", err)
+	}
+}
+
+func TestDirectMemoryReviewCommand(t *testing.T) {
+	workspace := t.TempDir()
+	longDir := filepath.Join(workspace, "memory", "agents", "main", "long")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := `---
+type: decision
+scope: agent
+status: active
+sources:
+  - manual
+confidence: medium
+created_at: 2026-03-01
+updated_at: 2026-03-01
+---
+
+# Stale Memory
+
+Old decision note.
+`
+	if err := os.WriteFile(filepath.Join(longDir, "decision-stale-memory.md"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:memory-review",
+		Channel:    "cli",
+		Text:       "mateway memory review --review stale --kind decision",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "Long memory review queue") || !strings.Contains(resp.Reply.Text, "Stale Memory") {
+		t.Fatalf("expected direct memory review success, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "下一步：") || !strings.Contains(resp.Reply.Text, "--proposal") {
+		t.Fatalf("expected review next-step hint, got %q", resp.Reply.Text)
+	}
+
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:memory-review-proposal",
+		Channel:    "cli",
+		Text:       "mateway memory review --review stale --proposal",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "Long memory review proposal written:") {
+		t.Fatalf("expected direct memory review proposal success, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "mateway memory list --area inbox --status proposed") {
+		t.Fatalf("expected proposal follow-up hint, got %q", resp.Reply.Text)
+	}
+}
+
+func TestDirectMemoryHelpCommand(t *testing.T) {
+	rt := Runtime{
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:memory-help",
+		Channel:    "cli",
+		Text:       "mateway memory",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "第一批一等 memory 直达命令") {
+		t.Fatalf("expected memory help output, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "命令帮助：`mateway memory`") {
+		t.Fatalf("expected help header, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "commit`、`reject` 会修改 memory 状态") {
+		t.Fatalf("expected confirmation boundary in help, got %q", resp.Reply.Text)
+	}
+}
+
+func TestDirectMemoryErrorUsesUnfinishedHeader(t *testing.T) {
+	rt := Runtime{
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:memory-error",
+		Channel:    "cli",
+		Text:       "mateway memory show",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "命令未完成：`mateway memory show`") {
+		t.Fatalf("expected unfinished command header, got %#v", resp)
+	}
+	if strings.Contains(resp.Reply.Text, "下一步：") {
+		t.Fatalf("expected usage error to omit next-step hint, got %q", resp.Reply.Text)
+	}
+}
+
+func TestDirectMemoryUnknownSubcommandDoesNotFallBackToPlanner(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:memory-unknown",
+		Channel:    "cli",
+		Text:       "mateway memory wat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected unknown direct command not to call planner, got %d", fp.planCalls)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "命令未完成：`mateway memory wat`") || !strings.Contains(resp.Reply.Text, "unknown memory command") {
+		t.Fatalf("expected direct unknown command error, got %#v", resp)
+	}
+}
+
+func TestDirectKnownNamespacesDoNotFallBackToPlannerOnUsageErrors(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Home: t.TempDir(), Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	cases := []struct {
+		text string
+		want string
+	}{
+		{text: "mateway schedule wat", want: "unknown schedule command"},
+		{text: "mateway heartbeat wat", want: "unknown heartbeat command"},
+		{text: "mateway trace", want: "用法：`mateway trace show <trace_id> [--raw]`"},
+	}
+	for _, tc := range cases {
+		resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+			SessionKey: "cli:known-namespace-" + strings.ReplaceAll(tc.text, " ", "-"),
+			Channel:    "cli",
+			Text:       tc.text,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(resp.Reply.Text, tc.want) {
+			t.Fatalf("expected %q for %q, got %q", tc.want, tc.text, resp.Reply.Text)
+		}
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected known namespace usage errors not to call planner, got %d", fp.planCalls)
+	}
+}
+
+func TestDirectTopLevelMatewayCommandsDoNotFallBackToPlanner(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Home: t.TempDir(), Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	cases := []struct {
+		text string
+		want string
+	}{
+		{text: "mateway doctor", want: "请在本机终端运行"},
+		{text: "mateway ask hello", want: "不会嵌套执行"},
+		{text: "mateway init", want: "会初始化本机"},
+		{text: "mateway nope", want: "unknown mateway command"},
+	}
+	for _, tc := range cases {
+		resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+			SessionKey: "cli:top-command-" + strings.ReplaceAll(tc.text, " ", "-"),
+			Channel:    "cli",
+			Text:       tc.text,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(resp.Reply.Text, tc.want) {
+			t.Fatalf("expected %q for %q, got %q", tc.want, tc.text, resp.Reply.Text)
+		}
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected mateway top-level commands not to call planner, got %d", fp.planCalls)
+	}
+}
+
+func TestDirectSkillPromoteAddsNextStepHint(t *testing.T) {
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	cfg := memory.LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	path, err := store.ProcessTask(memory.TaskOutcome{
+		AgentID:     "main",
+		TraceID:     "trace-1",
+		TaskID:      "task-1",
+		Intent:      "review latest release notes",
+		PlanSummary: "review release notes",
+		Tools:       []string{"web.search", "file.summary"},
+		Success:     true,
+		FinishedAt:  time.Now(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:skill-promote-hint",
+		Channel:    "cli",
+		Text:       "mateway skill promote --proposal " + path.CandidatePath + " --name release-review",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "Skill promoted:") {
+		t.Fatalf("expected direct skill promote success, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "mateway skill list") || !strings.Contains(resp.Reply.Text, "下一次 planning turn 会自动重载") {
+		t.Fatalf("expected promote next-step hint, got %q", resp.Reply.Text)
+	}
+}
+
+func TestDirectMemoryListAndShowRouteSkillCandidateToPromote(t *testing.T) {
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	cfg := memory.LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	path, err := store.ProcessTask(memory.TaskOutcome{
+		AgentID:     "main",
+		TraceID:     "trace-1",
+		TaskID:      "task-1",
+		Intent:      "review latest release notes",
+		PlanSummary: "review release notes",
+		Tools:       []string{"web.search", "file.summary"},
+		Success:     true,
+		FinishedAt:  time.Now(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateID := strings.TrimSuffix(filepath.Base(path.CandidatePath), filepath.Ext(path.CandidatePath))
+	rt := Runtime{
+		Model:    &fakePlanner{},
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:skill-candidate-list",
+		Channel:    "cli",
+		Text:       "mateway memory list --area inbox --status proposed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "mateway skill promote --proposal "+candidateID) {
+		t.Fatalf("expected skill candidate list to suggest promote, got %#v", resp)
+	}
+	if strings.Contains(resp.Reply.Text, "mateway memory commit --proposal "+candidateID) {
+		t.Fatalf("expected skill candidate list not to suggest memory commit, got %q", resp.Reply.Text)
+	}
+
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{
+		SessionKey: "cli:skill-candidate-show",
+		Channel:    "cli",
+		Text:       "mateway memory show " + candidateID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "mateway skill promote --proposal "+candidateID) {
+		t.Fatalf("expected skill candidate show to suggest promote, got %#v", resp)
+	}
+	if strings.Contains(resp.Reply.Text, "mateway memory commit --proposal "+candidateID) {
+		t.Fatalf("expected skill candidate show not to suggest memory commit, got %q", resp.Reply.Text)
 	}
 }
 
@@ -1541,7 +2230,7 @@ func TestRuntimeInjectsShortMemoryIntoModelContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompt := fp.lastPlanSkillPrompt
+	prompt := fp.firstPlanSkillPrompt
 	if !strings.Contains(prompt, "Short memory:") {
 		t.Fatalf("expected short memory section, got %q", prompt)
 	}
@@ -1553,6 +2242,95 @@ func TestRuntimeInjectsShortMemoryIntoModelContext(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "Known artifacts:") || !strings.Contains(prompt, "/tmp/report.md") {
 		t.Fatalf("expected artifact summary in short memory, got %q", prompt)
+	}
+}
+
+func TestRepairUsesFocusedShortMemory(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "initial", Understanding: model.UnderstandingJSON{Goal: "continue task", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "web.search", Args: map[string]string{"query": "latest updates"},
+		}}},
+		repairPlan: model.Plan{Summary: "repair", Understanding: model.UnderstandingJSON{Goal: "continue task", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "r1", Tool: "time.now", Args: map[string]string{},
+		}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	now := time.Now()
+	if err := store.Save(session.State{
+		SessionKey:   "cli:repair-memory",
+		Channel:      "cli",
+		UserID:       "local",
+		ThreadID:     "cli",
+		ActiveTaskID: "task-1",
+		TaskOrder:    []string{"task-2", "task-1"},
+		Tasks: map[string]session.TaskState{
+			"task-1": {
+				ID:            "task-1",
+				Status:        session.TaskOpen,
+				Topic:         "项目复盘",
+				UserText:      "总结当前项目",
+				ResolvedQuery: "总结当前项目并列出下一步",
+				PlanSummary:   "read project docs",
+				StepOrder:     []string{"s1", "s2"},
+				StepStates: map[string]session.StepState{
+					"s1": {ID: "s1", Tool: "file.read", Status: "passed", AcceptanceStatus: "passed", ResultSummary: "read README"},
+					"s2": {ID: "s2", Tool: "web.search", Status: "failed", ResultError: "timeout"},
+				},
+				Artifacts: []session.Artifact{{
+					Kind:  "file",
+					Path:  "/tmp/report.md",
+					Label: "项目复盘文档",
+				}},
+				UpdatedAt: now,
+			},
+			"task-2": {
+				ID:            "task-2",
+				Status:        session.TaskOpen,
+				Topic:         "旁路线索",
+				UserText:      "查一下旧问题",
+				ResolvedQuery: "查一下旧问题",
+				PlanSummary:   "inspect old issue",
+				Artifacts: []session.Artifact{{
+					Kind:  "file",
+					Path:  "/tmp/other.md",
+					Label: "旧问题记录",
+				}},
+				UpdatedAt: now,
+			},
+		},
+		RecentTurns: []session.Turn{
+			{Role: "user", Text: "上一轮问题", At: now.Add(-time.Minute)},
+			{Role: "assistant", Text: "上一轮回答", At: now},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:repair-memory",
+		Text:       "继续当前任务",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := fp.lastRepairSkillPrompt
+	if !strings.Contains(prompt, "Short memory:") || !strings.Contains(prompt, "Current step focus:") || !strings.Contains(prompt, "s2 status=failed tool=web.search") {
+		t.Fatalf("expected focused repair short memory, got %q", prompt)
+	}
+	if strings.Contains(prompt, "Current execution progress:") {
+		t.Fatalf("expected repair prompt to omit duplicated execution progress, got %q", prompt)
+	}
+	for _, banned := range []string{
+		"Recent turns:",
+		"Open tasks:",
+		"/tmp/other.md",
+	} {
+		if strings.Contains(prompt, banned) {
+			t.Fatalf("expected repair short memory to omit %q, got %q", banned, prompt)
+		}
 	}
 }
 
@@ -1603,6 +2381,63 @@ func TestRuntimeInjectsRelevantLongMemoryIntoModelContext(t *testing.T) {
 	}
 	if !strings.Contains(fp.lastPlanSkillPrompt, "lines:") {
 		t.Fatalf("expected long memory line evidence, got %q", fp.lastPlanSkillPrompt)
+	}
+}
+
+func TestRuntimeSkipsSourceTypeLongMemoryInPromptInjection(t *testing.T) {
+	workspace := t.TempDir()
+	longDir := filepath.Join(workspace, "memory", "agents", "main", "long")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(longDir, "search-source.md")
+	sourceText := `---
+type: source
+scope: agent
+owner_agent: main
+visibility: private
+status: active
+tags: [memory]
+aliases: []
+sources:
+  - manual
+confidence: low
+created_at: 2026-05-25
+updated_at: 2026-05-25
+---
+
+# Search Source
+
+This source note mentions durable memory in Markdown files.
+`
+	if err := os.WriteFile(sourcePath, []byte(sourceText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "answer memory question", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:long-memory-source",
+		Text:       "How does Mateway store memory?",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fp.lastPlanSkillPrompt, "Relevant long memory:") {
+		t.Fatalf("expected source-type long memory to stay out of prompt injection, got %q", fp.lastPlanSkillPrompt)
 	}
 }
 
@@ -1892,6 +2727,171 @@ func TestBuildModelContextPromptIncludesCurrentExecutionProgress(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected prompt to contain %q, got %q", want, prompt)
 		}
+	}
+}
+
+func TestBuildModelContextPromptShrinksSynthesisContext(t *testing.T) {
+	prompt := buildModelContextPrompt("请总结结果", skill.StageSynthesis, []skill.Match{{
+		Definition: skill.Definition{Name: "chinese-summary", Instruction: "请输出自然中文总结"},
+	}}, []tool.Definition{{
+		Name:        "web.search",
+		Description: "Search the web",
+	}}, tool.Context{}, promptContextOptions{
+		ShortMemory: "recent context",
+		LongMemory:  "durable memory",
+		Understanding: taskUnderstanding{
+			Goal: "总结结果",
+		},
+	})
+	for _, banned := range []string{
+		"Current date:",
+		"Current environment:",
+		"Short memory:",
+		"Relevant long memory:",
+		"Task understanding:",
+		"Available tools:",
+		"Selected skills:",
+		"Current user request:",
+	} {
+		if strings.Contains(prompt, banned) {
+			t.Fatalf("expected synthesis prompt to omit %q, got:\n%s", banned, prompt)
+		}
+	}
+	for _, want := range []string{
+		"Core objective:",
+		"Current stage:",
+		string(skill.StageSynthesis),
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected synthesis prompt to keep %q, got:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildModelContextPromptShrinksRepairUnderstanding(t *testing.T) {
+	prompt := buildModelContextPrompt("继续修复任务", skill.StagePlanningRepair, nil, nil, tool.Context{}, promptContextOptions{
+		Understanding: taskUnderstanding{
+			Goal:            "finish the remaining fix",
+			Constraints:     []string{"previous step timed out", "missing required path"},
+			Capabilities:    []string{"search_web", "patch_file"},
+			CompletionDraft: []string{"obtain the missing path", "complete the patch safely"},
+			EvidenceHints:   []string{"query", "provider", "line range"},
+			RiskLevel:       "guarded_mutation",
+			NeedsGrounding:  true,
+			NeedsMutation:   true,
+		},
+	})
+	for _, want := range []string{
+		"Task understanding:",
+		"remaining_goal: finish the remaining fix",
+		"failure_reason: previous step timed out | missing required path",
+		"completion_delta: obtain the missing path | complete the patch safely",
+		"risk_level: guarded_mutation",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected repair prompt to contain %q, got:\n%s", want, prompt)
+		}
+	}
+	for _, banned := range []string{
+		"capabilities:",
+		"evidence_hints:",
+		"needs_grounding:",
+		"needs_mutation:",
+		"completion_draft:",
+		"- goal:",
+	} {
+		if strings.Contains(prompt, banned) {
+			t.Fatalf("expected repair prompt to omit %q, got:\n%s", banned, prompt)
+		}
+	}
+}
+
+func TestBuildStageModelPromptSeparatesSkillsContext(t *testing.T) {
+	text := buildStageModelPrompt("Current stage:\nplanning", []skill.Definition{{
+		Name:        "doc-review",
+		Description: "Review docs",
+		Instruction: "Focus on docs.",
+	}})
+	for _, want := range []string{
+		"Current stage:",
+		"Skills context:",
+		"Selected skills:",
+		"doc-review",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected structured model prompt to contain %q, got %q", want, text)
+		}
+	}
+}
+
+func TestRepairUsesWiderCandidateToolSubset(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "initial", Understanding: model.UnderstandingJSON{Goal: "diagnose local tool", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "missing-cmd"}, Risk: string(tool.RiskSafeRead),
+		}}},
+		repairPlan: model.Plan{Summary: "repair", Understanding: model.UnderstandingJSON{Goal: "diagnose local tool", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "r1", Tool: "time.now", Args: map[string]string{},
+		}}},
+	}
+	reg := tool.NewRegistry()
+	for _, name := range []string{"time.now", "terminal.run", "project.index", "web.search", "web.fetch", "file.read", "file.summary", "memory.search", "config.summary"} {
+		def, _ := tool.NewBuiltinRegistry().Get(name)
+		reg.Register(def)
+	}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "帮我诊断一下当前工具为什么不可用"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.lastPlanTools) == 0 || len(fp.lastPlanTools) > planningCandidateBudget {
+		t.Fatalf("expected planning subset <= %d, got %v", planningCandidateBudget, fp.lastPlanTools)
+	}
+	if len(fp.lastRepairTools) == 0 || len(fp.lastRepairTools) > repairCandidateBudget {
+		t.Fatalf("expected repair subset <= %d, got %v", repairCandidateBudget, fp.lastRepairTools)
+	}
+	if len(fp.lastRepairTools) <= len(fp.lastPlanTools) {
+		t.Fatalf("expected repair candidates wider than planning, plan=%v repair=%v", fp.lastPlanTools, fp.lastRepairTools)
+	}
+	if strings.Contains(fp.lastRepairSkillPrompt, "Relevant long memory:") {
+		t.Fatalf("expected repair prompt to omit long memory, got %q", fp.lastRepairSkillPrompt)
+	}
+}
+
+func TestRepairUsesWiderSkillSubset(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "initial", Understanding: model.UnderstandingJSON{Goal: "search latest updates", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "s1", Tool: "web.search", Args: map[string]string{"query": "latest updates"},
+		}}},
+		repairPlan: model.Plan{Summary: "repair", Understanding: model.UnderstandingJSON{Goal: "search latest updates", RiskLevel: "safe_read"}, Steps: []model.PlanStep{{
+			ID: "r1", Tool: "time.now", Args: map[string]string{},
+		}}},
+		finalAcceptText: `{"status":"accepted","reason":"ok"}`,
+	}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{Name: "web.search", Description: "web", Risk: tool.RiskSafeRead, Run: func(ctx context.Context, call tool.Call) tool.Result {
+		return tool.Result{OK: false, Error: "timeout", Output: "timeout"}
+	}})
+	reg.Register(tool.TimeNow())
+	skills := skill.NewRegistry()
+	for i, name := range []string{"skill-a", "skill-b", "skill-c", "skill-d", "skill-e"} {
+		skills.Register(skill.Definition{Name: name, Stage: skill.StagePlanning, Priority: i + 1, WhenContains: []string{"latest"}})
+	}
+	rt := Runtime{Model: fp, Tools: reg, Skills: skills, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Acceptors: NewAcceptanceRegistry()}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "search latest updates"}); err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(fp.firstPlanSkillPrompt, "- skill-"); count != 2 {
+		t.Fatalf("expected 2 planning skills in prompt block, got %d\n%s", count, fp.firstPlanSkillPrompt)
+	}
+	if !strings.Contains(fp.firstPlanSkillPrompt, "Skills context:") {
+		t.Fatalf("expected planning prompt to separate skills context, got %q", fp.firstPlanSkillPrompt)
+	}
+	if count := strings.Count(fp.lastRepairSkillPrompt, "- skill-"); count != 4 {
+		t.Fatalf("expected 4 repair skills in prompt block, got %d\n%s", count, fp.lastRepairSkillPrompt)
+	}
+	if !strings.Contains(fp.lastRepairSkillPrompt, "Skills context:") {
+		t.Fatalf("expected repair prompt to separate skills context, got %q", fp.lastRepairSkillPrompt)
 	}
 }
 
@@ -2515,6 +3515,267 @@ func TestRuntimeSoftwareInstallRunsWhenPlannerSelectsInstallTool(t *testing.T) {
 	}
 }
 
+func TestRuntimeReloadsWorkspaceSkillsAfterInstall(t *testing.T) {
+	workspace := t.TempDir()
+	skillDir := filepath.Join(workspace, "skills", "agent-browser")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skillBody := `---
+name: agent-browser
+description: Browser automation CLI for AI agents.
+stage: planning
+priority: 9
+when_contains: [打开, 网页, 网站, 截图, browser, screenshot]
+---
+
+# agent-browser
+
+Before browser actions, load the real workflow with:
+
+agent-browser skills get core
+`
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "use browser", Steps: []model.PlanStep{{
+			ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "printf ok"},
+		}}},
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		Skills:   skill.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace, AllowedRoots: []string{workspace}},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:reload-skill",
+		Text:       "帮我打开百度并截图",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "agent-browser") {
+		t.Fatalf("expected runtime to reload installed workspace skill, got %q", fp.lastPlanSkillPrompt)
+	}
+	if !strings.Contains(fp.lastPlanSkillPrompt, "agent-browser skills get core") {
+		t.Fatalf("expected skill instruction in planning prompt, got %q", fp.lastPlanSkillPrompt)
+	}
+}
+
+func TestRuntimeDoesNotReusePassedStepsFromFailedTaskOnRetry(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "use browser", Steps: []model.PlanStep{{
+			ID: "step-1", Tool: "terminal.run", Args: map[string]string{"command": "printf fresh-run"},
+		}}},
+		finalAcceptText: `{"status":"accepted","reason":"ok"}`,
+	}
+	calls := 0
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "terminal.run",
+		Metadata: tool.Metadata{
+			AcceptanceMode: tool.AcceptanceCodeOnly,
+			ResourceScope:  "terminal:command",
+		},
+		ArgsSchema: map[string]string{"command": "command"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			calls++
+			return tool.Result{
+				OK:     true,
+				Output: "fresh-run",
+				Evidence: map[string]any{
+					"kind":      "terminal",
+					"exit_code": 0,
+					"stdout":    "fresh-run",
+				},
+			}
+		},
+	})
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	now := time.Now()
+	if err := store.Save(session.State{
+		SessionKey:   "cli:retry-failed",
+		Channel:      "cli",
+		UserID:       "local",
+		ThreadID:     "cli",
+		ActiveTaskID: "task-failed",
+		TaskOrder:    []string{"task-failed"},
+		Tasks: map[string]session.TaskState{
+			"task-failed": {
+				ID:              "task-failed",
+				TraceID:         "task-failed",
+				Topic:           "打开百度并截图",
+				UserText:        "帮我打开百度并截图",
+				ResolvedQuery:   "帮我打开百度并截图",
+				PlanSummary:     "old failed browser run",
+				ToolNames:       []string{"terminal.run"},
+				Status:          session.TaskFailed,
+				Failed:          true,
+				ExecutionStatus: "failed",
+				StepOrder:       []string{"step-1"},
+				StepStates: map[string]session.StepState{
+					"step-1": {
+						ID:            "step-1",
+						Tool:          "terminal.run",
+						Status:        "passed",
+						ResultOK:      true,
+						ResultSummary: "old-version-only-output",
+						Evidence: map[string]any{
+							"kind":      "terminal",
+							"exit_code": 0,
+							"stdout":    "old-version-only-output",
+						},
+					},
+					"step-2": {
+						ID:          "step-2",
+						Tool:        "terminal.run",
+						Status:      "failed",
+						ResultOK:    false,
+						ResultError: "step_verification_failed",
+					},
+				},
+				UpdatedAt:  now,
+				StartedAt:  now.Add(-time.Minute),
+				FinishedAt: now.Add(-time.Second),
+			},
+		},
+		RecentTurns: []session.Turn{
+			{Role: "user", Text: "帮我打开百度并截图", At: now.Add(-time.Minute)},
+			{Role: "assistant", Text: "任务失败了", At: now.Add(-time.Second)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    reg,
+		ToolCtx:  tool.Context{ProjectRoot: "."},
+		MaxSteps: 6,
+		Sessions: store,
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:retry-failed",
+		Text:       "帮我打开百度并截图",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected retry to execute terminal.run again instead of reusing passed step from failed task, calls=%d", calls)
+	}
+}
+
+func TestRuntimeDoesNotReusePassedOnlyStepsWhenTaskStatusIsFailed(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "use browser", Steps: []model.PlanStep{{
+			ID: "step-1", Tool: "terminal.run", Args: map[string]string{"command": "printf rerun-open"},
+		}, {
+			ID: "step-2", Tool: "terminal.run", Args: map[string]string{"command": "printf rerun-shot"},
+		}}},
+		finalAcceptText: `{"status":"accepted","reason":"ok"}`,
+	}
+	calls := 0
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "terminal.run",
+		Metadata: tool.Metadata{
+			AcceptanceMode: tool.AcceptanceCodeOnly,
+			ResourceScope:  "terminal:command",
+		},
+		ArgsSchema: map[string]string{"command": "command"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			calls++
+			out := call.Args["command"]
+			return tool.Result{
+				OK:     true,
+				Output: out,
+				Evidence: map[string]any{
+					"kind":      "terminal",
+					"exit_code": 0,
+					"stdout":    out,
+				},
+			}
+		},
+	})
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	now := time.Now()
+	if err := store.Save(session.State{
+		SessionKey:   "cli:retry-failed-passed-only",
+		Channel:      "cli",
+		UserID:       "local",
+		ThreadID:     "cli",
+		ActiveTaskID: "task-failed",
+		TaskOrder:    []string{"task-failed"},
+		Tasks: map[string]session.TaskState{
+			"task-failed": {
+				ID:              "task-failed",
+				TraceID:         "task-failed",
+				Topic:           "打开百度并截图",
+				UserText:        "帮我打开百度并截图",
+				ResolvedQuery:   "帮我打开百度并截图",
+				PlanSummary:     "old failed browser run",
+				ToolNames:       []string{"terminal.run"},
+				Status:          session.TaskFailed,
+				Failed:          true,
+				ExecutionStatus: "failed",
+				StepOrder:       []string{"step-1"},
+				StepStates: map[string]session.StepState{
+					"step-1": {
+						ID:            "step-1",
+						Tool:          "terminal.run",
+						Status:        "passed",
+						ResultOK:      true,
+						ResultSummary: "old-verify-output",
+						Evidence: map[string]any{
+							"kind":      "terminal",
+							"exit_code": 0,
+							"stdout":    "old-verify-output",
+						},
+					},
+				},
+				UpdatedAt:  now,
+				StartedAt:  now.Add(-time.Minute),
+				FinishedAt: now.Add(-time.Second),
+			},
+		},
+		RecentTurns: []session.Turn{
+			{Role: "user", Text: "帮我打开百度并截图", At: now.Add(-time.Minute)},
+			{Role: "assistant", Text: "任务失败了", At: now.Add(-time.Second)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    reg,
+		ToolCtx:  tool.Context{ProjectRoot: "."},
+		MaxSteps: 6,
+		Sessions: store,
+	}
+	rt.Logger.Quiet = true
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:retry-failed-passed-only",
+		Text:       "帮我打开百度并截图",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected failed task retry to execute both new steps instead of reusing stale passed step, calls=%d", calls)
+	}
+}
+
 func TestRuntimeHistoricalContinuationCreatesNewTask(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "history", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
@@ -2697,6 +3958,412 @@ func TestRuntimeDirectlyAnswersGenericRecentArtifactPathLookup(t *testing.T) {
 	}
 	if !strings.Contains(resp.Reply.Text, "/Users/dongping/project/mateway/docs/当前功能体系.md") {
 		t.Fatalf("expected artifact path in reply, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDirectlyExecutesMatewayMemoryListCommand(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	proposal, err := store.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Scope:   "agent",
+		Type:    "note",
+		Title:   "Inbox note",
+		Body:    "remember this",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(t.TempDir(), "sessions")),
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "mateway memory list --area inbox --status proposed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected direct memory list without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "已执行命令：`mateway memory list --area inbox --status proposed`") {
+		t.Fatalf("expected executed command header, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "Inbox note") || !strings.Contains(resp.Reply.Text, "proposed") {
+		t.Fatalf("expected memory list output, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "mateway memory show "+proposal.ID) || !strings.Contains(resp.Reply.Text, "mateway memory commit --proposal "+proposal.ID) {
+		t.Fatalf("expected actionable inbox workflow hints, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDirectGatewayStatusReturnsCommandNote(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:gateway-note",
+		Text:       "mateway gateway status",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected gateway status note without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "命令说明：`mateway gateway status`") {
+		t.Fatalf("expected command note header, got %q", resp.Reply.Text)
+	}
+	if strings.Contains(resp.Reply.Text, "已执行命令：") {
+		t.Fatalf("expected gateway note not to claim execution, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "不会安装开机自启动") || !strings.Contains(resp.Reply.Text, "OS service") {
+		t.Fatalf("expected service boundary explanation, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDirectGatewayServiceCommandDoesNotFallBackToPlanner(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: t.TempDir()},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:gateway-start-note",
+		Text:       "mateway gateway start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected gateway start note without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "命令说明：`mateway gateway start`") || !strings.Contains(resp.Reply.Text, "请在本机终端运行") {
+		t.Fatalf("expected gateway start note, got %q", resp.Reply.Text)
+	}
+
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "cli",
+		UserID:     "local",
+		SessionKey: "cli:gateway-unknown",
+		Text:       "mateway gateway install",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected unknown gateway command not to call planner, got %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "命令未完成：`mateway gateway install`") || !strings.Contains(resp.Reply.Text, "unknown gateway command") {
+		t.Fatalf("expected gateway unknown error, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDirectlyExecutesMatewayMemoryShowCommand(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	written, err := store.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Scope:   "agent",
+		Type:    "note",
+		Title:   "Review me",
+		Body:    "proposal body",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(t.TempDir(), "sessions")),
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "mateway memory show " + written.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected direct memory show without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "Review me") || !strings.Contains(resp.Reply.Text, "proposal body") {
+		t.Fatalf("expected memory show output, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "Memory item: "+written.ID) || !strings.Contains(resp.Reply.Text, "mateway memory commit --proposal "+written.ID) {
+		t.Fatalf("expected actionable show output, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeMatewayMemoryCommitRequiresApprovalThenExecutes(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	written, err := store.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Scope:   "agent",
+		Type:    "note",
+		Title:   "Guard me",
+		Body:    "do not auto commit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(t.TempDir(), "sessions")),
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "mateway memory commit --proposal " + written.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected approval pending, got %#v", resp)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected guarded direct path without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "执行前需要你确认") {
+		t.Fatalf("expected approval prompt, got %q", resp.Reply.Text)
+	}
+	item, err := store.Show("main", written.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(item.Text, "status: proposed") {
+		t.Fatalf("expected proposal to remain proposed, got %q", item.Text)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "确认",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected approved commit to run, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "Memory committed:") {
+		t.Fatalf("expected commit output, got %q", resp.Reply.Text)
+	}
+	item, err = store.Show("main", written.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(item.Text, "status: committed") {
+		t.Fatalf("expected proposal to become committed, got %q", item.Text)
+	}
+	longItems, err := store.List(memory.ListOptions{AgentID: "main", Area: "long", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range longItems {
+		if strings.Contains(entry.Title, "Guard me") && entry.Kind == "note" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected committed memory entry in long memory list, got %#v", longItems)
+	}
+}
+
+func TestRuntimeMatewayMemoryRejectRequiresApprovalThenExecutes(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	written, err := store.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Scope:   "agent",
+		Type:    "note",
+		Title:   "Reject me",
+		Body:    "reject body",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(t.TempDir(), "sessions")),
+		Memory:   store,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "mateway memory reject --proposal " + written.ID + " --reason duplicate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected approval pending, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "同意",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected approved reject to run, got %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "Memory proposal rejected:") {
+		t.Fatalf("expected reject output, got %q", resp.Reply.Text)
+	}
+	item, err := store.Show("main", written.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(item.Text, "status: rejected") {
+		t.Fatalf("expected proposal to become rejected, got %q", item.Text)
+	}
+}
+
+func TestRuntimeDirectlyExecutesReferencedMatewayCommandFromAssistantTurn(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	workspace := t.TempDir()
+	memStore := memory.NewStore(workspace)
+	if _, err := memStore.Propose(memory.ProposalInput{
+		AgentID: "main",
+		Scope:   "agent",
+		Type:    "note",
+		Title:   "Inbox note",
+		Body:    "remember this",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessStore := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	now := time.Now()
+	if err := sessStore.Save(session.State{
+		SessionKey: "cli:cli",
+		RecentTurns: []session.Turn{
+			{Role: "assistant", Text: "可以用 `mateway memory list --area inbox --status proposed` 查看。", At: now.Add(-time.Minute)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: sessStore,
+		Memory:   memStore,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "执行上一条命令",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected referenced command direct execution without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "已执行命令：`mateway memory list --area inbox --status proposed`") {
+		t.Fatalf("expected referenced command header, got %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "Inbox note") {
+		t.Fatalf("expected referenced memory list output, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeDirectlyExecutesMatewayScheduleListCommand(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now"}}},
+	}
+	home := t.TempDir()
+	store := schedule.NewStore(home)
+	if _, _, err := store.Create(schedule.CreateInput{
+		ID:           "daily-sync",
+		Title:        "Daily Sync",
+		Prompt:       "send summary",
+		AgentID:      "main",
+		DailyAt:      "09:00",
+		Channel:      "cli",
+		ThreadID:     "cli",
+		UserID:       "local",
+		DeliveryMode: "artifact",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: ".", Home: home, Workspace: filepath.Join(home, "workspace")},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(t.TempDir(), "sessions")),
+		Memory:   memory.NewStore(filepath.Join(home, "workspace")),
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:cli",
+		Text: "mateway schedule list",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected direct schedule list without planning, got plan calls %d", fp.planCalls)
+	}
+	if !strings.Contains(resp.Reply.Text, "daily-sync") || !strings.Contains(resp.Reply.Text, "Daily Sync") {
+		t.Fatalf("expected schedule list output, got %q", resp.Reply.Text)
 	}
 }
 

@@ -91,6 +91,7 @@ func TestPlanVerifierWarnsWhenSuccessCriteriaDoNotAlignWithUnderstandingCompleti
 	}
 }
 
+
 func TestPlanVerificationRepairGuidanceIncludesWarningsAndErrors(t *testing.T) {
 	verification := PlanVerification{
 		Warnings:           []string{"step-1: success_criteria is empty"},
@@ -122,6 +123,27 @@ func TestStepVerifierRejectsMissingExpectedEvidence(t *testing.T) {
 	got := verifyStepResult(step, result)
 	if !got.Blocking() || !containsVerificationError(got.Errors, "expected evidence") {
 		t.Fatalf("expected evidence error, got %#v", got)
+	}
+}
+
+func TestStepVerifierAcceptsWebFetchDocumentEvidence(t *testing.T) {
+	step := model.PlanStep{ID: "s1", Tool: "web.fetch", ExpectedEvidence: []string{"README 页面包含安装命令"}}
+	result := model.ToolResult{
+		StepID: "s1",
+		Tool:   "web.fetch",
+		OK:     true,
+		Output: "Fetched URL: https://raw.githubusercontent.com/larksuite/cli/main/README.md",
+		Evidence: map[string]any{
+			"kind":   "web_fetch",
+			"url":    "https://raw.githubusercontent.com/larksuite/cli/main/README.md",
+			"title":  "README",
+			"status": 200,
+			"bytes":  16468,
+		},
+	}
+	got := verifyStepResult(step, result)
+	if got.Blocking() {
+		t.Fatalf("expected web.fetch README evidence to pass, got %#v", got)
 	}
 }
 

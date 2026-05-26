@@ -148,6 +148,15 @@ func (r Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respon
 	return loop.Run(ctx)
 }
 
+func (r Runtime) currentSkills() *skill.Registry {
+	if strings.TrimSpace(r.ToolCtx.Workspace) != "" {
+		if reg, err := skill.LoadRegistry(r.ToolCtx.Workspace, "main"); err == nil && reg != nil {
+			return reg
+		}
+	}
+	return r.Skills
+}
+
 func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string, previousSteps map[string]session.StepState, previousResults []model.ToolResult) ([]model.ToolResult, string) {
 	var results []model.ToolResult
 	approvalConsumed := false
@@ -155,7 +164,14 @@ func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Pla
 	if r.MaxSteps > 0 && len(steps) > r.MaxSteps {
 		steps = steps[:r.MaxSteps]
 	}
-	completed := reusableResultsMap(previousSteps, previousResults)
+	reuseAllowed := true
+	for _, prev := range previousSteps {
+		if strings.TrimSpace(prev.Status) == "failed" {
+			reuseAllowed = false
+			break
+		}
+	}
+	completed := reusableResultsMap(previousSteps, previousResults, reuseAllowed)
 	for i := 0; i < len(steps); {
 		if failedDep := firstFailedDependency(steps[i], completed); failedDep != "" {
 			result := dependencyFailedResult(steps[i], failedDep)
@@ -168,7 +184,7 @@ func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Pla
 			i++
 			continue
 		}
-		if reused, ok := reuseStepResult(steps[i], completed); ok {
+		if reused, ok := reuseStepResult(steps[i], completed, r.Tools); ok {
 			results = append(results, reused)
 			completed[reused.StepID] = reused
 			i++
@@ -454,8 +470,11 @@ func (r Runtime) ExecutePlanForEval(ctx context.Context, traceID string, plan mo
 	return r.executePlan(ctx, traceID, plan, approvalGranted, approvedStepID, nil, nil)
 }
 
-func reusableResultsMap(previousSteps map[string]session.StepState, previousResults []model.ToolResult) map[string]model.ToolResult {
+func reusableResultsMap(previousSteps map[string]session.StepState, previousResults []model.ToolResult, allowReuse bool) map[string]model.ToolResult {
 	out := map[string]model.ToolResult{}
+	if !allowReuse {
+		return out
+	}
 	for id, prev := range previousSteps {
 		if prev.Status != "passed" && prev.Status != "usable" {
 			continue
@@ -478,7 +497,7 @@ func reusableResultsMap(previousSteps map[string]session.StepState, previousResu
 	return out
 }
 
-func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult) (model.ToolResult, bool) {
+func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult, registry *tool.Registry) (model.ToolResult, bool) {
 	if reusable == nil {
 		return model.ToolResult{}, false
 	}
@@ -493,18 +512,38 @@ func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult) 
 	if strings.TrimSpace(prev.Tool) != strings.TrimSpace(step.Tool) || !prev.OK {
 		return model.ToolResult{}, false
 	}
-	if !stepReusable(step, prev) {
+	if !stepReusable(step, prev, registry) {
 		return model.ToolResult{}, false
 	}
 	return prev, true
 }
 
-func stepReusable(step model.PlanStep, result model.ToolResult) bool {
-	switch strings.TrimSpace(step.Tool) {
-	case "time.now":
+func stepReusable(step model.PlanStep, result model.ToolResult, registry *tool.Registry) bool {
+	if registry != nil {
+		if def, ok := registry.Get(strings.TrimSpace(step.Tool)); ok {
+			if def.Metadata.ReusePolicy == tool.ReuseStableRead {
+				return len(result.Evidence) > 0
+			}
+			if def.Metadata.ReusePolicy == "" || def.Metadata.ReusePolicy == tool.ReuseNever {
+				return stableReadEvidence(result.Evidence)
+			}
+			return false
+		}
+	}
+	return stableReadEvidence(result.Evidence)
+}
+
+func stableReadEvidence(evidence map[string]any) bool {
+	if len(evidence) == 0 {
 		return false
 	}
-	return len(result.Evidence) > 0
+	kind, _ := evidence["kind"].(string)
+	switch strings.TrimSpace(kind) {
+	case "file_read", "file_summary", "project_index", "web_search", "web_fetch", "memory_search", "memory_index":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results []model.ToolResult, err error) Response {
@@ -579,6 +618,20 @@ func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
 			}
 			if source := strings.TrimSpace(args["source_url"]); source != "" {
 				text += "\n来源：" + source
+			}
+			return text + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
+		}
+	case "memory.commit":
+		proposal := firstNonEmpty(args["proposal"], args["id"], args["path"])
+		kind := strings.TrimSpace(args["type"])
+		target := strings.TrimSpace(args["target_hint"])
+		if proposal != "" {
+			text := "这条长期记忆提交可能会影响后续默认记忆注入，执行前需要你确认。\n\nProposal：" + proposal
+			if kind != "" {
+				text += "\n类型：" + kind
+			}
+			if target != "" {
+				text += "\n推荐落点：" + target
 			}
 			return text + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
 		}

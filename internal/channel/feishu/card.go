@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/dongping/mateway/internal/channel"
@@ -12,8 +13,132 @@ func renderReplyMessage(reply channel.OutboundMessage) (string, string, error) {
 	if text == "" {
 		text = "No content."
 	}
-	content, err := json.Marshal(map[string]string{"text": text})
-	return "text", string(content), err
+	return renderReplyCard(reply, text)
+}
+
+func renderReplyCard(reply channel.OutboundMessage, text string) (string, string, error) {
+	card := map[string]any{
+		"config": map[string]any{
+			"wide_screen_mode": true,
+			"enable_forward":   true,
+		},
+		"header": map[string]any{
+			"template": headerTemplateForStyle(reply.Style),
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": feishuCardTitle(reply),
+			},
+		},
+		"elements": buildCardElements(reply, text),
+	}
+	content, err := json.Marshal(card)
+	return "interactive", string(content), err
+}
+
+func buildCardElements(reply channel.OutboundMessage, text string) []map[string]any {
+	elements := []map[string]any{
+		{
+			"tag": "div",
+			"text": map[string]any{
+				"tag":     "lark_md",
+				"content": text,
+			},
+		},
+	}
+	if actions := approvalActions(reply.Style); len(actions) > 0 {
+		elements = append(elements, map[string]any{
+			"tag":     "action",
+			"actions": actions,
+		})
+	}
+	if note := cardFooterNote(reply.Style); note != "" {
+		elements = append(elements, map[string]any{
+			"tag": "note",
+			"elements": []map[string]any{
+				{
+					"tag":     "plain_text",
+					"content": note,
+				},
+			},
+		})
+	}
+	return elements
+}
+
+func approvalActions(style string) []map[string]any {
+	if strings.TrimSpace(style) != "approval_pending" {
+		return nil
+	}
+	return []map[string]any{
+		{
+			"tag":  "button",
+			"type": "primary",
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": "同意",
+			},
+			"value": map[string]any{
+				"mateway_action": "approval",
+				"decision":       "confirm",
+				"mateway_text":   "确认",
+			},
+		},
+		{
+			"tag":  "button",
+			"type": "default",
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": "拒绝",
+			},
+			"value": map[string]any{
+				"mateway_action": "approval",
+				"decision":       "cancel",
+				"mateway_text":   "取消",
+			},
+		},
+	}
+}
+
+func headerTemplateForStyle(style string) string {
+	switch strings.TrimSpace(style) {
+	case "approval_pending":
+		return "orange"
+	case "input_required":
+		return "blue"
+	case "error":
+		return "red"
+	default:
+		return "green"
+	}
+}
+
+func feishuCardTitle(reply channel.OutboundMessage) string {
+	if title := strings.TrimSpace(reply.Title); title != "" {
+		return title
+	}
+	switch strings.TrimSpace(reply.Style) {
+	case "approval_pending":
+		return "Mateway 等待确认"
+	case "input_required":
+		return "Mateway 需要补充信息"
+	case "error":
+		return "Mateway 执行失败"
+	default:
+		return "Mateway"
+	}
+}
+
+func cardFooterNote(style string) string {
+	switch strings.TrimSpace(style) {
+	case "approval_pending":
+		return "也可以直接回复“确认”或“取消”。"
+	case "input_required":
+		return "请直接回复消息补充所需信息。"
+	case "error":
+		return "任务已停在安全位置，可以补充信息后重试。"
+	default:
+		return fmt.Sprintf("状态：%s", firstNonEmpty(strings.TrimSpace(style), "completed"))
+	}
 }
 
 func sanitizeFeishuText(reply channel.OutboundMessage) string {

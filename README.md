@@ -6,6 +6,15 @@ Mateway is a lightweight Go runtime for building a practical personal or team ag
 
 It is designed for people who want an agent that can actually operate inside a local workspace and business chat, without starting from a heavy workflow platform.
 
+## Highlights
+
+- **Lightweight agent framework**: a compact single-agent runtime with session/task state, memory, tools, skills, schedule, heartbeat, CLI, and Feishu gateway.
+- **One runtime, multiple entries**: CLI, Feishu, and scheduled invocations all reuse the same agent loop instead of becoming separate products.
+- **Reviewable memory**: durable memory is Markdown-first, proposal-based, searchable, and governed through explicit `list -> show -> commit/reject` workflows.
+- **Clear tool boundaries**: risky writes, patches, and dangerous commands are guarded by confirmation, while read/review commands can run directly.
+- **Practical direct commands**: `mateway memory ...`, `mateway skill promote`, schedules, traces, heartbeat, and gateway status paths have stable CLI and runtime behavior.
+- **Extensible without becoming a platform**: add capability through tools, skills, and external command wrappers; traditional software can be integrated without a heavy connector system.
+
 ## Why Mateway
 
 Most agent demos are easy to start but hard to trust in daily work. Mateway focuses on a smaller, inspectable system:
@@ -17,7 +26,7 @@ Most agent demos are easy to start but hard to trust in daily work. Mateway focu
 - **Session-aware follow-up**: short memory tracks recent tasks, artifacts, pending confirmations, and follow-up context.
 - **Markdown-first memory**: durable memory is kept as reviewable Markdown, with evidence and an optional rebuildable index.
 - **User scheduled tasks**: create natural-language recurring tasks that run through the same runtime.
-- **Skill-oriented extension**: add capabilities through skills and future connector packages instead of hard-coding business systems.
+- **Skill-oriented extension**: add capabilities through skills, tools, and external command wrappers instead of hard-coding business systems.
 
 The core runtime loop stays intentionally small:
 
@@ -46,9 +55,8 @@ Implemented:
 
 Still evolving:
 
-- higher quality memory review and promotion workflows
-- connector scanning for external APIs and CLIs
 - multi-agent profile routing beyond the current configuration contract
+- optional custom tool contracts for teams that need deeper API or CLI integration
 - optional FTS5 or embedding-backed retrieval
 - packaging, release automation, and more production hardening
 
@@ -116,6 +124,8 @@ Start the gateway process:
 
 `gateway serve` is the foreground runtime process. Run it under LaunchAgent, systemd, or another service manager when you want Mateway to stay online.
 
+`gateway serve` does not install autostart by itself. `gateway start`, `gateway restart`, `gateway stop`, and `gateway status` are thin adapters for an already-registered OS service: launchd on macOS and `systemctl --user` on Linux. Create the LaunchAgent plist or systemd user unit separately if you want the gateway to start after login or reboot.
+
 ## Configuration
 
 Runtime configuration lives under `~/.mateway/config`.
@@ -174,15 +184,28 @@ mateway trace tail
 mateway trace show <trace_id>
 ```
 
+`gateway serve` runs in the foreground. The service-management commands only control an already-registered OS service; they do not create launchd or systemd autostart files.
+
 Memory commands:
 
 ```bash
 mateway memory list --area inbox --status proposed
 mateway memory show <id-or-path>
+mateway memory review --review stale
+mateway memory review --review stale --proposal
 mateway memory commit --proposal <proposal-id>
 mateway memory reject --proposal <proposal-id>
 mateway memory lint
 mateway memory index
+```
+
+Inbox review is designed as a direct workflow: `memory list` and `memory show` print suggested follow-up commands for approve, reject, or skill promotion. `memory commit` and `memory reject` require confirmation before changing durable memory state.
+
+Skill promotion:
+
+```bash
+mateway skill promote --proposal <skill-candidate-id-or-path> --name <skill-name>
+mateway skill list
 ```
 
 Scheduled task commands:
@@ -263,18 +286,19 @@ The lifecycle is:
 user request -> planner selects schedule tool -> task YAML -> due run -> runtime invocation -> artifact
 ```
 
-## Skills And Connectors
+## Skills And External Tools
 
-Skills are local capability packages that describe how the agent should work in a domain.
+Skills are local capability packages that describe how the agent should work in a domain. Traditional software can still be reached through built-in tools, workspace skills, shell commands, or lightweight custom tool wrappers.
 
 The current direction is:
 
 ```text
 skill = instructions + metadata + optional scripts/assets + allowed tools
-connector = scanned config that exposes API/CLI/software capability as a tool
+tool = explicit capability with args, risk, evidence, and confirmation boundary
+external command = optional bridge to existing CLI software
 ```
 
-Mateway does not hard-code business integrations into the core runtime. Future connector support should let teams expose existing APIs, CLIs, and internal systems through configuration, with explicit argument schemas, risk levels, evidence, auth requirements, and confirmation boundaries.
+Mateway does not hard-code business integrations into the core runtime. A separate connector scanning system is no longer the next-stage goal; deeper integrations should grow from the same tool and skill contracts instead.
 
 ## Security Model
 

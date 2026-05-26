@@ -56,12 +56,70 @@ func (l *AgentLoop) proposeMemoryFromTask(resp channel.OutboundMessage, task ses
 }
 
 func taskHasMemoryEvidence(task session.TaskState) bool {
+	if taskLooksLikePlainReadSummary(task) {
+		return false
+	}
 	if len(task.Artifacts) > 0 {
 		return true
 	}
 	for _, toolName := range task.ToolNames {
 		switch strings.TrimSpace(toolName) {
-		case "file.read", "file.summary", "project.index", "web.search":
+		case "web.search", "web.fetch", "memory.search":
+			return true
+		}
+	}
+	return false
+}
+
+func taskLooksLikePlainReadSummary(task session.TaskState) bool {
+	if len(task.ToolNames) != 1 {
+		return false
+	}
+	switch strings.TrimSpace(task.ToolNames[0]) {
+	case "file.summary", "file.read", "project.index":
+		return !taskHasDurableMemorySignal(task)
+	default:
+		return false
+	}
+}
+
+func taskHasDurableMemorySignal(task session.TaskState) bool {
+	if len(task.ToolNames) == 1 {
+		switch strings.TrimSpace(task.ToolNames[0]) {
+		case "file.summary", "file.read", "project.index":
+			return taskTextLooksDurable(task)
+		}
+	}
+	for _, artifact := range task.Artifacts {
+		if artifact.StartLine > 0 || artifact.EndLine > 0 {
+			return true
+		}
+	}
+	return taskTextLooksDurable(task)
+}
+
+func taskTextLooksDurable(task session.TaskState) bool {
+	text := strings.ToLower(strings.TrimSpace(strings.Join([]string{
+		task.Topic,
+		task.PlanSummary,
+		task.ResolvedQuery,
+	}, " ")))
+	markers := []string{
+		"memory",
+		"direction",
+		"rule",
+		"decision",
+		"workflow",
+		"preference",
+		"记忆",
+		"方向",
+		"规则",
+		"决策",
+		"流程",
+		"偏好",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
 			return true
 		}
 	}

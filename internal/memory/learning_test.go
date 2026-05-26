@@ -44,6 +44,73 @@ func TestProcessTaskGeneratesSkillCandidateAtThreshold(t *testing.T) {
 	}
 }
 
+func TestWriteSkillCandidateDedupesNearDuplicateCandidates(t *testing.T) {
+	store := NewStore(t.TempDir())
+	root := store.agentLearningRoot("main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	first, err := store.writeSkillCandidate("main", PatternRecord{
+		TaskID:      "task-1",
+		TraceID:     "trace-1",
+		PlanSummary: "review release notes",
+		ReplyPreview:"done",
+	}, Counter{
+		PatternKey:   "pattern-a",
+		IntentFamily: "review-latest-release-notes",
+		Tools:        []string{"file.summary", "web.search"},
+		SuccessCount: 3,
+		LastTaskID:   "task-1",
+		LastTraceID:  "trace-1",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("first candidate: %v", err)
+	}
+	second, err := store.writeSkillCandidate("main", PatternRecord{
+		TaskID:      "task-2",
+		TraceID:     "trace-2",
+		PlanSummary: "review release-notes",
+		ReplyPreview:"done again",
+	}, Counter{
+		PatternKey:   "pattern-b",
+		IntentFamily: "review-latest-release-notes",
+		Tools:        []string{"file.summary", "web.search"},
+		SuccessCount: 4,
+		LastTaskID:   "task-2",
+		LastTraceID:  "trace-2",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("second candidate: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected near-duplicate skill candidates to reuse existing path, first=%q second=%q", first, second)
+	}
+	matches, err := filepath.Glob(filepath.Join(store.Root, "agents", "main", "inbox", "skill-candidate-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one deduped skill candidate, got %v", matches)
+	}
+	data, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"success_count: 4",
+		"- Last task: task-2",
+		"- Last trace: trace-2",
+		"- Last plan summary: review release-notes",
+		"- Last reply preview: done again",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected upgraded skill candidate to contain %q, got:\n%s", want, text)
+		}
+	}
+}
+
 func TestProcessTaskSkipsTestLikeOutcomes(t *testing.T) {
 	store := NewStore(t.TempDir())
 	cfg := LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
@@ -131,6 +198,12 @@ func TestProposeAndCommitMemory(t *testing.T) {
 	committed, err := store.Commit(CommitInput{AgentID: "main", Proposal: proposal.ID, At: now.Add(time.Hour)})
 	if err != nil {
 		t.Fatalf("commit: %v", err)
+	}
+	if committed.Type != "decision" {
+		t.Fatalf("expected committed type decision, got %#v", committed)
+	}
+	if !strings.Contains(filepath.Base(committed.TargetPath), "decision-memory-direction") {
+		t.Fatalf("expected typed long memory filename, got %q", committed.TargetPath)
 	}
 	longData, err := os.ReadFile(committed.TargetPath)
 	if err != nil {
@@ -224,6 +297,9 @@ func TestSearchLongReturnsRelevantActiveMemory(t *testing.T) {
 	if !strings.Contains(results[0].Snippet, "Markdown") {
 		t.Fatalf("expected memory snippet, got %#v", results[0])
 	}
+	if results[0].Type != "note" {
+		t.Fatalf("expected default committed proposal type note, got %#v", results[0])
+	}
 	if results[0].StartLine <= 0 || results[0].EndLine < results[0].StartLine {
 		t.Fatalf("expected snippet line evidence, got %#v", results[0])
 	}
@@ -287,6 +363,191 @@ func TestSearchLongUsesIndexCandidatesWhenAvailable(t *testing.T) {
 	}
 	if len(results) != 1 || !strings.Contains(results[0].Title, "Keep Memory") {
 		t.Fatalf("expected search to use index candidates, got %#v", results)
+	}
+}
+
+func TestWriteSkillImprovementProposal(t *testing.T) {
+	store := NewStore(t.TempDir())
+	path, err := store.WriteSkillImprovementProposal(SkillImprovementInput{
+		AgentID:             "main",
+		SkillName:           "doc-review",
+		ImprovementType:     "weak_verification",
+		Reason:              "The current flow misses a quick verification step after reading the file.",
+		ProposedChange:      "Add a final check that confirms headings and preview lines are present before summarizing.",
+		RepairReason:        "preview evidence was incomplete",
+		PreviousPlanSummary: "read doc and summarize",
+		RepairedPlanSummary: "read doc, verify evidence, then summarize",
+		TaskID:              "task-1",
+		TraceID:             "trace-1",
+		Sources:             []string{"task:task-1", "trace:trace-1"},
+	})
+	if err != nil {
+		t.Fatalf("write improvement proposal: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"type: skill_improvement",
+		"improvement_type: weak_verification",
+		"# Proposed Skill Improvement: doc-review",
+		"The current flow misses a quick verification step",
+		"Add a final check that confirms headings",
+		"- weak_verification",
+		"Repair reason: preview evidence was incomplete",
+		"Previous plan summary: read doc and summarize",
+		"Repaired plan summary: read doc, verify evidence, then summarize",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected proposal to contain %q, got:\n%s", want, text)
+		}
+	}
+}
+
+func TestWriteSkillImprovementProposalDedupesSameRepairContext(t *testing.T) {
+	store := NewStore(t.TempDir())
+	input := SkillImprovementInput{
+		AgentID:             "main",
+		SkillName:           "doc-review",
+		ImprovementType:     "weak_verification",
+		Reason:              "The current flow misses a quick verification step after reading the file.",
+		ProposedChange:      "Add a final check that confirms headings and preview lines are present before summarizing.",
+		RepairReason:        "preview evidence was incomplete",
+		PreviousPlanSummary: "read doc and summarize",
+		RepairedPlanSummary: "read doc, verify evidence, then summarize",
+		TaskID:              "task-1",
+		TraceID:             "trace-1",
+		Sources:             []string{"task:task-1", "trace:trace-1"},
+	}
+	first, err := store.WriteSkillImprovementProposal(input)
+	if err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	second, err := store.WriteSkillImprovementProposal(input)
+	if err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected duplicate skill improvement proposal to reuse existing path, first=%q second=%q", first, second)
+	}
+	matches, err := filepath.Glob(filepath.Join(store.Root, "agents", "main", "inbox", "skill-improvement-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one deduped skill improvement proposal, got %v", matches)
+	}
+}
+
+func TestWriteSkillImprovementProposalDedupesNearDuplicateRepairContext(t *testing.T) {
+	store := NewStore(t.TempDir())
+	first, err := store.WriteSkillImprovementProposal(SkillImprovementInput{
+		AgentID:             "main",
+		SkillName:           "doc-review",
+		ImprovementType:     "weak_verification",
+		Reason:              "The current flow misses a quick verification step after reading the file.",
+		ProposedChange:      "Add a final check that confirms headings and preview lines are present before summarizing.",
+		RepairReason:        "preview evidence was incomplete",
+		PreviousPlanSummary: "read doc and summarize",
+		RepairedPlanSummary: "read doc, verify evidence, then summarize",
+		TaskID:              "task-1",
+		TraceID:             "trace-1",
+		Sources:             []string{"task:task-1", "trace:trace-1"},
+	})
+	if err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	second, err := store.WriteSkillImprovementProposal(SkillImprovementInput{
+		AgentID:             "main",
+		SkillName:           "doc-review",
+		ImprovementType:     "weak_verification",
+		Reason:              "The current flow still misses a verification step.",
+		ProposedChange:      "Add a final check for headings and preview lines.",
+		RepairReason:        "preview evidence incomplete",
+		PreviousPlanSummary: "read doc, summarize",
+		RepairedPlanSummary: "read doc verify evidence then summarize",
+		TaskID:              "task-2",
+		TraceID:             "trace-2",
+		Sources:             []string{"task:task-2", "trace:trace-2"},
+	})
+	if err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected near-duplicate skill improvement proposal to reuse existing path, first=%q second=%q", first, second)
+	}
+	matches, err := filepath.Glob(filepath.Join(store.Root, "agents", "main", "inbox", "skill-improvement-*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one merged skill improvement proposal, got %v", matches)
+	}
+}
+
+func TestPromoteSkillCandidate(t *testing.T) {
+	workspace := t.TempDir()
+	store := NewStore(workspace)
+	cfg := LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	path, err := store.writeSkillCandidate("main", PatternRecord{
+		TaskID:       "task-1",
+		TraceID:      "trace-1",
+		PlanSummary:  "review release notes",
+		ReplyPreview: "done",
+	}, Counter{
+		PatternKey:   "pattern-a",
+		IntentFamily: "review-latest-release-notes",
+		Tools:        []string{"file.summary", "web.search"},
+		SuccessCount: 3,
+		LastTaskID:   "task-1",
+		LastTraceID:  "trace-1",
+	}, cfg)
+	if err != nil {
+		t.Fatalf("write skill candidate: %v", err)
+	}
+	result, err := store.PromoteSkillCandidate(SkillPromotionInput{
+		AgentID:   "main",
+		Proposal:  path,
+		SkillName: "release-review",
+		At:        time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("promote skill candidate: %v", err)
+	}
+	if !strings.HasSuffix(result.TargetPath, filepath.Join("skills", "release-review", "SKILL.md")) {
+		t.Fatalf("unexpected promoted skill path %q", result.TargetPath)
+	}
+	data, err := os.ReadFile(result.TargetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"name: release-review",
+		"stage: planning",
+		"# release-review",
+		"## Workflow",
+		"## Source Candidate Notes",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected promoted skill file to contain %q, got:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "# Proposed Skill:") {
+		t.Fatalf("expected promoted skill file to stop using proposal heading, got:\n%s", text)
+	}
+	if !strings.Contains(text, "Review the source tasks") {
+		t.Fatalf("expected promoted skill file to contain skill heading, got:\n%s", string(data))
+	}
+	sourceData, err := os.ReadFile(result.SourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceText := string(sourceData)
+	if !strings.Contains(sourceText, "status: committed") || !strings.Contains(sourceText, "Promoted to: [[skills/release-review/SKILL]]") {
+		t.Fatalf("expected source proposal updated as committed, got:\n%s", sourceText)
 	}
 }
 
@@ -357,6 +618,45 @@ Conversion improved by 42 percent.
 		if issue.Code == "weak_evidence" {
 			t.Fatalf("did not expect weak_evidence, got %#v", report.Issues)
 		}
+	}
+}
+
+func TestLintReportsStaleLongMemory(t *testing.T) {
+	root := t.TempDir()
+	longDir := filepath.Join(root, "agents", "main", "long")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	text := `---
+type: decision
+scope: agent
+status: active
+sources:
+  - manual
+confidence: medium
+created_at: 2026-03-01
+updated_at: 2026-03-01
+---
+
+# Stale Memory
+
+This long memory should be reviewed again.
+`
+	if err := os.WriteFile(filepath.Join(longDir, "stale.md"), []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Lint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, issue := range report.Issues {
+		if issue.Code == "stale_long_memory" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected stale_long_memory issue, got %#v", report.Issues)
 	}
 }
 

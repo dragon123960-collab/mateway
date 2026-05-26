@@ -257,7 +257,7 @@ func llmAcceptStep(ctx context.Context, planner model.Planner, user string, step
 	if !ok {
 		return StepAcceptance{Status: AcceptancePass, Source: "fallback"}
 	}
-	raw, err := reviewer.AcceptStepJSON(ctx, buildStepAcceptanceTask(user, step, def, registry), step, result)
+	raw, err := reviewer.AcceptStepJSON(ctx, buildStepAcceptancePrompt(user, step, def, registry), step, result)
 	if err != nil {
 		return StepAcceptance{Status: AcceptanceSuspect, Reason: err.Error(), Source: "llm"}
 	}
@@ -276,7 +276,10 @@ func llmAcceptStep(ctx context.Context, planner model.Planner, user string, step
 }
 
 func buildStepAcceptanceTask(user string, step model.PlanStep, def tool.Definition, registry *AcceptanceRegistry) string {
-	parts := []string{strings.TrimSpace(user)}
+	parts := []string{
+		"User task: " + strings.TrimSpace(user),
+		"Step goal: " + strings.TrimSpace(step.Goal),
+	}
 	if spec, ok := acceptanceSpecForStep(registry, step, def); ok {
 		if len(spec.CodeChecks) > 0 {
 			parts = append(parts, "Tool code checks: "+strings.Join(spec.CodeChecks, " | "))
@@ -295,6 +298,12 @@ func buildStepAcceptanceTask(user string, step model.PlanStep, def tool.Definiti
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func buildStepAcceptancePrompt(user string, step model.PlanStep, def tool.Definition, registry *AcceptanceRegistry) string {
+	contextPrompt := buildModelContextPrompt("", promptStageStepAcceptance, nil, nil, tool.Context{}, promptContextOptions{})
+	taskPrompt := buildStepAcceptanceTask(user, step, def, registry)
+	return strings.TrimSpace(contextPrompt + "\n\nAcceptance task:\n" + taskPrompt)
 }
 
 func derivedAcceptanceSpecRef(step model.PlanStep, def tool.Definition) string {
@@ -336,7 +345,7 @@ func llmAcceptFinal(ctx context.Context, planner model.Planner, user string, und
 		}
 		return FinalAcceptance{Status: AcceptanceAccepted, Reason: "all steps completed"}
 	}
-	user = buildFinalAcceptanceTask(user, understanding)
+	user = buildFinalAcceptancePrompt(user, understanding)
 	raw, err := reviewer.AcceptFinalJSON(ctx, user, plan, results)
 	if err != nil {
 		if anyFailed(results) {
@@ -362,17 +371,19 @@ func llmAcceptFinal(ctx context.Context, planner model.Planner, user string, und
 }
 
 func buildFinalAcceptanceTask(user string, understanding taskUnderstanding) string {
-	parts := []string{strings.TrimSpace(user)}
+	parts := []string{"User task: " + strings.TrimSpace(user)}
 	if len(understanding.CompletionDraft) > 0 {
-		parts = append(parts, "Completion draft: "+strings.Join(understanding.CompletionDraft, " | "))
-	}
-	if len(understanding.EvidenceHints) > 0 {
-		parts = append(parts, "Evidence hints: "+strings.Join(understanding.EvidenceHints, " | "))
-	}
-	if strings.TrimSpace(understanding.RiskLevel) != "" {
-		parts = append(parts, "Risk level: "+understanding.RiskLevel)
+		parts = append(parts, "Completion criteria: "+strings.Join(understanding.CompletionDraft, " | "))
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func buildFinalAcceptancePrompt(user string, understanding taskUnderstanding) string {
+	contextPrompt := buildModelContextPrompt("", promptStageFinalAcceptance, nil, nil, tool.Context{}, promptContextOptions{
+		Understanding: understanding,
+	})
+	taskPrompt := buildFinalAcceptanceTask(user, understanding)
+	return strings.TrimSpace(contextPrompt + "\n\nAcceptance task:\n" + taskPrompt)
 }
 
 func extractAcceptanceJSONObject(text string) string {

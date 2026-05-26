@@ -46,6 +46,10 @@ func parseMarkdown(text string) (ParsedMarkdown, error) {
 	return ParsedMarkdown{Frontmatter: fm, Body: body, RawYAML: raw, HasYAML: true}, nil
 }
 
+func ParseMarkdownForTools(text string) (ParsedMarkdown, error) {
+	return parseMarkdown(text)
+}
+
 func validateMemoryFrontmatter(path string, fm Frontmatter) []LintIssue {
 	var issues []LintIssue
 	if strings.TrimSpace(fm.Type) == "" {

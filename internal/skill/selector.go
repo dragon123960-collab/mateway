@@ -6,14 +6,16 @@ import (
 )
 
 const (
-	StagePlanning  = "planning"
-	StageSynthesis = "synthesis"
-	StageUniversal = "universal"
+	StagePlanning       = "planning"
+	StagePlanningRepair = "planning_repair"
+	StageSynthesis      = "synthesis"
+	StageUniversal      = "universal"
 )
 
 var stageSelectionBudget = map[string]int{
-	StagePlanning:  2,
-	StageSynthesis: 3,
+	StagePlanning:       2,
+	StagePlanningRepair: 4,
+	StageSynthesis:      3,
 }
 
 type Match struct {
@@ -89,9 +91,12 @@ func selectionBudgetForStage(stage string) int {
 }
 
 func matchesStage(def Definition, stage string) bool {
+	stage = strings.TrimSpace(stage)
 	switch strings.TrimSpace(def.Stage) {
 	case "", StageUniversal:
 		return true
+	case StagePlanning:
+		return stage == StagePlanning || stage == StagePlanningRepair
 	default:
 		return strings.EqualFold(def.Stage, stage)
 	}

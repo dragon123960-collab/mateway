@@ -24,6 +24,7 @@ func ProjectIndex() Definition {
 			AcceptanceMode: AcceptanceCodeOnly,
 			ParallelMode:   ParallelReadOnlyOK,
 			ResourceScope:  "project:index",
+			ReusePolicy:    ReuseNever,
 		},
 		Risk:        RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -62,6 +63,7 @@ func FileSummary() Definition {
 			SoftFailureSignals: []string{"requires a file path"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "filesystem:path",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk:        RiskSafeRead,
 		ArgsSchema: map[string]string{

@@ -18,6 +18,7 @@ func TestEnsureWorkspaceLayoutSeedsDefaultSkills(t *testing.T) {
 		filepath.Join(home, "run"),
 		filepath.Join(home, "trace"),
 		filepath.Join(workspace, "skills", "chinese-summary", "SKILL.md"),
+		filepath.Join(workspace, "skills", "software-install", "SKILL.md"),
 		filepath.Join(workspace, "agents", "main", "skills"),
 	}
 	for _, path := range checks {
@@ -37,8 +38,19 @@ func TestLoadRegistryFindsWorkspaceSkill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := reg.Names(); len(got) == 0 || got[0] != "chinese-summary" {
-		t.Fatalf("expected chinese-summary in registry, got %v", got)
+	names := reg.Names()
+	if len(names) == 0 || names[0] != "chinese-summary" {
+		t.Fatalf("expected chinese-summary in registry, got %v", names)
+	}
+	found := false
+	for _, name := range names {
+		if name == "software-install" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected software-install in registry, got %v", names)
 	}
 }
 
@@ -132,6 +144,23 @@ func TestSelectLimitsPromptBudgetByPriority(t *testing.T) {
 	}
 }
 
+func TestSelectAllowsPlanningSkillsDuringRepairWithWiderBudget(t *testing.T) {
+	defs := []Definition{
+		{Name: "a", Stage: StagePlanning, Priority: 1, WhenContains: []string{"最新"}},
+		{Name: "b", Stage: StagePlanning, Priority: 2, WhenContains: []string{"最新"}},
+		{Name: "c", Stage: StagePlanning, Priority: 3, WhenContains: []string{"最新"}},
+		{Name: "d", Stage: StagePlanning, Priority: 4, WhenContains: []string{"最新"}},
+		{Name: "e", Stage: StagePlanning, Priority: 5, WhenContains: []string{"最新"}},
+	}
+	got := Select(defs, StagePlanningRepair, Context{UserText: "请查最新情况"})
+	if len(got) != 4 {
+		t.Fatalf("expected 4 selected skills for repair budget, got %d", len(got))
+	}
+	if got[0].Name != "e" || got[1].Name != "d" || got[2].Name != "c" || got[3].Name != "b" {
+		t.Fatalf("unexpected repair selected order: %#v", got)
+	}
+}
+
 func TestSelectKeepsOnlyHighestPriorityPerScope(t *testing.T) {
 	defs := []Definition{
 		{Name: "fresh-search", Stage: StagePlanning, Scope: "search-planning", Priority: 8, WhenContains: []string{"最新"}},
@@ -164,6 +193,16 @@ func TestSelectKeepsFreshSearchForFreshWebContext(t *testing.T) {
 	got := Select(defs, StagePlanning, Context{UserText: "搜索当前 AI 应用趋势"})
 	if len(got) != 1 || got[0].Name != "fresh-search" {
 		t.Fatalf("expected fresh-search for fresh web context, got %#v", got)
+	}
+}
+
+func TestSelectMatchesSoftwareInstallSkillForCLIInstallRequests(t *testing.T) {
+	defs := []Definition{
+		{Name: "software-install", Stage: StagePlanning, Scope: "software-install", Priority: 9, WhenContains: []string{"install", "安装", "cli", "工具", "github"}},
+	}
+	got := Select(defs, StagePlanning, Context{UserText: "去看看larkcli这个cli怎么样，我想测试安装一下"})
+	if len(got) != 1 || got[0].Name != "software-install" {
+		t.Fatalf("expected software-install skill for cli install request, got %#v", got)
 	}
 }
 

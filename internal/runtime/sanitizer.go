@@ -114,6 +114,9 @@ func stripPromptEcho(text string) string {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		switch {
+		case trimmed == "Skills context:":
+			skipBlock = true
+			continue
 		case trimmed == "Selected skills:":
 			skipBlock = true
 			continue

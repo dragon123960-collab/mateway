@@ -21,6 +21,7 @@ type SearchResult struct {
 	ID        string
 	Path      string
 	Title     string
+	Type      string
 	Score     int
 	Snippet   string
 	StartLine int
@@ -65,6 +66,7 @@ func (s Store) SearchLong(opts SearchOptions) ([]SearchResult, error) {
 			ID:        strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
 			Path:      path,
 			Title:     firstNonEmptyMemory(titleFromMarkdown(text), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))),
+			Type:      strings.ToLower(strings.TrimSpace(memoryType(text))),
 			Score:     score,
 			Snippet:   snippet,
 			StartLine: startLine,
@@ -141,6 +143,14 @@ func isActiveMemory(text string) bool {
 	}
 	status := strings.ToLower(strings.TrimSpace(parsed.Frontmatter.Status))
 	return status == "" || status == "active"
+}
+
+func memoryType(text string) string {
+	parsed, err := parseMarkdown(text)
+	if err != nil {
+		return ""
+	}
+	return parsed.Frontmatter.Type
 }
 
 func queryTokens(text string) []string {

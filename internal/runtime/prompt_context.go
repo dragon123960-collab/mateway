@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,64 +29,208 @@ type promptContextOptions struct {
 	CurrentTask   *session.TaskState
 }
 
-func buildModelContextPrompt(msg string, stage string, matches []skill.Match, toolDefs []tool.Definition, toolCtx tool.Context, opts ...promptContextOptions) string {
+type promptStageProfile struct {
+	IncludeDateTime      bool
+	IncludeEnvironment   bool
+	IncludeSoul          bool
+	IncludeAgent         bool
+	IncludeUser          bool
+	IncludeMemoryGuide   bool
+	IncludeToolsGuide    bool
+	IncludeShortMemory   bool
+	IncludeLongMemory    bool
+	IncludeUnderstanding bool
+	IncludeCurrentTask   bool
+	IncludeToolRules     bool
+}
+
+const (
+	promptStageStepAcceptance  = "step_acceptance"
+	promptStageFinalAcceptance = "final_acceptance"
+)
+
+func buildModelContextPrompt(_ string, stage string, _ []skill.Match, _ []tool.Definition, toolCtx tool.Context, opts ...promptContextOptions) string {
 	now := time.Now()
 	files := loadAgentPromptFiles(toolCtx.Workspace, "main")
 	var option promptContextOptions
 	if len(opts) > 0 {
 		option = opts[0]
 	}
+	profile := promptProfileForStage(stage)
 	sections := []string{
 		"You are Mateway, a practical personal work assistant agent.",
 		"",
 		"Core objective:",
 		"Help the user complete work, organize information, call tools safely, and produce clear conclusions in the user's language.",
-		"",
-		"Current date:",
-		now.Format("2006-01-02"),
-		"",
-		"User timezone:",
-		firstNonEmpty(now.Location().String(), "Asia/Shanghai"),
-		"",
-		"Current user request:",
-		strings.TrimSpace(msg),
-		"",
 	}
-	if env := renderEnvironmentContext(toolCtx); env != "" {
-		sections = append(sections, "", "Current environment:", env)
+	if profile.IncludeDateTime {
+		sections = append(sections,
+			"",
+			"Current date:",
+			now.Format("2006-01-02"),
+			"",
+			"User timezone:",
+			firstNonEmpty(now.Location().String(), "Asia/Shanghai"),
+		)
 	}
-	if extra := renderAgentPromptFiles(files); extra != "" {
+	if profile.IncludeEnvironment {
+		if env := renderEnvironmentContext(toolCtx); env != "" {
+			sections = append(sections, "", "Current environment:", env)
+		}
+	}
+	if extra := renderAgentPromptFilesForStage(files, profile); extra != "" {
 		sections = append(sections, "", extra)
 	}
-	if memory := strings.TrimSpace(option.ShortMemory); memory != "" {
-		sections = append(sections, "", "Short memory:", memory)
+	if profile.IncludeShortMemory {
+		if memory := strings.TrimSpace(option.ShortMemory); memory != "" {
+			sections = append(sections, "", "Short memory:", memory)
+		}
 	}
-	if memory := strings.TrimSpace(option.LongMemory); memory != "" {
-		sections = append(sections, "", "Relevant long memory:", memory)
+	if profile.IncludeLongMemory {
+		if memory := strings.TrimSpace(option.LongMemory); memory != "" {
+			sections = append(sections, "", "Relevant long memory:", memory)
+		}
 	}
-	if understanding := renderUnderstanding(option.Understanding); understanding != "" {
-		sections = append(sections, "", "Task understanding:", understanding)
+	if profile.IncludeUnderstanding {
+		understanding := renderUnderstandingForStage(stage, option.Understanding)
+		if understanding != "" {
+			sections = append(sections, "", "Task understanding:", understanding)
+		}
 	}
-	if progress := renderCurrentTaskProgress(option.CurrentTask); progress != "" {
-		sections = append(sections, "", "Current execution progress:", progress)
+	if profile.IncludeCurrentTask {
+		if progress := renderCurrentTaskProgress(option.CurrentTask); progress != "" {
+			sections = append(sections, "", "Current execution progress:", progress)
+		}
 	}
-	if selected := renderSelectedSkills(matches); selected != "" {
-		sections = append(sections, "", "Selected skills:", selected)
-	}
-	if toolsText := renderToolNames(toolDefs); toolsText != "" {
-		sections = append(sections, "", "Available tools:", toolsText)
+	if profile.IncludeToolRules {
+		sections = append(sections,
+			"",
+			"Tool-use rules:",
+			"1. Do not expose raw tool calls or internal tool arguments to the user.",
+			"2. Tool results will be supplied by the system.",
+			"3. Final answers must be structured, readable, and written in the user's language unless the user requests otherwise.",
+		)
 	}
 	sections = append(sections,
-		"",
-		"Tool-use rules:",
-		"1. Do not expose raw tool calls or internal tool arguments to the user.",
-		"2. Tool results will be supplied by the system.",
-		"3. Final answers must be structured, readable, and written in the user's language unless the user requests otherwise.",
 		"",
 		"Current stage:",
 		stage,
 	)
 	return strings.TrimSpace(strings.Join(sections, "\n"))
+}
+
+func buildStageModelPrompt(contextPrompt string, defs []skill.Definition) string {
+	contextPrompt = strings.TrimSpace(contextPrompt)
+	skillPrompt := strings.TrimSpace(skill.PromptBlock(defs))
+	switch {
+	case contextPrompt == "" && skillPrompt == "":
+		return ""
+	case skillPrompt == "":
+		return contextPrompt
+	case contextPrompt == "":
+		return "Skills context:\n" + skillPrompt
+	default:
+		return contextPrompt + "\n\nSkills context:\n" + skillPrompt
+	}
+}
+
+func promptProfileForStage(stage string) promptStageProfile {
+	switch strings.TrimSpace(stage) {
+	case promptStageFinalAcceptance:
+		return promptStageProfile{
+			IncludeDateTime:      true,
+			IncludeSoul:          true,
+			IncludeAgent:         true,
+			IncludeUser:          true,
+			IncludeUnderstanding: true,
+			IncludeToolRules:     true,
+		}
+	case promptStageStepAcceptance:
+		return promptStageProfile{
+			IncludeDateTime:    true,
+			IncludeSoul:        true,
+			IncludeAgent:       true,
+			IncludeUser:        true,
+			IncludeToolRules:   true,
+			IncludeEnvironment: false,
+		}
+	case skill.StageSynthesis:
+		return promptStageProfile{
+			IncludeSoul:        true,
+			IncludeAgent:       true,
+			IncludeUser:        true,
+			IncludeToolRules:   true,
+			IncludeDateTime:    false,
+			IncludeEnvironment: false,
+		}
+	case skill.StagePlanningRepair:
+		return promptStageProfile{
+			IncludeDateTime:      true,
+			IncludeEnvironment:   true,
+			IncludeSoul:          true,
+			IncludeAgent:         true,
+			IncludeUser:          true,
+			IncludeShortMemory:   true,
+			IncludeUnderstanding: true,
+			IncludeCurrentTask:   false,
+			IncludeToolRules:     true,
+		}
+	case skill.StagePlanning:
+		return promptStageProfile{
+			IncludeDateTime:      true,
+			IncludeEnvironment:   true,
+			IncludeSoul:          true,
+			IncludeAgent:         true,
+			IncludeUser:          true,
+			IncludeMemoryGuide:   true,
+			IncludeShortMemory:   true,
+			IncludeLongMemory:    true,
+			IncludeUnderstanding: true,
+			IncludeCurrentTask:   true,
+			IncludeToolRules:     true,
+		}
+	default:
+		return promptStageProfile{
+			IncludeDateTime:      true,
+			IncludeEnvironment:   true,
+			IncludeSoul:          true,
+			IncludeAgent:         true,
+			IncludeUser:          true,
+			IncludeShortMemory:   true,
+			IncludeUnderstanding: true,
+			IncludeToolRules:     true,
+		}
+	}
+}
+
+func renderAgentPromptFilesForStage(files agentPromptFiles, profile promptStageProfile) string {
+	parts := make([]string, 0, 5)
+	if profile.IncludeSoul && files.Soul != "" {
+		parts = append(parts, "soul.md:\n"+files.Soul)
+	}
+	if profile.IncludeAgent && files.Agent != "" {
+		parts = append(parts, "agent.md:\n"+files.Agent)
+	}
+	if profile.IncludeUser && files.User != "" {
+		parts = append(parts, "user.md:\n"+files.User)
+	}
+	if profile.IncludeMemoryGuide && files.Memory != "" {
+		parts = append(parts, "memory.md:\n"+files.Memory)
+	}
+	if profile.IncludeToolsGuide && files.Tools != "" {
+		parts = append(parts, "tools.md:\n"+files.Tools)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func renderAgentPromptFiles(files agentPromptFiles) string {
+	return renderAgentPromptFilesForStage(files, promptStageProfile{
+		IncludeSoul:        true,
+		IncludeAgent:       true,
+		IncludeUser:        true,
+		IncludeMemoryGuide: true,
+		IncludeToolsGuide:  true,
+	})
 }
 
 func loadAgentPromptFiles(workspace, agentID string) agentPromptFiles {
@@ -109,26 +252,6 @@ func readOptionalFile(path string) string {
 	return strings.TrimSpace(string(data))
 }
 
-func renderAgentPromptFiles(files agentPromptFiles) string {
-	parts := make([]string, 0, 5)
-	if files.Soul != "" {
-		parts = append(parts, "soul.md:\n"+files.Soul)
-	}
-	if files.Agent != "" {
-		parts = append(parts, "agent.md:\n"+files.Agent)
-	}
-	if files.User != "" {
-		parts = append(parts, "user.md:\n"+files.User)
-	}
-	if files.Memory != "" {
-		parts = append(parts, "memory.md:\n"+files.Memory)
-	}
-	if files.Tools != "" {
-		parts = append(parts, "tools.md:\n"+files.Tools)
-	}
-	return strings.Join(parts, "\n\n")
-}
-
 func renderEnvironmentContext(toolCtx tool.Context) string {
 	lines := []string{
 		"- operating_system: " + runtime.GOOS,
@@ -140,6 +263,12 @@ func renderEnvironmentContext(toolCtx tool.Context) string {
 	}
 	if cmds := availableCommandSummary(); cmds != "" {
 		lines = append(lines, "- available_commands: "+cmds)
+	}
+	if pkg := packageManagerSummary(); pkg != "" {
+		lines = append(lines, "- package_managers: "+pkg)
+	}
+	if toolchain := keyToolAvailabilitySummary(); toolchain != "" {
+		lines = append(lines, "- key_tooling: "+toolchain)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -155,34 +284,29 @@ func availableCommandSummary() string {
 	return strings.Join(available, ", ")
 }
 
-func renderSelectedSkills(matches []skill.Match) string {
-	if len(matches) == 0 {
-		return "none"
+func packageManagerSummary() string {
+	candidates := []string{"brew", "apt", "apt-get", "yum", "dnf", "pacman"}
+	available := make([]string, 0, len(candidates))
+	for _, name := range candidates {
+		if _, err := exec.LookPath(name); err == nil {
+			available = append(available, name)
+		}
 	}
-	lines := make([]string, 0, len(matches))
-	for _, match := range matches {
-		line := "- " + match.Definition.Name
-		if match.Definition.Description != "" {
-			line += ": " + match.Definition.Description
+	return strings.Join(available, ", ")
+}
+
+func keyToolAvailabilitySummary() string {
+	candidates := []string{"git", "go", "node", "python3"}
+	status := make([]string, 0, len(candidates))
+	for _, name := range candidates {
+		_, err := exec.LookPath(name)
+		availability := "missing"
+		if err == nil {
+			availability = "available"
 		}
-		if strings.TrimSpace(match.Reason) != "" {
-			line += " (" + match.Reason + ")"
-		}
-		if len(match.Definition.UseFor) > 0 {
-			line += "\n  use_for: " + strings.Join(match.Definition.UseFor, ", ")
-		}
-		if len(match.Definition.Produces) > 0 {
-			line += "\n  produces: " + strings.Join(match.Definition.Produces, ", ")
-		}
-		if strings.TrimSpace(match.Definition.AcceptanceMode) != "" {
-			line += "\n  acceptance_mode: " + match.Definition.AcceptanceMode
-		}
-		if strings.TrimSpace(match.Definition.ParallelMode) != "" {
-			line += "\n  parallel_mode: " + match.Definition.ParallelMode
-		}
-		lines = append(lines, line)
+		status = append(status, name+"="+availability)
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(status, ", ")
 }
 
 func renderUnderstanding(understanding taskUnderstanding) string {
@@ -214,6 +338,44 @@ func renderUnderstanding(understanding taskUnderstanding) string {
 	return strings.Join(lines, "\n")
 }
 
+func renderUnderstandingForStage(stage string, understanding taskUnderstanding) string {
+	if strings.TrimSpace(stage) == skill.StagePlanningRepair {
+		return renderRepairUnderstanding(understanding)
+	}
+	return renderUnderstanding(understanding)
+}
+
+func renderRepairUnderstanding(understanding taskUnderstanding) string {
+	lines := []string{}
+	if goal := strings.TrimSpace(understanding.Goal); goal != "" {
+		lines = append(lines, "- remaining_goal: "+goal)
+	}
+	if reason := strings.TrimSpace(repairFailureReason(understanding)); reason != "" {
+		lines = append(lines, "- failure_reason: "+reason)
+	}
+	if delta := strings.TrimSpace(repairCompletionDelta(understanding)); delta != "" {
+		lines = append(lines, "- completion_delta: "+delta)
+	}
+	if risk := strings.TrimSpace(understanding.RiskLevel); risk != "" {
+		lines = append(lines, "- risk_level: "+risk)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func repairFailureReason(understanding taskUnderstanding) string {
+	if len(understanding.Constraints) == 0 {
+		return ""
+	}
+	return strings.Join(understanding.Constraints, " | ")
+}
+
+func repairCompletionDelta(understanding taskUnderstanding) string {
+	if len(understanding.CompletionDraft) == 0 {
+		return ""
+	}
+	return strings.Join(understanding.CompletionDraft, " | ")
+}
+
 func renderCurrentTaskProgress(task *session.TaskState) string {
 	if task == nil || len(task.StepOrder) == 0 || len(task.StepStates) == 0 {
 		return ""
@@ -239,36 +401,6 @@ func renderCurrentTaskProgress(task *session.TaskState) string {
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
-}
-
-func renderToolNames(defs []tool.Definition) string {
-	if len(defs) == 0 {
-		return ""
-	}
-	names := make([]string, 0, len(defs))
-	for _, def := range defs {
-		line := fmt.Sprintf("- %s: %s", def.Name, def.Description)
-		if len(def.Metadata.WhenToUse) > 0 {
-			line += "\n  when_to_use: " + strings.Join(def.Metadata.WhenToUse, ", ")
-		}
-		if len(def.Metadata.WhenNotToUse) > 0 {
-			line += "\n  when_not_to_use: " + strings.Join(def.Metadata.WhenNotToUse, ", ")
-		}
-		if len(def.Metadata.OutputContract) > 0 {
-			line += "\n  output_contract: " + strings.Join(def.Metadata.OutputContract, ", ")
-		}
-		if def.Metadata.AcceptanceMode != "" {
-			line += "\n  acceptance_mode: " + string(def.Metadata.AcceptanceMode)
-		}
-		if def.Metadata.ParallelMode != "" {
-			line += "\n  parallel_mode: " + string(def.Metadata.ParallelMode)
-		}
-		if strings.TrimSpace(def.Metadata.ResourceScope) != "" {
-			line += "\n  resource_scope: " + def.Metadata.ResourceScope
-		}
-		names = append(names, line)
-	}
-	return strings.Join(names, "\n")
 }
 
 func selectedSkillsTraceFields(matches []skill.Match) []map[string]any {

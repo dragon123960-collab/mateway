@@ -61,6 +61,9 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 			for _, missing := range missingRequiredArgs(def, step.Args) {
 				out.Errors = append(out.Errors, label+": missing required arg "+missing)
 			}
+			if placeholderCommand(step.Tool, step.Args) {
+				out.Errors = append(out.Errors, label+": command contains unresolved download placeholder")
+			}
 		}
 		for _, dep := range step.DependsOn {
 			dep = strings.TrimSpace(dep)
@@ -89,6 +92,15 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 		out.RepairableWarnings = append(out.RepairableWarnings, "plan success_criteria do not clearly align with understanding completion criteria")
 	}
 	return out
+}
+
+func placeholderCommand(toolName string, args map[string]string) bool {
+	switch strings.TrimSpace(toolName) {
+	case "terminal.run", "shell.run", "software.install":
+		return strings.Contains(strings.TrimSpace(args["command"]), "<下载URL>")
+	default:
+		return false
+	}
 }
 
 func toolNeedsCoverageWarnings(toolNeeds []string, tools []string) []string {
@@ -267,6 +279,8 @@ func evidenceMatchesStep(step model.PlanStep, result model.ToolResult) bool {
 	text := strings.ToLower(strings.Join(step.ExpectedEvidence, " "))
 	kind, _ := result.Evidence["kind"].(string)
 	switch {
+	case strings.TrimSpace(kind) == "web_fetch":
+		return evidenceHasAny(result.Evidence, "url", "title", "status", "bytes")
 	case strings.Contains(text, "file") || strings.Contains(text, "path") || strings.Contains(text, "line"):
 		return evidenceHasAny(result.Evidence, "path", "target_path", "start_line", "end_line")
 	case strings.Contains(text, "url") || strings.Contains(text, "search"):

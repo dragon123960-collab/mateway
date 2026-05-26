@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/memory"
 )
@@ -76,6 +77,62 @@ func TestSoftwareSearchQueriesStayGeneric(t *testing.T) {
 	}
 }
 
+func TestSoftwareSearchQueriesIncludeCanonicalLarkCLIAlias(t *testing.T) {
+	got := softwareSearchQueries("larkcli")
+	found := false
+	for _, item := range got {
+		if item == "lark-cli" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected canonical lark-cli alias in queries, got %#v", got)
+	}
+	if len(got) == 0 || got[0] != "lark-cli" {
+		t.Fatalf("expected canonical lark-cli alias to be prioritized first, got %#v", got)
+	}
+}
+
+func TestCanonicalCommandNameNormalizesLarkCLIAliases(t *testing.T) {
+	for _, input := range []string{"larkcli", "lark cli", "lark-cli", "@larksuite/cli"} {
+		if got := canonicalCommandName(input); got != "lark-cli" {
+			t.Fatalf("expected %q to normalize to lark-cli, got %q", input, got)
+		}
+	}
+}
+
+func TestSoftwareSearchQueriesGenerateGenericCLIVariants(t *testing.T) {
+	got := softwareSearchQueries("ghcli")
+	if !containsQuery(got, "gh cli") || !containsQuery(got, "gh-cli") {
+		t.Fatalf("expected ghcli variants, got %#v", got)
+	}
+
+	got = softwareSearchQueries("aws cli")
+	if !containsQuery(got, "aws-cli") {
+		t.Fatalf("expected dashed cli variant, got %#v", got)
+	}
+}
+
+func TestSoftwareSearchQueriesRecoverCanonicalCLIFromLongNaturalLanguageQuery(t *testing.T) {
+	got := softwareSearchQueries("lark feishu CLI command line tool github")
+	if !containsQuery(got, "lark-cli") {
+		t.Fatalf("expected long natural-language query to recover lark-cli candidate, got %#v", got)
+	}
+	if !containsQuery(got, "lark cli") {
+		t.Fatalf("expected long natural-language query to recover spaced lark cli candidate, got %#v", got)
+	}
+}
+
+func containsQuery(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSkillSearchNoResultSuggestsBroaderCapabilityPhrases(t *testing.T) {
 	output := renderSkillSearchOutput("text humanizer rewriting assistant AI text", nil)
 	if !strings.Contains(output, "Searched priority catalogs") || !strings.Contains(output, "broader capability phrases") {
@@ -126,6 +183,34 @@ func TestSoftwareInstallPreviewAndResult(t *testing.T) {
 	}
 	if !strings.Contains(result.Output, "安装完成") || !strings.Contains(result.Output, "lark-cli --help") {
 		t.Fatalf("expected completion and next commands, got %q", result.Output)
+	}
+}
+
+func TestSoftwareInstallTreatsVerifiedInstallAsSuccess(t *testing.T) {
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, "agent-browser")
+	mustWriteFile(t, binPath, "#!/bin/sh\nprintf 'agent-browser 0.27.0\\n'\n")
+	if err := os.Chmod(binPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := SoftwareInstall().Run(context.Background(), Call{
+		Args: map[string]string{
+			"name":           "agent-browser",
+			"method":         "npm",
+			"command":        "sh -lc 'echo installing >&2; exit 1'",
+			"executable":     "agent-browser",
+			"verify_command": shellQuote(binPath) + " --version",
+		},
+		Confirmed: true,
+	})
+	if !result.OK {
+		t.Fatalf("expected verified install to count as success, got %#v", result)
+	}
+	if strings.TrimSpace(result.Error) != "" {
+		t.Fatalf("expected empty error after verify success, got %q", result.Error)
+	}
+	if !strings.Contains(result.Output, "安装完成") || !strings.Contains(result.Output, "agent-browser --help") {
+		t.Fatalf("expected verified install guidance, got %q", result.Output)
 	}
 }
 
@@ -186,14 +271,114 @@ func TestMemoryToolsSearchAndIndex(t *testing.T) {
 	}
 }
 
+func TestMemoryListAndShowIncludeReviewSignals(t *testing.T) {
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	longDir := filepath.Join(workspace, "memory", "agents", "main", "long")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := `---
+type: decision
+scope: agent
+status: active
+sources:
+  - manual
+confidence: medium
+created_at: 2026-03-01
+updated_at: 2026-03-01
+---
+
+# Stale Memory
+
+Old decision note.
+`
+	fresh := `---
+type: project
+scope: agent
+status: active
+sources:
+  - manual
+confidence: low
+created_at: 2026-05-20
+updated_at: 2026-05-20
+---
+
+# Fresh Memory
+
+Recent project note.
+`
+	if err := os.WriteFile(filepath.Join(longDir, "decision-stale-memory.md"), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(longDir, "project-fresh-memory.md"), []byte(fresh), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	list := MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "long", "status": "active", "review": "stale"},
+		Context: Context{Workspace: workspace},
+	})
+	if !list.OK || !strings.Contains(list.Output, "Stale Memory") || strings.Contains(list.Output, "Fresh Memory") || !strings.Contains(list.Output, "review=stale") {
+		t.Fatalf("expected stale review filter in memory list, got %#v", list)
+	}
+	grouped := MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "long", "status": "active", "group_by": "review"},
+		Context: Context{Workspace: workspace},
+	})
+	if !grouped.OK || !strings.Contains(grouped.Output, "[review=stale]") || !strings.Contains(grouped.Output, "[review=fresh]") {
+		t.Fatalf("expected review grouping in memory list, got %#v", grouped)
+	}
+	targetGrouped := MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "long", "status": "active", "group_by": "target"},
+		Context: Context{Workspace: workspace},
+	})
+	if !targetGrouped.OK || !strings.Contains(targetGrouped.Output, "[target=decision-style long memory]") || !strings.Contains(targetGrouped.Output, "[target=project fact/note-style long memory]") {
+		t.Fatalf("expected target grouping in memory list, got %#v", targetGrouped)
+	}
+	show := MemoryShow().Run(context.Background(), Call{
+		Args:    map[string]string{"id": filepath.Join(longDir, "decision-stale-memory.md")},
+		Context: Context{Workspace: workspace},
+	})
+	if !show.OK || !strings.Contains(show.Output, "Review: stale") || !strings.Contains(show.Output, "Review tip: this entry appears stale") {
+		t.Fatalf("expected review label in memory show, got %#v", show)
+	}
+	review := MemoryReview().Run(context.Background(), Call{
+		Args:    map[string]string{},
+		Context: Context{Workspace: workspace},
+	})
+	if !review.OK || !strings.Contains(review.Output, "Long memory review queue") || !strings.Contains(review.Output, "Stale Memory") || strings.Contains(review.Output, "Fresh Memory") || !strings.Contains(review.Output, "suggestion: re-validate this decision-style long memory") {
+		t.Fatalf("expected memory review queue to include stale/soon only, got %#v", review)
+	}
+	if strings.Index(review.Output, "Stale Memory") > strings.Index(review.Output, "Fresh Memory") && strings.Contains(review.Output, "Fresh Memory") {
+		t.Fatalf("expected stale entries to be prioritized in review queue, got %#v", review)
+	}
+	targetReview := MemoryReview().Run(context.Background(), Call{
+		Args:    map[string]string{"target": "decision-style long memory"},
+		Context: Context{Workspace: workspace},
+	})
+	if !targetReview.OK || !strings.Contains(targetReview.Output, "Stale Memory") || strings.Contains(targetReview.Output, "Fresh Memory") {
+		t.Fatalf("expected target-filtered review queue, got %#v", targetReview)
+	}
+	proposalReview := MemoryReview().Run(context.Background(), Call{
+		Args:    map[string]string{"proposal": "true"},
+		Context: Context{Workspace: workspace},
+	})
+	if !proposalReview.OK || !strings.Contains(proposalReview.Output, "Long memory review proposal written:") {
+		t.Fatalf("expected review proposal write, got %#v", proposalReview)
+	}
+	_ = store
+}
+
 func TestMemoryToolsListShowRejectAndCommit(t *testing.T) {
 	workspace := t.TempDir()
 	store := memory.NewStore(workspace)
 	proposal, err := store.Propose(memory.ProposalInput{
-		AgentID: "main",
-		Title:   "Review Memory",
-		Body:    "Review this proposal before promotion.",
-		Sources: []string{"manual"},
+		AgentID:    "main",
+		Type:       "decision",
+		Title:      "Review Memory",
+		Body:       "Review this proposal before promotion.",
+		Sources:    []string{"manual"},
+		Confidence: "medium",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -205,12 +390,95 @@ func TestMemoryToolsListShowRejectAndCommit(t *testing.T) {
 	if !list.OK || !strings.Contains(list.Output, proposal.ID) {
 		t.Fatalf("expected list output to include proposal, got %#v", list)
 	}
+	if !strings.Contains(list.Output, "target=decision") {
+		t.Fatalf("expected typed target hint in list output, got %#v", list)
+	}
+	if !strings.Contains(list.Output, "origin=manual") {
+		t.Fatalf("expected origin hint in list output, got %#v", list)
+	}
+	if !strings.Contains(list.Output, "--tag distill-decision|distill-playbook|distill-preference|distill-project") {
+		t.Fatalf("expected review tip for distillation tags, got %#v", list)
+	}
+	third, err := store.Propose(memory.ProposalInput{
+		AgentID:    "main",
+		Type:       "project",
+		Title:      "Project Note",
+		Body:       "Project summary candidate.",
+		Sources:    []string{"manual"},
+		Confidence: "low",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = third
+	fourth, err := store.Propose(memory.ProposalInput{
+		AgentID:    "main",
+		Type:       "playbook",
+		Title:      "Workflow Note",
+		Body:       "Workflow candidate.",
+		Sources:    []string{"manual"},
+		Confidence: "medium",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = fourth
+	list = MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "inbox", "status": "proposed"},
+		Context: Context{Workspace: workspace},
+	})
+	lines := strings.Split(list.Output, "\n")
+	if len(lines) < 3 || !strings.Contains(lines[1], "decision") || !strings.Contains(lines[2], "playbook") {
+		t.Fatalf("expected high-priority memory kinds first in list output, got %#v", list.Output)
+	}
+	filtered := MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "inbox", "status": "proposed", "kind": "playbook"},
+		Context: Context{Workspace: workspace},
+	})
+	if !filtered.OK || !strings.Contains(filtered.Output, "Workflow Note") || strings.Contains(filtered.Output, "Review Memory") {
+		t.Fatalf("expected kind-filtered list output, got %#v", filtered)
+	}
+	tagged, err := store.Propose(memory.ProposalInput{
+		AgentID:    "main",
+		Type:       "decision",
+		Title:      "Distilled Memory",
+		Body:       "Auto distilled memory.",
+		Sources:    []string{"manual"},
+		Tags:       []string{"daily-distillation", "auto-proposal"},
+		Confidence: "medium",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tagged
+	filtered = MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "inbox", "status": "proposed", "tag": "daily-distillation"},
+		Context: Context{Workspace: workspace},
+	})
+	if !filtered.OK || !strings.Contains(filtered.Output, "Distilled Memory") || !strings.Contains(filtered.Output, "origin=daily_distillation") || strings.Contains(filtered.Output, "Workflow Note") {
+		t.Fatalf("expected tag-filtered list output, got %#v", filtered)
+	}
+	grouped := MemoryList().Run(context.Background(), Call{
+		Args:    map[string]string{"area": "inbox", "status": "proposed", "group_by": "origin"},
+		Context: Context{Workspace: workspace},
+	})
+	if !grouped.OK || !strings.Contains(grouped.Output, "[origin=daily_distillation]") || !strings.Contains(grouped.Output, "[origin=manual]") {
+		t.Fatalf("expected grouped list output, got %#v", grouped)
+	}
 	show := MemoryShow().Run(context.Background(), Call{
 		Args:    map[string]string{"id": proposal.ID},
 		Context: Context{Workspace: workspace},
 	})
 	if !show.OK || !strings.Contains(show.Output, "Review Memory") {
 		t.Fatalf("expected show output to include proposal body, got %#v", show)
+	}
+	for _, want := range []string{"Type: decision", "Confidence: medium", "Recommended target: decision-style long memory"} {
+		if !strings.Contains(show.Output, want) {
+			t.Fatalf("expected show output to contain %q, got %#v", want, show)
+		}
+	}
+	if !strings.Contains(show.Output, "Origin: manual") {
+		t.Fatalf("expected show output to contain origin summary, got %#v", show)
 	}
 	reject := MemoryReject().Run(context.Background(), Call{
 		Args:    map[string]string{"proposal": proposal.ID, "reason": "test reject"},
@@ -221,10 +489,12 @@ func TestMemoryToolsListShowRejectAndCommit(t *testing.T) {
 	}
 
 	second, err := store.Propose(memory.ProposalInput{
-		AgentID: "main",
-		Title:   "Commit Memory",
-		Body:    "This proposal should become long memory.",
-		Sources: []string{"manual"},
+		AgentID:    "main",
+		Type:       "decision",
+		Title:      "Commit Memory",
+		Body:       "This proposal should become long memory.",
+		Sources:    []string{"manual"},
+		Confidence: "medium",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -233,8 +503,43 @@ func TestMemoryToolsListShowRejectAndCommit(t *testing.T) {
 		Args:    map[string]string{"proposal": second.ID},
 		Context: Context{Workspace: workspace},
 	})
-	if !commit.OK || !strings.Contains(commit.Output, "Memory committed.") {
-		t.Fatalf("expected commit success, got %#v", commit)
+	if commit.OK || !commit.RequiresConfirm || !strings.Contains(commit.ConfirmMessage, "类型：decision") {
+		t.Fatalf("expected high-impact memory commit confirmation, got %#v", commit)
+	}
+	commit = MemoryCommit().Run(context.Background(), Call{
+		Args:      map[string]string{"proposal": second.ID},
+		Context:   Context{Workspace: workspace},
+		Confirmed: true,
+	})
+	if !commit.OK || !strings.Contains(commit.Output, "Memory committed as") {
+		t.Fatalf("expected commit success after confirmation, got %#v", commit)
+	}
+	if !strings.Contains(commit.Output, "Recommended target: decision-style long memory") {
+		t.Fatalf("expected commit output to include recommended target, got %#v", commit)
+	}
+	if !RequireConfirmForTool("memory.commit", map[string]string{"type": "decision"}) {
+		t.Fatalf("expected high-impact memory commit to require confirmation")
+	}
+	if RequireConfirmForTool("memory.commit", map[string]string{"type": "project"}) {
+		t.Fatalf("expected project memory commit not to require confirmation by default")
+	}
+	thirdCommit, err := store.Propose(memory.ProposalInput{
+		AgentID:    "main",
+		Type:       "project",
+		Title:      "Project Commit",
+		Body:       "This proposal should become project memory.",
+		Sources:    []string{"manual"},
+		Confidence: "low",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectCommit := MemoryCommit().Run(context.Background(), Call{
+		Args:    map[string]string{"proposal": thirdCommit.ID},
+		Context: Context{Workspace: workspace},
+	})
+	if !projectCommit.OK || projectCommit.RequiresConfirm {
+		t.Fatalf("expected low-impact project memory commit without confirmation, got %#v", projectCommit)
 	}
 }
 
@@ -265,6 +570,43 @@ func TestScheduleToolsConfirmationBoundary(t *testing.T) {
 	}
 	if RequireConfirmForTool("schedule.update", map[string]string{"id": "ai-trends"}) {
 		t.Fatalf("expected schedule.update not to require confirmation")
+	}
+}
+
+func TestSkillPromoteRequiresConfirmationAndPromotes(t *testing.T) {
+	workspace := t.TempDir()
+	store := memory.NewStore(workspace)
+	cfg := memory.LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
+	skillCandidate, err := store.ProcessTask(memory.TaskOutcome{
+		AgentID:     "main",
+		TraceID:     "trace-1",
+		TaskID:      "task-1",
+		Intent:      "review latest release notes",
+		PlanSummary: "review release notes",
+		Tools:       []string{"web.search", "file.summary"},
+		Success:     true,
+		FinishedAt:  time.Now(),
+	}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	promote := SkillPromote().Run(context.Background(), Call{
+		Args:    map[string]string{"proposal": skillCandidate.CandidatePath, "name": "release-review"},
+		Context: Context{Workspace: workspace},
+	})
+	if promote.OK || !promote.RequiresConfirm {
+		t.Fatalf("expected skill promote confirmation, got %#v", promote)
+	}
+	promote = SkillPromote().Run(context.Background(), Call{
+		Args:      map[string]string{"proposal": skillCandidate.CandidatePath, "name": "release-review"},
+		Context:   Context{Workspace: workspace},
+		Confirmed: true,
+	})
+	if !promote.OK || !strings.Contains(promote.Output, "Skill promoted as:") || !strings.Contains(promote.Output, "next planning turn") {
+		t.Fatalf("expected skill promote success, got %#v", promote)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "skills", "release-review", "SKILL.md")); err != nil {
+		t.Fatalf("expected promoted skill file: %v", err)
 	}
 }
 

@@ -20,30 +20,31 @@ type AgentLoop struct {
 }
 
 type loopState struct {
-	message         channel.InboundMessage
-	traceID         string
-	understanding   taskUnderstanding
-	plan            model.Plan
-	results         []model.ToolResult
-	control         string
-	replyText       string
-	awaitConfirm    bool
-	awaitUserInput  bool
-	failed          bool
-	synthesisFailed bool
-	startedAt       time.Time
-	session         session.State
-	resolvedQuery   string
-	topic           string
-	selectedSkills  []string
-	binding         taskBindingDecision
-	currentTask     *session.TaskState
-	shortMemory     shortMemorySummary
-	longMemory      longMemorySummary
-	inboxReminder   inboxReminder
-	repairReason    string
-	repairAttempted bool
-	finalAccept     FinalAcceptance
+	message             channel.InboundMessage
+	traceID             string
+	understanding       taskUnderstanding
+	plan                model.Plan
+	previousPlanSummary string
+	results             []model.ToolResult
+	control             string
+	replyText           string
+	awaitConfirm        bool
+	awaitUserInput      bool
+	failed              bool
+	synthesisFailed     bool
+	startedAt           time.Time
+	session             session.State
+	resolvedQuery       string
+	topic               string
+	selectedSkills      []string
+	binding             taskBindingDecision
+	currentTask         *session.TaskState
+	shortMemory         shortMemorySummary
+	longMemory          longMemorySummary
+	inboxReminder       inboxReminder
+	repairReason        string
+	repairAttempted     bool
+	finalAccept         FinalAcceptance
 }
 
 type taskUnderstanding struct {
@@ -83,8 +84,17 @@ func (l *AgentLoop) Run(ctx context.Context) (Response, error) {
 	if resp := l.resolveArtifactDirectAnswer(); resp != nil {
 		return *resp, nil
 	}
+	if resp := l.resolveMatewayDirectCommand(); resp != nil {
+		return *resp, nil
+	}
 	binding := l.resolveTaskBinding(ctx)
+	if resp := l.resolveApprovedMatewayDirectCommandFromBinding(binding); resp != nil {
+		return *resp, nil
+	}
 	if resp := l.applyTaskBinding(binding); resp != nil {
+		return *resp, nil
+	}
+	if resp := l.resolveApprovedMatewayDirectCommand(); resp != nil {
 		return *resp, nil
 	}
 	l.receive()
@@ -280,8 +290,7 @@ func (l *AgentLoop) loadSession() {
 func (l *AgentLoop) plan(ctx context.Context) error {
 	fallbackUnderstanding := l.fallbackUnderstanding()
 	allTools := l.runtime.Tools.Definitions()
-	recommendedTools := composeCandidateTools(allTools, fallbackUnderstanding)
-	candidateTools := orderToolsForPlanning(allTools, recommendedTools)
+	candidateTools := composeCandidateTools(allTools, fallbackUnderstanding, planningCandidateBudget)
 	planMatches := skill.SelectMatches(l.skillDefinitions(), skill.StagePlanning, l.skillContext())
 	planSkills := make([]skill.Definition, 0, len(planMatches))
 	for _, match := range planMatches {
@@ -294,10 +303,10 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 	})
 	l.recordSelectedSkills(planSkills)
 	contextPrompt := l.buildContextPrompt(skill.StagePlanning, planMatches)
-	if recommendation := renderRecommendedTools(recommendedTools, len(allTools)); recommendation != "" {
+	if recommendation := renderRecommendedTools(candidateTools); recommendation != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\n" + recommendation)
 	}
-	plan, check, err := l.planJSON(ctx, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)), candidateTools)
+	plan, check, err := l.planJSON(ctx, buildStageModelPrompt(contextPrompt, planSkills), candidateTools)
 	if err != nil {
 		return err
 	}
@@ -337,10 +346,13 @@ func (l *AgentLoop) planJSON(ctx context.Context, skillPrompt string, candidates
 
 func (l *AgentLoop) act(ctx context.Context, plan model.Plan) {
 	var previous map[string]session.StepState
+	var previousResults []model.ToolResult
 	if l.state.currentTask != nil {
-		previous = l.state.currentTask.StepStates
+		if l.state.currentTask.Status != session.TaskFailed && !l.state.currentTask.Failed {
+			previous = l.state.currentTask.StepStates
+		}
 	}
-	results, control := l.runtime.executePlan(ctx, l.state.traceID, plan, l.state.binding.ApprovalGranted, l.state.binding.ApprovalStepID, previous, nil)
+	results, control := l.runtime.executePlan(ctx, l.state.traceID, plan, l.state.binding.ApprovalGranted, l.state.binding.ApprovalStepID, previous, previousResults)
 	l.state.plan = plan
 	l.state.results = results
 	l.state.control = control
@@ -365,10 +377,14 @@ func (l *AgentLoop) repair(ctx context.Context) {
 		return
 	}
 	var previous map[string]session.StepState
+	var priorResults []model.ToolResult
 	if l.state.currentTask != nil {
-		previous = l.state.currentTask.StepStates
+		if l.state.currentTask.Status != session.TaskFailed && !l.state.currentTask.Failed {
+			previous = l.state.currentTask.StepStates
+			priorResults = l.state.results
+		}
 	}
-	results, control := l.runtime.executePlan(ctx, l.state.traceID, l.state.plan, l.state.binding.ApprovalGranted, l.state.binding.ApprovalStepID, previous, l.state.results)
+	results, control := l.runtime.executePlan(ctx, l.state.traceID, l.state.plan, l.state.binding.ApprovalGranted, l.state.binding.ApprovalStepID, previous, priorResults)
 	l.state.results = mergeToolResultsForPlan(l.state.plan, l.state.results, results)
 	l.state.control = control
 }
@@ -379,28 +395,28 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 	}
 	l.state.repairAttempted = true
 	allTools := l.runtime.Tools.Definitions()
-	recommendedTools := composeCandidateTools(allTools, l.state.understanding)
-	candidateTools := orderToolsForPlanning(allTools, recommendedTools)
-	planMatches := skill.SelectMatches(l.skillDefinitions(), skill.StagePlanning, l.skillContext())
+	candidateTools := composeCandidateTools(allTools, l.state.understanding, repairCandidateBudget, repairCandidateHints(l.state.results, l.state.repairReason)...)
+	planMatches := skill.SelectMatches(l.skillDefinitions(), skill.StagePlanningRepair, l.skillContext())
 	planSkills := make([]skill.Definition, 0, len(planMatches))
 	for _, match := range planMatches {
 		planSkills = append(planSkills, match.Definition)
 	}
 	l.runtime.Logger.Event("runtime.skills_selected", map[string]any{
 		"trace_id": l.state.traceID,
-		"stage":    "planning_repair",
+		"stage":    skill.StagePlanningRepair,
 		"skills":   selectedSkillsTraceFields(planMatches),
 	})
 	l.recordSelectedSkills(planSkills)
-	contextPrompt := l.buildContextPrompt("planning_repair", planMatches)
-	if recommendation := renderRecommendedTools(recommendedTools, len(allTools)); recommendation != "" {
+	contextPrompt := l.buildContextPrompt(skill.StagePlanningRepair, planMatches)
+	if recommendation := renderRecommendedTools(candidateTools); recommendation != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\n" + recommendation)
 	}
 	repairGuidance := strings.TrimSpace(l.state.repairReason)
 	if repairGuidance != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\nRepair guidance:\n" + repairGuidance)
 	}
-	repaired, check, err := l.repairPlanJSON(ctx, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(planSkills)), candidateTools)
+	l.state.previousPlanSummary = strings.TrimSpace(l.state.plan.Summary)
+	repaired, check, err := l.repairPlanJSON(ctx, buildStageModelPrompt(contextPrompt, planSkills), candidateTools)
 	if err != nil {
 		l.runtime.Logger.Event("runtime.plan_repair_failed", map[string]any{
 			"trace_id": l.state.traceID,
@@ -408,6 +424,7 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 		})
 		return false
 	}
+	repaired = l.normalizePlanForRuntime(repaired)
 	l.runtime.Logger.Event("runtime.plan_repair", map[string]any{
 		"trace_id":       l.state.traceID,
 		"reason":         firstNonEmpty(l.state.repairReason, repairReasonFromResults(l.state.results)),
@@ -621,7 +638,7 @@ func (l *AgentLoop) synthesize(ctx context.Context) {
 	})
 	l.recordSelectedSkills(synthSkills)
 	contextPrompt := l.buildContextPrompt(skill.StageSynthesis, synthMatches)
-	text, err := l.runtime.Model.Synthesize(ctx, l.state.resolvedRequest(), l.state.plan, l.state.results, strings.TrimSpace(contextPrompt+"\n\n"+skill.PromptBlock(synthSkills)))
+	text, err := l.runtime.Model.Synthesize(ctx, l.state.resolvedRequest(), l.state.plan, l.state.results, buildStageModelPrompt(contextPrompt, synthSkills))
 	if err != nil {
 		l.state.synthesisFailed = true
 		l.state.replyText = fallbackSynthesis(l.state.results)
@@ -647,15 +664,20 @@ func (l *AgentLoop) skillContext() skill.Context {
 }
 
 func (l *AgentLoop) skillDefinitions() []skill.Definition {
-	if l.runtime.Skills == nil {
+	reg := l.runtime.currentSkills()
+	if reg == nil {
 		return nil
 	}
-	return l.runtime.Skills.Definitions()
+	return reg.Definitions()
 }
 
 func (l *AgentLoop) buildContextPrompt(stage string, matches []skill.Match) string {
+	shortMemory := l.state.shortMemory.Text
+	if l.state.shortMemory.SessionPresent {
+		shortMemory = buildShortMemorySummaryForStage(l.state.session, stage).Text
+	}
 	return buildModelContextPrompt(l.state.resolvedRequest(), stage, matches, l.runtime.Tools.Definitions(), l.runtime.ToolCtx, promptContextOptions{
-		ShortMemory:   l.state.shortMemory.Text,
+		ShortMemory:   shortMemory,
 		LongMemory:    l.state.longMemory.Text,
 		Understanding: l.state.understanding,
 		CurrentTask:   l.state.currentTask,
@@ -784,12 +806,21 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 	}
 	if resp.AwaitConfirm {
 		approvedStepID := ""
+		existingApproval := task.PendingApproval
 		if task.PendingApproval != nil {
 			action := strings.TrimSpace(task.PendingApproval.RequestedAction)
 			if strings.HasPrefix(action, "approved:") {
 				approvedStepID = strings.TrimSpace(strings.TrimPrefix(action, "approved:"))
 			}
 		}
+		if existingApproval != nil && isDirectMatewayApprovalAction(existingApproval.RequestedAction) {
+			task.PendingApproval = existingApproval
+			task.PendingQuestions = nil
+			l.runtime.Logger.Event("runtime.task_pending_approval", map[string]any{
+				"trace_id": l.state.traceID,
+				"task_id":  task.ID,
+			})
+		} else {
 		pendingAction := firstNonEmpty(task.PlanSummary, task.ResolvedQuery)
 		for i := len(resp.Results) - 1; i >= 0; i-- {
 			result := resp.Results[i]
@@ -814,6 +845,7 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 			"trace_id": l.state.traceID,
 			"task_id":  task.ID,
 		})
+		}
 	} else if resp.AwaitUserInput {
 		task.PendingQuestions = []string{strings.TrimSpace(resp.Reply.Text)}
 		if len(task.PendingFields) == 0 {
@@ -859,8 +891,12 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 		"task_status":  task.Status,
 		"result_count": task.ResultCount,
 	})
-	l.proposeMemoryFromTask(resp.Reply, task)
-	return l.recordLearningPattern(resp, task)
+	learning := l.recordLearningPattern(resp, task)
+	l.maybeProposeSkillImprovement(resp, task)
+	if !learning.CandidateGenerated {
+		l.proposeMemoryFromTask(resp.Reply, task)
+	}
+	return learning
 }
 
 func (l *AgentLoop) recordLearningPattern(resp Response, task session.TaskState) memory.ProcessResult {
@@ -917,6 +953,90 @@ func (l *AgentLoop) recordLearningPattern(resp Response, task session.TaskState)
 		})
 	}
 	return result
+}
+
+func (l *AgentLoop) maybeProposeSkillImprovement(resp Response, task session.TaskState) {
+	if l.runtime.Config == nil || !l.runtime.Config.Learning.Enabled {
+		return
+	}
+	if !l.state.repairAttempted || resp.Failed || resp.AwaitConfirm || resp.AwaitUserInput {
+		return
+	}
+	if task.Status != session.TaskCompleted {
+		return
+	}
+	skillName := firstSelectedSkill(task.SelectedSkills)
+	if skillName == "" {
+		return
+	}
+	agentID := firstNonEmpty(l.runtime.Config.Agents.Default, "main")
+	path, err := l.runtime.Memory.WriteSkillImprovementProposal(memory.SkillImprovementInput{
+		AgentID:             agentID,
+		SkillName:           skillName,
+		ImprovementType:     inferSkillImprovementType(l.state.repairReason),
+		Reason:              buildSkillImprovementReason(skillName, l.state.repairReason),
+		ProposedChange:      buildSkillImprovementChange(skillName, l.state.previousPlanSummary, l.state.plan.Summary),
+		RepairReason:        strings.TrimSpace(l.state.repairReason),
+		PreviousPlanSummary: strings.TrimSpace(l.state.previousPlanSummary),
+		RepairedPlanSummary: strings.TrimSpace(l.state.plan.Summary),
+		TaskID:              task.ID,
+		TraceID:             l.state.traceID,
+		Sources:             []string{"task:" + task.ID, "trace:" + l.state.traceID},
+	})
+	if err != nil {
+		l.runtime.Logger.Event("runtime.skill_improvement_failed", map[string]any{
+			"trace_id": l.state.traceID,
+			"skill":    skillName,
+			"error":    err.Error(),
+		})
+		return
+	}
+	l.runtime.Logger.Event("runtime.skill_improvement_proposed", map[string]any{
+		"trace_id": l.state.traceID,
+		"skill":    skillName,
+		"path":     path,
+		"type":     inferSkillImprovementType(l.state.repairReason),
+	})
+}
+
+func firstSelectedSkill(skills []string) string {
+	for _, skillName := range skills {
+		if strings.TrimSpace(skillName) != "" {
+			return strings.TrimSpace(skillName)
+		}
+	}
+	return ""
+}
+
+func inferSkillImprovementType(repairReason string) string {
+	text := strings.ToLower(strings.TrimSpace(repairReason))
+	switch {
+	case strings.Contains(text, "missing"), strings.Contains(text, "evidence"), strings.Contains(text, "verify"):
+		return "weak_verification"
+	case strings.Contains(text, "unclear"), strings.Contains(text, "ambiguous"):
+		return "unclear_instruction"
+	default:
+		return "missing_step"
+	}
+}
+
+func buildSkillImprovementReason(skillName, repairReason string) string {
+	reason := strings.TrimSpace(repairReason)
+	if reason == "" {
+		return fmt.Sprintf("The current %s flow needed repair before the task could complete successfully.", skillName)
+	}
+	return fmt.Sprintf("The current %s flow needed repair before the task could complete successfully. Repair signal: %s", skillName, reason)
+}
+
+func buildSkillImprovementChange(skillName, previousPlanSummary, repairedPlanSummary string) string {
+	switch {
+	case strings.TrimSpace(previousPlanSummary) != "" && strings.TrimSpace(repairedPlanSummary) != "":
+		return fmt.Sprintf("Update %s so the default flow moves from %q toward %q when similar tasks are detected.", skillName, strings.TrimSpace(previousPlanSummary), strings.TrimSpace(repairedPlanSummary))
+	case strings.TrimSpace(repairedPlanSummary) != "":
+		return fmt.Sprintf("Update %s to incorporate the repaired flow: %s", skillName, strings.TrimSpace(repairedPlanSummary))
+	default:
+		return fmt.Sprintf("Update %s to include the missing repair guidance that was needed in this task.", skillName)
+	}
 }
 
 func (l *AgentLoop) saveConversationOnly(resp Response) {

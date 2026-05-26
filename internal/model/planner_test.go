@@ -97,6 +97,20 @@ func TestPlanCheckerParsesUnderstandingBlock(t *testing.T) {
 	}
 }
 
+func TestPlanCheckerParsesInstallSummaryBlock(t *testing.T) {
+	result, err := CheckAndRepairPlanJSON(`{"summary":"install tool","understanding":{"goal":"install lark cli","tool_needs":["software.search","web.fetch","software.install"],"install_summary":{"official_source":"https://github.com/larksuite/cli","install_method":"npm","install_command":"npm install -g @larksuite/cli","verify_command":"lark-cli --version","executable_name":"lark-cli","common_commands":["lark-cli --help","lark-cli auth login --recommend"]}},"steps":[{"id":"s1","tool":"software.search","args":{"query":"lark cli install"}}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := result.Plan.Understanding.InstallSummary
+	if summary.OfficialSource != "https://github.com/larksuite/cli" || summary.InstallCommand != "npm install -g @larksuite/cli" {
+		t.Fatalf("expected install summary parsed, got %#v", summary)
+	}
+	if len(summary.CommonCommands) != 2 || summary.CommonCommands[0] != "lark-cli --help" {
+		t.Fatalf("expected install summary commands parsed, got %#v", summary)
+	}
+}
+
 func TestPlanCheckerAcceptsSingleStringEvidenceAndCriteria(t *testing.T) {
 	result, err := CheckAndRepairPlanJSON(`{"summary":"search","steps":[{"id":"s1","tool":"web.search","args":{"query":"AI trends"},"expected_evidence":"search results with URLs","success_criteria":"results are returned"}]}`)
 	if err != nil {
@@ -137,6 +151,20 @@ func TestPlanCheckerRepairsMissingStringArrayClosure(t *testing.T) {
 	}
 }
 
+func TestExtractJSONObjectStripsInlineToolCallArtifacts(t *testing.T) {
+	raw := `好的，前两步已经成功。
+<minimax:tool_call>
+<invoke name="terminal.run">
+<parameter name="command">echo $PATH</parameter>
+</invoke>
+</minimax:tool_call>
+{"summary":"repair","steps":[{"id":"s1","tool":"terminal.run","args":{"command":"echo $PATH"}}]}`
+	got := extractJSONObject(raw)
+	if !strings.Contains(got, `"summary":"repair"`) || !strings.Contains(got, `"tool":"terminal.run"`) {
+		t.Fatalf("expected json object after stripping tool call artifacts, got %q", got)
+	}
+}
+
 func TestSynthesisResultViewHidesStepIDsAndTruncatesOutput(t *testing.T) {
 	results := []ToolResult{{
 		StepID: "step-2",
@@ -163,14 +191,14 @@ func TestSynthesisResultViewHidesStepIDsAndTruncatesOutput(t *testing.T) {
 }
 
 func TestPlannerPromptKeepsSkillSearchCapabilityDriven(t *testing.T) {
-	prompt := plannerSystemPrompt("")
+	prompt := plannerSystemPrompt()
 	if !strings.Contains(prompt, "first understand the capability") || !strings.Contains(prompt, "concise capability keywords") {
 		t.Fatalf("expected capability-driven skill search instruction, got %q", prompt)
 	}
 }
 
 func TestPlannerPromptPutsCriticalRulesAtBeginningAndEnd(t *testing.T) {
-	prompt := plannerSystemPrompt("")
+	prompt := plannerSystemPrompt()
 	if !strings.Contains(prompt, "Most important rules:") || !strings.Contains(prompt, "Final reminders:") {
 		t.Fatalf("expected prompt to have emphasized beginning/end sections, got %q", prompt)
 	}
@@ -179,6 +207,9 @@ func TestPlannerPromptPutsCriticalRulesAtBeginningAndEnd(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "understanding.tool_needs to capture the concrete tools") {
 		t.Fatalf("expected tool_needs contract to mention concrete tools, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "If the official source is known but the install command or verify command is still unclear, do not emit software.install yet") {
+		t.Fatalf("expected planner prompt to block speculative software.install, got %q", prompt)
 	}
 }
 
@@ -207,6 +238,48 @@ func TestToolListForPromptIncludesStructuredMetadata(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected prompt tool list to contain %q, got %q", want, text)
+		}
+	}
+}
+
+func TestBuildPlannerUserPromptSeparatesSections(t *testing.T) {
+	text := buildPlannerUserPrompt("summarize README", "- file.summary: summarize file", "Skills context:\nSelected skills:\n- doc-review")
+	for _, want := range []string{
+		"User task:\nsummarize README",
+		"Available tools:\n- file.summary: summarize file",
+		"Context guidance:\nSkills context:",
+		"Return the JSON plan now.",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected planner user prompt to contain %q, got %q", want, text)
+		}
+	}
+}
+
+func TestBuildRepairPlannerUserPromptSeparatesSections(t *testing.T) {
+	text := buildRepairPlannerUserPrompt("fix task", `{"summary":"old"}`, `[{"tool":"web.search","error":"timeout"}]`, "- web.search: latest info", "Repair guidance:\ntimeout")
+	for _, want := range []string{
+		"User task:\nfix task",
+		"Previous plan:\n{\"summary\":\"old\"}",
+		"Tool results/errors:\n[{\"tool\":\"web.search\",\"error\":\"timeout\"}]",
+		"Available tools:\n- web.search: latest info",
+		"Context guidance:\nRepair guidance:\ntimeout",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected repair planner user prompt to contain %q, got %q", want, text)
+		}
+	}
+}
+
+func TestBuildSynthesisUserPromptSeparatesSections(t *testing.T) {
+	text := buildSynthesisUserPrompt("summarize results", `[{"tool":"file.summary","ok":true}]`, "Skills context:\nSelected skills:\n- chinese-summary")
+	for _, want := range []string{
+		"User task:\nsummarize results",
+		"Tool result summaries:\n[{\"tool\":\"file.summary\",\"ok\":true}]",
+		"Context guidance:\nSkills context:",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected synthesis user prompt to contain %q, got %q", want, text)
 		}
 	}
 }

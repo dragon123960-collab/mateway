@@ -1122,7 +1122,7 @@ func uniqueTaskSuffix(title string) string {
 
 func runSkill(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway skill <search|install|list>")
+		return fmt.Errorf("usage: mateway skill <search|install|promote|list>")
 	}
 	a, err := app.Build("", true)
 	if err != nil {
@@ -1165,6 +1165,21 @@ func runSkill(args []string, out io.Writer) error {
 		}
 		fmt.Fprintf(out, "Skill installed: %s\n%s\n", result.Item.Name, result.TargetPath)
 		return nil
+	case "promote":
+		opts, err := parseSkillPromoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		result, err := memory.NewStore(a.Config.App.Workspace).PromoteSkillCandidate(memory.SkillPromotionInput{
+			AgentID:   opts.AgentID,
+			Proposal:  opts.Proposal,
+			SkillName: opts.SkillName,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Skill promoted: %s\nThis skill will be reloadable from workspace skills on the next planning turn.\n", result.TargetPath)
+		return nil
 	case "list":
 		defs, err := skill.ListInstalled(a.Config.App.Workspace)
 		if err != nil {
@@ -1179,8 +1194,50 @@ func runSkill(args []string, out io.Writer) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("usage: mateway skill <search|install|list>")
+		return fmt.Errorf("usage: mateway skill <search|install|promote|list>")
 	}
+}
+
+type skillPromoteOptions struct {
+	AgentID   string
+	Proposal  string
+	SkillName string
+}
+
+func parseSkillPromoteOptions(args []string) (skillPromoteOptions, error) {
+	opts := skillPromoteOptions{AgentID: "main"}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.AgentID, i = value, next
+		case "--proposal":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.Proposal, i = value, next
+		case "--name":
+			value, next, err := optionValue(args, i)
+			if err != nil {
+				return opts, err
+			}
+			opts.SkillName, i = value, next
+		default:
+			if strings.TrimSpace(opts.Proposal) == "" && !strings.HasPrefix(args[i], "-") {
+				opts.Proposal = args[i]
+				continue
+			}
+			return opts, fmt.Errorf("unknown skill promote option %q", args[i])
+		}
+	}
+	if strings.TrimSpace(opts.Proposal) == "" {
+		return opts, fmt.Errorf("usage: mateway skill promote --proposal <proposal-id-or-path> [--name <skill-name>]")
+	}
+	return opts, nil
 }
 
 func runEval(args []string, out io.Writer) error {
@@ -1832,10 +1889,10 @@ Commands:
   doctor                 validate config and list tools
   eval routing           run real-model planner/tool routing evaluation
   ask <message>          run one CLI task
-  gateway serve          run the configured gateway in foreground
-  gateway start          start OS-managed gateway service
-  gateway restart        restart OS-managed gateway service
-  gateway stop           stop OS-managed gateway service
+  gateway serve          run the configured gateway in foreground; does not install autostart
+  gateway start          start an already-registered OS-managed gateway service
+  gateway restart        restart an already-registered OS-managed gateway service
+  gateway stop           stop an already-registered OS-managed gateway service
   gateway status         show service and instance-lock status
   heartbeat status       show heartbeat job state
   heartbeat run          run one heartbeat job manually
@@ -1848,14 +1905,16 @@ Commands:
   schedule run-due       run due user scheduled tasks through runtime
   skill search <query>   search installable skills from priority catalogs
   skill install <ref>    install a skill into ~/.mateway/workspace/skills
+  skill promote          promote a reviewed skill candidate into ~/.mateway/workspace/skills
   skill list             list installed Mateway workspace skills
   memory lint            check Markdown memory wiki health without modifying files
   memory index           rebuild JSON memory index from Markdown
-  memory list            list inbox or long memory items
-  memory show            print one memory item
+  memory list            first-class direct command to list inbox or long memory items
+  memory show            first-class direct command to print one memory item
+  memory review          first-class direct command to inspect or write a long-memory review proposal
   memory propose         write a reviewed memory proposal into inbox
-  memory commit          commit an inbox proposal into long memory
-  memory reject          mark an inbox proposal as rejected
+  memory commit          direct command with confirmation; commit an inbox proposal into long memory
+  memory reject          direct command with confirmation; mark an inbox proposal as rejected
   trace tail             follow today's structured trace
   trace show <trace_id>  show events for one trace id
 

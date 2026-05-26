@@ -17,14 +17,24 @@ type Plan struct {
 }
 
 type UnderstandingJSON struct {
-	Goal                 string   `json:"goal"`
-	Subtasks             []string `json:"subtasks,omitempty"`
-	Constraints          []string `json:"constraints,omitempty"`
-	MissingInfo          []string `json:"missing_info,omitempty"`
-	CompletionCriteria   []string `json:"completion_criteria,omitempty"`
-	EvidenceExpectations []string `json:"evidence_expectations,omitempty"`
-	RiskLevel            string   `json:"risk_level,omitempty"`
-	ToolNeeds            []string `json:"tool_needs,omitempty"`
+	Goal                 string             `json:"goal"`
+	Subtasks             []string           `json:"subtasks,omitempty"`
+	Constraints          []string           `json:"constraints,omitempty"`
+	MissingInfo          []string           `json:"missing_info,omitempty"`
+	CompletionCriteria   []string           `json:"completion_criteria,omitempty"`
+	EvidenceExpectations []string           `json:"evidence_expectations,omitempty"`
+	RiskLevel            string             `json:"risk_level,omitempty"`
+	ToolNeeds            []string           `json:"tool_needs,omitempty"`
+	InstallSummary       InstallSummaryJSON `json:"install_summary,omitempty"`
+}
+
+type InstallSummaryJSON struct {
+	OfficialSource string   `json:"official_source,omitempty"`
+	InstallMethod  string   `json:"install_method,omitempty"`
+	InstallCommand string   `json:"install_command,omitempty"`
+	VerifyCommand  string   `json:"verify_command,omitempty"`
+	ExecutableName string   `json:"executable_name,omitempty"`
+	CommonCommands []string `json:"common_commands,omitempty"`
 }
 
 func (u *UnderstandingJSON) UnmarshalJSON(data []byte) error {
@@ -37,6 +47,14 @@ func (u *UnderstandingJSON) UnmarshalJSON(data []byte) error {
 		CompletionCriteria   flexibleStringList `json:"completion_criteria,omitempty"`
 		EvidenceExpectations flexibleStringList `json:"evidence_expectations,omitempty"`
 		ToolNeeds            flexibleStringList `json:"tool_needs,omitempty"`
+		InstallSummary       struct {
+			OfficialSource string             `json:"official_source,omitempty"`
+			InstallMethod  string             `json:"install_method,omitempty"`
+			InstallCommand string             `json:"install_command,omitempty"`
+			VerifyCommand  string             `json:"verify_command,omitempty"`
+			ExecutableName string             `json:"executable_name,omitempty"`
+			CommonCommands flexibleStringList `json:"common_commands,omitempty"`
+		} `json:"install_summary,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -48,6 +66,14 @@ func (u *UnderstandingJSON) UnmarshalJSON(data []byte) error {
 	u.CompletionCriteria = []string(raw.CompletionCriteria)
 	u.EvidenceExpectations = []string(raw.EvidenceExpectations)
 	u.ToolNeeds = []string(raw.ToolNeeds)
+	u.InstallSummary = InstallSummaryJSON{
+		OfficialSource: strings.TrimSpace(raw.InstallSummary.OfficialSource),
+		InstallMethod:  strings.TrimSpace(raw.InstallSummary.InstallMethod),
+		InstallCommand: strings.TrimSpace(raw.InstallSummary.InstallCommand),
+		VerifyCommand:  strings.TrimSpace(raw.InstallSummary.VerifyCommand),
+		ExecutableName: strings.TrimSpace(raw.InstallSummary.ExecutableName),
+		CommonCommands: []string(raw.InstallSummary.CommonCommands),
+	}
 	return nil
 }
 
@@ -189,12 +215,8 @@ func (c Client) PlanJSON(ctx context.Context, user string, tools []tool.Definiti
 }
 
 func (c Client) PlanCheckedJSON(ctx context.Context, user string, tools []tool.Definition, skillPrompt string) (PlanCheckResult, error) {
-	prompt := "User task:\n" + user + "\n\nAvailable tools:\n" + toolListForPrompt(tools)
-	if strings.TrimSpace(skillPrompt) != "" {
-		prompt += "\n\n" + skillPrompt
-	}
-	prompt += "\n\nReturn the JSON plan now."
-	text, err := c.Generate(ctx, plannerSystemPrompt(skillPrompt), []Message{{Role: "user", Content: prompt}})
+	prompt := buildPlannerUserPrompt(user, toolListForPrompt(tools), skillPrompt)
+	text, err := c.Generate(ctx, plannerSystemPrompt(), []Message{{Role: "user", Content: prompt}})
 	if err != nil {
 		return PlanCheckResult{}, err
 	}
@@ -212,12 +234,8 @@ func (c Client) RepairPlanJSON(ctx context.Context, user string, plan Plan, resu
 func (c Client) RepairPlanCheckedJSON(ctx context.Context, user string, plan Plan, results []ToolResult, tools []tool.Definition, skillPrompt string) (PlanCheckResult, error) {
 	planData, _ := json.MarshalIndent(plan, "", "  ")
 	resultData, _ := json.MarshalIndent(results, "", "  ")
-	prompt := "User task:\n" + user + "\n\nPrevious plan:\n" + string(planData) + "\n\nTool results/errors:\n" + string(resultData) + "\n\nAvailable tools:\n" + toolListForPrompt(tools)
-	if strings.TrimSpace(skillPrompt) != "" {
-		prompt += "\n\n" + skillPrompt
-	}
-	prompt += "\n\nReturn a corrected JSON plan. Keep already successful work in mind and only plan the remaining necessary steps."
-	text, err := c.Generate(ctx, plannerSystemPrompt(skillPrompt), []Message{{Role: "user", Content: prompt}})
+	prompt := buildRepairPlannerUserPrompt(user, string(planData), string(resultData), toolListForPrompt(tools), skillPrompt)
+	text, err := c.Generate(ctx, plannerSystemPrompt(), []Message{{Role: "user", Content: prompt}})
 	if err != nil {
 		return PlanCheckResult{}, err
 	}
@@ -234,11 +252,8 @@ func (c Client) Synthesize(ctx context.Context, user string, plan Plan, results 
 		"If a search returns no results, explain what was searched and suggest 2-3 better next search phrases or a broader plan.",
 		"If execution stopped for confirmation, explain what is waiting and why.",
 	}
-	if strings.TrimSpace(skillPrompt) != "" {
-		systemParts = append(systemParts, skillPrompt)
-	}
 	system := strings.Join(systemParts, "\n")
-	prompt := "User task:\n" + user + "\n\nTool result summaries:\n" + string(resultData)
+	prompt := buildSynthesisUserPrompt(user, string(resultData), skillPrompt)
 	return c.Generate(ctx, system, []Message{{Role: "user", Content: prompt}})
 }
 
@@ -300,7 +315,7 @@ func summarizeToolOutput(text string, limit int) string {
 	return strings.TrimSpace(string(runes[:limit])) + "..."
 }
 
-func plannerSystemPrompt(skillPrompt string) string {
+func plannerSystemPrompt() string {
 	lines := []string{
 		"You are the Mateway planner.",
 		"Most important rules:",
@@ -311,7 +326,7 @@ func plannerSystemPrompt(skillPrompt string) string {
 		"5. Always fill the understanding block before planning steps.",
 		"First understand the user's task, then decompose it into subtasks, choose tools, and produce a verifiable execution contract.",
 		"The JSON schema is:",
-		`{"summary":"short summary","understanding":{"goal":"core goal","subtasks":["subtask"],"constraints":["constraint"],"missing_info":["missing fact"],"completion_criteria":["what counts as done"],"evidence_expectations":["evidence expected"],"risk_level":"safe_read|guarded_mutation|dangerous_execute","tool_needs":["tool.name"]},"steps":[{"id":"step-1","goal":"what this step must accomplish","tool":"tool.name","args":{"key":"value"},"depends_on":["step-id"],"risk":"safe_read|guarded_mutation|dangerous_execute","requires_confirm":false,"expected_evidence":["file path, URL, line range, search result, task id, or verification record"],"success_criteria":["how to know this step is complete"],"on_failure":"repair|ask_user|stop"}]}`,
+		`{"summary":"short summary","understanding":{"goal":"core goal","subtasks":["subtask"],"constraints":["constraint"],"missing_info":["missing fact"],"completion_criteria":["what counts as done"],"evidence_expectations":["evidence expected"],"risk_level":"safe_read|guarded_mutation|dangerous_execute","tool_needs":["tool.name"],"install_summary":{"official_source":"optional official source URL","install_method":"optional method","install_command":"optional explicit command","verify_command":"optional verify command","executable_name":"optional executable name","common_commands":["optional quickstart command"]}},"steps":[{"id":"step-1","goal":"what this step must accomplish","tool":"tool.name","args":{"key":"value"},"depends_on":["step-id"],"risk":"safe_read|guarded_mutation|dangerous_execute","requires_confirm":false,"expected_evidence":["file path, URL, line range, search result, task id, or verification record"],"success_criteria":["how to know this step is complete"],"on_failure":"repair|ask_user|stop"}]}`,
 		"depends_on, expected_evidence, and success_criteria must always be JSON arrays of strings, even when there is only one item.",
 		"Use at most 6 steps.",
 		"Use depends_on when a step needs prior output. References must point to earlier step IDs.",
@@ -319,6 +334,7 @@ func plannerSystemPrompt(skillPrompt string) string {
 		"Do not call tools just to fill a plan. If required information is missing, use user.ask with the missing fields in the question.",
 		"Use understanding.tool_needs to capture the concrete tools the plan expects to use, not abstract capability labels.",
 		"Use understanding.completion_criteria and understanding.evidence_expectations to guide step success_criteria and expected_evidence.",
+		"For software or CLI installation tasks, populate understanding.install_summary after you have enough official evidence. If install_summary.install_command or verify_command is still unknown, do not emit software.install yet.",
 		"Prefer the shortest verifiable plan that can complete the task.",
 		"Simple tasks should usually be 1-3 steps. Most complex tasks should stay within 3-5 steps unless there is a strong reason for more.",
 		"Do not repeat near-identical read or summary steps for the same source unless the second step is truly necessary.",
@@ -331,6 +347,7 @@ func plannerSystemPrompt(skillPrompt string) string {
 		"When the user provides a URL or a previous search result contains a URL that needs reading, use web.fetch instead of searching again.",
 		"For finding public software, CLI tools, GitHub repositories, install commands, or whether a tool can be used, use software.search before generic web.search.",
 		"For installing CLI software use software.install only after you have an explicit install command from upstream docs or the user. Include command, executable or verify_command, method, source_url when known, and verification evidence. Do not guess install commands.",
+		"If the official source is known but the install command or verify command is still unclear, do not emit software.install yet. Use user.ask or keep reading official docs until the command is explicit.",
 		"For requests about finding or installing agent skills, first understand the capability the user wants. Use skill.search with concise capability keywords, not the whole user sentence. Prefer skills.sh, skillhub.cn, and clawhub.ai through that tool. skill.search only searches and never installs. If the user asks to install, the plan must include skill.install after skill.search, with skill.install depending on the search result. If the first query is too specific, repair with broader synonyms.",
 		"For installing agent skills use skill.install. The name arg may be an exact skill name, URL, or the same concise capability query used in skill.search; the tool resolves the best catalog match. If the user asks to install a skill and test it, plan skill.install first, then a matching test task. Do not use terminal.run or local file scans to find or install skills.",
 		"For reading files use file.read.",
@@ -340,7 +357,7 @@ func plannerSystemPrompt(skillPrompt string) string {
 		"For local terminal diagnostics, CLI status checks, logs, tests, builds, and running small local scripts, use terminal.run. When checking whether local software is stuck or running, first verify the CLI exists with command -v, then run the read-only status command if obvious, then inspect safe process or log output if needed.",
 		"For generic local shell commands, use terminal.run. Destructive delete commands require runtime confirmation. Safe read-only commands such as pwd, ls, git status, go test, and find-like inspection should use requires_confirm=false.",
 		"For scheduled user tasks, distinguish one-shot from recurring schedules. Requests like 'in 30 minutes', 'tonight at 8', or 'tomorrow morning' are one-shot: use schedule.create with run_at as an RFC3339 timestamp. Requests like 'every 30 minutes', 'daily', 'weekly', 'monthly', or 'recurring' are repeating schedules and should use interval, daily_at, weekly_at, or monthly_at. Do not turn 'after 30 minutes' into interval:30m.",
-		"Before creating a scheduled task that will later perform an external or local action, first verify the action can run now with the appropriate tool when possible. For example, check mail access with a read-only terminal/software/connector step before schedule.create. If verification is impossible or fails, stop or ask the user; do not create the schedule yet.",
+		"Before creating a scheduled task that will later perform an external or local action, first verify the action can run now with the appropriate tool when possible. For example, check mail access with a read-only terminal, software, or custom tool step before schedule.create. If verification is impossible or fails, stop or ask the user; do not create the schedule yet.",
 		"For recurring or scheduled user tasks use schedule.create, schedule.update, schedule.list, schedule.show, schedule.pause, schedule.resume, or schedule.delete. If the user gives a schedule name or likely id for deletion, prefer schedule.delete with that id; do not stop at schedule.list unless the target is genuinely ambiguous. Do not use terminal.run to configure crontab, launchd, or background daemons. Ask for missing schedule fields with user.ask.",
 		"When information is missing, use user.ask.",
 		"Final reminders:",
@@ -351,10 +368,56 @@ func plannerSystemPrompt(skillPrompt string) string {
 		"- Keep the plan short; avoid redundant file reads, summaries, and terminal calls.",
 		"- Non-trivial steps must include goal, expected_evidence, and success_criteria.",
 	}
-	if strings.TrimSpace(skillPrompt) != "" {
-		lines = append(lines, skillPrompt)
-	}
 	return strings.Join(lines, "\n")
+}
+
+func buildPlannerUserPrompt(user, toolList, guidance string) string {
+	sections := []string{
+		renderPromptSection("User task", user),
+		renderPromptSection("Available tools", toolList),
+	}
+	if strings.TrimSpace(guidance) != "" {
+		sections = append(sections, renderPromptSection("Context guidance", guidance))
+	}
+	sections = append(sections, "Return the JSON plan now.")
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+func buildRepairPlannerUserPrompt(user, planJSON, resultJSON, toolList, guidance string) string {
+	sections := []string{
+		renderPromptSection("User task", user),
+		renderPromptSection("Previous plan", planJSON),
+		renderPromptSection("Tool results/errors", resultJSON),
+		renderPromptSection("Available tools", toolList),
+	}
+	if strings.TrimSpace(guidance) != "" {
+		sections = append(sections, renderPromptSection("Context guidance", guidance))
+	}
+	sections = append(sections, "Return a corrected JSON plan. Keep already successful work in mind and only plan the remaining necessary steps.")
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+func buildSynthesisUserPrompt(user, resultJSON, guidance string) string {
+	sections := []string{
+		renderPromptSection("User task", user),
+		renderPromptSection("Tool result summaries", resultJSON),
+	}
+	if strings.TrimSpace(guidance) != "" {
+		sections = append(sections, renderPromptSection("Context guidance", guidance))
+	}
+	return strings.TrimSpace(strings.Join(sections, "\n\n"))
+}
+
+func renderPromptSection(title, body string) string {
+	title = strings.TrimSpace(title)
+	body = strings.TrimSpace(body)
+	if title == "" {
+		return body
+	}
+	if body == "" {
+		return title + ":"
+	}
+	return title + ":\n" + body
 }
 
 func toolListForPrompt(tools []tool.Definition) string {
@@ -416,6 +479,7 @@ func CheckAndRepairPlanJSON(raw string) (PlanCheckResult, error) {
 
 func extractJSONObject(text string) string {
 	text = strings.TrimSpace(text)
+	text = stripInlineToolCallArtifacts(text)
 	if match := fencedJSON.FindStringSubmatch(text); len(match) == 2 {
 		text = strings.TrimSpace(match[1])
 	}
@@ -425,6 +489,18 @@ func extractJSONObject(text string) string {
 		text = text[start : end+1]
 	}
 	return text
+}
+
+func stripInlineToolCallArtifacts(text string) string {
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "[tool_call]") && !strings.Contains(lower, "<minimax:tool_call") {
+		return text
+	}
+	reToolCall := regexp.MustCompile(`(?is)\[TOOL_CALL\].*?(?:\[/TOOL_CALL\]|$)`)
+	reMinimax := regexp.MustCompile(`(?is)<minimax:tool_call\b[^>]*>.*?(?:</minimax:tool_call>|$)`)
+	text = reToolCall.ReplaceAllString(text, "")
+	text = reMinimax.ReplaceAllString(text, "")
+	return strings.TrimSpace(text)
 }
 
 func normalizePlan(plan Plan) (Plan, []string) {

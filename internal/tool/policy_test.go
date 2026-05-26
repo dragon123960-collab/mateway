@@ -33,6 +33,15 @@ func TestBuiltinDefinitionsHideDeprecatedShellRun(t *testing.T) {
 	}
 }
 
+func TestBuiltinDefinitionsDeclareExplicitReusePolicy(t *testing.T) {
+	registry := NewBuiltinRegistry()
+	for _, def := range registry.AllDefinitions() {
+		if def.Metadata.ReusePolicy == "" {
+			t.Fatalf("expected builtin tool %q to declare explicit reuse policy", def.Name)
+		}
+	}
+}
+
 func TestDangerousCommandGuard(t *testing.T) {
 	cases := []string{
 		"rm -rf tmp",

@@ -26,6 +26,13 @@ const (
 	ParallelIsolatedOnly ParallelMode = "isolated_only"
 )
 
+type ReusePolicy string
+
+const (
+	ReuseNever      ReusePolicy = "never"
+	ReuseStableRead ReusePolicy = "stable_read"
+)
+
 type Metadata struct {
 	Purpose            string
 	WhenToUse          []string
@@ -37,6 +44,7 @@ type Metadata struct {
 	SoftFailureSignals []string
 	ParallelMode       ParallelMode
 	ResourceScope      string
+	ReusePolicy        ReusePolicy
 	RecoverHints       []string
 }
 

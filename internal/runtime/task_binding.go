@@ -40,6 +40,7 @@ type taskBindingDecision struct {
 	ClarifyPrompt   string
 	ApprovalGranted bool
 	ApprovalStepID  string
+	ApprovalAction  string
 }
 
 func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision {
@@ -322,6 +323,7 @@ func (l *AgentLoop) resolveApprovalReply() (taskBindingDecision, bool) {
 			Confidence:      0.98,
 			ApprovalGranted: approved,
 			ApprovalStepID:  pendingApprovalStepID(task.PendingApproval),
+			ApprovalAction:  strings.TrimSpace(task.PendingApproval.RequestedAction),
 		}, true
 	}
 	return taskBindingDecision{}, false
@@ -346,6 +348,7 @@ func (l *AgentLoop) resolveSuspendedApprovalReply() (taskBindingDecision, bool) 
 				Confidence:      0.93,
 				ApprovalGranted: approved,
 				ApprovalStepID:  pendingApprovalStepID(task.PendingApproval),
+				ApprovalAction:  strings.TrimSpace(task.PendingApproval.RequestedAction),
 			}, true
 		}
 	}

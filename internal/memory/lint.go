@@ -21,6 +21,8 @@ type LintReport struct {
 	Issues    []LintIssue `json:"issues"`
 }
 
+const staleLongMemoryDays = 30
+
 func Lint(root string) (LintReport, error) {
 	report := LintReport{Root: root, CheckedAt: time.Now()}
 	if strings.TrimSpace(root) == "" {
@@ -52,6 +54,9 @@ func Lint(root string) (LintReport, error) {
 				report.Issues = append(report.Issues, LintIssue{Path: path, Code: "invalid_frontmatter", Message: parseErr.Error()})
 			} else {
 				report.Issues = append(report.Issues, validateMemoryFrontmatter(path, parsed.Frontmatter)...)
+				if issue, ok := staleLongMemoryIssue(path, parsed.Frontmatter, report.CheckedAt); ok {
+					report.Issues = append(report.Issues, issue)
+				}
 			}
 		}
 		if requiresSource(path) && hasSpecificClaim(parsed.Body) && !hasStrongSourceEvidence(parsed.Frontmatter.Sources) {
@@ -80,6 +85,32 @@ func Lint(root string) (LintReport, error) {
 		return nil
 	})
 	return report, nil
+}
+
+func staleLongMemoryIssue(path string, fm Frontmatter, now time.Time) (LintIssue, bool) {
+	normalized := filepath.ToSlash(path)
+	if !strings.Contains(normalized, "/long/") {
+		return LintIssue{}, false
+	}
+	if strings.ToLower(strings.TrimSpace(fm.Status)) != "active" {
+		return LintIssue{}, false
+	}
+	updated := strings.TrimSpace(fm.UpdatedAt)
+	if updated == "" {
+		return LintIssue{}, false
+	}
+	day, err := time.Parse("2006-01-02", updated)
+	if err != nil {
+		return LintIssue{}, false
+	}
+	if int(now.Sub(day).Hours()/24) < staleLongMemoryDays {
+		return LintIssue{}, false
+	}
+	return LintIssue{
+		Path:    path,
+		Code:    "stale_long_memory",
+		Message: fmt.Sprintf("active long memory has not been reviewed for %d+ days; re-validate before relying on it", staleLongMemoryDays),
+	}, true
 }
 
 func stripMarkdownCode(text string) string {

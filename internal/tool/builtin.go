@@ -31,10 +31,12 @@ func RegisterBuiltins(r *Registry) {
 	r.Register(MemoryShow())
 	r.Register(MemorySearch())
 	r.Register(MemoryIndex())
+	r.Register(MemoryReview())
 	r.Register(MemoryCommit())
 	r.Register(MemoryReject())
 	r.Register(SkillSearch())
 	r.Register(SkillInstall())
+	r.Register(SkillPromote())
 	r.Register(SoftwareSearch())
 	r.Register(SoftwareInstall())
 	r.Register(ScheduleCreate())
@@ -71,6 +73,7 @@ func SkillSearch() Definition {
 			SoftFailureSignals: []string{"no matching skills found"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "skill:query",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -111,6 +114,7 @@ func SkillInstall() Definition {
 			SoftFailureSignals: []string{"skill name or url is required"},
 			ParallelMode:       ParallelForbid,
 			ResourceScope:      "skill:install",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -135,6 +139,66 @@ func SkillInstall() Definition {
 	}
 }
 
+func SkillPromote() Definition {
+	return Definition{
+		Name:        "skill.promote",
+		Description: "Promote one proposed skill candidate from memory inbox into workspace/skills/<name>/SKILL.md.",
+		Metadata: Metadata{
+			Purpose:            "promote a reviewed skill candidate into the workspace skills directory",
+			WhenToUse:          []string{"approve a generated skill candidate", "materialize reviewed skill candidate into workspace skills"},
+			WhenNotToUse:       []string{"searching only", "editing an existing skill in place"},
+			RequiredArgs:       []string{"proposal"},
+			OutputContract:     []string{"source path", "target path", "skill name"},
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"skill candidate path is required", "must have frontmatter with type: skill_candidate and status: proposed"},
+			ParallelMode:       ParallelForbid,
+			ResourceScope:      "skill:promote",
+			ReusePolicy:        ReuseNever,
+		},
+		Risk: RiskGuardedMutation,
+		ArgsSchema: map[string]string{
+			"agent":    "optional agent id, defaults to main",
+			"proposal": "skill candidate id or path",
+			"name":     "optional promoted skill directory name",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			proposal := strings.TrimSpace(firstNonEmpty(call.Args["proposal"], call.Args["id"], call.Args["path"]))
+			if proposal == "" {
+				return ErrorResult("proposal is required")
+			}
+			if !call.Confirmed {
+				return ConfirmResult(
+					fmt.Sprintf("这个操作会把 skill candidate 提升为 workspace skill。\n\nProposal：%s\n目标目录：workspace/skills\n\n回复“确认”继续执行，或回复“取消”放弃。", proposal),
+					map[string]any{"kind": "skill_promote_confirm", "proposal": proposal},
+				)
+			}
+			result, err := store.PromoteSkillCandidate(memory.SkillPromotionInput{
+				AgentID:   firstNonEmpty(call.Args["agent"], "main"),
+				Proposal:  proposal,
+				SkillName: strings.TrimSpace(call.Args["name"]),
+				At:        time.Now(),
+			})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			return Result{
+				OK:     true,
+				Output: fmt.Sprintf("Skill promoted as: %s\nSource proposal: %s\nThe runtime reloads workspace skills on the next planning turn, so this skill can be selected in subsequent tasks.", result.TargetPath, result.SourcePath),
+				Evidence: map[string]any{
+					"kind":        "skill_promote",
+					"source_path": result.SourcePath,
+					"target_path": result.TargetPath,
+					"skill_name":  result.SkillName,
+				},
+			}
+		},
+	}
+}
+
 func SoftwareSearch() Definition {
 	return Definition{
 		Name:        "software.search",
@@ -150,6 +214,7 @@ func SoftwareSearch() Definition {
 			SoftFailureSignals: []string{"no software results found"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "software:query",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -189,6 +254,7 @@ func SoftwareInstall() Definition {
 			SoftFailureSignals: []string{"install command is required", "not found", "permission denied", "timed out"},
 			ParallelMode:       ParallelForbid,
 			ResourceScope:      "software:install",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -211,13 +277,17 @@ func SoftwareInstall() Definition {
 			if installCommand == "" {
 				return ErrorResult("install command is required; run software.search or read the upstream install docs before using software.install")
 			}
-			ok, exitCode, output := runReadOnlyCommand(ctx, installCommand, call.Context.ProjectRoot)
-			verifyOK, verifyExit, verifyOutput := runReadOnlyCommand(ctx, verifyCommand, call.Context.ProjectRoot)
-			result := renderSoftwareInstallResult(name, executable, installCommand, ok, exitCode, output, verifyCommand, verifyOK, verifyExit, verifyOutput)
+			installOK, exitCode, output := runCommandWithTimeout(ctx, installCommand, call.Context.ProjectRoot, 12*time.Second)
+			verifyOK, verifyExit, verifyOutput := runCommandWithTimeout(ctx, verifyCommand, call.Context.ProjectRoot, 12*time.Second)
+			effectiveOK := installOK && verifyOK
+			if verifyOK {
+				effectiveOK = true
+			}
+			result := renderSoftwareInstallResult(name, executable, installCommand, effectiveOK, exitCode, output, verifyCommand, verifyOK, verifyExit, verifyOutput)
 			return Result{
-				OK:     ok && verifyOK,
+				OK:     effectiveOK,
 				Output: result,
-				Error:  softwareInstallError(ok, verifyOK, output, verifyOutput),
+				Error:  softwareInstallError(effectiveOK, verifyOK, output, verifyOutput),
 				Evidence: map[string]any{
 					"kind":              "software_install",
 					"name":              name,
@@ -249,6 +319,7 @@ func ScheduleCreate() Definition {
 			SoftFailureSignals: []string{"missing_schedule_fields"},
 			ParallelMode:       ParallelForbid,
 			ResourceScope:      "schedule:task",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -290,6 +361,7 @@ func ScheduleList() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelReadOnlyOK,
 			ResourceScope:     "schedule:list",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk:       RiskSafeRead,
 		ArgsSchema: map[string]string{},
@@ -316,6 +388,7 @@ func ScheduleShow() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelReadOnlyOK,
 			ResourceScope:     "schedule:task",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk:       RiskSafeRead,
 		ArgsSchema: map[string]string{"id": "schedule id"},
@@ -354,6 +427,7 @@ func scheduleStatusTool(name, description, status, verb string) Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelForbid,
 			ResourceScope:     "schedule:task",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk:       RiskGuardedMutation,
 		ArgsSchema: map[string]string{"id": "schedule id"},
@@ -384,6 +458,7 @@ func ScheduleUpdate() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelForbid,
 			ResourceScope:     "schedule:task",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -447,6 +522,7 @@ func ScheduleDelete() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelForbid,
 			ResourceScope:     "schedule:task",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk:       RiskGuardedMutation,
 		ArgsSchema: map[string]string{"id": "schedule id"},
@@ -580,6 +656,7 @@ func TimeNow() Definition {
 			AcceptanceMode: AcceptanceCodeOnly,
 			ParallelMode:   ParallelReadOnlyOK,
 			ResourceScope:  "system:time",
+			ReusePolicy:    ReuseNever,
 		},
 		Risk:       RiskSafeRead,
 		ArgsSchema: map[string]string{"timezone": "optional IANA timezone, defaults to local"},
@@ -611,6 +688,7 @@ func ConfigSummary() Definition {
 			AcceptanceMode: AcceptanceCodeOnly,
 			ParallelMode:   ParallelReadOnlyOK,
 			ResourceScope:  "config:summary",
+			ReusePolicy:    ReuseNever,
 		},
 		Risk:       RiskSafeRead,
 		ArgsSchema: map[string]string{},
@@ -635,6 +713,7 @@ func MemorySearch() Definition {
 			SoftFailureSignals: []string{"no matching long memory found"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "memory:query",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -679,7 +758,7 @@ func MemorySearch() Definition {
 func MemoryList() Definition {
 	return Definition{
 		Name:        "memory.list",
-		Description: "List inbox or long memory items by area and optional status.",
+		Description: "List inbox or long memory items by area and optional status/kind.",
 		Metadata: Metadata{
 			Purpose:            "inspect inbox or long memory items",
 			WhenToUse:          []string{"review inbox proposals", "check pending memory items", "inspect long memory entries"},
@@ -689,12 +768,17 @@ func MemoryList() Definition {
 			SoftFailureSignals: []string{"no memory items found"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "memory:list",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
-			"agent":  "optional agent id, defaults to main",
-			"area":   "optional memory area: inbox or long",
-			"status": "optional filter such as proposed, active, rejected, or committed",
+			"agent":    "optional agent id, defaults to main",
+			"area":     "optional memory area: inbox or long",
+			"status":   "optional filter such as proposed, active, rejected, or committed",
+			"kind":     "optional type filter such as decision, playbook, preference, project, source, or skill_candidate",
+			"tag":      "optional tag filter such as daily-distillation, auto-proposal, skill-candidate, or skill-improvement",
+			"group_by": "optional grouping key: kind, origin, review, or target",
+			"review":   "optional review filter for long memory recency: stale, soon, or fresh",
 		},
 		Run: func(ctx context.Context, call Call) Result {
 			store, err := memoryStoreFromToolContext(call.Context)
@@ -704,13 +788,18 @@ func MemoryList() Definition {
 			agentID := firstNonEmpty(call.Args["agent"], "main")
 			area := firstNonEmpty(call.Args["area"], "inbox")
 			status := strings.TrimSpace(call.Args["status"])
-			items, err := store.List(memory.ListOptions{AgentID: agentID, Area: area, Status: status})
+			kind := strings.TrimSpace(call.Args["kind"])
+			tag := strings.TrimSpace(call.Args["tag"])
+			groupBy := strings.TrimSpace(call.Args["group_by"])
+			review := strings.TrimSpace(call.Args["review"])
+			items, err := store.List(memory.ListOptions{AgentID: agentID, Area: area, Status: status, Kind: kind, Tag: tag})
 			if err != nil {
 				return ErrorResult(err.Error())
 			}
+			items = filterMemoryItemsByReviewStatus(firstNonEmpty(area, "inbox"), review, items, time.Now())
 			return Result{
 				OK:       true,
-				Output:   renderMemoryListOutput(agentID, area, status, items),
+				Output:   renderMemoryListOutput(agentID, area, status, groupBy, review, items),
 				Evidence: memoryListEvidence(agentID, area, status, items),
 			}
 		},
@@ -728,6 +817,7 @@ func MemoryShow() Definition {
 			AcceptanceMode: AcceptanceCodeOnly,
 			ParallelMode:   ParallelReadOnlyOK,
 			ResourceScope:  "memory:item",
+			ReusePolicy:    ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -752,6 +842,74 @@ func MemoryShow() Definition {
 				OK:       true,
 				Output:   renderMemoryShowOutput(result),
 				Evidence: map[string]any{"kind": "memory_show", "id": result.ID, "path": result.Path},
+			}
+		},
+	}
+}
+
+func MemoryReview() Definition {
+	return Definition{
+		Name:        "memory.review",
+		Description: "Show a review-focused long-memory checklist, prioritizing soon/stale entries.",
+		Metadata: Metadata{
+			Purpose:            "review long memory entries that may need re-validation",
+			WhenToUse:          []string{"review stale long memory", "inspect long memory that may need refresh"},
+			WhenNotToUse:       []string{"full-text memory inspection", "memory commit or reject"},
+			OutputContract:     []string{"item id", "review status", "type", "updated date"},
+			AcceptanceMode:     AcceptanceCodeOnly,
+			SoftFailureSignals: []string{"no long memory items currently need review"},
+			ParallelMode:       ParallelReadOnlyOK,
+			ResourceScope:      "memory:review",
+			ReusePolicy:        ReuseNever,
+		},
+		Risk: RiskSafeRead,
+		ArgsSchema: map[string]string{
+			"agent":  "optional agent id, defaults to main",
+			"review": "optional review filter: stale, soon, or all; default includes soon and stale",
+			"kind":   "optional type filter such as decision, playbook, preference, or project",
+			"target": "optional recommended target filter",
+			"proposal": "optional true to write the current review queue into inbox as a review proposal",
+		},
+		Run: func(ctx context.Context, call Call) Result {
+			store, err := memoryStoreFromToolContext(call.Context)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			agentID := firstNonEmpty(call.Args["agent"], "main")
+			items, err := store.List(memory.ListOptions{AgentID: agentID, Area: "long", Status: "active", Kind: strings.TrimSpace(call.Args["kind"])})
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			review := strings.TrimSpace(call.Args["review"])
+			target := strings.TrimSpace(call.Args["target"])
+			items = filterMemoryItemsForReviewQueue(review, items, time.Now())
+			items = filterMemoryItemsByTarget(target, items)
+			if parseBoolArg(call.Args["proposal"]) {
+				input, ok := memory.BuildLongMemoryReviewProposal(memory.ReviewProposalOptions{
+					AgentID: agentID,
+					Review:  review,
+					Kind:    strings.TrimSpace(call.Args["kind"]),
+					Target:  target,
+					Items:   items,
+					At:      time.Now(),
+				})
+				if !ok {
+					return Result{OK: true, Output: "No long memory items currently need review, so no review proposal was written."}
+				}
+				result, err := store.Propose(input)
+				if err != nil {
+					return ErrorResult(err.Error())
+				}
+				return Result{
+					OK:       true,
+					Output:   fmt.Sprintf("Long memory review proposal written: %s", result.Path),
+					Evidence: map[string]any{"kind": "memory_review_proposal", "path": result.Path, "item_count": len(items)},
+				}
+			}
+			return Result{
+				OK:       true,
+				Output:   renderMemoryReviewOutput(agentID, review, target, items, time.Now()),
+				Evidence: memoryListEvidence(agentID, "long", "active", items),
 			}
 		},
 	}
@@ -785,6 +943,7 @@ func MemoryCommit() Definition {
 			SoftFailureSignals: []string{"memory proposal path is required", "must have frontmatter with status: proposed"},
 			ParallelMode:       ParallelForbid,
 			ResourceScope:      "memory:mutation",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -801,6 +960,24 @@ func MemoryCommit() Definition {
 			if proposal == "" {
 				return ErrorResult("proposal is required")
 			}
+			shown, err := store.Show(firstNonEmpty(call.Args["agent"], "main"), proposal)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			parsed, err := memory.ParseMarkdownForTools(shown.Text)
+			if err != nil {
+				return ErrorResult(err.Error())
+			}
+			kind := strings.TrimSpace(parsed.Frontmatter.Type)
+			target := promotionTargetHint(kind)
+			if RequireConfirmForTool("memory.commit", map[string]string{"type": kind}) && !call.Confirmed {
+				return ConfirmResult(memoryCommitConfirmPrompt(proposal, kind, target), map[string]any{
+					"kind":        "memory_commit_confirm",
+					"proposal":    proposal,
+					"type":        kind,
+					"target_hint": target,
+				})
+			}
 			result, err := store.Commit(memory.CommitInput{
 				AgentID:  firstNonEmpty(call.Args["agent"], "main"),
 				Proposal: proposal,
@@ -813,7 +990,7 @@ func MemoryCommit() Definition {
 			return Result{
 				OK:       true,
 				Output:   renderMemoryCommitOutput(result),
-				Evidence: map[string]any{"kind": "memory_commit", "source_path": result.SourcePath, "target_path": result.TargetPath},
+				Evidence: map[string]any{"kind": "memory_commit", "source_path": result.SourcePath, "target_path": result.TargetPath, "type": result.Type},
 			}
 		},
 	}
@@ -833,6 +1010,7 @@ func MemoryReject() Definition {
 			SoftFailureSignals: []string{"proposal is required", "only proposed memory items can be rejected"},
 			ParallelMode:       ParallelForbid,
 			ResourceScope:      "memory:mutation",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -879,6 +1057,7 @@ func MemoryIndex() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelReadOnlyOK,
 			ResourceScope:     "memory:index",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -915,15 +1094,54 @@ func MemoryIndex() Definition {
 	}
 }
 
-func renderMemoryListOutput(agentID, area, status string, items []memory.MemoryItem) string {
+func renderMemoryListOutput(agentID, area, status, groupBy, review string, items []memory.MemoryItem) string {
 	if len(items) == 0 {
-		return fmt.Sprintf("No memory items found for area=%s status=%s agent=%s.", firstNonEmpty(area, "inbox"), firstNonEmpty(status, "any"), firstNonEmpty(agentID, "main"))
+		return fmt.Sprintf("No memory items found for area=%s status=%s review=%s agent=%s.", firstNonEmpty(area, "inbox"), firstNonEmpty(status, "any"), firstNonEmpty(review, "any"), firstNonEmpty(agentID, "main"))
 	}
-	lines := []string{fmt.Sprintf("Memory items for area=%s status=%s agent=%s:", firstNonEmpty(area, "inbox"), firstNonEmpty(status, "any"), firstNonEmpty(agentID, "main"))}
+	items = sortMemoryItemsForReview(items)
+	lines := []string{fmt.Sprintf("Memory items for area=%s status=%s review=%s agent=%s:", firstNonEmpty(area, "inbox"), firstNonEmpty(status, "any"), firstNonEmpty(review, "any"), firstNonEmpty(agentID, "main"))}
+	if groupBy == "kind" || groupBy == "origin" || groupBy == "review" || groupBy == "target" {
+		current := ""
+		for _, item := range items {
+			group := memoryGroupValue(item, firstNonEmpty(area, "inbox"), groupBy, time.Now())
+			if group != current {
+				current = group
+				lines = append(lines, fmt.Sprintf("[%s=%s]", groupBy, firstNonEmpty(current, "other")))
+			}
+			lines = append(lines, fmt.Sprintf("- %s\t%s\t%s\t%s\t%s%s%s%s", item.ID, item.Status, item.Kind, item.Updated, item.Title, memoryKindHint(item.Kind), memoryOriginHint(item), memoryReviewHint(firstNonEmpty(area, "inbox"), item, time.Now())))
+		}
+		return strings.Join(lines, "\n")
+	}
 	for _, item := range items {
-		lines = append(lines, fmt.Sprintf("- %s\t%s\t%s\t%s\t%s", item.ID, item.Status, item.Kind, item.Updated, item.Title))
+		lines = append(lines, fmt.Sprintf("- %s\t%s\t%s\t%s\t%s%s%s%s", item.ID, item.Status, item.Kind, item.Updated, item.Title, memoryKindHint(item.Kind), memoryOriginHint(item), memoryReviewHint(firstNonEmpty(area, "inbox"), item, time.Now())))
+	}
+	lines = append(lines, "")
+	lines = append(lines, "Review tips:")
+	lines = append(lines, "- `--tag daily-distillation` shows all daily distillation proposals")
+	lines = append(lines, "- `--tag distill-decision|distill-playbook|distill-preference|distill-project` narrows distillation proposals by target type")
+	if firstNonEmpty(area, "inbox") == "long" {
+		lines = append(lines, "- `--review stale|soon|fresh` filters long memory by review age")
+		lines = append(lines, "- `--group_by target` shows which long-memory targets are aging")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func memoryGroupValue(item memory.MemoryItem, area, groupBy string, now time.Time) string {
+	switch strings.TrimSpace(groupBy) {
+	case "kind":
+		return strings.TrimSpace(item.Kind)
+	case "origin":
+		return memoryOriginFromFrontmatter(item.Tags, item.Sources, item.Kind)
+	case "review":
+		if strings.TrimSpace(area) != "long" {
+			return ""
+		}
+		return memoryReviewLabel(item.Updated, now)
+	case "target":
+		return promotionTargetHint(item.Kind)
+	default:
+		return ""
+	}
 }
 
 func memoryListEvidence(agentID, area, status string, items []memory.MemoryItem) map[string]any {
@@ -942,15 +1160,298 @@ func memoryListEvidence(agentID, area, status string, items []memory.MemoryItem)
 }
 
 func renderMemoryShowOutput(result memory.ShowResult) string {
+	summary := renderMemoryShowSummary(result.Text)
+	if summary != "" {
+		return fmt.Sprintf("Memory item: %s\nPath: %s\n%s\n\n%s", result.ID, result.Path, summary, result.Text)
+	}
 	return fmt.Sprintf("Memory item: %s\nPath: %s\n\n%s", result.ID, result.Path, result.Text)
 }
 
+func renderMemoryReviewOutput(agentID, review, target string, items []memory.MemoryItem, now time.Time) string {
+	if len(items) == 0 {
+		return fmt.Sprintf("No long memory items currently need review for agent=%s review=%s target=%s.", firstNonEmpty(agentID, "main"), firstNonEmpty(review, "soon_or_stale"), firstNonEmpty(target, "any"))
+	}
+	items = sortMemoryItemsForReviewQueue(items, now)
+	lines := []string{fmt.Sprintf("Long memory review queue for agent=%s review=%s target=%s:", firstNonEmpty(agentID, "main"), firstNonEmpty(review, "soon_or_stale"), firstNonEmpty(target, "any"))}
+	for _, item := range items {
+		label := memoryReviewLabel(item.Updated, now)
+		lines = append(lines, fmt.Sprintf("- %s\t%s\t%s\t%s\t%s%s", item.ID, item.Kind, item.Updated, label, item.Title, memoryKindHint(item.Kind)))
+		if suggestion := memoryReviewSuggestion(label, item.Kind); suggestion != "" {
+			lines = append(lines, "  - suggestion: "+suggestion)
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, "Review tips:")
+	lines = append(lines, "- Start with `review=stale` items before relying on them as default long memory")
+	lines = append(lines, "- Use `mateway memory show <id-or-path>` to inspect one item in full")
+	return strings.Join(lines, "\n")
+}
+
 func renderMemoryCommitOutput(result memory.CommitResult) string {
+	if strings.TrimSpace(result.Type) != "" {
+		target := promotionTargetHint(result.Type)
+		if target != "" {
+			return fmt.Sprintf("Memory committed as %s.\nRecommended target: %s\nSource: %s\nTarget: %s", result.Type, target, result.SourcePath, result.TargetPath)
+		}
+		return fmt.Sprintf("Memory committed as %s.\nSource: %s\nTarget: %s", result.Type, result.SourcePath, result.TargetPath)
+	}
 	return fmt.Sprintf("Memory committed.\nSource: %s\nTarget: %s", result.SourcePath, result.TargetPath)
 }
 
 func renderMemoryRejectOutput(result memory.RejectResult) string {
 	return fmt.Sprintf("Memory proposal rejected: %s", result.Path)
+}
+
+func memoryCommitConfirmPrompt(proposal, kind, target string) string {
+	text := "这条长期记忆提交可能会影响后续默认记忆注入，执行前需要你确认。\n\nProposal：" + proposal
+	if strings.TrimSpace(kind) != "" {
+		text += "\n类型：" + kind
+	}
+	if strings.TrimSpace(target) != "" {
+		text += "\n推荐落点：" + target
+	}
+	return text + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
+}
+
+func memoryKindHint(kind string) string {
+	switch strings.TrimSpace(kind) {
+	case "decision", "playbook", "preference", "project":
+		return fmt.Sprintf("\ttarget=%s", kind)
+	default:
+		return ""
+	}
+}
+
+func renderMemoryShowSummary(text string) string {
+	parsed, err := memoryParseMarkdownSafe(text)
+	if err != nil {
+		return ""
+	}
+	parts := []string{}
+	if kind := strings.TrimSpace(parsed.Frontmatter.Type); kind != "" {
+		parts = append(parts, "Type: "+kind)
+	}
+	if confidence := strings.TrimSpace(parsed.Frontmatter.Confidence); confidence != "" {
+		parts = append(parts, "Confidence: "+confidence)
+	}
+	if target := promotionTargetHint(strings.TrimSpace(parsed.Frontmatter.Type)); target != "" {
+		parts = append(parts, "Recommended target: "+target)
+	}
+	if origin := memoryOriginFromFrontmatter(parsed.Frontmatter.Tags, parsed.Frontmatter.Sources, parsed.Frontmatter.Type); origin != "" {
+		parts = append(parts, "Origin: "+origin)
+	}
+	if review := memoryReviewLabel(parsed.Frontmatter.UpdatedAt, time.Now()); review != "" {
+		parts = append(parts, "Review: "+review)
+		if tip := memoryReviewTip(review); tip != "" {
+			parts = append(parts, "Review tip: "+tip)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func memoryOriginHint(item memory.MemoryItem) string {
+	if origin := memoryOriginFromFrontmatter(item.Tags, item.Sources, item.Kind); origin != "" {
+		return fmt.Sprintf("\torigin=%s", origin)
+	}
+	return ""
+}
+
+func memoryReviewHint(area string, item memory.MemoryItem, now time.Time) string {
+	if strings.TrimSpace(area) != "long" {
+		return ""
+	}
+	if review := memoryReviewLabel(item.Updated, now); review != "" {
+		return fmt.Sprintf("\treview=%s", review)
+	}
+	return ""
+}
+
+func filterMemoryItemsByReviewStatus(area, review string, items []memory.MemoryItem, now time.Time) []memory.MemoryItem {
+	if strings.TrimSpace(area) != "long" || strings.TrimSpace(review) == "" {
+		return items
+	}
+	var out []memory.MemoryItem
+	for _, item := range items {
+		if strings.EqualFold(memoryReviewLabel(item.Updated, now), review) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func filterMemoryItemsForReviewQueue(review string, items []memory.MemoryItem, now time.Time) []memory.MemoryItem {
+	switch strings.TrimSpace(review) {
+	case "all":
+		return items
+	case "stale", "soon", "fresh":
+		return filterMemoryItemsByReviewStatus("long", review, items, now)
+	default:
+		var out []memory.MemoryItem
+		for _, item := range items {
+			label := memoryReviewLabel(item.Updated, now)
+			if label == "stale" || label == "soon" {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+}
+
+func filterMemoryItemsByTarget(target string, items []memory.MemoryItem) []memory.MemoryItem {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return items
+	}
+	var out []memory.MemoryItem
+	for _, item := range items {
+		if strings.EqualFold(promotionTargetHint(item.Kind), target) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func sortMemoryItemsForReviewQueue(items []memory.MemoryItem, now time.Time) []memory.MemoryItem {
+	items = append([]memory.MemoryItem(nil), items...)
+	sort.SliceStable(items, func(i, j int) bool {
+		li := memoryReviewPriority(memoryReviewLabel(items[i].Updated, now))
+		lj := memoryReviewPriority(memoryReviewLabel(items[j].Updated, now))
+		if li != lj {
+			return li > lj
+		}
+		if items[i].Updated != items[j].Updated {
+			return items[i].Updated < items[j].Updated
+		}
+		return items[i].Title < items[j].Title
+	})
+	return items
+}
+
+func memoryReviewPriority(label string) int {
+	switch strings.TrimSpace(label) {
+	case "stale":
+		return 3
+	case "soon":
+		return 2
+	case "fresh":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func memoryReviewSuggestion(review, kind string) string {
+	target := promotionTargetHint(kind)
+	switch strings.TrimSpace(review) {
+	case "stale":
+		return "re-validate this " + firstNonEmpty(target, kind, "memory") + " before relying on it in new tasks"
+	case "soon":
+		return "schedule a quick review if this " + firstNonEmpty(target, kind, "memory") + " still affects active work"
+	default:
+		return ""
+	}
+}
+
+func memoryReviewLabel(updated string, now time.Time) string {
+	updated = strings.TrimSpace(updated)
+	if updated == "" {
+		return ""
+	}
+	day, err := time.Parse("2006-01-02", updated)
+	if err != nil {
+		return ""
+	}
+	ageDays := int(now.Sub(day).Hours() / 24)
+	switch {
+	case ageDays >= 30:
+		return "stale"
+	case ageDays >= 14:
+		return "soon"
+	default:
+		return "fresh"
+	}
+}
+
+func memoryReviewTip(review string) string {
+	switch strings.TrimSpace(review) {
+	case "stale":
+		return "this entry appears stale and should be re-validated before relying on it as default long memory"
+	case "soon":
+		return "this entry is aging and should be reviewed soon if it still affects current decisions"
+	case "fresh":
+		return "this entry looks recent enough for normal review cadence"
+	default:
+		return ""
+	}
+}
+
+func memoryOriginFromFrontmatter(tags, sources []string, kind string) string {
+	switch strings.TrimSpace(kind) {
+	case "skill_candidate":
+		return "skill_candidate"
+	case "skill_improvement":
+		return "skill_improvement"
+	}
+	for _, tag := range tags {
+		switch strings.TrimSpace(tag) {
+		case "daily-distillation":
+			return "daily_distillation"
+		case "auto-proposal":
+			return "task_auto_proposal"
+		}
+	}
+	for _, source := range sources {
+		if strings.EqualFold(strings.TrimSpace(source), "manual") {
+			return "manual"
+		}
+	}
+	return ""
+}
+
+func promotionTargetHint(kind string) string {
+	switch strings.TrimSpace(kind) {
+	case "decision":
+		return "decision-style long memory"
+	case "playbook":
+		return "workflow/playbook-style long memory"
+	case "preference":
+		return "preference-style long memory"
+	case "project":
+		return "project fact/note-style long memory"
+	default:
+		return ""
+	}
+}
+
+func sortMemoryItemsForReview(items []memory.MemoryItem) []memory.MemoryItem {
+	out := append([]memory.MemoryItem(nil), items...)
+	sort.SliceStable(out, func(i, j int) bool {
+		pi := memoryKindPriority(out[i].Kind)
+		pj := memoryKindPriority(out[j].Kind)
+		if pi != pj {
+			return pi < pj
+		}
+		if out[i].Updated != out[j].Updated {
+			return out[i].Updated > out[j].Updated
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func memoryKindPriority(kind string) int {
+	switch strings.TrimSpace(kind) {
+	case "decision", "playbook":
+		return 0
+	case "preference", "project":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func memoryParseMarkdownSafe(text string) (memory.ParsedMarkdown, error) {
+	return memory.ParseMarkdownForTools(text)
 }
 
 func WebSearch() Definition {
@@ -968,6 +1469,7 @@ func WebSearch() Definition {
 			SoftFailureSignals: []string{"no results"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "web:query",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -1001,6 +1503,7 @@ func WebFetch() Definition {
 			SoftFailureSignals: []string{"unsupported url scheme", "status="},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "web:url",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskSafeRead,
 		ArgsSchema: map[string]string{
@@ -1035,6 +1538,7 @@ func FileRead() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelReadOnlyOK,
 			ResourceScope:     "filesystem:path",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk:       RiskSafeRead,
 		ArgsSchema: map[string]string{"path": "file path"},
@@ -1072,6 +1576,7 @@ func FileWrite() Definition {
 			AcceptanceMode:    AcceptanceCodeOnly,
 			ParallelMode:      ParallelForbid,
 			ResourceScope:     "filesystem:path",
+			ReusePolicy:       ReuseNever,
 		},
 		Risk:       RiskGuardedMutation,
 		ArgsSchema: map[string]string{"path": "file path", "content": "new file content"},
@@ -1107,6 +1612,7 @@ func FilePatch() Definition {
 			SoftFailureSignals: []string{"old text not found", "old text is not unique"},
 			ParallelMode:       ParallelForbid,
 			ResourceScope:      "filesystem:path",
+			ReusePolicy:        ReuseNever,
 		},
 		Risk: RiskGuardedMutation,
 		ArgsSchema: map[string]string{
@@ -1162,8 +1668,11 @@ func ShellRun() Definition {
 	return Definition{
 		Name:        "shell.run",
 		Description: "Deprecated compatibility alias for terminal.run. Do not plan new work with this tool.",
-		Risk:        RiskDangerous,
-		Hidden:      true,
+		Metadata: Metadata{
+			ReusePolicy: ReuseNever,
+		},
+		Risk:   RiskDangerous,
+		Hidden: true,
 		ArgsSchema: map[string]string{
 			"command":   "shell command",
 			"workdir":   "optional working directory",
@@ -1201,6 +1710,7 @@ func TerminalRun() Definition {
 			SoftFailureSignals: []string{"not found", "data not found", "no results", "permission denied", "unauthorized", "timed out"},
 			ParallelMode:       ParallelReadOnlyOK,
 			ResourceScope:      "terminal:command",
+			ReusePolicy:        ReuseNever,
 			RecoverHints:       []string{"retry with narrower command", "ask user when destructive command is needed"},
 		},
 		Risk: RiskDangerous,
@@ -1235,8 +1745,11 @@ func UserAsk() Definition {
 	return Definition{
 		Name:        "user.ask",
 		Description: "Ask user for missing information.",
-		Risk:        RiskSafeRead,
-		ArgsSchema:  map[string]string{"question": "question for user"},
+		Metadata: Metadata{
+			ReusePolicy: ReuseNever,
+		},
+		Risk:       RiskSafeRead,
+		ArgsSchema: map[string]string{"question": "question for user"},
 		Run: func(ctx context.Context, call Call) Result {
 			q := strings.TrimSpace(call.Args["question"])
 			if q == "" {
@@ -1395,7 +1908,17 @@ func githubSoftwareSearch(ctx context.Context, query string, limit int) ([]softw
 
 func softwareSearchQueries(query string) []string {
 	trimmed := strings.TrimSpace(query)
-	queries := []string{trimmed}
+	queries := []string{}
+	if alias := normalizedSoftwareAlias(trimmed); alias != "" {
+		queries = append(queries, alias)
+		if !strings.EqualFold(alias, trimmed) {
+			queries = append(queries, trimmed)
+		}
+	} else {
+		queries = append(queries, trimmed)
+	}
+	queries = append(queries, softwareNameVariants(trimmed)...)
+	queries = append(queries, softwareQueryCandidates(trimmed)...)
 	lower := strings.ToLower(trimmed)
 	if !strings.Contains(lower, "cli") {
 		queries = append(queries, trimmed+" cli")
@@ -1511,6 +2034,9 @@ func displaySoftwareName(name string) string {
 
 func canonicalCommandName(name string) string {
 	key := strings.ToLower(strings.TrimSpace(name))
+	if alias := normalizedSoftwareAlias(key); alias != "" {
+		return alias
+	}
 	return key
 }
 
@@ -1518,8 +2044,137 @@ func executableFromInstallCommand(command string) string {
 	return ""
 }
 
-func runReadOnlyCommand(ctx context.Context, command, workdir string) (bool, int, string) {
-	runCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+func normalizedSoftwareAlias(value string) string {
+	key := strings.ToLower(strings.TrimSpace(value))
+	key = strings.ReplaceAll(key, "_", "-")
+	key = strings.Join(strings.Fields(key), " ")
+	switch key {
+	case "larkcli", "lark cli", "lark-cli", "@larksuite/cli", "larksuite/cli":
+		return "lark-cli"
+	default:
+		return ""
+	}
+}
+
+func softwareNameVariants(value string) []string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return nil
+	}
+	lower := strings.ToLower(raw)
+	if !looksLikeCompactCLIName(lower) {
+		return nil
+	}
+	normalizedSpaces := strings.Join(strings.Fields(lower), " ")
+	normalizedDashes := strings.ReplaceAll(normalizedSpaces, " ", "-")
+	var out []string
+	if normalizedSpaces != lower {
+		out = append(out, normalizedSpaces)
+	}
+	if normalizedDashes != lower && normalizedDashes != normalizedSpaces {
+		out = append(out, normalizedDashes)
+	}
+	if strings.HasSuffix(normalizedSpaces, "cli") {
+		base := strings.TrimSpace(strings.TrimSuffix(normalizedSpaces, "cli"))
+		if base != "" {
+			out = append(out, base+" cli")
+			out = append(out, strings.ReplaceAll(base, " ", "-")+"-cli")
+		}
+	}
+	if strings.Contains(normalizedSpaces, "-cli") {
+		out = append(out, strings.ReplaceAll(normalizedSpaces, "-cli", " cli"))
+	}
+	if strings.Contains(normalizedSpaces, " cli") {
+		out = append(out, strings.ReplaceAll(normalizedSpaces, " cli", "-cli"))
+	}
+	return uniqueNonEmptyStrings(out)
+}
+
+func softwareQueryCandidates(query string) []string {
+	tokens := softwareQueryTokens(query)
+	if len(tokens) == 0 {
+		return nil
+	}
+	var out []string
+	for i, token := range tokens {
+		alias := normalizedSoftwareAlias(token)
+		if alias != "" {
+			out = append(out, alias)
+		}
+		if strings.EqualFold(token, "cli") {
+			if i > 0 {
+				out = append(out, tokens[i-1]+" cli")
+				out = append(out, tokens[i-1]+"-cli")
+			}
+			if i > 1 {
+				out = append(out, tokens[i-2]+" cli")
+				out = append(out, tokens[i-2]+"-cli")
+				out = append(out, tokens[i-2]+" "+tokens[i-1]+" cli")
+			}
+		}
+	}
+	if len(tokens) >= 2 {
+		for i := 0; i < len(tokens)-1; i++ {
+			pair := tokens[i] + " " + tokens[i+1]
+			if looksLikeCompactCLIName(pair) {
+				out = append(out, softwareNameVariants(pair)...)
+			}
+		}
+	}
+	return uniqueNonEmptyStrings(out)
+}
+
+func softwareQueryTokens(query string) []string {
+	lower := strings.ToLower(strings.TrimSpace(query))
+	if lower == "" {
+		return nil
+	}
+	replacer := strings.NewReplacer(
+		"(", " ", ")", " ", "[", " ", "]", " ", "{", " ", "}", " ",
+		",", " ", ".", " ", ":", " ", ";", " ", "，", " ", "。", " ", "：", " ",
+		"！", " ", "？", " ", "\n", " ", "\t", " ",
+	)
+	parts := strings.Fields(replacer.Replace(lower))
+	stop := map[string]struct{}{
+		"tool": {}, "tools": {}, "github": {}, "install": {}, "installer": {}, "installation": {},
+		"command": {}, "commands": {}, "line": {}, "line-tool": {}, "download": {}, "latest": {},
+		"official": {}, "package": {}, "binary": {}, "commandline": {}, "command-line": {},
+		"怎么样": {}, "看看": {}, "测试": {}, "一下": {}, "这个": {}, "详情": {}, "查看": {},
+	}
+	var out []string
+	for _, part := range parts {
+		if _, drop := stop[part]; drop {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func looksLikeCompactCLIName(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	hasASCII := false
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			hasASCII = true
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == ' ' || r == '.' || r == '/':
+		default:
+			return false
+		}
+	}
+	return hasASCII && strings.Contains(value, "cli")
+}
+
+func runCommandWithTimeout(ctx context.Context, command, workdir string, timeout time.Duration) (bool, int, string) {
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "sh", "-lc", command)
 	if strings.TrimSpace(workdir) != "" {

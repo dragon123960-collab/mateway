@@ -18,9 +18,13 @@ func buildLongMemorySummary(results []memory.SearchResult) longMemorySummary {
 	if len(results) == 0 {
 		return longMemorySummary{}
 	}
+	filtered := filterPromptRelevantLongMemory(results)
+	if len(filtered) == 0 {
+		return longMemorySummary{}
+	}
 	var sections []string
 	used := 0
-	for _, result := range results {
+	for _, result := range filtered {
 		item := renderLongMemoryItem(result)
 		if item == "" {
 			continue
@@ -31,7 +35,7 @@ func buildLongMemorySummary(results []memory.SearchResult) longMemorySummary {
 		sections = append(sections, item)
 		used += len(item)
 	}
-	return longMemorySummary{Text: strings.TrimSpace(strings.Join(sections, "\n\n")), Items: results}
+	return longMemorySummary{Text: strings.TrimSpace(strings.Join(sections, "\n\n")), Items: filtered}
 }
 
 func renderLongMemoryItem(result memory.SearchResult) string {
@@ -67,4 +71,25 @@ func longMemoryTraceFields(results []memory.SearchResult) []map[string]any {
 		})
 	}
 	return out
+}
+
+func filterPromptRelevantLongMemory(results []memory.SearchResult) []memory.SearchResult {
+	out := make([]memory.SearchResult, 0, len(results))
+	for _, result := range results {
+		if allowLongMemoryForPrompt(result) {
+			out = append(out, result)
+		}
+	}
+	return out
+}
+
+func allowLongMemoryForPrompt(result memory.SearchResult) bool {
+	switch strings.ToLower(strings.TrimSpace(result.Type)) {
+	case "preference", "decision", "playbook", "project", "system", "note", "":
+		return true
+	case "source", "skill_candidate":
+		return false
+	default:
+		return false
+	}
 }

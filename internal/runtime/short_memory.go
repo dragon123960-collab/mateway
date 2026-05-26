@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/skill"
 )
 
 const (
@@ -13,6 +14,7 @@ const (
 	shortMemoryOpenTaskLimit   = 4
 	shortMemoryArtifactLimit   = 6
 	shortMemoryTextLimit       = 180
+	shortMemoryStepLimit       = 4
 )
 
 type shortMemorySummary struct {
@@ -24,14 +26,27 @@ type shortMemorySummary struct {
 	SessionPresent bool
 }
 
+type shortMemoryProfile struct {
+	IncludeRecentTurns bool
+	IncludeActiveTask  bool
+	IncludeOpenTasks   bool
+	IncludeArtifacts   bool
+	IncludeStepFocus   bool
+}
+
 func buildShortMemorySummary(st session.State) shortMemorySummary {
+	return buildShortMemorySummaryForStage(st, skill.StagePlanning)
+}
+
+func buildShortMemorySummaryForStage(st session.State, stage string) shortMemorySummary {
 	st = normalizeSessionForShortMemory(st)
 	if !hasShortMemory(st) {
 		return shortMemorySummary{}
 	}
+	profile := shortMemoryProfileForStage(stage)
 	var sections []string
 	recentTurns := recentTurnsForShortMemory(st.RecentTurns, shortMemoryRecentTurnLimit)
-	if len(recentTurns) > 0 {
+	if profile.IncludeRecentTurns && len(recentTurns) > 0 {
 		lines := []string{"Recent turns:"}
 		for _, turn := range recentTurns {
 			role := strings.TrimSpace(turn.Role)
@@ -42,11 +57,17 @@ func buildShortMemorySummary(st session.State) shortMemorySummary {
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
-	if active := session.ActiveTask(st); active != nil {
+	active := session.ActiveTask(st)
+	if profile.IncludeActiveTask && active != nil {
 		sections = append(sections, "Active task:\n"+renderShortTask(*active))
 	}
+	if profile.IncludeStepFocus && active != nil {
+		if focus := renderShortStepFocus(*active); focus != "" {
+			sections = append(sections, "Current step focus:\n"+focus)
+		}
+	}
 	openTasks := session.OpenTasks(st)
-	if len(openTasks) > 0 {
+	if profile.IncludeOpenTasks && len(openTasks) > 0 {
 		lines := []string{"Open tasks:"}
 		count := 0
 		for i := len(openTasks) - 1; i >= 0 && count < shortMemoryOpenTaskLimit; i-- {
@@ -61,7 +82,10 @@ func buildShortMemorySummary(st session.State) shortMemorySummary {
 			sections = append(sections, strings.Join(lines, "\n"))
 		}
 	}
-	artifactLines := shortArtifactLines(st, shortMemoryArtifactLimit)
+	artifactLines := []string{}
+	if profile.IncludeArtifacts {
+		artifactLines = shortArtifactLines(st, shortMemoryArtifactLimit, profile.IncludeActiveTask && !profile.IncludeOpenTasks && active != nil, strings.TrimSpace(st.ActiveTaskID))
+	}
 	if len(artifactLines) > 0 {
 		sections = append(sections, "Known artifacts:\n"+strings.Join(artifactLines, "\n"))
 	}
@@ -72,6 +96,31 @@ func buildShortMemorySummary(st session.State) shortMemorySummary {
 		Artifacts:      len(artifactLines),
 		ActiveTaskID:   strings.TrimSpace(st.ActiveTaskID),
 		SessionPresent: true,
+	}
+}
+
+func shortMemoryProfileForStage(stage string) shortMemoryProfile {
+	switch strings.TrimSpace(stage) {
+	case skill.StagePlanningRepair:
+		return shortMemoryProfile{
+			IncludeActiveTask: true,
+			IncludeArtifacts:  true,
+			IncludeStepFocus:  true,
+		}
+	case skill.StagePlanning:
+		return shortMemoryProfile{
+			IncludeRecentTurns: true,
+			IncludeActiveTask:  true,
+			IncludeOpenTasks:   true,
+			IncludeArtifacts:   true,
+		}
+	default:
+		return shortMemoryProfile{
+			IncludeRecentTurns: true,
+			IncludeActiveTask:  true,
+			IncludeOpenTasks:   true,
+			IncludeArtifacts:   true,
+		}
 	}
 }
 
@@ -142,7 +191,32 @@ func renderPendingTaskState(task session.TaskState) string {
 	return ""
 }
 
-func shortArtifactLines(st session.State, limit int) []string {
+func renderShortStepFocus(task session.TaskState) string {
+	if len(task.StepOrder) == 0 || len(task.StepStates) == 0 {
+		return ""
+	}
+	lines := []string{}
+	for _, id := range task.StepOrder {
+		step, ok := task.StepStates[id]
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(step.Status) == "passed" && strings.TrimSpace(step.AcceptanceStatus) == "passed" {
+			continue
+		}
+		line := "- " + firstNonEmpty(step.ID, "unknown") + " status=" + firstNonEmpty(step.Status, "unknown") + " tool=" + firstNonEmpty(step.Tool, "unknown")
+		if reason := strings.TrimSpace(firstNonEmpty(step.AcceptanceReason, step.ResultError, step.ResultSummary)); reason != "" {
+			line += " detail=" + compactText(reason, 140)
+		}
+		lines = append(lines, line)
+		if len(lines) >= shortMemoryStepLimit {
+			break
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func shortArtifactLines(st session.State, limit int, activeOnly bool, activeTaskID string) []string {
 	if limit <= 0 {
 		return nil
 	}
@@ -150,6 +224,9 @@ func shortArtifactLines(st session.State, limit int) []string {
 	for i := len(st.TaskOrder) - 1; i >= 0 && len(lines) < limit; i-- {
 		task, ok := st.Tasks[st.TaskOrder[i]]
 		if !ok {
+			continue
+		}
+		if activeOnly && strings.TrimSpace(task.ID) != strings.TrimSpace(activeTaskID) {
 			continue
 		}
 		for j := len(task.Artifacts) - 1; j >= 0 && len(lines) < limit; j-- {

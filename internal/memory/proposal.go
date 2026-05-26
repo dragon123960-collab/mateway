@@ -36,6 +36,7 @@ type CommitInput struct {
 type CommitResult struct {
 	SourcePath string
 	TargetPath string
+	Type       string
 }
 
 type MemoryItem struct {
@@ -44,6 +45,8 @@ type MemoryItem struct {
 	Status  string
 	Title   string
 	Kind    string
+	Tags    []string
+	Sources []string
 	Scope   string
 	Updated string
 }
@@ -52,6 +55,8 @@ type ListOptions struct {
 	AgentID string
 	Status  string
 	Area    string
+	Kind    string
+	Tag     string
 }
 
 type ShowResult struct {
@@ -143,6 +148,12 @@ func (s Store) List(opts ListOptions) ([]MemoryItem, error) {
 		if status := strings.TrimSpace(opts.Status); status != "" && !strings.EqualFold(item.Status, status) {
 			continue
 		}
+		if kind := strings.TrimSpace(opts.Kind); kind != "" && !strings.EqualFold(item.Kind, kind) {
+			continue
+		}
+		if tag := strings.TrimSpace(opts.Tag); tag != "" && !memoryItemHasTag(item, tag) {
+			continue
+		}
 		out = append(out, item)
 	}
 	return out, nil
@@ -186,9 +197,14 @@ func (s Store) Commit(in CommitInput) (CommitResult, error) {
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return CommitResult{}, err
 	}
-	targetPath := filepath.Join(targetDir, slugForMemory(title)+".md")
+	prefix := longMemoryPrefixForProposal(text)
+	filename := slugForMemory(title)
+	if prefix != "" {
+		filename = prefix + "-" + filename
+	}
+	targetPath := filepath.Join(targetDir, filename+".md")
 	if _, err := os.Stat(targetPath); err == nil {
-		targetPath = filepath.Join(targetDir, slugForMemory(title)+"-"+time.Now().Format("20060102-150405")+".md")
+		targetPath = filepath.Join(targetDir, filename+"-"+time.Now().Format("20060102-150405")+".md")
 	} else if !os.IsNotExist(err) {
 		return CommitResult{}, err
 	}
@@ -214,7 +230,20 @@ func (s Store) Commit(in CommitInput) (CommitResult, error) {
 		return CommitResult{}, err
 	}
 	s.rebuildIndexBestEffort(now)
-	return CommitResult{SourcePath: sourcePath, TargetPath: targetPath}, nil
+	return CommitResult{SourcePath: sourcePath, TargetPath: targetPath, Type: strings.ToLower(strings.TrimSpace(memoryType(text)))}, nil
+}
+
+func longMemoryPrefixForProposal(text string) string {
+	parsed, err := parseMarkdown(text)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Frontmatter.Type)) {
+	case "decision", "playbook", "preference", "project":
+		return strings.ToLower(strings.TrimSpace(parsed.Frontmatter.Type))
+	default:
+		return ""
+	}
 }
 
 func (s Store) Reject(in RejectInput) (RejectResult, error) {
@@ -480,9 +509,24 @@ func memoryItemFromText(path, text string) MemoryItem {
 		Status:  parsed.Frontmatter.Status,
 		Title:   titleFromMarkdown(text),
 		Kind:    parsed.Frontmatter.Type,
+		Tags:    cleanList(parsed.Frontmatter.Tags),
+		Sources: cleanList(parsed.Frontmatter.Sources),
 		Scope:   parsed.Frontmatter.Scope,
 		Updated: parsed.Frontmatter.UpdatedAt,
 	}
+}
+
+func memoryItemHasTag(item MemoryItem, tag string) bool {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return true
+	}
+	for _, itemTag := range item.Tags {
+		if strings.EqualFold(strings.TrimSpace(itemTag), tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func pathWithoutRoot(root, path string) string {

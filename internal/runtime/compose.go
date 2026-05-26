@@ -4,18 +4,27 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/tool"
 )
 
-func composeCandidateTools(defs []tool.Definition, understanding taskUnderstanding) []tool.Definition {
-	if len(defs) <= 3 {
+const (
+	planningCandidateBudget = 5
+	repairCandidateBudget   = 8
+)
+
+func composeCandidateTools(defs []tool.Definition, understanding taskUnderstanding, budget int, extraHints ...string) []tool.Definition {
+	if budget <= 0 {
+		budget = planningCandidateBudget
+	}
+	if len(defs) <= budget {
 		return defs
 	}
 	type candidate struct {
 		def   tool.Definition
 		score int
 	}
-	user := normalizeComposeText(understanding.Goal)
+	user := normalizeComposeText(strings.TrimSpace(strings.Join(append([]string{understanding.Goal}, extraHints...), " ")))
 	scored := make([]candidate, 0, len(defs))
 	for _, def := range defs {
 		score := toolMatchScore(def, user, understanding)
@@ -32,7 +41,7 @@ func composeCandidateTools(defs []tool.Definition, understanding taskUnderstandi
 		}
 		return scored[i].def.Name < scored[j].def.Name
 	})
-	limit := 3
+	limit := budget
 	if len(scored) < limit {
 		limit = len(scored)
 	}
@@ -43,43 +52,33 @@ func composeCandidateTools(defs []tool.Definition, understanding taskUnderstandi
 	return out
 }
 
-func orderToolsForPlanning(all, recommended []tool.Definition) []tool.Definition {
-	if len(all) == 0 || len(recommended) == 0 {
-		return all
-	}
-	recommendedNames := map[string]struct{}{}
-	out := make([]tool.Definition, 0, len(all))
-	for _, def := range recommended {
-		name := strings.TrimSpace(def.Name)
-		if name == "" {
-			continue
-		}
-		if _, exists := recommendedNames[name]; exists {
-			continue
-		}
-		recommendedNames[name] = struct{}{}
-		out = append(out, def)
-	}
-	for _, def := range all {
-		if _, exists := recommendedNames[strings.TrimSpace(def.Name)]; exists {
-			continue
-		}
-		out = append(out, def)
-	}
-	return out
-}
-
-func renderRecommendedTools(recommended []tool.Definition, total int) string {
-	if len(recommended) == 0 || len(recommended) >= total {
+func renderRecommendedTools(recommended []tool.Definition) string {
+	if len(recommended) == 0 {
 		return ""
 	}
 	names := toolNames(recommended)
 	if len(names) == 0 {
 		return ""
 	}
-	return "Recommended tools for this request:\n" +
-		"- Prefer these tools when they fit the task: " + strings.Join(names, ", ") + "\n" +
-		"- Other available tools remain valid when the request requires them. Do not treat this recommendation as a hard limit."
+	return "Candidate tools for this request:\n" +
+		"- Prefer these tools when they fit the task: " + strings.Join(names, ", ")
+}
+
+func repairCandidateHints(results []model.ToolResult, repairReason string) []string {
+	hints := []string{}
+	if strings.TrimSpace(repairReason) != "" {
+		hints = append(hints, repairReason)
+	}
+	for _, result := range results {
+		if result.OK {
+			continue
+		}
+		text := strings.TrimSpace(result.Tool + " " + result.Error + " " + result.Output)
+		if text != "" {
+			hints = append(hints, text)
+		}
+	}
+	return hints
 }
 
 func toolMatchScore(def tool.Definition, user string, understanding taskUnderstanding) int {

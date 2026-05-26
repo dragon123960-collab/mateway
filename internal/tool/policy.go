@@ -24,6 +24,13 @@ func RequireConfirmForTool(name string, args map[string]string) bool {
 		return true
 	case "shell.run", "terminal.run":
 		return IsDangerousCommand(args["command"])
+	case "memory.commit":
+		kind := strings.TrimSpace(args["type"])
+		switch kind {
+		case "decision", "playbook", "preference":
+			return true
+		}
+		return false
 	default:
 		return false
 	}

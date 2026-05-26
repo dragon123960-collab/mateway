@@ -9,6 +9,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/larksuite/oapi-sdk-go/v3/ws"
 )
@@ -30,6 +31,18 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 		OnP2MessageReceiveV1(func(eventCtx context.Context, event *larkim.P2MessageReceiveV1) error {
 			msg := NormalizeMessageReceive(event)
 			return receiver(eventCtx, msg)
+		}).
+		OnP2CardActionTrigger(func(eventCtx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			msg := NormalizeCardAction(event)
+			if err := receiver(eventCtx, msg); err != nil {
+				return nil, err
+			}
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{
+					Type:    "info",
+					Content: "已收到，正在处理",
+				},
+			}, nil
 		}).
 		OnP2MessageReadV1(func(eventCtx context.Context, event *larkim.P2MessageReadV1) error {
 			return nil
@@ -66,6 +79,27 @@ func NormalizeMessageReceive(event *larkim.P2MessageReceiveV1) channel.InboundMe
 	return msg
 }
 
+func NormalizeCardAction(event *callback.CardActionTriggerEvent) channel.InboundMessage {
+	msg := channel.InboundMessage{Channel: "feishu", Metadata: map[string]string{}}
+	if event == nil || event.Event == nil {
+		return msg
+	}
+	if event.Event.Context != nil {
+		msg.ID = strings.TrimSpace(event.Event.Context.OpenMessageID)
+		msg.ThreadID = firstNonEmpty(event.Event.Context.OpenChatID, event.Event.Context.OpenMessageID)
+	}
+	msg.Text = extractCardActionText(event.Event.Action)
+	msg.Metadata["message_type"] = "interactive"
+	msg.Metadata["sender_type"] = "user"
+	if decision := extractCardActionDecision(event.Event.Action); decision != "" {
+		msg.Metadata["card_action"] = decision
+	}
+	if event.Event.Operator != nil {
+		msg.UserID = firstNonEmpty(event.Event.Operator.OpenID, value(event.Event.Operator.UserID))
+	}
+	return msg
+}
+
 func extractText(content string) string {
 	content = strings.TrimSpace(content)
 	var payload struct {
@@ -82,6 +116,32 @@ func value(ptr *string) string {
 		return ""
 	}
 	return *ptr
+}
+
+func extractCardActionText(action *callback.CallBackAction) string {
+	if action == nil {
+		return ""
+	}
+	if text, _ := action.Value["mateway_text"].(string); strings.TrimSpace(text) != "" {
+		return strings.TrimSpace(text)
+	}
+	switch extractCardActionDecision(action) {
+	case "confirm":
+		return "确认"
+	case "cancel":
+		return "取消"
+	}
+	return strings.TrimSpace(action.InputValue)
+}
+
+func extractCardActionDecision(action *callback.CallBackAction) string {
+	if action == nil {
+		return ""
+	}
+	if decision, _ := action.Value["decision"].(string); strings.TrimSpace(decision) != "" {
+		return strings.TrimSpace(decision)
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {
