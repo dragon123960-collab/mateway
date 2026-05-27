@@ -75,6 +75,7 @@ type Context struct {
 }
 
 type SearchConfig struct {
+	DefaultTool              string
 	CacheDir                 string
 	CacheEnabled             bool
 	CacheTTLHours            int

@@ -205,11 +205,11 @@ func (c FeishuConfig) ResolveSecrets() FeishuConfig {
 }
 
 func (c SearchProviderConfig) ResolvedAPIKey() string {
-	return firstNonEmpty(c.APIKey, getenv(c.APIKeyEnv))
+	return firstNonEmpty(c.APIKey, getenvWithMatewayFallback(c.APIKeyEnv))
 }
 
 func (c ModelConfig) ResolvedAPIKey() string {
-	return firstNonEmpty(c.APIKey, getenv(c.APIKeyEnv))
+	return firstNonEmpty(c.APIKey, getenvWithMatewayFallback(c.APIKeyEnv))
 }
 
 func DefaultHome() string {
@@ -460,4 +460,18 @@ func getenv(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(os.Getenv(strings.TrimSpace(name)))
+}
+
+func getenvWithMatewayFallback(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if value := getenv(name); value != "" {
+		return value
+	}
+	if strings.HasPrefix(name, "MATEWAY_") {
+		return ""
+	}
+	return getenv("MATEWAY_" + name)
 }

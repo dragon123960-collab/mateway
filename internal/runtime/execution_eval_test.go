@@ -51,7 +51,11 @@ func TestExecutionEvalTerminalSoftFailureBecomesSuspect(t *testing.T) {
 				Output: "data not found",
 				Evidence: map[string]any{
 					"kind":      "terminal",
+					"command":   "echo",
 					"exit_code": 0,
+					"stdout":    "data not found",
+					"stderr":    "",
+					"timed_out": false,
 				},
 			}
 		},

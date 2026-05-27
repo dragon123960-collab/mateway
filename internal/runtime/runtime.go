@@ -97,6 +97,7 @@ func BuildToolContext(cfg *config.Root, projectRoot string) tool.Context {
 		workspace = cfg.App.Workspace
 		allowed = append(allowed, cfg.Security.AccessiblePaths...)
 		search = tool.SearchConfig{
+			DefaultTool:              cfg.Search.DefaultTool,
 			CacheDir:                 filepath.Join(firstNonEmpty(cfg.App.Workspace, cfg.App.Home, config.DefaultHome()), "web-cache"),
 			CacheEnabled:             cfg.Search.CacheEnabled,
 			CacheTTLHours:            cfg.Search.CacheTTLHours,
@@ -459,7 +460,7 @@ func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step mod
 	args := copyArgs(step.Args)
 	delete(args, "confirmed")
 	delete(args, "confirm")
-	needsConfirm := tool.RequireConfirmForTool(step.Tool, args) || terminalStepRequiresExternalWriteConfirm(step.Tool, args)
+	needsConfirm := r.requiresStepConfirmation(step, args)
 	stepApproved := false
 	if approvalGranted {
 		switch {
@@ -499,9 +500,13 @@ func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step mod
 		}
 		return tr, "await_confirm", consumed
 	}
-	accept := codeAcceptStep(step, tr, def, r.Acceptors)
+	acceptors := r.Acceptors
+	if acceptors == nil {
+		acceptors = NewAcceptanceRegistry()
+	}
+	accept := codeAcceptStep(step, tr, def, acceptors)
 	if shouldLLMAcceptStep(step, def, accept, nil) {
-		accept = llmAcceptStep(ctx, r.Model, step.Goal, step, tr, def, r.Acceptors)
+		accept = llmAcceptStep(ctx, r.Model, step.Goal, step, tr, def, acceptors)
 	}
 	r.Logger.Event("runtime.step_accept", map[string]any{
 		"trace_id": traceID,
@@ -543,6 +548,27 @@ func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step mod
 		r.Observer.ToolDone(traceID, tr)
 	}
 	return tr, "", consumed
+}
+
+func (r Runtime) requiresStepConfirmation(step model.PlanStep, args map[string]string) bool {
+	if !r.requireApprovalForRiskyTools() {
+		switch strings.TrimSpace(step.Tool) {
+		case "shell.run", "terminal.run":
+			return tool.IsDangerousCommand(args["command"])
+		case "file.write", "file.patch":
+			return true
+		default:
+			return false
+		}
+	}
+	return tool.RequireConfirmForTool(step.Tool, args) || terminalStepRequiresExternalWriteConfirm(step.Tool, args)
+}
+
+func (r Runtime) requireApprovalForRiskyTools() bool {
+	if r.Config == nil {
+		return true
+	}
+	return r.Config.Security.RequireApprovalForRiskyTool
 }
 
 func (r Runtime) ExecutePlanForEval(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string) ([]model.ToolResult, string) {
@@ -657,6 +683,8 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 	text := userFacingError(err)
 	if preflight := userFacingTerminalPreconditionMessage(results); preflight != "" {
 		text = preflight
+	} else if software := userFacingSoftwareDiscoveryMessage(results); software != "" {
+		text = software
 	} else if planVerification := userFacingPlanVerificationMessage(results); planVerification != "" {
 		text = planVerification
 	}
@@ -667,6 +695,45 @@ func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results [
 		FinalAcceptStatus: string(AcceptanceRejected),
 		FinalAcceptReason: err.Error(),
 	}
+}
+
+func userFacingSoftwareDiscoveryMessage(results []model.ToolResult) string {
+	var weak []model.ToolResult
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "software.search" {
+			continue
+		}
+		if result.OK {
+			continue
+		}
+		if result.Error == "step_acceptance_suspect" || strings.Contains(strings.ToLower(result.Output), "acceptance suspect") {
+			weak = append(weak, result)
+		}
+	}
+	if len(weak) == 0 {
+		return ""
+	}
+	first := weak[0]
+	query := strings.TrimSpace(stringValue(first.Evidence["query"]))
+	name := strings.TrimSpace(stringValue(first.Evidence["name"]))
+	url := strings.TrimSpace(stringValue(first.Evidence["url"]))
+	var b strings.Builder
+	b.WriteString("这次没有找到可信的 OpenCLI 官方来源，所以我先停下，避免用相似项目或猜测仓库去安装。")
+	if query != "" || name != "" {
+		b.WriteString("\n\n已确认：")
+		if query != "" {
+			b.WriteString("\n- 搜索词：" + query)
+		}
+		if name != "" {
+			b.WriteString("\n- 最靠前结果是 `" + name + "`")
+			if url != "" {
+				b.WriteString("（" + url + "）")
+			}
+			b.WriteString("，但它和目标不匹配。")
+		}
+	}
+	b.WriteString("\n\n下一步应该继续做来源发现：换更精确的查询、查官方 README / npm 包页面 / GitHub 仓库，而不是直接安装。")
+	return b.String()
 }
 
 func userFacingError(err error) string {
@@ -718,8 +785,13 @@ func userFacingPlanVerificationMessage(results []model.ToolResult) string {
 	if len(reasons) == 0 && len(diagnostics) == 0 {
 		return ""
 	}
+	installTask := planVerificationLooksLikeInstall(errors)
 	var b strings.Builder
-	b.WriteString("这次还没有执行发送命令，失败点在执行前的计划检查。")
+	if installTask {
+		b.WriteString("这次还没有执行安装命令，失败点在执行前的计划检查。")
+	} else {
+		b.WriteString("这次还没有执行本地写命令，失败点在执行前的计划检查。")
+	}
 	if len(diagnostics) > 0 {
 		b.WriteString("\n\n已确认的情况：")
 		for _, item := range diagnostics {
@@ -732,8 +804,22 @@ func userFacingPlanVerificationMessage(results []model.ToolResult) string {
 	for _, reason := range reasons {
 		b.WriteString("\n- " + reason)
 	}
-	b.WriteString("\n\n所以我停下了，避免用没确认过的命令或缺参数的命令去真实发送。")
+	if installTask {
+		b.WriteString("\n\n所以我停下了，避免用占位或缺少验证方式的命令去真实安装。")
+	} else {
+		b.WriteString("\n\n所以我停下了，避免用没确认过的命令或缺参数的命令去修改外部系统。")
+	}
 	return b.String()
+}
+
+func planVerificationLooksLikeInstall(errors []string) bool {
+	for _, item := range errors {
+		lower := strings.ToLower(strings.TrimSpace(item))
+		if strings.Contains(lower, "software.install") || strings.Contains(lower, "install command") || strings.Contains(lower, "verify_command") {
+			return true
+		}
+	}
+	return false
 }
 
 func hasToolResult(results []model.ToolResult, toolName string) bool {
@@ -818,6 +904,12 @@ func planVerificationReasons(errors []string) []string {
 			add("还缺认证/配置预检。建议先执行 `<cli> auth list`、`<cli> profile list`、`<cli> status`、`<cli> whoami` 中该工具支持的一条；不确定哪条可用时，先执行 `<cli> --help` 或 `<cli> auth --help`。")
 		case strings.Contains(lower, "unresolved placeholder"):
 			add("计划里还有占位参数，必须替换成真实命令、真实参数或先向用户确认。")
+		case strings.Contains(lower, "missing required arg command") && strings.Contains(lower, "software.install"):
+			add("安装命令还不是从官方文档或 README 提取出的具体命令。")
+		case strings.Contains(lower, "missing required arg verify_command") && strings.Contains(lower, "software.install"):
+			add("还缺安装后的验证命令，例如 `command -v <executable>`、`<executable> --version` 或官方 README 里的 doctor/check 命令。")
+		case strings.Contains(lower, "args contain unresolved placeholder values"):
+			add("计划里还有 `<install_command from step-...>` 这类占位参数，必须先读取官方用法并提取真实命令。")
 		}
 	}
 	if len(reasons) > 4 {
@@ -933,6 +1025,25 @@ func hasRepairableFailure(results []model.ToolResult) bool {
 		}
 	}
 	return false
+}
+
+func onlyDependencyFailuresAfterSourceSuspect(results []model.ToolResult) bool {
+	hasSourceSuspect := false
+	hasDependencyFailure := false
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) == "software.search" && strings.TrimSpace(result.Error) == "step_acceptance_suspect" {
+			hasSourceSuspect = true
+			continue
+		}
+		if strings.TrimSpace(result.Error) == "dependency_failed" {
+			hasDependencyFailure = true
+			continue
+		}
+		if !result.OK && strings.TrimSpace(result.Error) != "" && strings.TrimSpace(result.Error) != "await_confirm" {
+			return false
+		}
+	}
+	return hasSourceSuspect && hasDependencyFailure
 }
 
 func needsGroundingEvidence(user string, results []model.ToolResult) bool {
@@ -1085,7 +1196,7 @@ func terminalFailureRepairGuidance(results []model.ToolResult) string {
 			strings.Contains(text, "unknown flag") ||
 			strings.Contains(text, "invalid option") ||
 			strings.Contains(text, "unrecognized option"):
-			parts = append(parts, "The CLI syntax appears wrong. First use read-only parent help such as `"+executable+" --help` or the nearest subcommand help to correct the command/flag. If local help conflicts with the task or is insufficient, fetch official docs/README before trying another write command.")
+			parts = append(parts, "The CLI syntax appears wrong. First use read-only parent help such as `"+executable+" --help` or the nearest subcommand help to correct the command/flag. If the parent help lists an exact send command, inspect that exact command's help before replying or trying another write command. "+terminalMessageSendRepairHint(command, text)+"If local help conflicts with the task or is insufficient, fetch official docs/README before trying another write command.")
 		case strings.Contains(text, "missing required") ||
 			strings.Contains(text, "required flag") ||
 			strings.Contains(text, "requires an argument") ||
@@ -1119,6 +1230,14 @@ func terminalFailureRepairGuidance(results []model.ToolResult) string {
 	return strings.Join(dedupeStrings(parts), "\n")
 }
 
+func terminalMessageSendRepairHint(command, output string) string {
+	lower := strings.ToLower(strings.TrimSpace(command + "\n" + output))
+	if !strings.Contains(lower, "send") || !(strings.Contains(lower, "message") || strings.Contains(lower, "messages")) {
+		return ""
+	}
+	return "For this message-send shape, do not stop at parent help when it only lists candidate commands; inspect the exact listed send command's help, then build the send command from that output. "
+}
+
 func terminalStepRequiresExternalWriteConfirm(toolName string, args map[string]string) bool {
 	if strings.TrimSpace(toolName) != "terminal.run" && strings.TrimSpace(toolName) != "shell.run" {
 		return false
@@ -1130,11 +1249,14 @@ func terminalStepRequiresExternalWriteConfirm(toolName string, args map[string]s
 	return terminalCommandLooksExternalWriteAction(command)
 }
 
-func repairedTerminalWriteStepCoveredByApproval(results []model.ToolResult, plan model.Plan, approvalGranted bool) string {
+func repairedTerminalWriteStepCoveredByApproval(results []model.ToolResult, plan model.Plan, approvalGranted bool, approvedCommand string) string {
 	if !approvalGranted {
 		return ""
 	}
 	var approvedFailedCommands []string
+	if command := strings.TrimSpace(approvedCommand); terminalCommandLooksExternalWriteAction(command) {
+		approvedFailedCommands = append(approvedFailedCommands, command)
+	}
 	for _, result := range results {
 		if result.OK || strings.TrimSpace(result.Tool) != "terminal.run" {
 			continue
@@ -1173,15 +1295,67 @@ func terminalWriteCommandsShareApprovalBoundary(prev, next string) bool {
 	if terminalWriteActionKind(prev) == "" || terminalWriteActionKind(prev) != terminalWriteActionKind(next) {
 		return false
 	}
+	checkedTarget := false
 	for _, flag := range []string{"chat-id", "chat_id", "receive-id", "receive_id", "user-id", "user_id", "open-id", "open_id"} {
 		prevValue := commandFlagValue(prev, flag)
 		nextValue := commandFlagValue(next, flag)
 		if prevValue == "" || nextValue == "" {
 			continue
 		}
+		checkedTarget = true
 		return prevValue == nextValue
 	}
-	return false
+	if checkedTarget {
+		return false
+	}
+	return sameCLIWriteCommandPath(prev, next)
+}
+
+func sameCLIWriteCommandPath(prev, next string) bool {
+	prevPath := cliWriteCommandPath(prev)
+	nextPath := cliWriteCommandPath(next)
+	if len(prevPath) == 0 || len(nextPath) == 0 || len(prevPath) != len(nextPath) {
+		return false
+	}
+	for i := range prevPath {
+		if prevPath[i] != nextPath[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func cliWriteCommandPath(command string) []string {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 4)
+	for i, field := range fields {
+		field = strings.Trim(strings.TrimSpace(field), `'"`)
+		if field == "" {
+			continue
+		}
+		if i == 0 {
+			out = append(out, strings.ToLower(field))
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			break
+		}
+		token := strings.TrimLeft(strings.ToLower(field), "+")
+		if token == "" {
+			continue
+		}
+		out = append(out, token)
+		if terminalWriteActionKind(" "+token) != "" {
+			break
+		}
+	}
+	if len(out) < 2 {
+		return nil
+	}
+	return out
 }
 
 func terminalWriteActionKind(command string) string {

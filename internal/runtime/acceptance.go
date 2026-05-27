@@ -55,6 +55,9 @@ func codeAcceptStep(step model.PlanStep, result model.ToolResult, def tool.Defin
 		spec, hasSpec = acceptanceSpecForStep(registry, step, def)
 	}
 	if !result.OK {
+		if terminalFailedAfterParentHelpInsteadOfExactSubcommand(step, result) {
+			return StepAcceptance{Status: AcceptanceHardFail, Reason: "parent help listed a more exact subcommand; inspect that exact subcommand help before retrying the write command", Source: "code"}
+		}
 		if strings.TrimSpace(step.Tool) == "memory.search" && memorySearchNoMatch(result) {
 			return StepAcceptance{Status: AcceptanceUsable, Reason: "memory search returned no durable match but produced a valid no-result observation", Source: "code"}
 		}
@@ -68,6 +71,9 @@ func codeAcceptStep(step model.PlanStep, result model.ToolResult, def tool.Defin
 	}
 	if softwareSearchResultLooksWeak(step, result) {
 		return StepAcceptance{Status: AcceptanceSuspect, Reason: "software search top result does not clearly match the requested software", Source: "code"}
+	}
+	if reason := terminalResultLooksLikeNoopMutation(step, result); reason != "" {
+		return StepAcceptance{Status: AcceptanceHardFail, Reason: reason, Source: "code"}
 	}
 	if hasSpec {
 		if accept := codeAcceptWithSpec(spec, result); accept != nil {
@@ -89,6 +95,44 @@ func codeAcceptStep(step model.PlanStep, result model.ToolResult, def tool.Defin
 		return StepAcceptance{Status: AcceptanceSuspect, Reason: reason, Source: "code"}
 	}
 	return StepAcceptance{Status: AcceptancePass, Source: "code"}
+}
+
+func terminalResultLooksLikeNoopMutation(step model.PlanStep, result model.ToolResult) string {
+	if strings.TrimSpace(step.Tool) != "terminal.run" || strings.TrimSpace(result.Tool) != "terminal.run" || !terminalCommandLooksExternalWriteAction(step.Args["command"]) {
+		return ""
+	}
+	text := strings.ToLower(strings.TrimSpace(result.Output + "\n" + stringValue(result.Evidence["stdout"]) + "\n" + stringValue(result.Evidence["stderr"])))
+	switch {
+	case strings.Contains(text, "instruction produced no document changes"):
+		return "write command reported no document changes; repair the command content format and verify the requested content was written"
+	case strings.Contains(text, "no document changes") && strings.Contains(text, "unexpected"):
+		return "write command reported no effective changes; repair the command arguments and verify the requested mutation"
+	default:
+		return ""
+	}
+}
+
+func terminalFailedAfterParentHelpInsteadOfExactSubcommand(step model.PlanStep, result model.ToolResult) bool {
+	if strings.TrimSpace(step.Tool) != "terminal.run" || strings.TrimSpace(result.Tool) != "terminal.run" {
+		return false
+	}
+	command := strings.TrimSpace(firstNonEmpty(stringValue(result.Evidence["command"]), step.Args["command"]))
+	if command == "" || !terminalCommandLooksExternalWriteAction(command) {
+		return false
+	}
+	output := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringValue(result.Evidence["stdout"]), result.Output)))
+	if !strings.Contains(output, "available commands:") || !strings.Contains(output, "use ") || !strings.Contains(output, "[command] --help") {
+		return false
+	}
+	for _, token := range cliWriteCommandPath(command) {
+		if token == "" || strings.Contains(token, "/") {
+			continue
+		}
+		if strings.Contains(output, "+"+token) {
+			return true
+		}
+	}
+	return false
 }
 
 func terminalDiagnosticFailureIsUsable(step model.PlanStep, result model.ToolResult, def tool.Definition, registry *AcceptanceRegistry) bool {
@@ -117,12 +161,62 @@ func terminalDiagnosticFailureIsUsable(step model.PlanStep, result model.ToolRes
 	if strings.TrimSpace(stdout) == "" {
 		return false
 	}
+	stderr, _ := result.Evidence["stderr"].(string)
+	if terminalDiagnosticStderrLooksActionableFailure(stderr) {
+		return false
+	}
 	text := strings.ToLower(strings.TrimSpace(result.Output))
+	if terminalOutputLooksUsageAfterCommandError(text) {
+		return false
+	}
 	extraSignals := def.Metadata.SoftFailureSignals
 	if spec, ok := acceptanceSpecForStep(registry, step, def); ok {
 		extraSignals = append(extraSignals, spec.SoftFailureSignals...)
 	}
 	return softFailureReason(text, result.Evidence, extraSignals) == ""
+}
+
+func terminalDiagnosticStderrLooksActionableFailure(stderr string) bool {
+	lower := strings.ToLower(strings.TrimSpace(stderr))
+	if lower == "" {
+		return false
+	}
+	failureSignals := []string{
+		"unknown flag",
+		"unknown command",
+		"unknown subcommand",
+		"invalid option",
+		"unrecognized option",
+		"missing required",
+		"required flag",
+		"requires an argument",
+		"missing argument",
+		"unauthorized",
+		"authentication",
+		"not logged in",
+		"permission denied",
+	}
+	for _, signal := range failureSignals {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalOutputLooksUsageAfterCommandError(output string) bool {
+	lower := strings.ToLower(strings.TrimSpace(output))
+	if lower == "" {
+		return false
+	}
+	hasUsage := strings.Contains(lower, "usage:") || strings.Contains(lower, "available commands:")
+	hasError := strings.Contains(lower, "unknown flag") ||
+		strings.Contains(lower, "unknown command") ||
+		strings.Contains(lower, "invalid option") ||
+		strings.Contains(lower, "unrecognized option") ||
+		strings.Contains(lower, "missing required") ||
+		strings.Contains(lower, "required flag")
+	return hasUsage && hasError
 }
 
 func memorySearchNoMatch(result model.ToolResult) bool {
@@ -156,6 +250,14 @@ func softwareSearchResultLooksWeak(step model.PlanStep, result model.ToolResult)
 	nameTokens := stableSearchNameTokens(name)
 	if len(queryTokens) == 0 || len(nameTokens) == 0 {
 		return false
+	}
+	if len(queryTokens) >= 1 {
+		primary := queryTokens[0]
+		for _, actual := range nameTokens {
+			if actual != primary && strings.Contains(actual, primary) && len(actual) > len(primary)+3 {
+				return true
+			}
+		}
 	}
 	matches := 0
 	for _, token := range queryTokens {
@@ -516,8 +618,8 @@ func llmAcceptFinal(ctx context.Context, planner model.Planner, user string, und
 		return FinalAcceptance{Status: AcceptanceAccepted, Reason: "all steps completed"}
 	}
 	user = buildFinalAcceptancePrompt(user, understanding, finalAcceptanceContext{
-		Results:       results,
-		ScheduledRun:  understanding.IsScheduledRun,
+		Results:      results,
+		ScheduledRun: understanding.IsScheduledRun,
 	})
 	raw, err := reviewer.AcceptFinalJSON(ctx, user, plan, results)
 	if err != nil {

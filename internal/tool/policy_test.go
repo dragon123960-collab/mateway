@@ -190,11 +190,8 @@ func TestWebSearchProviderOverrideFallsBackToConfiguredOrder(t *testing.T) {
 		Args:    map[string]string{"query": "Mateway", "provider": "tavily"},
 		Context: Context{Search: cfg},
 	})
-	if !result.OK || !strings.Contains(result.Output, "cached fallback") {
-		t.Fatalf("expected provider override to fall back to cache, got %#v", result)
-	}
-	if hit, _ := result.Evidence["cache_hit"].(bool); !hit {
-		t.Fatalf("expected cache_hit evidence, got %#v", result.Evidence)
+	if result.OK || !strings.Contains(result.Error, "tavily disabled") {
+		t.Fatalf("expected provider override to force only tavily, got %#v", result)
 	}
 }
 

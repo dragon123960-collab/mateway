@@ -65,6 +65,9 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 			if placeholderCommand(step.Tool, step.Args) {
 				out.Errors = append(out.Errors, label+": command contains unresolved download placeholder")
 			}
+			if naturalLanguageCommand(step.Tool, step.Args) {
+				out.Errors = append(out.Errors, label+": command must be a concrete executable invocation, not a natural-language placeholder")
+			}
 			if placeholderArgs(step.Tool, step.Args) {
 				out.Errors = append(out.Errors, label+": args contain unresolved placeholder values")
 			}
@@ -98,7 +101,13 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 	for _, warning := range toolNeedsCoverageWarnings(understanding.Capabilities, usedTools) {
 		out.RepairableWarnings = append(out.RepairableWarnings, warning)
 	}
+	for _, err := range scheduledRunBlockingErrors(plan, understanding) {
+		out.Errors = append(out.Errors, err)
+	}
 	for _, warning := range localCLIExecutableValidationWarnings(plan, user) {
+		out.RepairableWarnings = append(out.RepairableWarnings, warning)
+	}
+	for _, warning := range cliUsageDiscoveryWarnings(plan, user) {
 		out.RepairableWarnings = append(out.RepairableWarnings, warning)
 	}
 	for _, warning := range cliMessageParameterWarnings(plan, user) {
@@ -110,6 +119,20 @@ func verifyPlanContract(plan model.Plan, registry *tool.Registry, user string, u
 	return out
 }
 
+func scheduledRunBlockingErrors(plan model.Plan, understanding taskUnderstanding) []string {
+	if !understanding.IsScheduledRun {
+		return nil
+	}
+	var errors []string
+	for i, step := range plan.Steps {
+		if strings.TrimSpace(step.Tool) != "user.ask" {
+			continue
+		}
+		errors = append(errors, planStepLabel(step, i)+": scheduled runs must not require user.ask; summarize missing inputs, blocked tools, or no-result findings in the final output instead")
+	}
+	return errors
+}
+
 func placeholderCommand(toolName string, args map[string]string) bool {
 	switch strings.TrimSpace(toolName) {
 	case "terminal.run", "shell.run", "software.install":
@@ -117,6 +140,35 @@ func placeholderCommand(toolName string, args map[string]string) bool {
 	default:
 		return false
 	}
+}
+
+func naturalLanguageCommand(toolName string, args map[string]string) bool {
+	switch strings.TrimSpace(toolName) {
+	case "terminal.run", "shell.run", "software.install":
+	default:
+		return false
+	}
+	command := strings.TrimSpace(args["command"])
+	if command == "" {
+		return false
+	}
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false
+	}
+	first := strings.TrimSpace(fields[0])
+	if strings.Contains(first, "/") || strings.Contains(first, ".") || strings.Contains(first, "-") || strings.Contains(first, "_") {
+		return false
+	}
+	if regexp.MustCompile(`[A-Za-z0-9]`).MatchString(first) {
+		return false
+	}
+	for _, prefix := range []string{"根据", "按", "参考", "使用上一步", "基于", "先根据"} {
+		if strings.HasPrefix(command, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func placeholderArgs(toolName string, args map[string]string) bool {
@@ -132,8 +184,13 @@ func placeholderArgs(toolName string, args map[string]string) bool {
 		if strings.Contains(value, "根据 step-") || strings.Contains(value, "根据官方") || strings.Contains(value, "官方说明填写") || strings.Contains(value, "待填写") {
 			return true
 		}
-		if strings.TrimSpace(toolName) == "web.fetch" && key == "url" && !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
-			return true
+		if strings.TrimSpace(toolName) == "web.fetch" && key == "url" {
+			if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+				return true
+			}
+			if strings.Contains(value, "<") || strings.Contains(value, ">") {
+				return true
+			}
 		}
 	}
 	return false
@@ -489,7 +546,7 @@ func terminalCommandLooksExternalWriteAction(command string) bool {
 	if lower == "" {
 		return false
 	}
-	if strings.Contains(lower, "--dry-run") {
+	if terminalCommandLooksCLIReadinessPreflight(command) || strings.Contains(lower, "--dry-run") {
 		return false
 	}
 	writeHints := []string{
@@ -542,15 +599,15 @@ func cliMessageParameterWarnings(plan model.Plan, user string) []string {
 		if !terminalCommandLooksMessageSend(command) {
 			continue
 		}
+		label := strings.TrimSpace(step.ID)
+		if label == "" {
+			label = fmt.Sprintf("step-%d", i+1)
+		}
 		if terminalCommandLooksHelp(command) {
 			hasHelpStep = true
 			continue
 		}
 		wantSend = true
-		label := strings.TrimSpace(step.ID)
-		if label == "" {
-			label = fmt.Sprintf("step-%d", i+1)
-		}
 		if !hasHelpStep {
 			return []string{label + ": before executing CLI message send, first inspect the exact help or usage for the send command"}
 		}
@@ -569,6 +626,33 @@ func cliMessageParameterWarnings(plan model.Plan, user string) []string {
 		return nil
 	}
 	return nil
+}
+
+func cliUsageDiscoveryWarnings(plan model.Plan, user string) []string {
+	userCLI := cliUsageCandidateFromText(user).Executable
+	if userCLI == "" || commonCLIExecutable(userCLI) {
+		return nil
+	}
+	seenUsageByRoot := map[string]bool{}
+	var warnings []string
+	for i, step := range plan.Steps {
+		if strings.TrimSpace(step.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.TrimSpace(step.Args["command"])
+		root := normalizeCLIExecutableName(commandRoot(command))
+		if root == "" || root != userCLI || commonCLIExecutable(root) {
+			continue
+		}
+		if terminalCommandLooksCommandVForRoot(command, root) || terminalCommandLooksCLIReadinessPreflight(command) {
+			seenUsageByRoot[root] = true
+			continue
+		}
+		if terminalCommandLooksExternalWriteAction(command) && !seenUsageByRoot[root] {
+			warnings = append(warnings, planStepLabel(step, i)+": unknown external CLI `"+root+"` has no loaded usage memory; first run read-only usage discovery such as command -v, --version, --help, and exact subcommand help before executing the user task")
+		}
+	}
+	return warnings
 }
 
 func safeDiagnosticPrefixForBlockedPlan(plan model.Plan, user string) (model.Plan, bool) {
@@ -593,6 +677,41 @@ func safeDiagnosticPrefixForBlockedPlan(plan model.Plan, user string) (model.Pla
 	out := plan
 	out.Steps = append([]model.PlanStep(nil), prefix...)
 	return out, true
+}
+
+func safeDiscoveryPrefixForBlockedPlan(plan model.Plan) (model.Plan, bool) {
+	if len(plan.Steps) == 0 {
+		return model.Plan{}, false
+	}
+	var prefix []model.PlanStep
+	for _, step := range plan.Steps {
+		if !isSafeDiscoveryStepBeforeInstall(step) {
+			break
+		}
+		prefix = append(prefix, step)
+	}
+	if len(prefix) == 0 || len(prefix) == len(plan.Steps) {
+		return model.Plan{}, false
+	}
+	out := plan
+	out.Steps = append([]model.PlanStep(nil), prefix...)
+	return out, true
+}
+
+func isSafeDiscoveryStepBeforeInstall(step model.PlanStep) bool {
+	switch strings.TrimSpace(step.Tool) {
+	case "terminal.run":
+		command := strings.TrimSpace(step.Args["command"])
+		return concreteArgValue(step.Tool, "command", command) && terminalCommandLooksCLIReadinessPreflight(command) && !terminalCommandLooksExternalWriteAction(command)
+	case "software.search":
+		return concreteArgValue(step.Tool, "query", step.Args["query"])
+	case "web.search":
+		return concreteArgValue(step.Tool, "query", step.Args["query"])
+	case "web.fetch":
+		return concreteArgValue(step.Tool, "url", step.Args["url"])
+	default:
+		return false
+	}
 }
 
 func isSafeExactCommandVDiagnosticStep(step model.PlanStep, explicitNames map[string]bool) bool {
@@ -722,11 +841,39 @@ func missingRequiredArgs(def tool.Definition, args map[string]string) []string {
 	required := requiredArgsForTool(def.Name)
 	var missing []string
 	for _, name := range required {
-		if strings.TrimSpace(args[name]) == "" {
+		if !concreteArgValue(def.Name, name, args[name]) {
 			missing = append(missing, name)
 		}
 	}
 	return missing
+}
+
+func concreteArgValue(toolName, argName, value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.TrimSpace(toolName) == "web.fetch" && argName == "url" {
+		if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+			return false
+		}
+		if strings.Contains(value, "<") || strings.Contains(value, ">") {
+			return false
+		}
+	}
+	if strings.TrimSpace(toolName) != "software.install" {
+		return true
+	}
+	lower := strings.ToLower(value)
+	if argName == "command" || argName == "verify_command" {
+		if strings.Contains(lower, "install_command") || strings.Contains(lower, "verify_command") || strings.Contains(lower, "from step") || strings.Contains(lower, "step-") {
+			return false
+		}
+		if strings.Contains(value, "<") || strings.Contains(value, ">") || strings.Contains(lower, "todo") || strings.Contains(value, "根据") || strings.Contains(value, "待") {
+			return false
+		}
+	}
+	return true
 }
 
 func requiredArgsForTool(name string) []string {
@@ -746,7 +893,7 @@ func requiredArgsForTool(name string) []string {
 	case "skill.install":
 		return []string{"name"}
 	case "software.install":
-		return []string{"command"}
+		return []string{"command", "verify_command"}
 	case "schedule.create":
 		return []string{"title", "prompt"}
 	case "schedule.show", "schedule.pause", "schedule.resume", "schedule.delete":

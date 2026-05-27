@@ -26,6 +26,23 @@ type ProposalResult struct {
 	Path string
 }
 
+type LongMemoryInput struct {
+	AgentID    string
+	Scope      string
+	Type       string
+	Title      string
+	Body       string
+	Sources    []string
+	Tags       []string
+	Confidence string
+	CreatedAt  time.Time
+}
+
+type LongMemoryResult struct {
+	ID   string
+	Path string
+}
+
 type CommitInput struct {
 	AgentID  string
 	Proposal string
@@ -112,6 +129,53 @@ func (s Store) Propose(in ProposalInput) (ProposalResult, error) {
 	}
 	s.rebuildIndexBestEffort(now)
 	return ProposalResult{ID: id, Path: path}, nil
+}
+
+func (s Store) WriteLong(in LongMemoryInput) (LongMemoryResult, error) {
+	if strings.TrimSpace(s.Root) == "" {
+		return LongMemoryResult{}, fmt.Errorf("memory root is required")
+	}
+	if strings.TrimSpace(in.Title) == "" {
+		return LongMemoryResult{}, fmt.Errorf("long memory title is required")
+	}
+	if strings.TrimSpace(in.Body) == "" {
+		return LongMemoryResult{}, fmt.Errorf("long memory body is required")
+	}
+	if secretLike(in.Title) || secretLike(in.Body) || secretLike(strings.Join(in.Sources, "\n")) {
+		return LongMemoryResult{}, fmt.Errorf("long memory appears to contain a secret or credential; refusing to write it")
+	}
+	agentID := firstNonEmptyMemory(in.AgentID, "main")
+	scope := normalizeMemoryScope(in.Scope)
+	typ := firstNonEmptyMemory(in.Type, "note")
+	confidence := normalizeConfidence(in.Confidence)
+	now := in.CreatedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	longDir := filepath.Join(s.Root, "agents", agentID, "long")
+	if err := os.MkdirAll(longDir, 0o755); err != nil {
+		return LongMemoryResult{}, err
+	}
+	filename := slugForMemory(in.Title)
+	if typ == "playbook" && !strings.HasPrefix(filename, "playbook-") {
+		filename = "playbook-" + filename
+	}
+	path := filepath.Join(longDir, filename+".md")
+	if _, err := os.Stat(path); err != nil && !os.IsNotExist(err) {
+		return LongMemoryResult{}, err
+	}
+	text := renderLongMemory(agentID, scope, typ, in.Title, in.Body, in.Sources, in.Tags, confidence, now)
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		return LongMemoryResult{}, err
+	}
+	if err := s.updateAgentIndex(agentID, in.Title, path); err != nil {
+		return LongMemoryResult{}, err
+	}
+	if err := s.appendLog(now, fmt.Sprintf("write long memory: %s -> %s", in.Title, path)); err != nil {
+		return LongMemoryResult{}, err
+	}
+	s.rebuildIndexBestEffort(now)
+	return LongMemoryResult{ID: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Path: path}, nil
 }
 
 func (s Store) List(opts ListOptions) ([]MemoryItem, error) {
@@ -312,6 +376,36 @@ func renderMemoryProposal(agentID, scope, typ, title, body string, sources, tags
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "- Confirm this is stable enough to become long memory.")
 	fmt.Fprintln(&b, "- Remove accidental private details before committing.")
+	return b.String()
+}
+
+func renderLongMemory(agentID, scope, typ, title, body string, sources, tags []string, confidence string, now time.Time) string {
+	if len(tags) == 0 {
+		tags = []string{"auto-memory"}
+	}
+	var b strings.Builder
+	fmt.Fprintln(&b, "---")
+	fmt.Fprintf(&b, "type: %s\n", typ)
+	fmt.Fprintf(&b, "scope: %s\n", scope)
+	fmt.Fprintf(&b, "owner_agent: %s\n", agentID)
+	fmt.Fprintf(&b, "visibility: %s\n", visibilityForScope(scope))
+	fmt.Fprintln(&b, "status: active")
+	fmt.Fprintf(&b, "tags: [%s]\n", strings.Join(cleanList(tags), ", "))
+	fmt.Fprintln(&b, "aliases: []")
+	fmt.Fprintln(&b, "sources:")
+	for _, source := range cleanList(sources) {
+		fmt.Fprintf(&b, "  - %s\n", source)
+	}
+	if len(cleanList(sources)) == 0 {
+		fmt.Fprintln(&b, "  - manual")
+	}
+	fmt.Fprintf(&b, "confidence: %s\n", confidence)
+	fmt.Fprintf(&b, "created_at: %s\n", now.Format("2006-01-02"))
+	fmt.Fprintf(&b, "updated_at: %s\n", now.Format("2006-01-02"))
+	fmt.Fprintln(&b, "---")
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "# Memory: %s\n\n", title)
+	fmt.Fprintln(&b, strings.TrimSpace(body))
 	return b.String()
 }
 

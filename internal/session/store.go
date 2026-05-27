@@ -47,21 +47,22 @@ type Artifact struct {
 }
 
 type StepState struct {
-	ID               string         `json:"id"`
-	Goal             string         `json:"goal,omitempty"`
-	Tool             string         `json:"tool"`
-	Status           string         `json:"status"`
-	AttemptCount     int            `json:"attempt_count"`
-	DependsOn        []string       `json:"depends_on,omitempty"`
-	ResultOK         bool           `json:"result_ok"`
-	ResultError      string         `json:"result_error,omitempty"`
-	ResultSummary    string         `json:"result_summary,omitempty"`
-	Evidence         map[string]any `json:"evidence,omitempty"`
-	AcceptanceStatus string         `json:"acceptance_status,omitempty"`
-	AcceptanceReason string         `json:"acceptance_reason,omitempty"`
-	StartedAt        time.Time      `json:"started_at,omitempty"`
-	FinishedAt       time.Time      `json:"finished_at,omitempty"`
-	UpdatedAt        time.Time      `json:"updated_at,omitempty"`
+	ID               string            `json:"id"`
+	Goal             string            `json:"goal,omitempty"`
+	Tool             string            `json:"tool"`
+	Args             map[string]string `json:"args,omitempty"`
+	Status           string            `json:"status"`
+	AttemptCount     int               `json:"attempt_count"`
+	DependsOn        []string          `json:"depends_on,omitempty"`
+	ResultOK         bool              `json:"result_ok"`
+	ResultError      string            `json:"result_error,omitempty"`
+	ResultSummary    string            `json:"result_summary,omitempty"`
+	Evidence         map[string]any    `json:"evidence,omitempty"`
+	AcceptanceStatus string            `json:"acceptance_status,omitempty"`
+	AcceptanceReason string            `json:"acceptance_reason,omitempty"`
+	StartedAt        time.Time         `json:"started_at,omitempty"`
+	FinishedAt       time.Time         `json:"finished_at,omitempty"`
+	UpdatedAt        time.Time         `json:"updated_at,omitempty"`
 }
 
 type TaskState struct {
@@ -86,6 +87,7 @@ type TaskState struct {
 	ExecutionStatus      string               `json:"execution_status,omitempty"`
 	StepOrder            []string             `json:"step_order,omitempty"`
 	StepStates           map[string]StepState `json:"step_states,omitempty"`
+	StepHistory          []StepState          `json:"step_history,omitempty"`
 	Artifacts            []Artifact           `json:"artifacts,omitempty"`
 	StartedAt            time.Time            `json:"started_at"`
 	FinishedAt           time.Time            `json:"finished_at"`

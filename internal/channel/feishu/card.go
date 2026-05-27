@@ -3,6 +3,7 @@ package feishu
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/dongping/mateway/internal/channel"
@@ -69,6 +70,9 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 	if strings.TrimSpace(reply.Style) != "approval_pending" {
 		return nil
 	}
+	if !feishuApprovalButtonsEnabled() {
+		return nil
+	}
 	value := func(decision, text string) map[string]any {
 		out := map[string]any{
 			"mateway_action": "approval",
@@ -101,6 +105,11 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 			"value": value("cancel", "取消"),
 		},
 	}
+}
+
+func feishuApprovalButtonsEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func headerTemplateForStyle(style string) string {

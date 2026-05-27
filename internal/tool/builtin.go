@@ -2406,6 +2406,10 @@ func runWebSearch(ctx context.Context, cfg SearchConfig, query string, args map[
 			}
 			result := duckDuckGoSearch(ctx, cfg, query)
 			if result.OK {
+				if resultCount, ok := searchResultCount(result.Evidence); ok && resultCount == 0 {
+					errors = append(errors, "duckduckgo: no results")
+					continue
+				}
 				writeWebSearchCache(cfg, query, result)
 				return result
 			}
@@ -2421,6 +2425,10 @@ func runWebSearch(ctx context.Context, cfg SearchConfig, query string, args map[
 			}
 			result := tavilySearch(ctx, cfg, query)
 			if result.OK {
+				if resultCount, ok := searchResultCount(result.Evidence); ok && resultCount == 0 {
+					errors = append(errors, "tavily: no results")
+					continue
+				}
 				recordTavilyUsage(cfg)
 				writeWebSearchCache(cfg, query, result)
 				return result
@@ -2437,11 +2445,19 @@ func runWebSearch(ctx context.Context, cfg SearchConfig, query string, args map[
 func providerOrderForSearch(cfg SearchConfig, args map[string]string) []string {
 	override := strings.ToLower(strings.TrimSpace(args["provider"]))
 	if override != "" {
-		return appendMissingFallbackProviders([]string{override}, cfg.ProviderOrder)
+		return dedupeProviderOrder([]string{override})
 	}
 	order := append([]string(nil), cfg.ProviderOrder...)
 	if len(order) == 0 {
-		order = []string{"cache", "duckduckgo", "tavily"}
+		defaultTool := strings.TrimSpace(strings.ToLower(cfg.DefaultTool))
+		switch defaultTool {
+		case "tavily":
+			order = []string{"cache", "tavily", "duckduckgo"}
+		case "duckduckgo":
+			order = []string{"cache", "duckduckgo", "tavily"}
+		default:
+			order = []string{"cache", "duckduckgo", "tavily"}
+		}
 	}
 	if searchFreshness(args) {
 		var fresh []string
@@ -2457,6 +2473,20 @@ func providerOrderForSearch(cfg SearchConfig, args map[string]string) []string {
 		order[i] = strings.TrimSpace(strings.ToLower(order[i]))
 	}
 	return dedupeProviderOrder(order)
+}
+
+func searchResultCount(evidence map[string]any) (int, bool) {
+	if evidence == nil {
+		return 0, false
+	}
+	switch value := evidence["result_count"].(type) {
+	case int:
+		return value, true
+	case float64:
+		return int(value), true
+	default:
+		return 0, false
+	}
 }
 
 func appendMissingFallbackProviders(primary, configured []string) []string {

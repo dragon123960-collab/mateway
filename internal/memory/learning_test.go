@@ -52,10 +52,10 @@ func TestWriteSkillCandidateDedupesNearDuplicateCandidates(t *testing.T) {
 	}
 	cfg := LearningConfig{Enabled: true, SuccessThreshold: 1, RequireUserConfirm: true}
 	first, err := store.writeSkillCandidate("main", PatternRecord{
-		TaskID:      "task-1",
-		TraceID:     "trace-1",
-		PlanSummary: "review release notes",
-		ReplyPreview:"done",
+		TaskID:       "task-1",
+		TraceID:      "trace-1",
+		PlanSummary:  "review release notes",
+		ReplyPreview: "done",
 	}, Counter{
 		PatternKey:   "pattern-a",
 		IntentFamily: "review-latest-release-notes",
@@ -68,10 +68,10 @@ func TestWriteSkillCandidateDedupesNearDuplicateCandidates(t *testing.T) {
 		t.Fatalf("first candidate: %v", err)
 	}
 	second, err := store.writeSkillCandidate("main", PatternRecord{
-		TaskID:      "task-2",
-		TraceID:     "trace-2",
-		PlanSummary: "review release-notes",
-		ReplyPreview:"done again",
+		TaskID:       "task-2",
+		TraceID:      "trace-2",
+		PlanSummary:  "review release-notes",
+		ReplyPreview: "done again",
 	}, Counter{
 		PatternKey:   "pattern-b",
 		IntentFamily: "review-latest-release-notes",
@@ -302,6 +302,40 @@ func TestSearchLongReturnsRelevantActiveMemory(t *testing.T) {
 	}
 	if results[0].StartLine <= 0 || results[0].EndLine < results[0].StartLine {
 		t.Fatalf("expected snippet line evidence, got %#v", results[0])
+	}
+}
+
+func TestWriteLongCreatesActiveCLIUsagePlaybook(t *testing.T) {
+	store := NewStore(t.TempDir())
+	result, err := store.WriteLong(LongMemoryInput{
+		AgentID:    "main",
+		Scope:      "agent",
+		Type:       "playbook",
+		Title:      "CLI usage: chatctl",
+		Body:       "Use `chatctl messages send --help` before sending messages.",
+		Sources:    []string{"task:task-1"},
+		Tags:       []string{"cli-usage"},
+		Confidence: "medium",
+	})
+	if err != nil {
+		t.Fatalf("write long: %v", err)
+	}
+	data, err := os.ReadFile(result.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{"status: active", "type: playbook", "# Memory: CLI usage: chatctl", "cli-usage"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected long memory to contain %q, got:\n%s", want, text)
+		}
+	}
+	results, err := store.SearchLong(SearchOptions{AgentID: "main", Query: "CLI usage chatctl messages", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || !strings.Contains(results[0].Title, "CLI usage: chatctl") || results[0].Type != "playbook" {
+		t.Fatalf("expected searchable CLI usage playbook, got %#v", results)
 	}
 }
 

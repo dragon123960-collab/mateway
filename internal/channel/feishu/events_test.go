@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -103,6 +104,7 @@ func TestRenderReplyMessageStripsBareJSONToolPlan(t *testing.T) {
 }
 
 func TestRenderReplyMessageBuildsApprovalCardActions(t *testing.T) {
+	t.Setenv("MATEWAY_FEISHU_APPROVAL_BUTTONS", "1")
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
 		Channel:  "feishu",
 		ThreadID: "thread_123",
@@ -118,6 +120,25 @@ func TestRenderReplyMessageBuildsApprovalCardActions(t *testing.T) {
 	}
 	if !strings.Contains(content, `"mateway_session_key":"feishu:thread_123"`) {
 		t.Fatalf("expected approval button to preserve session key, got %s", content)
+	}
+}
+
+func TestRenderReplyMessageDisablesApprovalButtonsByDefault(t *testing.T) {
+	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "approval_pending",
+		Text:     "这个操作会修改外部系统，执行前需要你确认。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, `"tag":"button"`) || strings.Contains(content, `"tag":"action"`) {
+		t.Fatalf("expected no approval buttons by default, got %s", content)
+	}
+	if !strings.Contains(content, "直接回复") {
+		t.Fatalf("expected text confirmation fallback, got %s", content)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 type fakePlanner struct {
 	plan                      model.Plan
 	repairPlan                model.Plan
+	repairPlans               []model.Plan
 	synthesizeText            string
 	stepAcceptText            string
 	finalAcceptText           string
@@ -88,6 +89,11 @@ func (f *fakePlanner) RepairPlanJSON(ctx context.Context, user string, plan mode
 	f.lastPlanSkillPrompt = skillPrompt
 	f.lastRepairSkillPrompt = skillPrompt
 	f.lastRepairTools = toolNames(tools)
+	if len(f.repairPlans) > 0 {
+		plan := f.repairPlans[0]
+		f.repairPlans = f.repairPlans[1:]
+		return plan, nil
+	}
 	if strings.TrimSpace(f.repairPlan.Summary) != "" || len(f.repairPlan.Steps) > 0 {
 		return f.repairPlan, nil
 	}
@@ -189,7 +195,7 @@ func TestRuntimeRepairPromptIncludesVerifierGuidance(t *testing.T) {
 	reg := tool.NewRegistry()
 	reg.Register(tool.FileRead())
 	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
-	rt.Logger.Quiet = true
+	rt.Logger.Quiet = false
 	_, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "请读取 README"})
 	if err != nil {
 		t.Fatal(err)
@@ -445,6 +451,30 @@ func TestCodeAcceptanceUsesRegistryForSoftwareInstallEvidence(t *testing.T) {
 	}, def, NewAcceptanceRegistry())
 	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "missing software install verification evidence") {
 		t.Fatalf("expected registry-based hard fail for software.install, got %#v", accept)
+	}
+}
+
+func TestCodeAcceptanceRejectsTerminalMutationWithNoEffectiveDocumentChanges(t *testing.T) {
+	def := tool.TerminalRun()
+	accept := codeAcceptStep(model.PlanStep{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Args: map[string]string{"command": `/opt/homebrew/bin/lark-cli docs +create --title "测试文档" --content '{"text":"测试"}'`},
+	}, model.ToolResult{
+		StepID: "s1",
+		Tool:   "terminal.run",
+		OK:     true,
+		Output: `{"ok":true,"data":{"warnings":["degrade_code=1011,msg=Instruction produced no document changes. The instruction content may be identical to the current document, or the format is unexpected"]}}`,
+		Evidence: map[string]any{
+			"kind":      "terminal",
+			"command":   `/opt/homebrew/bin/lark-cli docs +create --title "测试文档" --content '{"text":"测试"}'`,
+			"stdout":    `{"ok":true,"data":{"warnings":["degrade_code=1011,msg=Instruction produced no document changes. The instruction content may be identical to the current document, or the format is unexpected"]}}`,
+			"stderr":    "",
+			"exit_code": 0,
+		},
+	}, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "no document changes") {
+		t.Fatalf("expected no-op document mutation hard fail, got %#v", accept)
 	}
 }
 
@@ -1040,9 +1070,10 @@ func TestRuntimeSkipsMemoryProposalWithoutEvidence(t *testing.T) {
 	fp := &fakePlanner{plan: model.Plan{Summary: "time only", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}}}
 	rt := Runtime{
 		Config: &config.Root{
-			App:    config.AppConfig{Workspace: workspace},
-			Memory: config.MemoryConfig{Enabled: true},
-			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+			App:      config.AppConfig{Workspace: workspace},
+			Memory:   config.MemoryConfig{Enabled: true},
+			Security: config.SecurityConfig{RequireApprovalForRiskyTool: true},
+			Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
 		},
 		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
@@ -1288,6 +1319,238 @@ func TestRuntimeFailureTranslatesPlanVerificationIntoActionableCLIMessage(t *tes
 	}
 }
 
+func TestRuntimeFailureTranslatesSoftwareInstallPlaceholderPlan(t *testing.T) {
+	rt := Runtime{}
+	results := []model.ToolResult{{
+		StepID: "plan",
+		Tool:   "plan.verify",
+		OK:     false,
+		Error:  "plan_contract_invalid_after_repair",
+		Output: "step-4: missing required arg command\nstep-4: missing required arg verify_command\nstep-4: args contain unresolved placeholder values",
+		Evidence: map[string]any{
+			"kind": "plan_verification",
+			"errors": []string{
+				"step-4: missing required arg command",
+				"step-4: missing required arg verify_command",
+				"step-4: args contain unresolved placeholder values",
+			},
+		},
+	}}
+	resp := rt.failure(channel.InboundMessage{Channel: "feishu", ThreadID: "oc_xxx"}, nil, results, fmt.Errorf("plan contract verification failed"))
+	if !resp.Failed {
+		t.Fatalf("expected failed response, got %#v", resp)
+	}
+	if strings.Contains(resp.Reply.Text, "发送命令") || strings.Contains(resp.Reply.Text, "真实发送") {
+		t.Fatalf("expected install-specific failure copy, got %q", resp.Reply.Text)
+	}
+	for _, want := range []string{"安装命令", "真实命令", "真实安装"} {
+		if !strings.Contains(resp.Reply.Text, want) {
+			t.Fatalf("expected reply to contain %q, got %q", want, resp.Reply.Text)
+		}
+	}
+}
+
+func TestRuntimeFailureExplainsWeakSoftwareSearchInsteadOfGenericEvidence(t *testing.T) {
+	rt := Runtime{}
+	results := []model.ToolResult{{
+		StepID: "step-1",
+		Tool:   "software.search",
+		OK:     false,
+		Error:  "step_acceptance_suspect",
+		Output: "Software search results\n\nacceptance suspect:\n搜索返回5条结果但均非OpenCLI官方仓库",
+		Evidence: map[string]any{
+			"kind":  "software_search",
+			"query": "OpenCLI CLI tool",
+			"name":  "endjin/OpenCliToMcpTool",
+			"url":   "https://github.com/endjin/OpenCliToMcpTool",
+		},
+	}}
+	resp := rt.failure(channel.InboundMessage{Channel: "feishu", ThreadID: "oc_xxx"}, nil, results, fmt.Errorf("insufficient tool evidence for grounded answer"))
+	if !resp.Failed {
+		t.Fatalf("expected failed response, got %#v", resp)
+	}
+	for _, want := range []string{"没有找到可信", "相似项目", "OpenCLI CLI tool", "endjin/OpenCliToMcpTool", "继续做来源发现"} {
+		if !strings.Contains(resp.Reply.Text, want) {
+			t.Fatalf("expected reply to contain %q, got %q", want, resp.Reply.Text)
+		}
+	}
+	if strings.Contains(resp.Reply.Text, "没有拿到足够的工具证据") {
+		t.Fatalf("expected specific software discovery message, got %q", resp.Reply.Text)
+	}
+}
+
+func TestRuntimeRunsSafeDiscoveryPrefixBeforeRepairingSoftwareInstall(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "install opencli", Steps: []model.PlanStep{
+			{
+				ID:   "step-1",
+				Tool: "software.search",
+				Args: map[string]string{"query": "OpenCLI GitHub repository"},
+			},
+			{
+				ID:        "step-2",
+				Tool:      "web.fetch",
+				Args:      map[string]string{"url": "https://raw.githubusercontent.com/jackwener/OpenCLI/main/README.md"},
+				DependsOn: []string{"step-1"},
+			},
+			{
+				ID:        "step-3",
+				Tool:      "software.install",
+				Args:      map[string]string{"command": "<install_command from step-2>", "verify_command": "<verify_command from step-2>"},
+				DependsOn: []string{"step-2"},
+			},
+		}},
+		repairPlans: []model.Plan{
+			{Summary: "still placeholder", Steps: []model.PlanStep{
+				{
+					ID:   "step-1",
+					Tool: "software.search",
+					Args: map[string]string{"query": "OpenCLI GitHub repository"},
+				},
+				{
+					ID:        "step-2",
+					Tool:      "web.fetch",
+					Args:      map[string]string{"url": "https://raw.githubusercontent.com/jackwener/OpenCLI/main/README.md"},
+					DependsOn: []string{"step-1"},
+				},
+				{
+					ID:        "step-3",
+					Tool:      "software.install",
+					Args:      map[string]string{"command": "<install_command from step-2>", "verify_command": "<verify_command from step-2>"},
+					DependsOn: []string{"step-2"},
+				},
+			}},
+			{Summary: "install concrete opencli", Steps: []model.PlanStep{{
+				ID:        "step-3",
+				Tool:      "software.install",
+				Args:      map[string]string{"name": "opencli", "command": "npm install -g @jackwener/opencli", "verify_command": "opencli doctor", "executable": "opencli", "source_url": "https://github.com/jackwener/OpenCLI"},
+				DependsOn: []string{"step-2"},
+			}}},
+		},
+	}
+	reg := tool.NewRegistry()
+	searchCalls := 0
+	fetchCalls := 0
+	reg.Register(tool.Definition{
+		Name: "software.search",
+		Metadata: tool.Metadata{
+			RequiredArgs:      []string{"query"},
+			AcceptanceSpecRef: "software.search/default",
+			ReusePolicy:       tool.ReuseStableRead,
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			searchCalls++
+			return tool.Result{OK: true, Output: "OpenCLI official source: https://github.com/jackwener/OpenCLI", Evidence: map[string]any{"kind": "software_search", "provider": "test", "query": call.Args["query"], "result_count": 1, "name": "jackwener/OpenCLI", "url": "https://github.com/jackwener/OpenCLI"}}
+		},
+	})
+	reg.Register(tool.Definition{
+		Name: "web.fetch",
+		Metadata: tool.Metadata{
+			RequiredArgs:      []string{"url"},
+			AcceptanceSpecRef: "web.fetch/default",
+			ReusePolicy:       tool.ReuseStableRead,
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			fetchCalls++
+			return tool.Result{OK: true, Output: "Install: npm install -g @jackwener/opencli\nVerify: opencli doctor", Evidence: map[string]any{"kind": "web_fetch", "url": call.Args["url"], "status": 200}}
+		},
+	})
+	reg.Register(tool.Definition{
+		Name: "software.install",
+		Metadata: tool.Metadata{
+			RequiredArgs:      []string{"command", "verify_command"},
+			AcceptanceSpecRef: "software.install/default",
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{OK: true, Output: "installed and verified", Evidence: map[string]any{"kind": "software_install", "command": call.Args["command"], "verify_command": call.Args["verify_command"], "verified": true}}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "去查一下opencli，好用的话，我想装一下"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !resp.AwaitConfirm {
+		t.Fatalf("expected discovery prefix to reach concrete install confirmation, got %#v", resp)
+	}
+	if fp.repairCalls < 2 {
+		t.Fatalf("expected one pre-exec repair plus one post-discovery repair, got %d", fp.repairCalls)
+	}
+	if searchCalls != 1 || fetchCalls != 1 {
+		t.Fatalf("expected safe discovery tools to run once, search=%d fetch=%d", searchCalls, fetchCalls)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Tool != "software.install" || !strings.Contains(resp.Results[0].Output, "npm install -g @jackwener/opencli") {
+		t.Fatalf("expected concrete install confirmation after discovery, got %#v", resp.Results)
+	}
+}
+
+func TestRuntimeRepairsWeakSoftwareSearchInsteadOfStoppingForGrounding(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "install opencli", Steps: []model.PlanStep{
+			{
+				ID:   "step-1",
+				Tool: "software.search",
+				Args: map[string]string{"query": "OpenCLI CLI tool"},
+			},
+			{
+				ID:        "step-2",
+				Tool:      "web.fetch",
+				Args:      map[string]string{"url": "https://raw.githubusercontent.com/opencli/opencli/main/README.md"},
+				DependsOn: []string{"step-1"},
+			},
+		}},
+		repairPlan: model.Plan{Summary: "narrow opencli source", Steps: []model.PlanStep{{
+			ID:   "r1",
+			Tool: "software.search",
+			Args: map[string]string{"query": "jackwener OpenCLI GitHub"},
+		}}},
+	}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "software.search",
+		Metadata: tool.Metadata{
+			RequiredArgs:      []string{"query"},
+			AcceptanceSpecRef: "software.search/default",
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			query := call.Args["query"]
+			if strings.Contains(query, "jackwener") {
+				return tool.Result{OK: true, Output: "Found jackwener/OpenCLI", Evidence: map[string]any{"kind": "software_search", "provider": "test", "query": query, "result_count": 1, "name": "jackwener/OpenCLI", "url": "https://github.com/jackwener/OpenCLI"}}
+			}
+			return tool.Result{OK: true, Output: "Software search results: endjin/OpenCliToMcpTool", Evidence: map[string]any{"kind": "software_search", "provider": "test", "query": query, "result_count": 5, "name": "endjin/OpenCliToMcpTool", "url": "https://github.com/endjin/OpenCliToMcpTool"}}
+		},
+	})
+	reg.Register(tool.Definition{
+		Name: "web.fetch",
+		Metadata: tool.Metadata{
+			RequiredArgs:      []string{"url"},
+			AcceptanceSpecRef: "web.fetch/default",
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{OK: true, Output: "should not run because dependency is suspect", Evidence: map[string]any{"kind": "web_fetch", "url": call.Args["url"]}}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Text: "去查一下opencli，好用的话，我想装一下"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected weak source search to repair instead of generic grounding failure, got %#v", resp)
+	}
+	if fp.repairCalls == 0 {
+		t.Fatalf("expected repair after weak source search, got resp=%#v", resp)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Tool != "software.search" || !strings.Contains(resp.Results[0].Output, "jackwener/OpenCLI") {
+		t.Fatalf("expected repaired source search result, got %#v", resp.Results)
+	}
+	if !strings.Contains(fp.lastRepairSkillPrompt, "weak or mismatched") || !strings.Contains(fp.lastRepairSkillPrompt, "Repair source discovery first") {
+		t.Fatalf("expected source-discovery repair guidance, got %q", fp.lastRepairSkillPrompt)
+	}
+}
+
 func TestRuntimeFailureIncludesTerminalCommandEvidenceWhenAvailable(t *testing.T) {
 	rt := Runtime{}
 	results := []model.ToolResult{
@@ -1440,11 +1703,103 @@ func TestRepairedTerminalWriteCanReuseSameApprovalBoundary(t *testing.T) {
 		ID:   "r1",
 		Tool: "terminal.run",
 		Args: map[string]string{
-			"command": `/opt/homebrew/bin/lark-cli message send --chat-id oc_abc --msg-type text --content '{"text":"这是一条测试消息"}'`,
+			"command": `/opt/homebrew/bin/lark-cli im +messages-send --chat-id oc_abc --text '这是一条测试消息'`,
 		},
 	}}}
-	if got := repairedTerminalWriteStepCoveredByApproval(results, plan, true); got != "r1" {
+	if got := repairedTerminalWriteStepCoveredByApproval(results, plan, true, ""); got != "r1" {
 		t.Fatalf("expected repaired send step to reuse approval, got %q", got)
+	}
+}
+
+func TestRepairedTerminalWriteCanReuseApprovalCommandFromCheckpoint(t *testing.T) {
+	results := []model.ToolResult{{
+		StepID: "s1",
+		Tool:   "terminal.run",
+		OK:     false,
+		Error:  "await_confirm",
+		Evidence: map[string]any{
+			"kind": "step_confirm",
+		},
+	}}
+	plan := model.Plan{Summary: "repair create", Steps: []model.PlanStep{{
+		ID:   "r1",
+		Tool: "terminal.run",
+		Args: map[string]string{
+			"command": `/opt/homebrew/bin/lark-cli docs +create --title "测试文档" --markdown "测试"`,
+		},
+	}}}
+	approved := `/opt/homebrew/bin/lark-cli docs create --title "我的测试文档" --content "测试"`
+	if !terminalWriteCommandsShareApprovalBoundary(approved, plan.Steps[0].Args["command"]) {
+		t.Fatalf("expected docs create and docs +create to share approval boundary")
+	}
+	if got := repairedTerminalWriteStepCoveredByApproval(results, plan, true, approved); got != "r1" {
+		t.Fatalf("expected repaired create step to reuse checkpoint approval, got %q", got)
+	}
+}
+
+func TestAgentLoopFindsApprovedTerminalWriteCommand(t *testing.T) {
+	loop := AgentLoop{state: loopState{
+		binding: taskBindingDecision{
+			ApprovalGranted: true,
+			ApprovalStepID:  "s3",
+		},
+		currentTask: &session.TaskState{
+			PendingApproval: &session.PendingApproval{
+				ApprovalType:    "boolean_confirm",
+				Prompt:          "命令：`/opt/homebrew/bin/lark-cli docs create --title \"我的测试文档\" --content \"测试\"`",
+				RequestedAction: "step:s3",
+			},
+			StepStates: map[string]session.StepState{
+				"s3": {
+					ID:   "s3",
+					Tool: "terminal.run",
+					Args: map[string]string{"command": `/opt/homebrew/bin/lark-cli docs create --title "我的测试文档" --content "测试"`},
+				},
+			},
+		},
+	}}
+	if got := loop.approvedTerminalWriteCommand(); got == "" || !strings.Contains(got, "docs create") {
+		t.Fatalf("expected approved command, got %q", got)
+	}
+}
+
+func TestRuntimeFindsRepairedStepCoveredByTaskApproval(t *testing.T) {
+	loop := AgentLoop{state: loopState{
+		binding: taskBindingDecision{
+			ApprovalGranted: true,
+			ApprovalStepID:  "s3",
+		},
+		results: []model.ToolResult{{
+			StepID: "s3",
+			Tool:   "terminal.run",
+			OK:     false,
+			Error:  "step_verification_failed",
+			Evidence: map[string]any{
+				"command": `/opt/homebrew/bin/lark-cli docs create --title "我的测试文档" --content "测试"`,
+			},
+		}},
+		plan: model.Plan{Summary: "repair docs", Steps: []model.PlanStep{
+			{ID: "r1", Tool: "terminal.run", Args: map[string]string{"command": "/opt/homebrew/bin/lark-cli docs +create --help"}},
+			{ID: "r2", Tool: "terminal.run", Args: map[string]string{"command": `/opt/homebrew/bin/lark-cli docs +create --title "测试文档" --markdown "测试"`}},
+		}},
+		currentTask: &session.TaskState{
+			PendingApproval: &session.PendingApproval{
+				ApprovalType:    "boolean_confirm",
+				Prompt:          "命令：`/opt/homebrew/bin/lark-cli docs create --title \"我的测试文档\" --content \"测试\"`",
+				RequestedAction: "step:s3",
+			},
+			StepStates: map[string]session.StepState{
+				"s3": {
+					ID:   "s3",
+					Tool: "terminal.run",
+					Args: map[string]string{"command": `/opt/homebrew/bin/lark-cli docs create --title "我的测试文档" --content "测试"`},
+				},
+			},
+		},
+	}}
+	approved := loop.approvedTerminalWriteCommand()
+	if got := repairedTerminalWriteStepCoveredByApproval(loop.state.results, loop.state.plan, loop.state.binding.ApprovalGranted, approved); got != "r2" {
+		t.Fatalf("expected repaired write step to be covered by task approval, got %q approved=%q", got, approved)
 	}
 }
 
@@ -1465,7 +1820,7 @@ func TestRepairedTerminalWriteDoesNotReuseApprovalForDifferentTarget(t *testing.
 			"command": `chatctl messages send --chat-id oc_new --text hello`,
 		},
 	}}}
-	if got := repairedTerminalWriteStepCoveredByApproval(results, plan, true); got != "" {
+	if got := repairedTerminalWriteStepCoveredByApproval(results, plan, true, ""); got != "" {
 		t.Fatalf("expected different target not to reuse approval, got %q", got)
 	}
 }
@@ -1681,7 +2036,7 @@ func TestRuntimeRequiresConfirmationForExternalCLIWriteCommand(t *testing.T) {
 }
 
 func TestRuntimeDoesNotBlockLocalCLIFlowBeforeReadOnlyPreflightCanRun(t *testing.T) {
-	fp := &fakePlanner{plan: model.Plan{Summary: "send", Steps: []model.PlanStep{
+	plan := model.Plan{Summary: "send", Steps: []model.PlanStep{
 		{
 			ID:   "s1",
 			Tool: "terminal.run",
@@ -1705,7 +2060,8 @@ func TestRuntimeDoesNotBlockLocalCLIFlowBeforeReadOnlyPreflightCanRun(t *testing
 			Args:      map[string]string{"command": `chatctl messages send --chat-id oc_xxx --text "hello"`},
 			DependsOn: []string{"s3"},
 		},
-	}}}
+	}}
+	fp := &fakePlanner{plan: plan, repairPlan: plan}
 	reg := tool.NewRegistry()
 	var executed []string
 	reg.Register(tool.Definition{
@@ -1718,11 +2074,11 @@ func TestRuntimeDoesNotBlockLocalCLIFlowBeforeReadOnlyPreflightCanRun(t *testing
 			executed = append(executed, command)
 			switch command {
 			case "command -v chatctl":
-				return tool.Result{OK: true, Output: "/usr/local/bin/chatctl", Evidence: map[string]any{"kind": "terminal", "command": command, "exit_code": 0, "stdout": "/usr/local/bin/chatctl", "timed_out": false}}
+				return tool.Result{OK: true, Output: "/usr/local/bin/chatctl", Evidence: map[string]any{"kind": "terminal", "command": command, "exit_code": 0, "stdout": "/usr/local/bin/chatctl", "stderr": "", "timed_out": false}}
 			case "chatctl messages send --help":
-				return tool.Result{OK: true, Output: "Usage: chatctl messages send --chat-id string --text string", Evidence: map[string]any{"kind": "terminal", "command": command, "exit_code": 0, "stdout": "Usage", "timed_out": false}}
+				return tool.Result{OK: true, Output: "Usage: chatctl messages send --chat-id string --text string", Evidence: map[string]any{"kind": "terminal", "command": command, "exit_code": 0, "stdout": "Usage", "stderr": "", "timed_out": false}}
 			case "chatctl auth list":
-				return tool.Result{OK: true, Output: "authorized", Evidence: map[string]any{"kind": "terminal", "command": command, "exit_code": 0, "stdout": "authorized", "timed_out": false}}
+				return tool.Result{OK: true, Output: "authorized", Evidence: map[string]any{"kind": "terminal", "command": command, "exit_code": 0, "stdout": "authorized", "stderr": "", "timed_out": false}}
 			default:
 				return tool.Result{OK: false, Error: "send should require confirmation before execution"}
 			}
@@ -1812,6 +2168,72 @@ func TestRuntimeAllowsUsableTerminalDiagnosticWithNonZeroExit(t *testing.T) {
 	}
 	if len(resp.Results) != 1 || !resp.Results[0].OK {
 		t.Fatalf("expected runtime to keep usable diagnostic result, got %#v", resp.Results)
+	}
+}
+
+func TestRuntimeRejectsTerminalHelpOutputWhenCommandReturnedActionableError(t *testing.T) {
+	step := model.PlanStep{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "send message",
+		Args: map[string]string{
+			"command": `lark-cli im send --chat-id oc_xxx --text hello`,
+		},
+	}
+	result := model.ToolResult{
+		StepID: "s1",
+		Tool:   "terminal.run",
+		OK:     false,
+		Error:  "exit status 1",
+		Output: "Usage:\n  lark-cli im [flags]\n  lark-cli im [command]\n\nAvailable Commands:\n  +messages-send Send a message\n\nError: unknown flag: --chat-id",
+		Evidence: map[string]any{
+			"kind":      "terminal",
+			"command":   `lark-cli im send --chat-id oc_xxx --text hello`,
+			"exit_code": 1,
+			"stdout":    "Usage:\n  lark-cli im [flags]\n  lark-cli im [command]\n\nAvailable Commands:\n  +messages-send Send a message",
+			"stderr":    "Error: unknown flag: --chat-id",
+			"timed_out": false,
+		},
+	}
+	def, ok := tool.NewBuiltinRegistry().Get("terminal.run")
+	if !ok {
+		t.Fatal("terminal.run not registered")
+	}
+	accept := codeAcceptStep(step, result, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail {
+		t.Fatalf("expected actionable CLI error not to be accepted as usable, got %#v", accept)
+	}
+}
+
+func TestRuntimeRejectsParentHelpWhenExactSubcommandHelpIsRequired(t *testing.T) {
+	step := model.PlanStep{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "create document",
+		Args: map[string]string{"command": `lark-cli docs create --title "demo"`},
+	}
+	result := model.ToolResult{
+		StepID: "s1",
+		Tool:   "terminal.run",
+		OK:     false,
+		Error:  "exit status 1",
+		Output: "Usage:\n  lark-cli docs [flags]\n  lark-cli docs [command]\n\nAvailable Commands:\n  +create Create a Lark document\n\nUse \"lark-cli docs [command] --help\" for more information about a command.\n\nError: unknown flag: --title",
+		Evidence: map[string]any{
+			"kind":      "terminal",
+			"command":   `lark-cli docs create --title "demo"`,
+			"exit_code": 1,
+			"stdout":    "Usage:\n  lark-cli docs [flags]\n  lark-cli docs [command]\n\nAvailable Commands:\n  +create Create a Lark document\n\nUse \"lark-cli docs [command] --help\" for more information about a command.",
+			"stderr":    "Error: unknown flag: --title",
+			"timed_out": false,
+		},
+	}
+	def, ok := tool.NewBuiltinRegistry().Get("terminal.run")
+	if !ok {
+		t.Fatal("terminal.run not registered")
+	}
+	accept := codeAcceptStep(step, result, def, NewAcceptanceRegistry())
+	if accept.Status != AcceptanceHardFail || !strings.Contains(accept.Reason, "exact subcommand help") {
+		t.Fatalf("expected parent-help hard fail, got %#v", accept)
 	}
 }
 
@@ -2057,6 +2479,594 @@ func TestRuntimeApprovalReplyExecutesConfirmedMutation(t *testing.T) {
 	}
 	if string(data) != "ok" {
 		t.Fatalf("unexpected file content %q", data)
+	}
+}
+
+func TestRuntimeApprovalReplyResumesStoredPendingStepWithoutReplanning(t *testing.T) {
+	root := t.TempDir()
+	var executed []string
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:       "terminal.run",
+		Risk:       tool.RiskGuardedMutation,
+		ArgsSchema: map[string]string{"command": "command to run"},
+		Metadata:   tool.Metadata{RequiredArgs: []string{"command"}},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			executed = append(executed, call.Args["command"])
+			return tool.Result{OK: true, Output: "created", Evidence: map[string]any{
+				"kind":      "terminal",
+				"command":   call.Args["command"],
+				"exit_code": 0,
+				"stdout":    "created",
+				"stderr":    "",
+				"timed_out": false,
+			}}
+		},
+	})
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	task := session.TaskState{
+		ID:            "task-create",
+		Status:        session.TaskAwaitConfirm,
+		UserText:      "创建云文档",
+		ResolvedQuery: "创建云文档",
+		PlanSummary:   "create document",
+		PendingApproval: &session.PendingApproval{
+			ApprovalType:    "boolean_confirm",
+			Prompt:          "这个命令可能会修改外部系统。\n\n命令：`docctl create --title \"我的云文档\"`\n\n回复“确认”继续执行。",
+			RequestedAction: "step:s1",
+		},
+		StepOrder: []string{"s1"},
+		StepStates: map[string]session.StepState{
+			"s1": {
+				ID:               "s1",
+				Goal:             "create document",
+				Tool:             "terminal.run",
+				Status:           "blocked",
+				ResultError:      "await_confirm",
+				AcceptanceStatus: "await_confirm",
+			},
+		},
+	}
+	if err := store.Save(session.State{
+		SessionKey:   "cli:resume",
+		ActiveTaskID: task.ID,
+		TaskOrder:    []string{task.ID},
+		Tasks:        map[string]session.TaskState{task.ID: task},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{plan: model.Plan{Summary: "should not plan", Steps: []model.PlanStep{{ID: "bad", Tool: "time.now"}}}}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:resume", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected approved stored step to execute, got %#v", resp)
+	}
+	if fp.planCalls != 0 {
+		t.Fatalf("expected approval resume not to replan, got %d plan calls", fp.planCalls)
+	}
+	if len(executed) != 1 || executed[0] != `docctl create --title "我的云文档"` {
+		t.Fatalf("expected stored command to execute once, got %#v", executed)
+	}
+}
+
+func TestRuntimePlanningPromptRequiresUsageDiscoveryWhenCLIMemoryMissing(t *testing.T) {
+	workspace := t.TempDir()
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "inspect", Steps: []model.PlanStep{{
+			ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "command -v chatctl"},
+		}}},
+	}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   memory.NewStore(workspace),
+	}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:usage-miss", Text: "用本机 `chatctl` 发送消息"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fp.firstPlanSkillPrompt, "no long-memory playbook") || !strings.Contains(fp.firstPlanSkillPrompt, "usage discovery") {
+		t.Fatalf("expected CLI usage discovery guidance, got:\n%s", fp.firstPlanSkillPrompt)
+	}
+}
+
+func TestRuntimePlanningPromptUsesCLIUsageMemoryWhenPresent(t *testing.T) {
+	workspace := t.TempDir()
+	mem := memory.NewStore(workspace)
+	if _, err := mem.WriteLong(memory.LongMemoryInput{
+		AgentID:    "main",
+		Scope:      "agent",
+		Type:       "playbook",
+		Title:      "CLI usage: chatctl",
+		Body:       "Verified command: `chatctl messages send --chat-id <redacted> --text <value>`.",
+		Sources:    []string{"task:seed"},
+		Tags:       []string{"cli-usage"},
+		Confidence: "medium",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "inspect", Steps: []model.PlanStep{{
+			ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "chatctl messages send --help"},
+		}}},
+	}
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   mem,
+	}
+	rt.Logger.Quiet = true
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:usage-hit", Text: "用本机 `chatctl` 发送消息"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fp.firstPlanSkillPrompt, "CLI usage: chatctl") || strings.Contains(fp.firstPlanSkillPrompt, "no long-memory playbook") {
+		t.Fatalf("expected loaded CLI usage memory without miss guidance, got:\n%s", fp.firstPlanSkillPrompt)
+	}
+}
+
+func TestRuntimeWritesCLIUsageMemoryAfterSuccessfulUnknownCLITask(t *testing.T) {
+	workspace := t.TempDir()
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:     "terminal.run",
+		Risk:     tool.RiskSafeRead,
+		Metadata: tool.Metadata{AcceptanceSpecRef: "terminal.run/diagnostic"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			command := strings.TrimSpace(call.Args["command"])
+			return tool.Result{OK: true, Output: "ok", Evidence: map[string]any{
+				"kind":      "terminal",
+				"command":   command,
+				"exit_code": 0,
+				"stdout":    "ok",
+				"stderr":    "",
+				"timed_out": false,
+			}}
+		},
+	})
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "use chatctl", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "command -v chatctl"}},
+			{ID: "s2", Tool: "terminal.run", Args: map[string]string{"command": "chatctl messages send --help"}, DependsOn: []string{"s1"}},
+		}},
+	}
+	mem := memory.NewStore(workspace)
+	rt := Runtime{
+		Config: &config.Root{
+			App:    config.AppConfig{Workspace: workspace},
+			Memory: config.MemoryConfig{Enabled: true},
+			Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+		},
+		Model:    fp,
+		Tools:    reg,
+		ToolCtx:  tool.Context{ProjectRoot: workspace, Workspace: workspace},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(workspace, "sessions")),
+		Memory:   mem,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:usage-write", Text: "用本机 `chatctl` 查询消息用法"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.AwaitConfirm || resp.AwaitUserInput {
+		t.Fatalf("expected successful task, got %#v", resp)
+	}
+	results, err := mem.SearchLong(memory.SearchOptions{AgentID: "main", Query: "CLI usage chatctl messages", Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || !strings.Contains(results[0].Title, "CLI usage: chatctl") {
+		t.Fatalf("expected CLI usage memory, got %#v", results)
+	}
+	if strings.Contains(results[0].Snippet, "oc_") {
+		t.Fatalf("expected sanitized memory snippet, got %q", results[0].Snippet)
+	}
+}
+
+func TestRuntimeConfirmedCLIWriteRepairKeepsCheckpointHistory(t *testing.T) {
+	root := t.TempDir()
+	var executed []string
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:       "terminal.run",
+		Risk:       tool.RiskGuardedMutation,
+		ArgsSchema: map[string]string{"command": "command to run"},
+		Metadata:   tool.Metadata{RequiredArgs: []string{"command"}},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			command := strings.TrimSpace(call.Args["command"])
+			executed = append(executed, command)
+			evidence := map[string]any{
+				"kind":      "terminal",
+				"command":   command,
+				"exit_code": 0,
+				"stdout":    "",
+				"stderr":    "",
+				"timed_out": false,
+			}
+			if strings.Contains(command, "message send") {
+				evidence["exit_code"] = 1
+				evidence["stderr"] = "unknown flag: --content"
+				return tool.Result{OK: false, Error: "exit status 1", Output: "unknown flag: --content", Evidence: evidence}
+			}
+			return tool.Result{OK: true, Output: "sent", Evidence: evidence}
+		},
+	})
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	task := session.TaskState{
+		ID:            "task-send",
+		Status:        session.TaskAwaitConfirm,
+		UserText:      "发送飞书消息",
+		ResolvedQuery: "发送飞书消息",
+		PlanSummary:   "send message",
+		PendingApproval: &session.PendingApproval{
+			ApprovalType:    "boolean_confirm",
+			Prompt:          "这个命令可能会修改外部系统或发送消息，执行前需要你确认。\n\n命令：`/opt/homebrew/bin/lark-cli message send --chat-id oc_abc --content hello`\n\n回复“确认”继续执行。",
+			RequestedAction: "step:s1",
+		},
+		StepOrder: []string{"s1"},
+		StepStates: map[string]session.StepState{
+			"s1": {
+				ID:               "s1",
+				Goal:             "send message",
+				Tool:             "terminal.run",
+				Status:           "blocked",
+				ResultError:      "await_confirm",
+				AcceptanceStatus: "await_confirm",
+				Args: map[string]string{
+					"command": "/opt/homebrew/bin/lark-cli message send --chat-id oc_abc --content hello",
+				},
+			},
+		},
+	}
+	if err := store.Save(session.State{
+		SessionKey:   "cli:send",
+		ActiveTaskID: task.ID,
+		TaskOrder:    []string{task.ID},
+		Tasks:        map[string]session.TaskState{task.ID: task},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		repairPlan: model.Plan{Summary: "repair send", Steps: []model.PlanStep{{
+			ID:   "r1",
+			Tool: "terminal.run",
+			Args: map[string]string{
+				"command": "/opt/homebrew/bin/lark-cli im +messages-send --chat-id oc_abc --text hello",
+			},
+		}}},
+	}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:send", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected repaired send to execute under original approval, got %#v", resp)
+	}
+	if fp.planCalls != 0 || fp.repairCalls != 1 {
+		t.Fatalf("expected resume without fresh planning and one repair, plan=%d repair=%d", fp.planCalls, fp.repairCalls)
+	}
+	if len(executed) != 2 || !strings.Contains(executed[0], "message send") || !strings.Contains(executed[1], "+messages-send") {
+		t.Fatalf("expected failed original command then repaired command, got %#v", executed)
+	}
+	st, err := store.Load("cli:send")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := st.Tasks["task-send"]
+	if len(saved.StepHistory) < 2 {
+		t.Fatalf("expected checkpoint history for failed and repaired commands, got %#v", saved.StepHistory)
+	}
+	historyText := fmt.Sprintf("%#v", saved.StepHistory)
+	if !strings.Contains(historyText, "message send") || !strings.Contains(historyText, "+messages-send") {
+		t.Fatalf("expected checkpoint history to retain both command attempts, got %s", historyText)
+	}
+}
+
+func TestRuntimeConfirmedDocsCreateRepairReusesApproval(t *testing.T) {
+	root := t.TempDir()
+	var executed []string
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:       "terminal.run",
+		Risk:       tool.RiskGuardedMutation,
+		ArgsSchema: map[string]string{"command": "command to run"},
+		Metadata:   tool.Metadata{RequiredArgs: []string{"command"}},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			command := strings.TrimSpace(call.Args["command"])
+			executed = append(executed, command)
+			evidence := map[string]any{
+				"kind":      "terminal",
+				"command":   command,
+				"exit_code": 0,
+				"stdout":    "",
+				"stderr":    "",
+				"timed_out": false,
+			}
+			switch {
+			case strings.Contains(command, "--help") && !strings.Contains(command, "docs +create"):
+				evidence["stdout"] = "help"
+				return tool.Result{OK: true, Output: "help", Evidence: evidence}
+			case strings.Contains(command, "docs create "):
+				evidence["exit_code"] = 1
+				evidence["stderr"] = "Error: unknown flag: --title"
+				evidence["stdout"] = `Usage:
+  lark-cli docs [flags]
+  lark-cli docs [command]
+
+Available Commands:
+  +create            Create a Lark document
+
+Use "lark-cli docs [command] --help" for more information about a command.`
+				return tool.Result{OK: false, Error: "exit status 1", Output: stringValue(evidence["stdout"]) + "\nError: unknown flag: --title", Evidence: evidence}
+			case strings.Contains(command, "docs +create --help"):
+				evidence["stdout"] = "Usage:\n  lark-cli docs +create [flags]\n\nFlags:\n      --title string\n      --markdown string"
+				return tool.Result{OK: true, Output: stringValue(evidence["stdout"]), Evidence: evidence}
+			case strings.Contains(command, "docs +create "):
+				evidence["stdout"] = `{"ok":true,"data":{"document":{"document_id":"doc123","url":"https://example.test/doc123"}}}`
+				return tool.Result{OK: true, Output: stringValue(evidence["stdout"]), Evidence: evidence}
+			default:
+				return tool.Result{OK: false, Error: "unexpected command", Output: command, Evidence: evidence}
+			}
+		},
+	})
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	task := session.TaskState{
+		ID:            "task-docs",
+		Status:        session.TaskAwaitConfirm,
+		UserText:      "创建飞书云文档",
+		ResolvedQuery: "使用 lark-cli 创建飞书云文档，内容为测试",
+		PlanSummary:   "create doc",
+		PendingApproval: &session.PendingApproval{
+			ApprovalType:    "boolean_confirm",
+			Prompt:          "这个命令可能会修改外部系统或发送消息，执行前需要你确认。\n\n命令：`/opt/homebrew/bin/lark-cli docs create --title \"我的测试文档\" --content \"测试\"`\n\n回复“确认”继续执行。",
+			RequestedAction: "step:s3",
+		},
+		StepOrder: []string{"s1", "s2", "s3"},
+		StepStates: map[string]session.StepState{
+			"s1": {
+				ID: "s1", Tool: "terminal.run", Status: "passed", ResultOK: true, AcceptanceStatus: "passed",
+				Args:     map[string]string{"command": "/opt/homebrew/bin/lark-cli --help"},
+				Evidence: map[string]any{"kind": "terminal", "command": "/opt/homebrew/bin/lark-cli --help", "exit_code": 0, "stdout": "help"},
+			},
+			"s2": {
+				ID: "s2", Tool: "terminal.run", Status: "passed", ResultOK: true, AcceptanceStatus: "passed",
+				Args:     map[string]string{"command": "/opt/homebrew/bin/lark-cli docs create --help"},
+				Evidence: map[string]any{"kind": "terminal", "command": "/opt/homebrew/bin/lark-cli docs create --help", "exit_code": 0, "stdout": "Available Commands:\n  +create"},
+			},
+			"s3": {
+				ID: "s3", Goal: "create doc", Tool: "terminal.run", Status: "blocked", ResultError: "await_confirm", AcceptanceStatus: "await_confirm",
+				Args:      map[string]string{"command": `/opt/homebrew/bin/lark-cli docs create --title "我的测试文档" --content "测试"`},
+				DependsOn: []string{"s2"},
+			},
+		},
+	}
+	if err := store.Save(session.State{
+		SessionKey:   "cli:docs",
+		ActiveTaskID: task.ID,
+		TaskOrder:    []string{task.ID},
+		Tasks:        map[string]session.TaskState{task.ID: task},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakePlanner{
+		repairPlan: model.Plan{Summary: "repair docs create", Steps: []model.PlanStep{
+			{
+				ID:   "r1",
+				Tool: "terminal.run",
+				Args: map[string]string{"command": "/opt/homebrew/bin/lark-cli docs +create --help"},
+				Risk: string(tool.RiskSafeRead),
+			},
+			{
+				ID:        "r2",
+				Tool:      "terminal.run",
+				Args:      map[string]string{"command": `/opt/homebrew/bin/lark-cli docs +create --title "测试文档" --markdown "测试"`},
+				DependsOn: []string{"r1"},
+				Risk:      string(tool.RiskGuardedMutation),
+			},
+		}},
+	}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:docs", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected repaired docs create to execute under original approval, got %#v", resp)
+	}
+	joined := strings.Join(executed, "\n")
+	if !strings.Contains(joined, "docs create") || !strings.Contains(joined, "docs +create --help") || !strings.Contains(joined, "docs +create --title") {
+		t.Fatalf("expected original, exact help, and repaired write commands, got %#v", executed)
+	}
+	st, err := store.Load("cli:docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := st.Tasks["task-docs"]
+	if saved.Status != session.TaskCompleted || saved.PendingApproval != nil {
+		t.Fatalf("expected completed task without pending approval, got status=%s pending=%#v", saved.Status, saved.PendingApproval)
+	}
+}
+
+func TestRuntimeReturnsApprovalPendingWhenFinalAcceptanceRepairNeedsConfirm(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "out.txt")
+	fp := &finalSequencePlanner{
+		fakePlanner: &fakePlanner{
+			plan: model.Plan{Summary: "inspect", Steps: []model.PlanStep{{
+				ID: "s1", Tool: "time.now", Args: map[string]string{},
+			}}},
+			repairPlan: model.Plan{Summary: "write after repair", Steps: []model.PlanStep{{
+				ID: "r1", Tool: "file.write", Args: map[string]string{"path": target, "content": "ok"},
+			}}},
+		},
+		responses: []string{`{"status":"rejected","reason":"missing write"}`},
+	}
+	rt := Runtime{Model: fp, Tools: tool.NewBuiltinRegistry(), ToolCtx: tool.Context{ProjectRoot: root}, MaxSteps: 6, Sessions: session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:repair-confirm", Text: "写文件"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected repair to return approval pending instead of failure, got %#v", resp)
+	}
+	if fp.finalAcceptCalls != 1 {
+		t.Fatalf("expected final acceptance not to run again after repair entered await_confirm, got %d calls", fp.finalAcceptCalls)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected file not to be written before confirmation, stat err=%v", err)
+	}
+}
+
+func TestRuntimeAllowsMultipleRepairCyclesForLocalCLI(t *testing.T) {
+	root := t.TempDir()
+	var executed []string
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:       "terminal.run",
+		Risk:       tool.RiskSafeRead,
+		ArgsSchema: map[string]string{"command": "shell command"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			command := strings.TrimSpace(call.Args["command"])
+			executed = append(executed, command)
+			switch command {
+			case "command -v lark-cli":
+				return tool.Result{OK: true, Output: "/opt/homebrew/bin/lark-cli", Evidence: map[string]any{"kind": "terminal", "command": command, "stdout": "/opt/homebrew/bin/lark-cli", "stderr": "", "exit_code": 0, "timed_out": false, "workdir": root}}
+			case "lark-cli docs create --title 测试 --content 测试":
+				return tool.Result{OK: false, Output: "Usage:\n  lark-cli docs [command]", Error: "exit status 1", Evidence: map[string]any{"kind": "terminal", "command": command, "stderr": "Error: unknown flag: --title", "stdout": "Usage:\n  lark-cli docs [command]", "exit_code": 1, "timed_out": false, "workdir": root}}
+			case "lark-cli docs +create --help":
+				return tool.Result{OK: true, Output: "Flags:\n  --title string\n  --markdown string", Evidence: map[string]any{"kind": "terminal", "command": command, "stdout": "Flags:\n  --title string\n  --markdown string", "stderr": "", "exit_code": 0, "timed_out": false, "workdir": root}}
+			case `lark-cli docs +create --title "测试" --markdown "测试"`:
+				return tool.Result{OK: true, Output: `{"ok":true,"url":"https://example.com/doc"}`, Evidence: map[string]any{"kind": "terminal", "command": command, "stdout": `{"ok":true,"url":"https://example.com/doc"}`, "stderr": "", "exit_code": 0, "timed_out": false, "workdir": root}}
+			default:
+				return tool.Result{OK: false, Error: "unexpected command", Output: command}
+			}
+		},
+	})
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "create doc", Steps: []model.PlanStep{
+			{ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "command -v lark-cli"}, Risk: string(tool.RiskSafeRead)},
+			{ID: "s2", Tool: "terminal.run", Args: map[string]string{"command": "lark-cli docs create --title 测试 --content 测试"}, Risk: string(tool.RiskGuardedMutation)},
+		}},
+		repairPlans: []model.Plan{
+			{Summary: "inspect exact create help", Steps: []model.PlanStep{
+				{ID: "r1", Tool: "terminal.run", Args: map[string]string{"command": "lark-cli docs +create --help"}, Risk: string(tool.RiskSafeRead)},
+				{ID: "r2", Tool: "terminal.run", Args: map[string]string{"command": "根据 step-1 输出的正确参数执行创建命令"}, DependsOn: []string{"r1"}, Risk: string(tool.RiskGuardedMutation)},
+			}},
+			{Summary: "execute corrected create command", Steps: []model.PlanStep{
+				{ID: "r1", Tool: "terminal.run", Args: map[string]string{"command": "lark-cli docs +create --help"}, Risk: string(tool.RiskSafeRead)},
+				{ID: "r2", Tool: "terminal.run", Args: map[string]string{"command": `lark-cli docs +create --title "测试" --markdown "测试"`}, DependsOn: []string{"r1"}, Risk: string(tool.RiskGuardedMutation)},
+			}},
+		},
+	}
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: root, Workspace: root, AllowedRoots: []string{root}}, MaxSteps: 6}
+	rt.Logger.Quiet = true
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	rt.Sessions = store
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:local-react", Text: "用本机 lark-cli 创建一个云文档，标题就叫测试，内容写测试两个字"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected first turn to reach confirmation boundary, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:local-react", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.AwaitConfirm || resp.AwaitUserInput {
+		t.Fatalf("expected local CLI task to finish after multiple repair cycles, got %#v", resp)
+	}
+	if fp.repairCalls != 2 {
+		t.Fatalf("expected two repair cycles for local CLI, got %d", fp.repairCalls)
+	}
+	joined := strings.Join(executed, "\n")
+	for _, want := range []string{
+		"command -v lark-cli",
+		"lark-cli docs create --title 测试 --content 测试",
+		"lark-cli docs +create --help",
+		`lark-cli docs +create --title "测试" --markdown "测试"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected executed commands to contain %q, got %#v", want, executed)
+		}
+	}
+}
+
+func TestRuntimeSkipsExternalWriteConfirmationWhenRiskApprovalDisabled(t *testing.T) {
+	root := t.TempDir()
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name:       "terminal.run",
+		Risk:       tool.RiskGuardedMutation,
+		ArgsSchema: map[string]string{"command": "shell command"},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{
+				OK:     true,
+				Output: "created",
+				Evidence: map[string]any{
+					"kind":      "terminal",
+					"command":   call.Args["command"],
+					"stdout":    "created",
+					"stderr":    "",
+					"exit_code": 0,
+					"timed_out": false,
+					"workdir":   root,
+				},
+			}
+		},
+	})
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "create doc", Steps: []model.PlanStep{{
+			ID:   "s1",
+			Tool: "terminal.run",
+			Args: map[string]string{"command": `lark-cli docs +create --title "测试" --markdown "测试"`},
+			Risk: string(tool.RiskGuardedMutation),
+		}}},
+	}
+	rt := Runtime{
+		Config: &config.Root{Security: config.SecurityConfig{RequireApprovalForRiskyTool: false}},
+		Model:  fp,
+		Tools:  reg,
+		ToolCtx: tool.Context{
+			ProjectRoot:  root,
+			Workspace:    root,
+			AllowedRoots: []string{root},
+		},
+		MaxSteps: 6,
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:no-risk-confirm", Text: "用本机 lark-cli 创建一个云文档"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitConfirm || resp.Failed {
+		t.Fatalf("expected external CLI write to run without confirmation when risky approval disabled, got %#v", resp)
 	}
 }
 
@@ -4044,6 +5054,63 @@ func TestRuntimeSlotFillKeepsTaskWaitingWhenFieldsRemain(t *testing.T) {
 	}
 }
 
+func TestRuntimeShortPendingInputReplyContinuesActiveTask(t *testing.T) {
+	fp := &fakePlanner{
+		plan: model.Plan{Summary: "rewrite doc content", Steps: []model.PlanStep{{
+			ID:               "s1",
+			Tool:             "file.read",
+			Args:             map[string]string{"path": "README.md"},
+			ExpectedEvidence: []string{"file path"},
+			SuccessCriteria:  []string{"file content read"},
+		}}},
+	}
+	store := session.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
+	if err := store.Save(session.State{
+		SessionKey:   "cli:doc",
+		ActiveTaskID: "task-doc",
+		TaskOrder:    []string{"task-doc"},
+		Tasks: map[string]session.TaskState{
+			"task-doc": {
+				ID:               "task-doc",
+				Status:           session.TaskAwaitUserInput,
+				UserText:         "创建飞书云文档，内容为测试",
+				ResolvedQuery:    "创建飞书云文档，内容为测试",
+				Topic:            "修复飞书云文档内容写入",
+				PendingQuestions: []string{"需要我帮你用正确方式重新写入内容吗？"},
+				LastAnswer:       "需要我帮你用正确方式重新写入内容吗？",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reg := tool.NewRegistry()
+	reg.Register(tool.Definition{
+		Name: "file.read",
+		Metadata: tool.Metadata{
+			RequiredArgs:      []string{"path"},
+			AcceptanceSpecRef: "file.read/default",
+		},
+		Run: func(ctx context.Context, call tool.Call) tool.Result {
+			return tool.Result{OK: true, Output: "read ok", Evidence: map[string]any{"kind": "file_read", "path": call.Args["path"], "bytes": 7}}
+		},
+	})
+	rt := Runtime{Model: fp, Tools: reg, ToolCtx: tool.Context{ProjectRoot: "."}, MaxSteps: 6, Sessions: store}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:doc", Text: "需要"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AwaitUserInput || resp.Failed {
+		t.Fatalf("expected short reply to continue active pending input task, got %#v", resp)
+	}
+	if fp.followupCalls != 0 {
+		t.Fatalf("expected rule binding before model followup, got %d calls", fp.followupCalls)
+	}
+	if !strings.Contains(fp.lastPlanUser, "User answer: 需要") || !strings.Contains(fp.lastPlanUser, "创建飞书云文档") {
+		t.Fatalf("expected pending answer merged into planning input, got %q", fp.lastPlanUser)
+	}
+}
+
 func TestRuntimeApprovalReplyReusesCurrentTask(t *testing.T) {
 	fp := &fakePlanner{
 		plan: model.Plan{Summary: "install", Steps: []model.PlanStep{{ID: "s1", Tool: "time.now", Args: map[string]string{}}}},
@@ -4367,11 +5434,12 @@ func TestRuntimeSoftwareInstallRequiresConfirmationWhenPlannerSelectsInstallTool
 			ID:   "s1",
 			Tool: "software.install",
 			Args: map[string]string{
-				"name":       "larksuite/cli",
-				"method":     "npx",
-				"command":    "npx @larksuite/cli@latest install",
-				"executable": "lark-cli",
-				"source_url": "https://github.com/larksuite/cli",
+				"name":           "larksuite/cli",
+				"method":         "npx",
+				"command":        "npx @larksuite/cli@latest install",
+				"verify_command": "command -v lark-cli && lark-cli --version",
+				"executable":     "lark-cli",
+				"source_url":     "https://github.com/larksuite/cli",
 			},
 		}}},
 	}
@@ -5463,7 +6531,7 @@ func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
 		ID: "s1", Tool: "user.ask", Args: map[string]string{"question": "这个任务每天几点运行？"},
 	}}}}
 	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}, Security: config.SecurityConfig{RequireApprovalForRiskyTool: true}},
 		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
@@ -5495,6 +6563,37 @@ func TestRuntimeScheduleRequestAsksForMissingFields(t *testing.T) {
 	}
 }
 
+func TestRuntimeScheduledInvocationRejectsUserAskPlan(t *testing.T) {
+	home := t.TempDir()
+	fp := &fakePlanner{plan: model.Plan{Summary: "ask user", Steps: []model.PlanStep{{
+		ID: "s1", Tool: "user.ask", Args: map[string]string{"question": "你更想看国内还是全球趋势？"},
+	}}}}
+	rt := Runtime{
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}, Security: config.SecurityConfig{RequireApprovalForRiskyTool: true}},
+		Model:    fp,
+		Tools:    tool.NewBuiltinRegistry(),
+		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
+		MaxSteps: 6,
+		Sessions: session.NewFileStore(filepath.Join(home, "sessions")),
+		Memory:   memory.NewStore(home),
+	}
+	rt.Logger.Quiet = true
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		Channel:    "cli",
+		ThreadID:   "schedule:ai-agent",
+		UserID:     "schedule",
+		SessionKey: "schedule:ai-agent",
+		Text:       "这是一次已经触发的定时执行，请直接输出本次执行结果",
+		Metadata:   map[string]string{"source": "schedule", "schedule_id": "ai-agent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed || resp.AwaitUserInput {
+		t.Fatalf("expected scheduled invocation with user.ask plan to fail closed instead of awaiting input, got %#v", resp)
+	}
+}
+
 func TestRuntimeScheduleRequestUsesPlannerToolToCreateTask(t *testing.T) {
 	home := t.TempDir()
 	msg := channel.InboundMessage{Channel: "cli", ThreadID: "cli", UserID: "local", SessionKey: "cli:schedule-ready", Text: "每天 9点 帮我收集 AI 最新趋势文章"}
@@ -5510,7 +6609,7 @@ func TestRuntimeScheduleRequestUsesPlannerToolToCreateTask(t *testing.T) {
 		ExpectedEvidence: []string{"schedule task id and path"},
 	}}}}
 	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}, Security: config.SecurityConfig{RequireApprovalForRiskyTool: true}},
 		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
@@ -5568,7 +6667,7 @@ func TestRuntimeScheduleDeleteRequiresConfirmation(t *testing.T) {
 		ID: "s1", Tool: "schedule.delete", Args: map[string]string{"id": "ai-trends"},
 	}}}}
 	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}, Security: config.SecurityConfig{RequireApprovalForRiskyTool: true}},
 		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
@@ -5620,7 +6719,7 @@ func TestRuntimeSchedulePauseAndResumeRequireConfirmation(t *testing.T) {
 		ID: "s1", Tool: "schedule.pause", Args: map[string]string{"id": "ai-trends"},
 	}}}}
 	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}, Security: config.SecurityConfig{RequireApprovalForRiskyTool: true}},
 		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
@@ -5704,7 +6803,7 @@ func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
 		ID: "s1", Tool: "schedule.update", Args: map[string]string{"id": "ai-trends", "daily_at": "10:00"},
 	}}}}
 	rt := Runtime{
-		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}},
+		Config:   &config.Root{App: config.AppConfig{Home: home, Workspace: home}, Security: config.SecurityConfig{RequireApprovalForRiskyTool: true}},
 		Model:    fp,
 		Tools:    tool.NewBuiltinRegistry(),
 		ToolCtx:  tool.Context{Home: home, Workspace: home, ProjectRoot: home},
@@ -5744,6 +6843,35 @@ func TestRuntimeScheduleUpdateRequiresConfirmation(t *testing.T) {
 	}
 	if schedule.Summary(task.Schedule) != "daily@10:00" {
 		t.Fatalf("expected updated schedule, got %#v", task)
+	}
+}
+
+func TestInferCapabilitiesIncludesFreshFactLookup(t *testing.T) {
+	caps := inferCapabilities("查看北京天气")
+	found := false
+	for _, cap := range caps {
+		if cap == "fresh_fact_lookup" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected fresh_fact_lookup capability, got %#v", caps)
+	}
+}
+
+func TestNormalizePlanAddsCurrentFreshnessForFreshFactLookup(t *testing.T) {
+	loop := AgentLoop{state: loopState{
+		understanding: taskUnderstanding{Capabilities: []string{"fresh_fact_lookup"}},
+	}}
+	plan := model.Plan{Summary: "weather", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "web.search",
+		Args: map[string]string{"query": "北京天气"},
+	}}}
+	got := loop.normalizePlanForRuntime(plan)
+	if got.Steps[0].Args["freshness"] != "current" {
+		t.Fatalf("expected freshness=current, got %#v", got.Steps[0].Args)
 	}
 }
 

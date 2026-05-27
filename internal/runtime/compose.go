@@ -144,6 +144,7 @@ func inferCapabilities(user string) []string {
 	}
 	maybeAdd("install_software", "安装", "install")
 	maybeAdd("search_web", "搜索", "search", "最新", "today", "current")
+	maybeAdd("fresh_fact_lookup", "天气", "weather", "汇率", "exchange rate", "股价", "stock price", "比分", "score", "航班", "flight", "空气质量", "aqi", "温度")
 	maybeAdd("search_memory", "记忆", "memory")
 	maybeAdd("inspect_project", "项目", "repo", "仓库", "结构", "目录")
 	maybeAdd("inspect_file", "文件", "readme", "文档", "总结", "读取", "内容")
@@ -168,6 +169,8 @@ func inferCompletionDraft(user string, capabilities []string) []string {
 			out = append(out, "identify the install method and verify the install result")
 		case "search_web":
 			out = append(out, "return concrete search evidence or clearly say no results")
+		case "fresh_fact_lookup":
+			out = append(out, "return current fact values with time context, or clearly say the facts could not be obtained")
 		case "inspect_project":
 			out = append(out, "summarize the relevant project structure")
 		case "inspect_file":
@@ -192,6 +195,8 @@ func inferEvidenceHints(capabilities []string, user string) []string {
 			out = append(out, "install command and verify command output")
 		case "search_web":
 			out = append(out, "search query, provider, and result count")
+		case "fresh_fact_lookup":
+			out = append(out, "fresh/current query wording, provider used, result count, and concrete current fact fields")
 		case "inspect_project":
 			out = append(out, "project path, file count, and sample tree")
 		case "inspect_file":
@@ -256,6 +261,11 @@ func capabilityToolScore(capability, toolName string) int {
 		switch toolName {
 		case "web.search", "web.fetch", "software.search", "skill.search":
 			return 8
+		}
+	case "fresh_fact_lookup":
+		switch toolName {
+		case "web.search", "web.fetch":
+			return 10
 		}
 	case "search_memory":
 		switch toolName {

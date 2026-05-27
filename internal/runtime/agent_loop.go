@@ -26,6 +26,7 @@ type loopState struct {
 	plan                model.Plan
 	previousPlanSummary string
 	results             []model.ToolResult
+	historicalResults   []model.ToolResult
 	control             string
 	replyText           string
 	awaitConfirm        bool
@@ -41,9 +42,12 @@ type loopState struct {
 	currentTask         *session.TaskState
 	shortMemory         shortMemorySummary
 	longMemory          longMemorySummary
+	cliUsage            cliUsageContext
 	inboxReminder       inboxReminder
 	repairReason        string
 	repairAttempted     bool
+	repairCycles        int
+	repairNeedsContinuation bool
 	deferredResults     []model.ToolResult
 	finalAccept         FinalAcceptance
 }
@@ -99,6 +103,9 @@ func (l *AgentLoop) Run(ctx context.Context) (Response, error) {
 	if resp := l.resolveApprovedMatewayDirectCommand(); resp != nil {
 		return *resp, nil
 	}
+	if resp := l.resumeApprovedTask(ctx); resp != nil {
+		return *resp, nil
+	}
 	l.receive()
 	l.loadLongMemory()
 	l.state.inboxReminder = l.loadInboxReminder()
@@ -130,6 +137,9 @@ func (l *AgentLoop) Run(ctx context.Context) (Response, error) {
 		if !l.state.repairAttempted {
 			l.state.repairReason = firstNonEmpty(l.state.finalAccept.Reason, "final acceptance rejected")
 			l.repair(ctx)
+			if l.state.control != "" {
+				return l.controlReply(), nil
+			}
 			l.state.finalAccept = FinalAcceptance{}
 			l.finalAccept(ctx)
 		}
@@ -153,6 +163,24 @@ func (l *AgentLoop) verifyPlan(ctx context.Context) {
 		l.state.repairReason = guidance
 	}
 	if !verification.Blocking() {
+		return
+	}
+	if l.state.understanding.IsScheduledRun && containsScheduledRunUserAskError(verification.Errors) {
+		l.state.failed = true
+		l.state.results = []model.ToolResult{{
+			StepID: "plan",
+			Tool:   "plan.verify",
+			OK:     false,
+			Error:  "plan_contract_invalid",
+			Output: strings.Join(verification.Errors, "\n"),
+			Evidence: map[string]any{
+				"kind":                "plan_verification",
+				"warnings":            verification.Warnings,
+				"repairable_warnings": verification.RepairableWarnings,
+				"errors":              verification.Errors,
+			},
+		}}
+		l.state.repairReason = "scheduled_run_user_ask_forbidden:\n" + verification.RepairGuidance()
 		return
 	}
 	l.state.results = []model.ToolResult{{
@@ -207,6 +235,30 @@ func (l *AgentLoop) verifyPlan(ctx context.Context) {
 			})
 			return
 		}
+		if discoveryPlan, ok := safeDiscoveryPrefixForBlockedPlan(l.state.plan); ok {
+			originalStepCount := len(l.state.plan.Steps)
+			l.state.plan = discoveryPlan
+			l.state.repairAttempted = false
+			l.state.deferredResults = append(l.state.deferredResults, model.ToolResult{
+				StepID: "plan",
+				Tool:   "plan.verify",
+				OK:     false,
+				Error:  "plan_contract_invalid_after_repair",
+				Output: strings.Join(second.Errors, "\n"),
+				Evidence: map[string]any{
+					"kind":                "plan_verification",
+					"warnings":            second.Warnings,
+					"repairable_warnings": second.RepairableWarnings,
+					"errors":              second.Errors,
+				},
+			})
+			l.runtime.Logger.Event("runtime.plan_trimmed_to_safe_discovery_prefix", map[string]any{
+				"trace_id":       l.state.traceID,
+				"original_steps": originalStepCount,
+				"prefix_steps":   len(discoveryPlan.Steps),
+			})
+			return
+		}
 		l.state.failed = true
 		l.state.results = append(l.state.results, model.ToolResult{
 			StepID: "plan",
@@ -222,6 +274,15 @@ func (l *AgentLoop) verifyPlan(ctx context.Context) {
 			},
 		})
 	}
+}
+
+func containsScheduledRunUserAskError(errors []string) bool {
+	for _, err := range errors {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(err)), "scheduled runs must not require user.ask") {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *AgentLoop) receive() {
@@ -246,9 +307,13 @@ func (l *AgentLoop) loadLongMemory() {
 	if l.runtime.Config != nil {
 		agentID = firstNonEmpty(l.runtime.Config.Agents.Default, agentID)
 	}
+	query := strings.TrimSpace(l.state.resolvedRequest())
+	if cli := cliUsageCandidateFromText(query); cli.Executable != "" {
+		query = strings.TrimSpace(query + "\nCLI usage: " + cli.Executable)
+	}
 	results, err := l.runtime.Memory.SearchLong(memory.SearchOptions{
 		AgentID:      agentID,
-		Query:        l.state.resolvedRequest(),
+		Query:        query,
 		Limit:        4,
 		SnippetLimit: 500,
 	})
@@ -260,12 +325,20 @@ func (l *AgentLoop) loadLongMemory() {
 		return
 	}
 	l.state.longMemory = buildLongMemorySummary(results)
+	l.state.cliUsage = buildCLIUsageContext(l.state.resolvedRequest(), results)
 	if len(results) > 0 {
 		l.runtime.Logger.Event("runtime.long_memory_loaded", map[string]any{
 			"trace_id": l.state.traceID,
 			"count":    len(results),
 			"items":    longMemoryTraceFields(results),
 			"chars":    len(l.state.longMemory.Text),
+		})
+	}
+	if l.state.cliUsage.Executable != "" {
+		l.runtime.Logger.Event("runtime.cli_usage_memory_checked", map[string]any{
+			"trace_id":     l.state.traceID,
+			"executable":   l.state.cliUsage.Executable,
+			"memory_found": l.state.cliUsage.MemoryFound,
 		})
 	}
 }
@@ -328,6 +401,9 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 	})
 	l.recordSelectedSkills(planSkills)
 	contextPrompt := l.buildContextPrompt(skill.StagePlanning, planMatches)
+	if guidance := l.cliUsagePlanningGuidance(); guidance != "" {
+		contextPrompt = strings.TrimSpace(contextPrompt + "\n\n" + guidance)
+	}
 	if recommendation := renderRecommendedTools(candidateTools); recommendation != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\n" + recommendation)
 	}
@@ -356,7 +432,82 @@ func (l *AgentLoop) plan(ctx context.Context) error {
 }
 
 func (l *AgentLoop) normalizePlanForRuntime(plan model.Plan) model.Plan {
+	for i := range plan.Steps {
+		step := &plan.Steps[i]
+		if strings.TrimSpace(step.Tool) != "web.search" {
+			continue
+		}
+		if !understandingHasFreshFactLookup(l.state.understanding) {
+			continue
+		}
+		if step.Args == nil {
+			step.Args = map[string]string{}
+		}
+		if strings.TrimSpace(step.Args["freshness"]) == "" {
+			step.Args["freshness"] = "current"
+		}
+	}
 	return plan
+}
+
+func understandingHasFreshFactLookup(understanding taskUnderstanding) bool {
+	for _, capability := range understanding.Capabilities {
+		if strings.TrimSpace(capability) == "fresh_fact_lookup" {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *AgentLoop) resumeApprovedTask(ctx context.Context) *Response {
+	if l.state.binding.Kind != bindingApprovalReply || !l.state.binding.ApprovalGranted {
+		return nil
+	}
+	plan, ok := planFromTaskState(l.state.currentTask)
+	if !ok {
+		return nil
+	}
+	l.receive()
+	l.loadLongMemory()
+	l.state.inboxReminder = l.loadInboxReminder()
+	l.state.understanding = l.fallbackUnderstanding()
+	l.state.plan = plan
+	l.act(ctx, plan)
+	if l.state.control != "" {
+		resp := l.controlReply()
+		return &resp
+	}
+	if l.shouldRepairBeforeSynthesis() {
+		l.repair(ctx)
+		if l.state.control != "" {
+			resp := l.controlReply()
+			return &resp
+		}
+	}
+	if l.shouldBlockUnsupportedSynthesis() {
+		resp := l.fail(fmt.Errorf("insufficient tool evidence for grounded answer"))
+		return &resp
+	}
+	l.finalAccept(ctx)
+	if l.state.finalAccept.Status == AcceptanceRejected {
+		if !l.state.repairAttempted {
+			l.state.repairReason = firstNonEmpty(l.state.finalAccept.Reason, "final acceptance rejected")
+			l.repair(ctx)
+			if l.state.control != "" {
+				resp := l.controlReply()
+				return &resp
+			}
+			l.state.finalAccept = FinalAcceptance{}
+			l.finalAccept(ctx)
+		}
+		if anyFailed(l.state.results) || l.state.finalAccept.Status == AcceptanceRejected {
+			resp := l.fail(fmt.Errorf(firstNonEmpty(l.state.finalAccept.Reason, "final acceptance rejected")))
+			return &resp
+		}
+	}
+	l.synthesize(ctx)
+	resp := l.finalReply()
+	return &resp
 }
 
 func (l *AgentLoop) planJSON(ctx context.Context, skillPrompt string, candidates []tool.Definition) (model.Plan, model.PlanCheckResult, error) {
@@ -392,11 +543,14 @@ func (l *AgentLoop) shouldRepairBeforeSynthesis() bool {
 	if l.state.control != "" {
 		return false
 	}
-	return !l.state.repairAttempted && (hasRepairableFailure(l.state.results) || needsGroundingEvidence(l.state.resolvedRequest(), l.state.results))
+	return l.remainingRepairBudget() > 0 && (hasRepairableFailure(l.state.results) || needsGroundingEvidence(l.state.resolvedRequest(), l.state.results))
 }
 
 func (l *AgentLoop) shouldBlockUnsupportedSynthesis() bool {
 	if l.state.control != "" {
+		return false
+	}
+	if onlyDependencyFailuresAfterSourceSuspect(l.state.results) {
 		return false
 	}
 	if hasGroundingEvidence(l.state.results) {
@@ -406,31 +560,153 @@ func (l *AgentLoop) shouldBlockUnsupportedSynthesis() bool {
 }
 
 func (l *AgentLoop) repair(ctx context.Context) {
-	if !l.repairPlan(ctx) {
-		return
-	}
-	var previous map[string]session.StepState
-	var priorResults []model.ToolResult
-	if l.state.currentTask != nil {
-		if l.state.currentTask.Status != session.TaskFailed && !l.state.currentTask.Failed {
-			previous = l.state.currentTask.StepStates
-			priorResults = l.state.results
+	approvedCommand := l.approvedTerminalWriteCommand()
+	for l.remainingRepairBudget() > 0 {
+		if !l.repairPlan(ctx) {
+			return
+		}
+		if l.applyRepairPlanVerification() {
+			continue
+		}
+		var previous map[string]session.StepState
+		var priorResults []model.ToolResult
+		if l.state.currentTask != nil {
+			if l.state.currentTask.Status != session.TaskFailed && !l.state.currentTask.Failed {
+				previous = l.state.currentTask.StepStates
+				priorResults = l.state.results
+			}
+		}
+		approvedStepID := l.state.binding.ApprovalStepID
+		if repairedStepID := repairedTerminalWriteStepCoveredByApproval(l.state.results, l.state.plan, l.state.binding.ApprovalGranted, approvedCommand); repairedStepID != "" {
+			approvedStepID = repairedStepID
+		}
+		l.state.historicalResults = append(l.state.historicalResults, l.state.results...)
+		results, control := l.runtime.executePlan(ctx, l.state.traceID, l.state.plan, l.state.binding.ApprovalGranted, approvedStepID, previous, priorResults)
+		l.state.results = mergeToolResultsForPlan(l.state.plan, l.state.results, results)
+		l.state.control = control
+		if l.state.control != "" {
+			return
+		}
+		if l.state.repairNeedsContinuation {
+			l.state.repairNeedsContinuation = false
+			l.state.repairReason = "continue from the newly collected local CLI usage evidence and build the next concrete command"
+			continue
+		}
+		if !hasRepairableFailure(l.state.results) {
+			return
 		}
 	}
-	approvedStepID := l.state.binding.ApprovalStepID
-	if repairedStepID := repairedTerminalWriteStepCoveredByApproval(l.state.results, l.state.plan, l.state.binding.ApprovalGranted); repairedStepID != "" {
-		approvedStepID = repairedStepID
+}
+
+func (l *AgentLoop) applyRepairPlanVerification() bool {
+	verification := verifyPlanContract(l.state.plan, l.runtime.Tools, l.state.resolvedRequest(), l.state.understanding)
+	verification.Errors = filterRepairVerificationErrorsSatisfiedByHistory(verification.Errors, completedStepIDs(l.state.results, l.state.historicalResults))
+	if !verification.Blocking() {
+		return false
 	}
-	results, control := l.runtime.executePlan(ctx, l.state.traceID, l.state.plan, l.state.binding.ApprovalGranted, approvedStepID, previous, priorResults)
-	l.state.results = mergeToolResultsForPlan(l.state.plan, l.state.results, results)
-	l.state.control = control
+	l.state.repairReason = "repair_plan_invalid:\n" + verification.RepairGuidance()
+	if diagnosticPlan, ok := safeDiagnosticPrefixForBlockedPlan(l.state.plan, l.state.resolvedRequest()); ok {
+		l.state.plan = diagnosticPlan
+		l.state.repairNeedsContinuation = true
+		return false
+	}
+	if discoveryPlan, ok := safeDiscoveryPrefixForBlockedPlan(l.state.plan); ok {
+		l.state.plan = discoveryPlan
+		l.state.repairNeedsContinuation = true
+		return false
+	}
+	return true
+}
+
+func completedStepIDs(groups ...[]model.ToolResult) map[string]bool {
+	out := map[string]bool{}
+	for _, results := range groups {
+		for _, result := range results {
+			if !result.OK {
+				continue
+			}
+			if id := strings.TrimSpace(result.StepID); id != "" {
+				out[id] = true
+			}
+		}
+	}
+	return out
+}
+
+func filterRepairVerificationErrorsSatisfiedByHistory(errors []string, completed map[string]bool) []string {
+	if len(errors) == 0 || len(completed) == 0 {
+		return errors
+	}
+	filtered := make([]string, 0, len(errors))
+	for _, err := range errors {
+		trimmed := strings.TrimSpace(err)
+		if dep := historicalDependencyFromVerificationError(trimmed); dep != "" && completed[dep] {
+			continue
+		}
+		filtered = append(filtered, err)
+	}
+	return filtered
+}
+
+func historicalDependencyFromVerificationError(text string) string {
+	const marker = ": dependency "
+	idx := strings.Index(text, marker)
+	if idx < 0 || !strings.HasSuffix(text, " does not reference an earlier step") {
+		return ""
+	}
+	rest := text[idx+len(marker):]
+	rest = strings.TrimSuffix(rest, " does not reference an earlier step")
+	return strings.TrimSpace(rest)
+}
+
+func (l *AgentLoop) approvedTerminalWriteCommand() string {
+	if !l.state.binding.ApprovalGranted || l.state.currentTask == nil {
+		return ""
+	}
+	stepID := strings.TrimSpace(l.state.binding.ApprovalStepID)
+	if stepID == pendingApprovalStepID(l.state.currentTask.PendingApproval) {
+		if command := commandFromPendingApproval(l.state.currentTask.PendingApproval); terminalCommandLooksExternalWriteAction(command) {
+			return command
+		}
+	}
+	if stepID != "" && l.state.currentTask.StepStates != nil {
+		if step, ok := l.state.currentTask.StepStates[stepID]; ok {
+			if command := terminalWriteCommandFromStepState(step); command != "" {
+				return command
+			}
+		}
+	}
+	for i := len(l.state.currentTask.StepHistory) - 1; i >= 0; i-- {
+		step := l.state.currentTask.StepHistory[i]
+		if stepID != "" && strings.TrimSpace(step.ID) != stepID {
+			continue
+		}
+		if command := terminalWriteCommandFromStepState(step); command != "" {
+			return command
+		}
+	}
+	return ""
+}
+
+func terminalWriteCommandFromStepState(step session.StepState) string {
+	if strings.TrimSpace(step.Tool) != "terminal.run" {
+		return ""
+	}
+	if command := strings.TrimSpace(step.Args["command"]); terminalCommandLooksExternalWriteAction(command) {
+		return command
+	}
+	if command := strings.TrimSpace(stringValue(step.Evidence["command"])); terminalCommandLooksExternalWriteAction(command) {
+		return command
+	}
+	return ""
 }
 
 func (l *AgentLoop) repairPlan(ctx context.Context) bool {
-	if l.state.repairAttempted {
+	if l.remainingRepairBudget() <= 0 {
 		return false
 	}
 	l.state.repairAttempted = true
+	l.state.repairCycles++
 	allTools := l.runtime.availableToolDefinitions()
 	candidateTools := composeCandidateTools(allTools, l.state.understanding, repairCandidateBudget, repairCandidateHints(l.state.results, l.state.repairReason)...)
 	planMatches := skill.SelectMatches(l.skillDefinitions(), skill.StagePlanningRepair, l.skillContext())
@@ -445,6 +721,9 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 	})
 	l.recordSelectedSkills(planSkills)
 	contextPrompt := l.buildContextPrompt(skill.StagePlanningRepair, planMatches)
+	if guidance := l.cliUsagePlanningGuidance(); guidance != "" {
+		contextPrompt = strings.TrimSpace(contextPrompt + "\n\n" + guidance)
+	}
 	if recommendation := renderRecommendedTools(candidateTools); recommendation != "" {
 		contextPrompt = strings.TrimSpace(contextPrompt + "\n\n" + recommendation)
 	}
@@ -486,6 +765,51 @@ func (l *AgentLoop) repairPlan(ctx context.Context) bool {
 	}
 	l.state.plan = repaired
 	return true
+}
+
+func (l *AgentLoop) remainingRepairBudget() int {
+	maxCycles := 1
+	if localCLIReactCandidate(l.state.resolvedRequest(), l.state.results) || repairContinuationCandidate(l.state.results) {
+		maxCycles = 3
+	}
+	return maxCycles - l.state.repairCycles
+}
+
+func localCLIReactCandidate(user string, results []model.ToolResult) bool {
+	if !textLooksLikeLocalCLIUseRequest(strings.ToLower(strings.TrimSpace(user))) {
+		return false
+	}
+	if cli := cliUsageCandidateFromText(user); cli.Executable != "" {
+		return true
+	}
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "terminal.run" {
+			continue
+		}
+		command := strings.TrimSpace(stringValue(result.Evidence["command"]))
+		if command == "" {
+			continue
+		}
+		root := commandRoot(command)
+		if root == "" || commonCLIExecutable(root) || rootLooksLikeLocalProjectCommand(root) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func repairContinuationCandidate(results []model.ToolResult) bool {
+	for _, result := range results {
+		if strings.TrimSpace(result.Tool) != "plan.verify" {
+			continue
+		}
+		switch strings.TrimSpace(result.Error) {
+		case "plan_contract_invalid", "plan_contract_invalid_after_repair":
+			return true
+		}
+	}
+	return false
 }
 
 func (l *AgentLoop) repairPlanJSON(ctx context.Context, skillPrompt string, candidates []tool.Definition) (model.Plan, model.PlanCheckResult, error) {
@@ -610,7 +934,7 @@ func softwareInstallRepairGuidance(results []model.ToolResult) string {
 		"Do not emit software.install until install_command, verify_command, and executable_name are concrete.",
 	}
 	if hasWeakSearch {
-		parts = append(parts, "If software.search returns weak or mismatched results, do not guess a repository, README URL, npm package, or install command. Prefer user.ask or stop with a clear no-reliable-source explanation.")
+		parts = append(parts, "If software.search returns weak or mismatched results, do not guess a repository, README URL, npm package, or install command. Repair source discovery first: try a narrower software.search query with the exact package/project name, npm/package-manager clues, author/owner clues from prior evidence, or an official-docs query. Only stop after these source-discovery attempts still fail.")
 	}
 	if hasFetchFailure {
 		parts = append(parts, "If web.fetch failed because the URL was guessed or invalid, repair by narrowing the source-finding step first instead of emitting another guessed URL.")
@@ -646,6 +970,7 @@ func buildStepStates(plan model.Plan, results []model.ToolResult, now time.Time)
 			ID:        id,
 			Goal:      step.Goal,
 			Tool:      step.Tool,
+			Args:      copyStringMap(step.Args),
 			Status:    "pending",
 			DependsOn: append([]string(nil), step.DependsOn...),
 			UpdatedAt: now,
@@ -681,6 +1006,184 @@ func buildStepStates(plan model.Plan, results []model.ToolResult, now time.Time)
 			}
 		}
 		out[id] = item
+	}
+	return out
+}
+
+func appendStepHistory(existing []session.StepState, plan model.Plan, results []model.ToolResult, now time.Time) []session.StepState {
+	current := buildStepStatesForHistory(plan, results, now)
+	if len(current) == 0 {
+		return existing
+	}
+	out := append([]session.StepState(nil), existing...)
+	for _, id := range historyStepOrder(plan, results) {
+		state, ok := current[id]
+		if !ok {
+			continue
+		}
+		if state.AttemptCount == 0 && strings.TrimSpace(state.AcceptanceStatus) == "" {
+			continue
+		}
+		out = append(out, state)
+	}
+	const maxStepHistory = 40
+	if len(out) > maxStepHistory {
+		out = out[len(out)-maxStepHistory:]
+	}
+	return out
+}
+
+func buildStepStatesForHistory(plan model.Plan, results []model.ToolResult, now time.Time) map[string]session.StepState {
+	out := buildStepStates(plan, results, now)
+	if out == nil {
+		out = map[string]session.StepState{}
+	}
+	planByID := map[string]model.PlanStep{}
+	for _, step := range plan.Steps {
+		planByID[strings.TrimSpace(step.ID)] = step
+	}
+	for _, result := range results {
+		id := strings.TrimSpace(result.StepID)
+		if id == "" {
+			continue
+		}
+		if _, ok := out[id]; ok {
+			continue
+		}
+		step := planByID[id]
+		out[id] = stepStateFromResult(step, result, now)
+	}
+	return out
+}
+
+func stepStateFromResult(step model.PlanStep, result model.ToolResult, now time.Time) session.StepState {
+	id := firstNonEmpty(strings.TrimSpace(step.ID), strings.TrimSpace(result.StepID))
+	toolName := firstNonEmpty(strings.TrimSpace(step.Tool), strings.TrimSpace(result.Tool))
+	item := session.StepState{
+		ID:            id,
+		Goal:          step.Goal,
+		Tool:          toolName,
+		Args:          copyStringMap(step.Args),
+		Status:        "pending",
+		AttemptCount:  1,
+		DependsOn:     append([]string(nil), step.DependsOn...),
+		ResultOK:      result.OK,
+		ResultError:   result.Error,
+		ResultSummary: shortenReply(result.Output, 240),
+		Evidence:      result.Evidence,
+		StartedAt:     now,
+		FinishedAt:    now,
+		UpdatedAt:     now,
+	}
+	if len(item.Args) == 0 {
+		if command := strings.TrimSpace(stringValue(result.Evidence["command"])); command != "" && toolName == "terminal.run" {
+			item.Args = map[string]string{"command": command}
+		}
+	}
+	switch {
+	case result.Error == "await_confirm":
+		item.Status = "blocked"
+		item.AcceptanceStatus = "await_confirm"
+	case result.OK:
+		item.Status = "passed"
+		item.AcceptanceStatus = "passed"
+	default:
+		item.Status = "failed"
+		item.AcceptanceStatus = "failed"
+		item.AcceptanceReason = firstNonEmpty(result.Error, result.Output)
+	}
+	return item
+}
+
+func historyStepOrder(plan model.Plan, results []model.ToolResult) []string {
+	out := planStepOrder(plan)
+	seen := map[string]bool{}
+	for _, id := range out {
+		seen[strings.TrimSpace(id)] = true
+	}
+	for _, result := range results {
+		id := strings.TrimSpace(result.StepID)
+		if id == "" || seen[id] {
+			continue
+		}
+		out = append(out, id)
+		seen[id] = true
+	}
+	return out
+}
+
+func planFromTaskState(task *session.TaskState) (model.Plan, bool) {
+	if task == nil || len(task.StepOrder) == 0 || len(task.StepStates) == 0 {
+		return model.Plan{}, false
+	}
+	steps := make([]model.PlanStep, 0, len(task.StepOrder))
+	for _, id := range task.StepOrder {
+		state, ok := task.StepStates[id]
+		if !ok || strings.TrimSpace(state.ID) == "" || strings.TrimSpace(state.Tool) == "" {
+			return model.Plan{}, false
+		}
+		args := copyStringMap(state.Args)
+		if len(args) == 0 && strings.TrimSpace(state.Tool) == "terminal.run" && strings.TrimSpace(state.ID) == pendingApprovalStepID(task.PendingApproval) {
+			if command := commandFromPendingApproval(task.PendingApproval); command != "" {
+				args = map[string]string{"command": command}
+			}
+		}
+		if len(args) == 0 && toolRequiresArgsForResume(state.Tool) {
+			return model.Plan{}, false
+		}
+		steps = append(steps, model.PlanStep{
+			ID:        state.ID,
+			Goal:      state.Goal,
+			Tool:      state.Tool,
+			Args:      args,
+			DependsOn: append([]string(nil), state.DependsOn...),
+		})
+	}
+	if len(steps) == 0 {
+		return model.Plan{}, false
+	}
+	return model.Plan{Summary: task.PlanSummary, Steps: steps}, true
+}
+
+func toolRequiresArgsForResume(toolName string) bool {
+	switch strings.TrimSpace(toolName) {
+	case "terminal.run", "shell.run", "file.write", "file.patch", "software.install", "schedule.create", "schedule.update", "schedule.delete":
+		return true
+	default:
+		return false
+	}
+}
+
+func commandFromPendingApproval(approval *session.PendingApproval) string {
+	if approval == nil {
+		return ""
+	}
+	text := strings.TrimSpace(approval.Prompt)
+	if text == "" {
+		return ""
+	}
+	markers := []string{"命令：`", "Command: `", "command: `"}
+	for _, marker := range markers {
+		start := strings.Index(text, marker)
+		if start < 0 {
+			continue
+		}
+		rest := text[start+len(marker):]
+		end := strings.Index(rest, "`")
+		if end > 0 {
+			return strings.TrimSpace(rest[:end])
+		}
+	}
+	return ""
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
 	}
 	return out
 }
@@ -893,6 +1396,7 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 	task.ExecutionStatus = executionStatusForResponse(resp)
 	task.StepOrder = planStepOrder(l.state.plan)
 	task.StepStates = buildStepStates(l.state.plan, l.state.results, finishedAt)
+	task.StepHistory = appendStepHistory(task.StepHistory, l.state.plan, append(l.state.historicalResults, l.state.results...), finishedAt)
 	if task.Status != session.TaskAbandoned {
 		task.Status = taskStatusForResponse(resp)
 	}
@@ -995,10 +1499,28 @@ func (l *AgentLoop) saveSession(resp Response) memory.ProcessResult {
 	})
 	learning := l.recordLearningPattern(resp, task)
 	l.maybeProposeSkillImprovement(resp, task)
+	l.maybeWriteCLIUsageMemory(resp, task)
 	if !learning.CandidateGenerated {
 		l.proposeMemoryFromTask(resp.Reply, task)
 	}
 	return learning
+}
+
+func (l *AgentLoop) cliUsagePlanningGuidance() string {
+	ctx := l.state.cliUsage
+	if ctx.Executable == "" {
+		return ""
+	}
+	if ctx.MemoryFound {
+		return "CLI usage memory:\nA long-memory playbook for `" + ctx.Executable + "` is available in Relevant long memory. Use its verified command shapes before constructing local terminal commands."
+	}
+	return strings.Join([]string{
+		"CLI usage memory requirement:",
+		"- The user request involves unknown external CLI `" + ctx.Executable + "`, and no long-memory playbook titled `CLI usage: " + ctx.Executable + "` was found.",
+		"- Before executing the user's actual CLI task, first discover usage with read-only commands: verify the executable path, run version/help when available, then inspect the relevant parent and exact subcommand help.",
+		"- usage discovery is only a prerequisite. After the usage is clear, continue the user's original task in the same plan.",
+		"- If a parent help page only lists candidate subcommands, inspect the exact listed candidate help before building a write command.",
+	}, "\n")
 }
 
 func (l *AgentLoop) recordLearningPattern(resp Response, task session.TaskState) memory.ProcessResult {

@@ -139,6 +139,22 @@ func TestEnsureDefaultConfigFilesDoesNotOverwriteExistingConfig(t *testing.T) {
 	}
 }
 
+func TestSearchProviderResolvedAPIKeyReadsStandardEnv(t *testing.T) {
+	t.Setenv("TAVILY_API_KEY", "tvly-standard")
+	cfg := SearchProviderConfig{APIKeyEnv: "TAVILY_API_KEY"}
+	if got := cfg.ResolvedAPIKey(); got != "tvly-standard" {
+		t.Fatalf("expected standard env key, got %q", got)
+	}
+}
+
+func TestSearchProviderResolvedAPIKeyReadsMatewayPrefixedFallback(t *testing.T) {
+	t.Setenv("MATEWAY_TAVILY_API_KEY", "tvly-prefixed")
+	cfg := SearchProviderConfig{APIKeyEnv: "TAVILY_API_KEY"}
+	if got := cfg.ResolvedAPIKey(); got != "tvly-prefixed" {
+		t.Fatalf("expected prefixed fallback env key, got %q", got)
+	}
+}
+
 func writeFile(t *testing.T, path string, text string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

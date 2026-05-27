@@ -33,6 +33,18 @@ func TestPlanVerifierRejectsMissingRequiredArg(t *testing.T) {
 	}
 }
 
+func TestPlanVerifierRejectsPlaceholderWebFetchURL(t *testing.T) {
+	plan := model.Plan{Summary: "bad url", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "web.fetch",
+		Args: map[string]string{"url": "<opencli_official_url>/blob/main/README.md"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "读取 OpenCLI README", taskUnderstanding{})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "missing required arg url") || !containsVerificationError(got.Errors, "unresolved placeholder values") {
+		t.Fatalf("expected placeholder web.fetch URL to block before execution, got %#v", got)
+	}
+}
+
 func TestPlanVerifierWarnsWhenPlanDoesNotCoverCapability(t *testing.T) {
 	plan := model.Plan{Summary: "bad capability coverage", Steps: []model.PlanStep{{
 		ID:   "s1",
@@ -181,6 +193,106 @@ func TestPlanVerifierWarnsWhenSoftwareInstallLooksSpeculative(t *testing.T) {
 	if !containsVerificationError(got.RepairableWarnings, "include explicit upstream install command and verify_command before installing") {
 		t.Fatalf("expected speculative install warning, got %#v", got)
 	}
+	if !got.Blocking() || !containsVerificationError(got.Errors, "missing required arg verify_command") {
+		t.Fatalf("expected missing verify_command to block speculative install, got %#v", got)
+	}
+}
+
+func TestPlanVerifierRejectsPlaceholderSoftwareInstallCommand(t *testing.T) {
+	plan := model.Plan{Summary: "install", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "software.install",
+		Goal: "install opencli",
+		Args: map[string]string{
+			"command":        "<install_command from step-2>",
+			"verify_command": "<verify_command from step-2>",
+			"source_url":     "https://github.com/jackwener/OpenCLI",
+		},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "去查一下 opencli，好用的话我想装一下", taskUnderstanding{})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "missing required arg command") || !containsVerificationError(got.Errors, "missing required arg verify_command") {
+		t.Fatalf("expected placeholder software.install args to block before confirmation, got %#v", got)
+	}
+}
+
+func TestPlanVerifierRejectsNaturalLanguageTerminalCommand(t *testing.T) {
+	plan := model.Plan{Summary: "create doc", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Goal: "create doc",
+		Args: map[string]string{
+			"command": "根据 step-1 输出的正确参数执行创建命令",
+		},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机 lark-cli 创建云文档", taskUnderstanding{})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "natural-language placeholder") {
+		t.Fatalf("expected natural-language command to block, got %#v", got)
+	}
+}
+
+func TestPlanVerifierRejectsUserAskInScheduledRun(t *testing.T) {
+	plan := model.Plan{Summary: "scheduled report", Steps: []model.PlanStep{
+		{ID: "s1", Tool: "web.search", Args: map[string]string{"query": "latest AI Agent trends"}},
+		{ID: "s2", Tool: "user.ask", Args: map[string]string{"question": "你更想看国内还是全球趋势？"}},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "这是一次定时任务执行", taskUnderstanding{IsScheduledRun: true})
+	if !got.Blocking() || !containsVerificationError(got.Errors, "scheduled runs must not require user.ask") {
+		t.Fatalf("expected scheduled run user.ask to block, got %#v", got)
+	}
+}
+
+func TestSafeDiscoveryPrefixTrimsBeforePlaceholderSoftwareInstall(t *testing.T) {
+	plan := model.Plan{Summary: "install", Steps: []model.PlanStep{
+		{
+			ID:   "step-1",
+			Tool: "software.search",
+			Args: map[string]string{"query": "OpenCLI GitHub repository"},
+		},
+		{
+			ID:        "step-2",
+			Tool:      "web.fetch",
+			Args:      map[string]string{"url": "https://raw.githubusercontent.com/jackwener/OpenCLI/main/README.md"},
+			DependsOn: []string{"step-1"},
+		},
+		{
+			ID:        "step-3",
+			Tool:      "software.install",
+			Args:      map[string]string{"command": "<install_command from step-2>", "verify_command": "<verify_command from step-2>"},
+			DependsOn: []string{"step-2"},
+		},
+	}}
+	got, ok := safeDiscoveryPrefixForBlockedPlan(plan)
+	if !ok {
+		t.Fatalf("expected safe discovery prefix")
+	}
+	if len(got.Steps) != 2 || got.Steps[0].Tool != "software.search" || got.Steps[1].Tool != "web.fetch" {
+		t.Fatalf("unexpected prefix %#v", got.Steps)
+	}
+}
+
+func TestSafeDiscoveryPrefixTrimsCLIUsageDiscoveryBeforePlaceholderWrite(t *testing.T) {
+	plan := model.Plan{Summary: "create doc", Steps: []model.PlanStep{
+		{
+			ID:   "step-1",
+			Tool: "terminal.run",
+			Goal: "inspect lark-cli help",
+			Args: map[string]string{"command": "/opt/homebrew/bin/lark-cli --help"},
+		},
+		{
+			ID:        "step-2",
+			Tool:      "terminal.run",
+			Goal:      "create doc",
+			Args:      map[string]string{"command": "根据 step-1 帮助文档中的命令格式，构建并执行创建云文档的命令"},
+			DependsOn: []string{"step-1"},
+		},
+	}}
+	got, ok := safeDiscoveryPrefixForBlockedPlan(plan)
+	if !ok {
+		t.Fatalf("expected safe CLI discovery prefix")
+	}
+	if len(got.Steps) != 1 || got.Steps[0].Tool != "terminal.run" || got.Steps[0].Args["command"] != "/opt/homebrew/bin/lark-cli --help" {
+		t.Fatalf("unexpected prefix %#v", got.Steps)
+	}
 }
 
 func TestPlanVerifierAllowsExternalCLIWriteWithoutMandatoryAuthPreflight(t *testing.T) {
@@ -236,6 +348,30 @@ func TestPlanVerifierWarnsWhenCLIMessageSendLacksExplicitContent(t *testing.T) {
 	}
 	if got.Blocking() {
 		t.Fatalf("expected missing help warning not to block execution, got %#v", got)
+	}
+}
+
+func TestPlanVerifierWarnsWhenUnknownCLIWriteSkipsUsageDiscovery(t *testing.T) {
+	plan := model.Plan{Summary: "send", Steps: []model.PlanStep{{
+		ID:   "s1",
+		Tool: "terminal.run",
+		Args: map[string]string{"command": "chatctl messages send --chat-id oc_xxx --text hi"},
+	}}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机 `chatctl` 发送消息", taskUnderstanding{})
+	if !containsVerificationError(got.RepairableWarnings, "no loaded usage memory") {
+		t.Fatalf("expected usage discovery warning, got %#v", got)
+	}
+}
+
+func TestPlanVerifierAllowsUnknownCLIWriteAfterUsageDiscovery(t *testing.T) {
+	plan := model.Plan{Summary: "send", Steps: []model.PlanStep{
+		{ID: "s1", Tool: "terminal.run", Args: map[string]string{"command": "command -v chatctl"}},
+		{ID: "s2", Tool: "terminal.run", Args: map[string]string{"command": "chatctl messages send --help"}, DependsOn: []string{"s1"}},
+		{ID: "s3", Tool: "terminal.run", Args: map[string]string{"command": "chatctl messages send --chat-id oc_xxx --text hi"}, DependsOn: []string{"s2"}},
+	}}
+	got := verifyPlanContract(plan, tool.NewBuiltinRegistry(), "用本机 `chatctl` 发送消息", taskUnderstanding{})
+	if containsVerificationError(got.RepairableWarnings, "no loaded usage memory") {
+		t.Fatalf("expected usage discovery to satisfy warning, got %#v", got)
 	}
 }
 
@@ -450,7 +586,7 @@ func TestPlanVerifierWarnsWhenEvidenceDoesNotAlignWithUnderstandingHints(t *test
 	plan := model.Plan{Summary: "bad evidence alignment", Steps: []model.PlanStep{{
 		ID:               "s1",
 		Tool:             "software.install",
-		Args:             map[string]string{"command": "brew install x"},
+		Args:             map[string]string{"command": "brew install x", "verify_command": "command -v x && x --version"},
 		ExpectedEvidence: []string{"generic confirmation"},
 		SuccessCriteria:  []string{"tool ran"},
 	}}}

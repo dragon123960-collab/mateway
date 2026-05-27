@@ -79,6 +79,9 @@ func (l *AgentLoop) resolveTaskBinding(ctx context.Context) taskBindingDecision 
 	if decision, ok := l.resolveSlotFill(); ok {
 		return decision
 	}
+	if decision, ok := l.resolvePendingInputShortReply(); ok {
+		return decision
+	}
 	if decision, ok := l.resolveRuleFollowup(); ok {
 		return decision
 	}
@@ -213,12 +216,7 @@ func (l *AgentLoop) applyTaskBinding(decision taskBindingDecision) *Response {
 			task.UpdatedAt = l.state.startedAt
 			if decision.Kind == bindingApprovalReply {
 				task.Status = session.TaskOpen
-				if decision.ApprovalGranted && decision.ApprovalStepID != "" {
-					task.PendingApproval = &session.PendingApproval{
-						ApprovalType:    "boolean_confirm",
-						RequestedAction: "approved:" + decision.ApprovalStepID,
-					}
-				} else {
+				if !decision.ApprovalGranted {
 					task.PendingApproval = nil
 				}
 				task.PendingQuestions = nil
@@ -513,6 +511,52 @@ func (l *AgentLoop) resolveSlotFill() (taskBindingDecision, bool) {
 		Confidence:    0.96,
 		FilledFields:  filled,
 	}, true
+}
+
+func (l *AgentLoop) resolvePendingInputShortReply() (taskBindingDecision, bool) {
+	task := session.ActiveTask(l.state.session)
+	if task == nil || task.Status != session.TaskAwaitUserInput || len(task.PendingQuestions) == 0 {
+		return taskBindingDecision{}, false
+	}
+	text := normalizeFollowupText(l.state.message.Text)
+	if !isShortPendingInputReply(text) {
+		return taskBindingDecision{}, false
+	}
+	return taskBindingDecision{
+		Kind:          bindingActiveFollowup,
+		TargetTaskID:  task.ID,
+		ResolvedQuery: mergeBaseAndPendingInput(firstNonEmpty(task.ResolvedQuery, task.UserText), l.state.message.Text),
+		Reason:        "short reply answered pending input for active task",
+		Confidence:    0.97,
+	}, true
+}
+
+func isShortPendingInputReply(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || len([]rune(text)) > 8 {
+		return false
+	}
+	if textmatch.ExactGroup(text, "approval_yes") || text == "yes" || text == "y" || text == "ok" {
+		return true
+	}
+	switch text {
+	case "需要", "要", "用", "可以", "帮我", "请", "是", "对":
+		return true
+	default:
+		return false
+	}
+}
+
+func mergeBaseAndPendingInput(base, current string) string {
+	base = strings.TrimSpace(base)
+	current = strings.TrimSpace(current)
+	if base == "" {
+		return current
+	}
+	if current == "" {
+		return base
+	}
+	return "Continue the previous task after the user answered the pending question:\nOriginal task: " + base + "\nUser answer: " + current
 }
 
 func (l *AgentLoop) resolveRuleFollowup() (taskBindingDecision, bool) {
