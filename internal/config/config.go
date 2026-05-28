@@ -48,6 +48,7 @@ type SearchConfig struct {
 
 type SearchProvidersConfig struct {
 	Tavily     SearchProviderConfig `yaml:"tavily"`
+	SearXNG    SearchProviderConfig `yaml:"searxng"`
 	DuckDuckGo SearchProviderConfig `yaml:"duckduckgo"`
 }
 
@@ -256,6 +257,7 @@ func (l Loader) Load() (*Root, error) {
 		return nil, err
 	}
 	root.Models = models
+	root.normalizeSearch()
 	root.normalizeAgents()
 	channels, err := l.loadChannels()
 	if err != nil {
@@ -263,6 +265,26 @@ func (l Loader) Load() (*Root, error) {
 	}
 	root.Channels = channels
 	return root, nil
+}
+
+func (r *Root) normalizeSearch() {
+	if len(r.Search.ProviderOrder) == 0 {
+		if r.Search.Providers.Tavily.Enabled {
+			r.Search.ProviderOrder = append(r.Search.ProviderOrder, "tavily")
+		}
+		if r.Search.Providers.SearXNG.Enabled {
+			r.Search.ProviderOrder = append(r.Search.ProviderOrder, "searxng")
+		}
+		if r.Search.Providers.DuckDuckGo.Enabled {
+			r.Search.ProviderOrder = append(r.Search.ProviderOrder, "duckduckgo")
+		}
+	}
+	if len(r.Search.ProviderOrder) == 0 {
+		r.Search.ProviderOrder = []string{"tavily", "searxng", "duckduckgo"}
+	}
+	if strings.TrimSpace(r.Search.DefaultTool) == "" {
+		r.Search.DefaultTool = "web.search"
+	}
 }
 
 func (r *Root) DefaultAgent() AgentProfileConfig {

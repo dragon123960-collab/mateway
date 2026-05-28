@@ -1,15 +1,18 @@
 .DS_Store
+build/
+dist/
+tmp/
+coverage.out
 .gocache/
 .tmp_codex/
 .claude/
 .env
+# Local runtime state lives outside the repo.
+.mateway/
 *.log
 /docs/archive/
 /testdata/
-/dist/
 /bin/
-/build/
-coverage.out
 docs/
 scripts/
 AGENTS.md

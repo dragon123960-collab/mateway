@@ -7,10 +7,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/dongping/mateway/internal/config"
 )
 
 const (
-	DefaultServiceName = "mateway.gateway"
 	DarwinServiceLabel = "com.dongping.mateway.gateway"
 	LinuxUserUnit      = "mateway-gateway.service"
 )
@@ -73,7 +74,7 @@ func (m ServiceManager) Status(ctx context.Context, home string) (string, error)
 		err = unsupportedServiceOS(m.GOOS)
 	}
 	if err != nil {
-		if serviceText == "" {
+		if strings.TrimSpace(serviceText) == "" {
 			serviceText = err.Error()
 		} else {
 			serviceText = strings.TrimSpace(serviceText) + "\n" + err.Error()
@@ -116,4 +117,8 @@ func currentUID() int {
 		return 501
 	}
 	return uid
+}
+
+func DefaultHome() string {
+	return config.DefaultHome()
 }

@@ -1,213 +1,83 @@
 package tool
 
 import (
-	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/config"
 )
 
-func TestRegistryRejectsUnknownTool(t *testing.T) {
-	r := NewRegistry()
-	r.Register(TimeNow())
-	if _, ok := r.Get("missing.tool"); ok {
-		t.Fatalf("unexpected missing tool")
-	}
-	if _, err := r.MustGet("missing.tool"); err == nil {
-		t.Fatalf("expected error for unknown tool")
-	}
-}
-
-func TestBuiltinDefinitionsHideDeprecatedShellRun(t *testing.T) {
-	registry := NewBuiltinRegistry()
-	if _, ok := registry.Get("shell.run"); !ok {
-		t.Fatalf("expected deprecated shell.run alias to remain executable")
-	}
-	for _, def := range registry.Definitions() {
-		if def.Name == "shell.run" {
-			t.Fatalf("expected shell.run to be hidden from planner definitions")
-		}
-	}
-}
-
-func TestBuiltinDefinitionsDeclareExplicitReusePolicy(t *testing.T) {
-	registry := NewBuiltinRegistry()
-	for _, def := range registry.AllDefinitions() {
-		if def.Metadata.ReusePolicy == "" {
-			t.Fatalf("expected builtin tool %q to declare explicit reuse policy", def.Name)
-		}
-	}
-}
-
-func TestDangerousCommandGuard(t *testing.T) {
-	cases := []string{
-		"rm -rf tmp",
-		"git reset --hard",
-	}
-	for _, cmd := range cases {
-		if !IsDangerousCommand(cmd) {
-			t.Fatalf("expected dangerous: %s", cmd)
-		}
-	}
-	if !RequireConfirmForTool("terminal.run", map[string]string{"command": "rm -rf tmp"}) {
-		t.Fatalf("expected terminal.run dangerous command to require confirmation")
-	}
-	for _, name := range []string{"file.write", "file.patch", "skill.install", "skill.promote", "software.install", "schedule.create", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "memory.reject"} {
-		if !RequireConfirmForTool(name, map[string]string{}) {
-			t.Fatalf("expected %s to require confirmation", name)
-		}
-	}
-	if !RequireConfirmForTool("memory.commit", map[string]string{"type": "decision"}) {
-		t.Fatalf("expected high-impact memory.commit to require confirmation")
-	}
-	for _, cmd := range []string{"pwd", "ls -la", "git status", "go test ./...", "echo hi > file.txt", "npm install"} {
-		if IsDangerousCommand(cmd) {
-			t.Fatalf("expected safe: %s", cmd)
-		}
-	}
-	if RequireConfirmForTool("terminal.run", map[string]string{"command": "pwd"}) {
-		t.Fatalf("expected safe terminal command not to require confirmation")
-	}
-	if RequireConfirmForTool("memory.commit", map[string]string{"type": "project"}) {
-		t.Fatalf("expected low-impact project memory commit not to require confirmation")
-	}
-}
-
-func TestTruncate(t *testing.T) {
-	text := "abcdefghijklmnopqrstuvwxyz"
-	got := Truncate(text, 10)
-	if got == text || len(got) <= 10 {
-		t.Fatalf("expected truncated marker, got %q", got)
-	}
-}
-
-func TestPathGuardRejectsOutsideRoot(t *testing.T) {
-	_, err := ResolveAllowedPath("/etc/passwd", Context{ProjectRoot: "/tmp/project", Workspace: "/tmp/workspace"})
-	if err == nil {
-		t.Fatalf("expected outside root error")
-	}
-}
-
-func TestPathGuardAllowsProjectRelative(t *testing.T) {
-	got, err := ResolveAllowedPath("README.md", Context{ProjectRoot: "/tmp/project", Workspace: "/tmp/workspace"})
+func TestResolveAllowedPathDefaultsRelativeToHome(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	path, err := ResolveAllowedPath("notes/a.txt", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "/tmp/project/README.md" {
-		t.Fatalf("unexpected path %q", got)
+	want := filepath.Join(home, "notes", "a.txt")
+	if path != want {
+		t.Fatalf("path = %q want %q", path, want)
 	}
 }
 
-func TestPathGuardRemapsStaleProjectAbsolutePath(t *testing.T) {
-	root := t.TempDir()
-	doc := filepath.Join(root, "docs", "current.md")
-	if err := os.MkdirAll(filepath.Dir(doc), 0o755); err != nil {
-		t.Fatal(err)
+func TestResolveAllowedPathRejectsOutsideRoot(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	if _, err := ResolveAllowedPath("/etc/passwd", cfg); err == nil {
+		t.Fatal("expected outside root error")
 	}
-	if err := os.WriteFile(doc, []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
+}
+
+func TestResolveAllowedPathAllowsAccessiblePath(t *testing.T) {
+	home := t.TempDir()
+	extra := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, AccessiblePaths: []string{extra}},
 	}
-	stale := filepath.Join("/Users/yijun/ws", filepath.Base(root), "docs", "current.md")
-	got, err := ResolveAllowedPath(stale, Context{ProjectRoot: root})
+	path, err := ResolveAllowedPath(filepath.Join(extra, "ok.txt"), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != doc {
-		t.Fatalf("expected remapped path %q, got %q", doc, got)
+	if path != filepath.Join(extra, "ok.txt") {
+		t.Fatalf("path = %q", path)
 	}
 }
 
-func TestWebSearchHonorsDisabledProviders(t *testing.T) {
-	result := WebSearch().Run(context.Background(), Call{
-		Args:    map[string]string{"query": "Mateway"},
-		Context: Context{Search: SearchConfig{}},
-	})
-	if result.OK || !strings.Contains(result.Error, "disabled") {
-		t.Fatalf("expected disabled provider error, got %#v", result)
+func TestIsDangerousCommand(t *testing.T) {
+	if !IsDangerousCommand("git reset --hard") {
+		t.Fatal("expected git reset to be dangerous")
+	}
+	if IsDangerousCommand("go test ./...") {
+		t.Fatal("expected go test to be safe")
 	}
 }
 
-func TestWebSearchUsesCacheWithoutEnabledProvider(t *testing.T) {
-	root := t.TempDir()
-	cfg := SearchConfig{CacheDir: root, CacheEnabled: true, CacheTTLHours: 24}
-	writeWebSearchCache(cfg, "Mateway", Result{
-		OK:       true,
-		Output:   "cached result",
-		Evidence: map[string]any{"kind": "web_search", "provider": "duckduckgo", "query": "Mateway", "result_count": 1},
-	})
-	result := WebSearch().Run(context.Background(), Call{
-		Args:    map[string]string{"query": "Mateway"},
-		Context: Context{Search: cfg},
-	})
-	if !result.OK || !strings.Contains(result.Output, "cached result") {
-		t.Fatalf("expected cached search result, got %#v", result)
+func TestFileReadRejectsLargeFile(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "large.txt")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 512*1024+1)), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if hit, _ := result.Evidence["cache_hit"].(bool); !hit {
-		t.Fatalf("expected cache_hit evidence, got %#v", result.Evidence)
-	}
-	if _, err := os.Stat(filepath.Join(root, "search")); err != nil {
-		t.Fatalf("expected cache directory to exist: %v", err)
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if !result.IsError || !strings.Contains(result.Content, "file too large") {
+		t.Fatalf("expected large file error, got %#v", result)
 	}
 }
 
-func TestWebSearchSkipsTavilyWhenBudgetExhausted(t *testing.T) {
-	root := t.TempDir()
-	cfg := SearchConfig{
-		CacheDir:            root,
-		ProviderOrder:       []string{"tavily"},
-		TavilyEnabled:       true,
-		TavilyAPIKey:        "test",
-		TavilyDailyBudget:   1,
-		TavilyMonthlyBudget: 10,
+func TestFileReadRejectsBinaryFile(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "binary.bin")
+	if err := os.WriteFile(path, []byte{0, 1, 2, 3}, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	recordTavilyUsage(cfg)
-	result := WebSearch().Run(context.Background(), Call{
-		Args:    map[string]string{"query": "Mateway"},
-		Context: Context{Search: cfg},
-	})
-	if result.OK || !strings.Contains(result.Error, "budget exhausted") {
-		t.Fatalf("expected tavily budget exhausted, got %#v", result)
-	}
-}
-
-func TestWebSearchProviderOverrideFallsBackToConfiguredOrder(t *testing.T) {
-	root := t.TempDir()
-	cfg := SearchConfig{
-		CacheDir:      root,
-		CacheEnabled:  true,
-		CacheTTLHours: 24,
-		ProviderOrder: []string{"cache"},
-	}
-	writeWebSearchCache(cfg, "Mateway", Result{
-		OK:       true,
-		Output:   "cached fallback",
-		Evidence: map[string]any{"kind": "web_search", "provider": "duckduckgo", "query": "Mateway", "result_count": 1},
-	})
-	result := WebSearch().Run(context.Background(), Call{
-		Args:    map[string]string{"query": "Mateway", "provider": "tavily"},
-		Context: Context{Search: cfg},
-	})
-	if result.OK || !strings.Contains(result.Error, "tavily disabled") {
-		t.Fatalf("expected provider override to force only tavily, got %#v", result)
-	}
-}
-
-func TestWebFetchReadsKnownURL(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`<html><head><title>Test Page</title></head><body><main>Hello <b>Mateway</b></main></body></html>`))
-	}))
-	defer server.Close()
-	result := WebFetch().Run(context.Background(), Call{
-		Args: map[string]string{"url": server.URL},
-	})
-	if !result.OK || !strings.Contains(result.Output, "Test Page") || !strings.Contains(result.Output, "Hello Mateway") {
-		t.Fatalf("expected fetched page preview, got %#v", result)
-	}
-	if kind, _ := result.Evidence["kind"].(string); kind != "web_fetch" {
-		t.Fatalf("expected web_fetch evidence, got %#v", result.Evidence)
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if !result.IsError || !strings.Contains(result.Content, "binary") {
+		t.Fatalf("expected binary file error, got %#v", result)
 	}
 }

@@ -1,3 +1,0 @@
-display_name: Source Evaluation
-short_description: Rank and filter sources by authority, freshness, and directness.
-default_prompt: Evaluate source quality and preserve high-confidence conclusions.

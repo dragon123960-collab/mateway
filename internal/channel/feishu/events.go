@@ -47,6 +47,12 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 		OnP2MessageReadV1(func(eventCtx context.Context, event *larkim.P2MessageReadV1) error {
 			return nil
 		}).
+		OnP2MessageReactionCreatedV1(func(eventCtx context.Context, event *larkim.P2MessageReactionCreatedV1) error {
+			return nil
+		}).
+		OnP2MessageReactionDeletedV1(func(eventCtx context.Context, event *larkim.P2MessageReactionDeletedV1) error {
+			return nil
+		}).
 		OnP2ChatAccessEventBotP2pChatEnteredV1(func(eventCtx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
 			return nil
 		})
