@@ -34,6 +34,10 @@ func New(cfg *config.Root) Runtime {
 	hooks := defaultRuntimeHooks()
 	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
+	hooks.Providers = append(hooks.Providers, ruleFollowupHookProvider{})
+	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
+	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
+	hooks.Providers = append(hooks.Providers, defaultResponseHookProvider{})
 	return Runtime{
 		Config: cfg,
 		Store:  session.NewStore(cfg.App.Home),
@@ -66,7 +70,7 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		}
 		return resp, err
 	}
-	decision := resolveFollowup(state, msg.Text)
+	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text}, trace)
 	if decision.Kind == followupClarify {
 		task := state.StartTask(msg.Text)
 		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
@@ -151,17 +155,30 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		return Response{}, err
 	}
 
-	text := sanitizeResponse(result.FinalText)
-	if text == "" {
-		text = fallbackFinalReply(result.FinalText)
-	}
+	var learningResult *memory.LearningResult
 	if taskCompleted {
-		if learningResult, err := rt.recordTaskCompletion(*state, task.ID, text, trace); err != nil {
-			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "observe_hook", "provider": "self_learning", "error": err.Error()})
-		} else if learningResult.Proposal != nil {
-			text = appendMemoryReviewBlock(text, *learningResult.Proposal)
+		home := rt.home()
+		observe := rt.Hooks.observe(ctx, ObserveHookInput{
+			Kind:       "task_completed",
+			Home:       home,
+			SessionKey: state.Key,
+			State:      *state,
+			TaskID:     task.ID,
+			FinalText:  result.FinalText,
+			TraceID:    trace.id,
+			TracePath:  trace.path,
+		}, trace)
+		learningResult = observe.LearningResult
+		if learningResult != nil {
+			_ = trace.write(map[string]any{
+				"type":            "self_learning",
+				"diary_path":      learningResult.DiaryPath,
+				"reflection_path": learningResult.ReflectionPath,
+				"proposal_id":     proposalID(learningResult.Proposal),
+			})
 		}
 	}
+	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
 	resp := Response{
 		Reply: channel.OutboundMessage{
 			Channel:  msg.Channel,
@@ -175,42 +192,12 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	return resp, nil
 }
 
-func (rt Runtime) recordTaskCompletion(state session.State, taskID, finalText string, trace *traceRecorder) (memory.LearningResult, error) {
-	task, ok := taskByID(state, taskID)
-	if !ok {
-		return memory.LearningResult{}, nil
-	}
+func (rt Runtime) home() string {
 	home := config.DefaultHome()
 	if rt.Config != nil && strings.TrimSpace(rt.Config.App.Home) != "" {
 		home = rt.Config.App.Home
 	}
-	result, err := memory.RecordTaskCompletion(memory.LearningEvent{
-		Home:       home,
-		SessionKey: state.Key,
-		Task:       task,
-		FinalText:  finalText,
-		TraceID:    trace.id,
-		TracePath:  trace.path,
-	})
-	if err != nil {
-		return memory.LearningResult{}, err
-	}
-	_ = trace.write(map[string]any{
-		"type":            "self_learning",
-		"diary_path":      result.DiaryPath,
-		"reflection_path": result.ReflectionPath,
-		"proposal_id":     proposalID(result.Proposal),
-	})
-	return result, nil
-}
-
-func taskByID(state session.State, taskID string) (session.TaskNode, bool) {
-	for _, task := range state.Tasks {
-		if task.ID == taskID {
-			return task, true
-		}
-	}
-	return session.TaskNode{}, false
+	return home
 }
 
 func proposalID(proposal *memory.Proposal) string {
@@ -264,39 +251,31 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			return append([]agentcore.Message(nil), steering...), nil
 		},
 		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
-			if input.ToolCall.Name == "terminal.run" && tool.IsDangerousCommand(fmt.Sprint(input.ToolCall.Args["command"])) {
+			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)
+			if policy.Block {
 				state.Pending = &session.PendingAction{
 					Kind:       "confirm_tool",
 					TaskID:     taskID,
 					ToolCall:   input.ToolCall,
-					ResumeText: "确认后继续执行危险命令",
+					ResumeText: policy.ResumeText,
 				}
 				state.BlockActiveTask("await_confirm")
-				return agentcore.BeforeToolCallResult{Block: true, Reason: "这个命令可能有破坏性。回复“确认”继续，或回复“取消”放弃。"}, nil
-			}
-			if input.Tool.Risk() == agentcore.RiskGuardedMutation || input.Tool.Risk() == agentcore.RiskDangerous {
-				if rt.Config != nil && !rt.Config.Security.RequireApprovalForRiskyTool {
-					return agentcore.BeforeToolCallResult{}, nil
-				}
-				state.Pending = &session.PendingAction{
-					Kind:       "confirm_tool",
-					TaskID:     taskID,
-					ToolCall:   input.ToolCall,
-					ResumeText: "确认后继续执行 " + input.Tool.Name(),
-				}
-				state.BlockActiveTask("await_confirm")
-				return agentcore.BeforeToolCallResult{Block: true, Reason: "继续之前需要确认。回复“确认”继续，或回复“取消”放弃。"}, nil
+				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
 			}
 			return agentcore.BeforeToolCallResult{}, nil
 		},
 		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
-			status, evidence := acceptToolResult(input.Tool, input.ToolResult)
-			state.AddStep(taskID, session.TaskStep{
-				Tool:     input.ToolCall.Name,
-				Status:   status,
-				Summary:  summarize(input.ToolResult.Content),
-				Evidence: evidence,
-			})
+			observe := rt.Hooks.observe(context.Background(), ObserveHookInput{
+				Kind:       "tool_result",
+				State:      *state,
+				TaskID:     taskID,
+				ToolCall:   input.ToolCall,
+				Tool:       input.Tool,
+				ToolResult: input.ToolResult,
+			}, trace)
+			if observe.TaskStep != nil {
+				state.AddStep(taskID, *observe.TaskStep)
+			}
 			return agentcore.AfterToolCallResult{}, nil
 		},
 	}
@@ -325,8 +304,21 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
 		result := rt.Tools.Execute(ctx, call)
 		toolDef, _ := rt.Tools.Get(call.Name)
-		status, evidence := acceptToolResult(toolDef, result)
-		state.AddStep(state.ActiveTask, session.TaskStep{Tool: call.Name, Status: status, Summary: summarize(result.Content), Evidence: evidence})
+		observe := rt.Hooks.observe(ctx, ObserveHookInput{
+			Kind:       "tool_result",
+			State:      *state,
+			TaskID:     state.ActiveTask,
+			ToolCall:   call,
+			Tool:       toolDef,
+			ToolResult: result,
+		}, trace)
+		status := ""
+		evidence := map[string]any{}
+		if observe.TaskStep != nil {
+			state.AddStep(state.ActiveTask, *observe.TaskStep)
+			status = observe.TaskStep.Status
+			evidence = observe.TaskStep.Evidence
+		}
 		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": result, "acceptance": status, "evidence": evidence})
 		state.Messages = append(state.Messages,
 			agentcore.Message{Role: agentcore.RoleUser, Content: text},

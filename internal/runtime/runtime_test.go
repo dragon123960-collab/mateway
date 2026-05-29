@@ -613,6 +613,51 @@ func TestRuntimeContextHookTimeoutWritesWarningAndContinues(t *testing.T) {
 	}
 }
 
+func TestRuntimeResponseHookFailureFallsBack(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{panicResponseHookProvider{}}, rt.Hooks.Providers...)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "收到：hello" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"hook":"response_hook"`) || !contains(string(data), `"provider":"panic_response"`) {
+		t.Fatalf("expected response hook warning, got %s", data)
+	}
+}
+
+func TestRuntimeToolPolicyHookFailureFallsBackToLaterProvider(t *testing.T) {
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: t.TempDir()},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: true},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{panicToolPolicyHookProvider{}}, rt.Hooks.Providers...)
+	target := filepath.Join(t.TempDir(), "out.txt")
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/write " + target + " hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "确认") {
+		t.Fatalf("expected later policy provider to require confirmation, got %#v", resp.Reply)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"hook":"tool_policy_hook"`) || !contains(string(data), `"provider":"panic_tool_policy"`) {
+		t.Fatalf("expected tool policy hook warning, got %s", data)
+	}
+}
+
 func TestRuntimeContextHookInjectsStaticContextAsSystemMessage(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
@@ -786,6 +831,22 @@ func (blockingHookProvider) Name() string { return "blocking_provider" }
 func (blockingHookProvider) ContextHook(ctx context.Context, _ ContextHookInput) (ContextHookResult, error) {
 	<-ctx.Done()
 	return ContextHookResult{}, ctx.Err()
+}
+
+type panicResponseHookProvider struct{}
+
+func (panicResponseHookProvider) Name() string { return "panic_response" }
+
+func (panicResponseHookProvider) ResponseHook(context.Context, ResponseHookInput) (ResponseHookResult, error) {
+	panic("boom")
+}
+
+type panicToolPolicyHookProvider struct{}
+
+func (panicToolPolicyHookProvider) Name() string { return "panic_tool_policy" }
+
+func (panicToolPolicyHookProvider) ToolPolicyHook(context.Context, ToolPolicyHookInput) (ToolPolicyHookResult, error) {
+	panic("boom")
 }
 
 type captureRuntimeContextModel struct {
