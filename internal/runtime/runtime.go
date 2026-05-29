@@ -19,6 +19,7 @@ type Runtime struct {
 	Tools  *agentcore.ToolRegistry
 	Model  agentcore.Model
 	Pool   AgentPool
+	Hooks  RuntimeHooks
 }
 
 type Response struct {
@@ -29,12 +30,15 @@ type Response struct {
 }
 
 func New(cfg *config.Root) Runtime {
+	hooks := defaultRuntimeHooks()
+	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
 	return Runtime{
 		Config: cfg,
 		Store:  session.NewStore(cfg.App.Home),
 		Tools:  tool.NewRegistry(cfg),
 		Model:  HeuristicModel{},
 		Pool:   NewAgentPool(cfg),
+		Hooks:  hooks,
 	}
 }
 
@@ -99,7 +103,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	agent.Messages = messages
 	agent.MaxIterations = 6
-	agent.Hooks = rt.hooksForState(state, task.ID, trace)
+	profile := rt.Pool.ProfileForSession(msg.SessionKey)
+	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+		Message:  msg,
+		State:    *state,
+		TaskID:   task.ID,
+		UserText: userText,
+		Profile:  profile,
+	}, trace))
 	result, err := agent.Continue(ctx)
 	if err != nil {
 		state.BlockActiveTask("failed")
@@ -160,9 +171,17 @@ func fallbackFinalReply(raw string) string {
 	return "我还没有生成可用回复。"
 }
 
-func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+	steeringSent := false
 	return agentcore.Hooks{
 		Emit: trace.emit,
+		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
+			if steeringSent {
+				return nil, nil
+			}
+			steeringSent = true
+			return append([]agentcore.Message(nil), steering...), nil
+		},
 		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
 			if input.ToolCall.Name == "terminal.run" && tool.IsDangerousCommand(fmt.Sprint(input.ToolCall.Args["command"])) {
 				state.Pending = &session.PendingAction{
@@ -315,7 +334,7 @@ func summarize(text string) string {
 type HeuristicModel struct{}
 
 func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
-	last := lastMessage(ctx.Messages)
+	last := lastConversationMessage(ctx.Messages)
 	if last.Role == agentcore.RoleTool {
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: last.Content}, nil
 	}
@@ -346,11 +365,13 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "收到：" + text}, nil
 }
 
-func lastMessage(messages []agentcore.Message) agentcore.Message {
-	if len(messages) == 0 {
-		return agentcore.Message{}
+func lastConversationMessage(messages []agentcore.Message) agentcore.Message {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != agentcore.RoleSystem {
+			return messages[i]
+		}
 	}
-	return messages[len(messages)-1]
+	return agentcore.Message{}
 }
 
 func looksLikeInputRequest(text string) bool {

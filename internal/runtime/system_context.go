@@ -92,6 +92,7 @@ func workspaceProfileContext(cfg *config.Root, profile config.AgentProfileConfig
 		filepath.Join(workspace, "agents", agentID, "agent.md"),
 		filepath.Join(workspace, "agents", agentID, "user.md"),
 		filepath.Join(workspace, "agents", agentID, "tools.md"),
+		filepath.Join(workspace, "agents", agentID, "memory.md"),
 		filepath.Join(workspace, "memory", "user", "index.md"),
 	}
 	var sections []string

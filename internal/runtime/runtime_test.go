@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
@@ -502,6 +503,9 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 	if err := os.WriteFile(filepath.Join(agentDir, "user.md"), []byte("默认使用中文。"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(agentDir, "memory.md"), []byte("用户偏好：回答先给结论。"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	skillDir := filepath.Join(workspace, "skills", "fresh-search")
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -515,10 +519,86 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 		Search:   config.SearchConfig{ProviderOrder: []string{"searxng"}},
 	}
 	text := buildRuntimeSystemContext(cfg, config.AgentProfileConfig{ID: "main"})
-	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "默认使用中文", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
+	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
 		if !contains(text, want) {
 			t.Fatalf("context missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRuntimeContextHookFailureWritesWarningAndContinues(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = []HookProvider{panicHookProvider{}}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "收到：hello" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"hook_warning"`) || !contains(string(data), `"provider":"panic_provider"`) {
+		t.Fatalf("expected hook warning trace, got %s", data)
+	}
+}
+
+func TestRuntimeContextHookTimeoutWritesWarningAndContinues(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks = RuntimeHooks{Providers: []HookProvider{blockingHookProvider{}}, Timeout: time.Nanosecond}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "收到：hello" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"hook_warning"`) || !contains(string(data), `"provider":"blocking_provider"`) {
+		t.Fatalf("expected timeout hook warning trace, got %s", data)
+	}
+}
+
+func TestRuntimeContextHookInjectsStaticContextAsSystemMessage(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	agentDir := filepath.Join(workspace, "agents", "main")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "memory.md"), []byte("偏好：保持简短。"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home, Workspace: workspace},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	model := &captureRuntimeContextModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "ok" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	if !contains(model.systemMessages, "static_runtime_context") || !contains(model.systemMessages, "偏好：保持简短。") {
+		t.Fatalf("expected injected static context, got %q", model.systemMessages)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"hook_event"`) || !contains(string(data), `"sections":["static_runtime_context"]`) {
+		t.Fatalf("expected context hook trace event, got %s", data)
 	}
 }
 
@@ -569,6 +649,27 @@ type errorModel struct {
 	err error
 }
 
+type panicHookProvider struct{}
+
+func (panicHookProvider) Name() string { return "panic_provider" }
+
+func (panicHookProvider) ContextHook(context.Context, ContextHookInput) (ContextHookResult, error) {
+	panic("boom")
+}
+
+type blockingHookProvider struct{}
+
+func (blockingHookProvider) Name() string { return "blocking_provider" }
+
+func (blockingHookProvider) ContextHook(ctx context.Context, _ ContextHookInput) (ContextHookResult, error) {
+	<-ctx.Done()
+	return ContextHookResult{}, ctx.Err()
+}
+
+type captureRuntimeContextModel struct {
+	systemMessages string
+}
+
 func contains(text, want string) bool {
 	return strings.Contains(text, want)
 }
@@ -588,4 +689,15 @@ func (m staticModel) Next(context.Context, agentcore.Context) (agentcore.Message
 
 func (m errorModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
 	return agentcore.Message{}, m.err
+}
+
+func (m *captureRuntimeContextModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	var parts []string
+	for _, msg := range ctx.Messages {
+		if msg.Role == agentcore.RoleSystem {
+			parts = append(parts, msg.Content)
+		}
+	}
+	m.systemMessages = strings.Join(parts, "\n\n")
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "ok"}, nil
 }

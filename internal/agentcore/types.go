@@ -96,6 +96,7 @@ type Context struct {
 }
 
 type Config struct {
+	SystemPrompt  string
 	Model         Model
 	Tools         *ToolRegistry
 	MaxIterations int

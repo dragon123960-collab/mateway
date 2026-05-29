@@ -32,8 +32,9 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 
 		modelStart := time.Now()
 		assistant, err := cfg.Model.Next(ctx, Context{
-			Messages: transcript,
-			Tools:    toolsForContext(cfg.Tools),
+			SystemPrompt: cfg.SystemPrompt,
+			Messages:     transcript,
+			Tools:        toolsForContext(cfg.Tools),
 		})
 		modelDuration := time.Since(modelStart)
 		if err != nil {
@@ -160,8 +161,9 @@ func synthesizeAfterToolBudget(ctx context.Context, cfg Config, transcript []Mes
 	})
 	modelStart := time.Now()
 	assistant, err := cfg.Model.Next(ctx, Context{
-		Messages: transcript,
-		Tools:    nil,
+		SystemPrompt: cfg.SystemPrompt,
+		Messages:     transcript,
+		Tools:        nil,
 	})
 	modelDuration := time.Since(modelStart)
 	if err != nil {
@@ -197,7 +199,7 @@ func synthesizeMalformedToolCall(ctx context.Context, cfg Config, transcript []M
 		Content: "The last tool call block was malformed and cannot be executed. Do not call more tools. Provide the best final answer from the existing evidence and state what remains unverified.",
 	})
 	modelStart := time.Now()
-	assistant, err := cfg.Model.Next(ctx, Context{Messages: transcript, Tools: nil})
+	assistant, err := cfg.Model.Next(ctx, Context{SystemPrompt: cfg.SystemPrompt, Messages: transcript, Tools: nil})
 	modelDuration := time.Since(modelStart)
 	if err != nil {
 		return Result{}, err

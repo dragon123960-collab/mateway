@@ -43,6 +43,19 @@ func (p AgentPool) AgentForSession(sessionKey string) *agentcore.Agent {
 	return agentcore.NewAgent(HeuristicModel{}, tool.NewRegistry(p.config))
 }
 
+func (p AgentPool) ProfileForSession(sessionKey string) config.AgentProfileConfig {
+	agentID := p.resolveAgentID(sessionKey)
+	if profile, ok := p.profileByID(agentID); ok {
+		return profile
+	}
+	if p.config != nil {
+		if profile, ok := p.profileByID(p.config.Agents.Default); ok {
+			return profile
+		}
+	}
+	return config.AgentProfileConfig{ID: "main"}
+}
+
 func (p AgentPool) resolveAgentID(sessionKey string) string {
 	if p.config == nil {
 		return ""
@@ -57,6 +70,18 @@ func (p AgentPool) resolveAgentID(sessionKey string) string {
 		}
 	}
 	return p.config.Agents.Default
+}
+
+func (p AgentPool) profileByID(agentID string) (config.AgentProfileConfig, bool) {
+	if p.config == nil {
+		return config.AgentProfileConfig{}, false
+	}
+	for _, profile := range p.config.Agents.Profiles {
+		if strings.EqualFold(strings.TrimSpace(profile.ID), strings.TrimSpace(agentID)) {
+			return profile, true
+		}
+	}
+	return config.AgentProfileConfig{}, false
 }
 
 func cloneAgent(agent *agentcore.Agent) *agentcore.Agent {
@@ -97,9 +122,7 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 		}
 	}
 	if len(configs) > 0 {
-		agentModel := model.NewFallbackAgentModel(configs)
-		agentModel.SystemPrompt = strings.TrimSpace(agentModel.SystemPrompt + "\n\n" + buildRuntimeSystemContext(cfg, profile))
-		return agentModel
+		return model.NewFallbackAgentModel(configs)
 	}
 	return HeuristicModel{}
 }

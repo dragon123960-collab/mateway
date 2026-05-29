@@ -189,6 +189,28 @@ func TestRunAfterToolCallReceivesToolDefinition(t *testing.T) {
 	}
 }
 
+func TestRunPassesSystemPromptAndSteeringMessages(t *testing.T) {
+	model := captureContextModel{}
+	_, err := Run(context.Background(), Config{
+		SystemPrompt: "base system",
+		Model:        &model,
+		Hooks: Hooks{
+			GetSteeringMessages: func(context.Context) ([]Message, error) {
+				return []Message{{Role: RoleSystem, Content: "hook system"}}, nil
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "hi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.systemPrompt != "base system" {
+		t.Fatalf("system prompt = %q", model.systemPrompt)
+	}
+	if !containsSystemMessage(model.messages, "hook system") {
+		t.Fatalf("expected steering system message, got %#v", model.messages)
+	}
+}
+
 type scriptedModel struct {
 	messages []Message
 	index    int
@@ -254,4 +276,24 @@ func containsUserMessage(messages []Message, content string) bool {
 		}
 	}
 	return false
+}
+
+func containsSystemMessage(messages []Message, content string) bool {
+	for _, msg := range messages {
+		if msg.Role == RoleSystem && strings.Contains(msg.Content, content) {
+			return true
+		}
+	}
+	return false
+}
+
+type captureContextModel struct {
+	systemPrompt string
+	messages     []Message
+}
+
+func (m *captureContextModel) Next(_ context.Context, ctx Context) (Message, error) {
+	m.systemPrompt = ctx.SystemPrompt
+	m.messages = append([]Message(nil), ctx.Messages...)
+	return Message{Role: RoleAssistant, Content: "ok"}, nil
 }

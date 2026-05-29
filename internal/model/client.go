@@ -58,10 +58,16 @@ func NewFallbackAgentModel(configs []config.ModelConfig) AgentModel {
 
 func (m AgentModel) Next(ctx context.Context, agentCtx agentcore.Context) (agentcore.Message, error) {
 	messages := make([]Message, 0, len(agentCtx.Messages))
+	var systemSections []string
+	if base := strings.TrimSpace(agentCtx.SystemPrompt); base != "" {
+		systemSections = append(systemSections, base)
+	}
 	for _, msg := range agentCtx.Messages {
 		switch msg.Role {
 		case agentcore.RoleSystem:
-			continue
+			if text := strings.TrimSpace(msg.Content); text != "" {
+				systemSections = append(systemSections, text)
+			}
 		case agentcore.RoleTool:
 			messages = append(messages, Message{Role: "user", Content: "Tool result (" + msg.ToolCallID + "):\n" + msg.Content})
 		case agentcore.RoleAssistant:
@@ -72,7 +78,11 @@ func (m AgentModel) Next(ctx context.Context, agentCtx agentcore.Context) (agent
 			messages = append(messages, Message{Role: "user", Content: msg.Content})
 		}
 	}
-	text, err := m.generateWithFallbacks(ctx, buildSystemPrompt(m.SystemPrompt, agentCtx.Tools), messages)
+	systemPrompt := strings.TrimSpace(m.SystemPrompt)
+	if len(systemSections) > 0 {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + strings.Join(systemSections, "\n\n"))
+	}
+	text, err := m.generateWithFallbacks(ctx, buildSystemPrompt(systemPrompt, agentCtx.Tools), messages)
 	if err != nil {
 		return agentcore.Message{}, err
 	}

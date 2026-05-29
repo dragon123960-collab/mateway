@@ -28,6 +28,7 @@ func (a *Agent) Prompt(ctx context.Context, messages ...Message) (Result, error)
 	}
 	a.Messages = append(a.Messages, messages...)
 	result, err := Run(ctx, Config{
+		SystemPrompt:  a.SystemPrompt,
 		Model:         a.Model,
 		Tools:         a.Tools,
 		MaxIterations: a.MaxIterations,
@@ -42,6 +43,7 @@ func (a *Agent) Prompt(ctx context.Context, messages ...Message) (Result, error)
 
 func (a *Agent) Continue(ctx context.Context) (Result, error) {
 	result, err := Run(ctx, Config{
+		SystemPrompt:  a.SystemPrompt,
 		Model:         a.Model,
 		Tools:         a.Tools,
 		MaxIterations: a.MaxIterations,
