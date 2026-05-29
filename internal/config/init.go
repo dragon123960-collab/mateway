@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"gopkg.in/yaml.v3"
 )
 
 type templateFile struct {
@@ -52,7 +54,96 @@ func EnsureDefaultConfigFiles(home string) error {
 			return err
 		}
 	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "config.yaml"), []byte(configYAMLTemplate)); err != nil {
+		return err
+	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "feishu.yaml"), []byte(feishuYAMLTemplate)); err != nil {
+		return err
+	}
 	return nil
+}
+
+func mergeDefaultYAMLFile(path string, defaults []byte) error {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var currentNode yaml.Node
+	if err := yaml.Unmarshal(existing, &currentNode); err != nil {
+		return err
+	}
+	var defaultNode yaml.Node
+	if err := yaml.Unmarshal(defaults, &defaultNode); err != nil {
+		return err
+	}
+	if mergeYAMLMapping(documentMapping(&currentNode), documentMapping(&defaultNode)) {
+		out, err := yaml.Marshal(&currentNode)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(path, out, 0o644)
+	}
+	return nil
+}
+
+func documentMapping(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return node.Content[0]
+	}
+	if node.Kind == yaml.MappingNode {
+		return node
+	}
+	return nil
+}
+
+func mergeYAMLMapping(current, defaults *yaml.Node) bool {
+	if current == nil || defaults == nil || current.Kind != yaml.MappingNode || defaults.Kind != yaml.MappingNode {
+		return false
+	}
+	changed := false
+	for i := 0; i+1 < len(defaults.Content); i += 2 {
+		key := defaults.Content[i]
+		value := defaults.Content[i+1]
+		existing := mappingValue(current, key.Value)
+		if existing == nil {
+			current.Content = append(current.Content, cloneYAMLNode(key), cloneYAMLNode(value))
+			changed = true
+			continue
+		}
+		if existing.Kind == yaml.MappingNode && value.Kind == yaml.MappingNode {
+			if mergeYAMLMapping(existing, value) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	clone.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		clone.Content[i] = cloneYAMLNode(child)
+	}
+	return &clone
 }
 
 func writeFileIfMissing(path, content string) error {
@@ -106,22 +197,26 @@ skills:
       enabled: true
       base_url: https://skills.sh
       search_url: "https://skills.sh/?q={query}"
+      install_url: ""
       trust_level: high
     - name: skillhub.cn
       enabled: false
       base_url: https://skillhub.cn
       search_url: "https://skillhub.cn/search?q={query}"
+      install_url: ""
       trust_level: unknown
     - name: clawhub.ai
       enabled: false
       base_url: https://clawhub.ai
       search_url: "https://clawhub.ai/search?q={query}"
+      install_url: ""
       trust_level: medium
 
 scheduler:
   enabled: false
   timezone: Asia/Shanghai
   state_dir: ""
+  interval: 30s
 
 agents:
   default: main
@@ -139,9 +234,8 @@ agents:
         schedule:
           daily_at: "03:30"
         jobs:
-          - memory_daily_review
-          - memory_recent_compact
           - memory_lint
+          - memory_index_rebuild
         auto_send_summary: false
         quiet_hours:
           start: "23:00"

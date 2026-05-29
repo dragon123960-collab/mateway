@@ -25,6 +25,7 @@ type Skill struct {
 type SearchResult struct {
 	Catalog    string
 	URL        string
+	InstallURL string
 	Enabled    bool
 	TrustLevel string
 }
@@ -83,6 +84,7 @@ func SearchCatalogs(cfg *config.Root, query string) []SearchResult {
 		out = append(out, SearchResult{
 			Catalog:    catalog.Name,
 			URL:        searchURL,
+			InstallURL: strings.TrimSpace(catalog.InstallURL),
 			Enabled:    catalog.Enabled,
 			TrustLevel: catalog.TrustLevel,
 		})
@@ -246,8 +248,8 @@ func sanitizeName(name string) string {
 
 func defaultCatalogs() []config.SkillCatalogConfig {
 	return []config.SkillCatalogConfig{
-		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", TrustLevel: "high"},
-		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", TrustLevel: "unknown"},
-		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", TrustLevel: "medium"},
+		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", InstallURL: "", TrustLevel: "high"},
+		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", InstallURL: "", TrustLevel: "unknown"},
+		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", InstallURL: "", TrustLevel: "medium"},
 	}
 }

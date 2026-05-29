@@ -156,7 +156,7 @@ func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {
 	}
 }
 
-func TestEnsureDefaultConfigFilesDoesNotOverwriteExistingConfig(t *testing.T) {
+func TestEnsureDefaultConfigFilesPreservesExistingConfigValues(t *testing.T) {
 	home := t.TempDir()
 	configPath := filepath.Join(home, "config", "config.yaml")
 	writeFile(t, configPath, "app:\n  name: custom\n")
@@ -169,8 +169,33 @@ func TestEnsureDefaultConfigFilesDoesNotOverwriteExistingConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
-	if string(data) != "app:\n  name: custom\n" {
-		t.Fatalf("expected existing config to stay untouched, got %q", string(data))
+	text := string(data)
+	if !strings.Contains(text, "name: custom") {
+		t.Fatalf("expected existing config value to stay untouched, got %q", text)
+	}
+}
+
+func TestEnsureDefaultConfigFilesMergesMissingConfigKeys(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config", "config.yaml")
+	writeFile(t, configPath, "app:\n  name: custom\nscheduler:\n  enabled: true\n")
+
+	if err := EnsureDefaultConfigFiles(home); err != nil {
+		t.Fatalf("ensure default config files: %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "name: custom") || !strings.Contains(text, "enabled: true") {
+		t.Fatalf("existing values were not preserved:\n%s", text)
+	}
+	for _, want := range []string{"terminal_sandbox:", "interval: 30s", "skills:", "search:"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing merged key %q in:\n%s", want, text)
+		}
 	}
 }
 

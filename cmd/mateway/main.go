@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
 )
@@ -105,6 +107,8 @@ func run(args []string) error {
 		return nil
 	case "memory":
 		return runMemory(args[1:])
+	case "schedule":
+		return runSchedule(args[1:])
 	case "skill":
 		return runSkill(args[1:])
 	case "gateway":
@@ -222,7 +226,11 @@ func runSkill(args []string) error {
 			if !result.Enabled && !*includeDisabled {
 				continue
 			}
-			fmt.Printf("- %s enabled=%v trust=%s url=%s\n", result.Catalog, result.Enabled, result.TrustLevel, result.URL)
+			fmt.Printf("- %s enabled=%v trust=%s url=%s", result.Catalog, result.Enabled, result.TrustLevel, result.URL)
+			if result.InstallURL != "" {
+				fmt.Printf(" install_url=%s", result.InstallURL)
+			}
+			fmt.Println()
 		}
 		return nil
 	case "install":
@@ -250,6 +258,94 @@ func runSkill(args []string) error {
 	default:
 		return fmt.Errorf("usage: mateway skill <list|search|install>")
 	}
+}
+
+func runSchedule(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway schedule <list|run-due|serve>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := schedule.Store{Home: cfg.App.Home}
+	switch args[0] {
+	case "list":
+		tasks, err := store.List()
+		if err != nil {
+			return err
+		}
+		fmt.Println("schedules:", len(tasks))
+		for _, task := range tasks {
+			fmt.Printf("- %s status=%s run_at=%s interval=%s channel=%s thread=%s text=%s\n", task.ID, task.Status, task.RunAt, task.Interval, task.Channel, task.ThreadID, summarizeCLIText(task.Text, 80))
+		}
+		return nil
+	case "run-due":
+		return runDueSchedules(context.Background(), cfg, store)
+	case "serve":
+		interval := 30 * time.Second
+		if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Scheduler.Interval)); err == nil && parsed > 0 {
+			interval = parsed
+		}
+		fmt.Println("schedule:", "serve")
+		fmt.Println("interval:", interval)
+		for {
+			if err := runDueSchedules(context.Background(), cfg, store); err != nil {
+				return err
+			}
+			time.Sleep(interval)
+		}
+	default:
+		return fmt.Errorf("usage: mateway schedule <list|run-due|serve>")
+	}
+}
+
+func runDueSchedules(ctx context.Context, cfg *config.Root, store schedule.Store) error {
+	due, err := store.Due(time.Now())
+	if err != nil {
+		return err
+	}
+	fmt.Println("due:", len(due))
+	rt := runtime.New(cfg)
+	for _, task := range due {
+		msg := channel.InboundMessage{
+			ID:         task.ID,
+			Channel:    firstNonEmpty(task.Channel, "schedule"),
+			ThreadID:   task.ThreadID,
+			UserID:     task.UserID,
+			SessionKey: firstNonEmpty(task.SessionKey, task.Channel+":"+task.ThreadID),
+			Text:       task.Text,
+			Metadata:   map[string]string{"scheduled_task_id": task.ID},
+		}
+		if strings.TrimSpace(msg.SessionKey) == "" || strings.HasSuffix(msg.SessionKey, ":") {
+			msg.SessionKey = gateway.SessionKey(msg)
+		}
+		resp, err := rt.Handle(ctx, msg)
+		if err != nil {
+			return err
+		}
+		if err := deliverScheduledReply(ctx, cfg, task, resp.Reply); err != nil {
+			return err
+		}
+		if err := store.MarkRan(task, time.Now()); err != nil {
+			return err
+		}
+		fmt.Println("ran:", task.ID)
+	}
+	return nil
+}
+
+func deliverScheduledReply(ctx context.Context, cfg *config.Root, task schedule.Task, reply channel.OutboundMessage) error {
+	if task.Channel != "feishu" {
+		fmt.Println("reply:", strings.TrimSpace(reply.Text))
+		return nil
+	}
+	if cfg == nil || !cfg.Channels.Feishu.Enabled {
+		return fmt.Errorf("feishu channel is disabled")
+	}
+	reply.Channel = "feishu"
+	reply.ThreadID = task.ThreadID
+	return feishu.NewSender(cfg.Channels.Feishu).Send(ctx, reply)
 }
 
 func runMemory(args []string) error {
@@ -715,6 +811,23 @@ func splitComma(value string) []string {
 	return out
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func summarizeCLIText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + fmt.Sprintf("... (%d chars)", len(text))
+}
+
 type homeReport struct {
 	Home      string
 	Expected  []homeReportItem
@@ -743,6 +856,7 @@ func buildHomeReport(home string) (homeReport, error) {
 		"trace":   "runtime traces",
 		"observe": "learning diary, proposals, audit",
 		"indexes": "derived search indexes",
+		"schedules": "scheduled task state",
 		"run":     "process runtime state",
 		"logs":    "service logs",
 		"tmp":     "temporary files",
@@ -965,6 +1079,9 @@ Usage:
   mateway memory heartbeat lint-index
   mateway memory heartbeat serve [--once] [--interval <duration>]
   mateway memory report [--root <path>]
+  mateway schedule list
+  mateway schedule run-due
+  mateway schedule serve
   mateway home report
   mateway skill list
   mateway skill search [--all] <query>
