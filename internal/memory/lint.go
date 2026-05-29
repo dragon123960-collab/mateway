@@ -1,170 +1,257 @@
 package memory
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strings"
-	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-type LintIssue struct {
-	Path    string `json:"path"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+type Issue struct {
+	Path     string
+	Severity string
+	Code     string
+	Message  string
 }
 
-type LintReport struct {
-	Root      string      `json:"root"`
-	CheckedAt time.Time   `json:"checked_at"`
-	Issues    []LintIssue `json:"issues"`
+type LintResult struct {
+	Root   string
+	Files  int
+	Issues []Issue
 }
 
-const staleLongMemoryDays = 30
-
-func Lint(root string) (LintReport, error) {
-	report := LintReport{Root: root, CheckedAt: time.Now()}
-	if strings.TrimSpace(root) == "" {
-		return report, fmt.Errorf("memory root is required")
-	}
-	known := map[string]string{}
-	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || filepath.Ext(path) != ".md" {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, path)
-		name := strings.TrimSuffix(filepath.ToSlash(rel), ".md")
-		known[name] = path
-		known[strings.TrimSuffix(filepath.Base(path), ".md")] = path
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			report.Issues = append(report.Issues, LintIssue{Path: path, Code: "read_failed", Message: readErr.Error()})
-			return nil
-		}
-		text := string(data)
-		parsed, parseErr := parseMarkdown(text)
-		if requiresFrontmatter(path) {
-			if !parsed.HasYAML {
-				report.Issues = append(report.Issues, LintIssue{Path: path, Code: "missing_frontmatter", Message: "durable memory page should start with YAML frontmatter"})
-			} else if parseErr != nil {
-				report.Issues = append(report.Issues, LintIssue{Path: path, Code: "invalid_frontmatter", Message: parseErr.Error()})
-			} else {
-				report.Issues = append(report.Issues, validateMemoryFrontmatter(path, parsed.Frontmatter)...)
-				if issue, ok := staleLongMemoryIssue(path, parsed.Frontmatter, report.CheckedAt); ok {
-					report.Issues = append(report.Issues, issue)
-				}
-			}
-		}
-		if requiresSource(path) && hasSpecificClaim(parsed.Body) && !hasStrongSourceEvidence(parsed.Frontmatter.Sources) {
-			report.Issues = append(report.Issues, LintIssue{Path: path, Code: "weak_evidence", Message: "specific claims should include source path, URL, or line evidence"})
-		}
-		return nil
-	}); err != nil {
-		return report, err
-	}
-	linkRe := regexp.MustCompile(`\[\[([^\]]+)\]\]`)
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || filepath.Ext(path) != ".md" {
-			return nil
-		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
-		}
-		for _, match := range linkRe.FindAllStringSubmatch(stripMarkdownCode(string(data)), -1) {
-			target := strings.TrimSpace(strings.Split(match[1], "|")[0])
-			target = strings.TrimSuffix(filepath.ToSlash(target), ".md")
-			if _, ok := known[target]; !ok {
-				report.Issues = append(report.Issues, LintIssue{Path: path, Code: "broken_wikilink", Message: "missing target: " + target})
-			}
-		}
-		return nil
-	})
-	return report, nil
-}
-
-func staleLongMemoryIssue(path string, fm Frontmatter, now time.Time) (LintIssue, bool) {
-	normalized := filepath.ToSlash(path)
-	if !strings.Contains(normalized, "/long/") {
-		return LintIssue{}, false
-	}
-	if strings.ToLower(strings.TrimSpace(fm.Status)) != "active" {
-		return LintIssue{}, false
-	}
-	updated := strings.TrimSpace(fm.UpdatedAt)
-	if updated == "" {
-		return LintIssue{}, false
-	}
-	day, err := time.Parse("2006-01-02", updated)
-	if err != nil {
-		return LintIssue{}, false
-	}
-	if int(now.Sub(day).Hours()/24) < staleLongMemoryDays {
-		return LintIssue{}, false
-	}
-	return LintIssue{
-		Path:    path,
-		Code:    "stale_long_memory",
-		Message: fmt.Sprintf("active long memory has not been reviewed for %d+ days; re-validate before relying on it", staleLongMemoryDays),
-	}, true
-}
-
-func stripMarkdownCode(text string) string {
-	var out []string
-	inFence := false
-	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			out = append(out, "")
-			continue
-		}
-		if inFence {
-			out = append(out, "")
-			continue
-		}
-		out = append(out, stripInlineCode(line))
-	}
-	return strings.Join(out, "\n")
-}
-
-func stripInlineCode(line string) string {
-	var b strings.Builder
-	inCode := false
-	for _, r := range line {
-		if r == '`' {
-			inCode = !inCode
-			b.WriteRune(' ')
-			continue
-		}
-		if inCode {
-			b.WriteRune(' ')
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}
-
-func requiresFrontmatter(path string) bool {
-	normalized := filepath.ToSlash(path)
-	return strings.Contains(normalized, "/long/") || strings.Contains(normalized, "/inbox/")
-}
-
-func requiresSource(path string) bool {
-	normalized := filepath.ToSlash(path)
-	return strings.Contains(normalized, "/long/")
-}
-
-func hasSpecificClaim(text string) bool {
-	for _, r := range text {
-		if r >= '0' && r <= '9' {
+func (r LintResult) HasErrors() bool {
+	for _, issue := range r.Issues {
+		if issue.Severity == "error" {
 			return true
 		}
 	}
-	return strings.Contains(text, "%") || strings.Contains(text, "$")
+	return false
+}
+
+type Document struct {
+	Path        string
+	RelPath     string
+	FrontMatter map[string]any
+	Body        string
+}
+
+func LintRoot(root string) (LintResult, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return LintResult{}, fmt.Errorf("memory root is required")
+	}
+	result := LintResult{Root: root}
+	err := WalkDocuments(root, func(doc Document, issues []Issue) error {
+		result.Files++
+		result.Issues = append(result.Issues, issues...)
+		if len(issues) > 0 && doc.FrontMatter == nil {
+			return nil
+		}
+		result.Issues = append(result.Issues, lintDocument(doc)...)
+		return nil
+	})
+	sortIssues(result.Issues)
+	return result, err
+}
+
+func WalkDocuments(root string, fn func(Document, []Issue) error) error {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return fmt.Errorf("memory root is required")
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if shouldSkipMemoryDir(root, path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".md") {
+			return nil
+		}
+		if isSupportMarkdown(root, path) {
+			return nil
+		}
+		doc, issues := ReadDocument(path)
+		if rel, err := filepath.Rel(root, path); err == nil {
+			doc.RelPath = filepath.ToSlash(rel)
+		}
+		return fn(doc, issues)
+	})
+}
+
+func ReadDocument(path string) (Document, []Issue) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Document{Path: path}, []Issue{newIssue(path, "error", "read_failed", err.Error())}
+	}
+	frontMatter, body, err := parseFrontMatter(data)
+	if err != nil {
+		return Document{Path: path, Body: strings.TrimSpace(string(data))}, []Issue{newIssue(path, "error", "invalid_frontmatter", err.Error())}
+	}
+	if frontMatter == nil {
+		return Document{Path: path, Body: strings.TrimSpace(string(data))}, []Issue{newIssue(path, "error", "missing_frontmatter", "memory entry must start with YAML frontmatter")}
+	}
+	return Document{Path: path, FrontMatter: frontMatter, Body: strings.TrimSpace(body)}, nil
+}
+
+func parseFrontMatter(data []byte) (map[string]any, string, error) {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return nil, string(data), nil
+	}
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return nil, string(data), fmt.Errorf("frontmatter is missing closing ---")
+	}
+	raw := strings.Join(lines[1:end], "\n")
+	var fm map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &fm); err != nil {
+		return nil, string(data), err
+	}
+	if fm == nil {
+		fm = map[string]any{}
+	}
+	return fm, strings.Join(lines[end+1:], "\n"), nil
+}
+
+func lintDocument(doc Document) []Issue {
+	var issues []Issue
+	for _, field := range requiredFields {
+		if strings.TrimSpace(fmt.Sprint(doc.FrontMatter[field])) == "" {
+			issues = append(issues, newIssue(doc.Path, "error", "missing_required", "missing required frontmatter field: "+field))
+		}
+	}
+	for field, allowed := range enumFields {
+		value := strings.TrimSpace(fmt.Sprint(doc.FrontMatter[field]))
+		if value == "" {
+			continue
+		}
+		if !allowed[value] {
+			issues = append(issues, newIssue(doc.Path, "error", "invalid_enum", fmt.Sprintf("%s has invalid value %q", field, value)))
+		}
+	}
+	if status := strings.TrimSpace(fmt.Sprint(doc.FrontMatter["status"])); status == "active" && !hasSources(doc.FrontMatter["sources"]) {
+		issues = append(issues, newIssue(doc.Path, "warning", "active_without_sources", "active memory should include source evidence"))
+	}
+	if looksSensitive(doc.Body) {
+		issues = append(issues, newIssue(doc.Path, "error", "possible_secret", "memory body appears to contain a secret-like field"))
+	}
+	return issues
+}
+
+func hasSources(value any) bool {
+	switch typed := value.(type) {
+	case []any:
+		return len(typed) > 0
+	case []string:
+		return len(typed) > 0
+	default:
+		return strings.TrimSpace(fmt.Sprint(value)) != "" && strings.TrimSpace(fmt.Sprint(value)) != "[]"
+	}
+}
+
+func isSupportMarkdown(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(rel))
+	if base == "index.md" {
+		return true
+	}
+	if strings.Contains(filepath.ToSlash(rel), "/") {
+		return false
+	}
+	return base == "readme.md" || base == "schema.md" || base == "log.md"
+}
+
+func shouldSkipMemoryDir(root, path string) bool {
+	if filepath.Clean(root) == filepath.Clean(path) {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for _, part := range parts {
+		switch strings.ToLower(part) {
+		case ".obsidian", "inbox", "recent", "learning":
+			return true
+		}
+	}
+	return false
+}
+
+func looksSensitive(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"api_key", "app_secret", "password", "private_key", "cookie", "authorization: bearer"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func newIssue(path, severity, code, message string) Issue {
+	return Issue{Path: path, Severity: severity, Code: code, Message: message}
+}
+
+func sortIssues(issues []Issue) {
+	sort.SliceStable(issues, func(i, j int) bool {
+		if issues[i].Path != issues[j].Path {
+			return issues[i].Path < issues[j].Path
+		}
+		if issues[i].Severity != issues[j].Severity {
+			return issues[i].Severity < issues[j].Severity
+		}
+		return issues[i].Code < issues[j].Code
+	})
+}
+
+var requiredFields = []string{
+	"type",
+	"scope",
+	"visibility",
+	"status",
+	"sources",
+	"confidence",
+	"created_at",
+	"updated_at",
+	"schema_version",
+}
+
+var enumFields = map[string]map[string]bool{
+	"type": {
+		"preference": true, "decision": true, "experience": true, "skill": true,
+		"pattern": true, "wiki": true, "diary": true, "reflection": true, "proposal": true,
+	},
+	"scope": {
+		"global": true, "user": true, "org": true, "agent": true, "project": true,
+	},
+	"visibility": {
+		"private": true, "shared-user": true, "shared-org": true,
+	},
+	"status": {
+		"proposed": true, "active": true, "rejected": true, "deprecated": true, "archived": true,
+	},
+	"confidence": {
+		"high": true, "medium": true, "low": true,
+	},
 }

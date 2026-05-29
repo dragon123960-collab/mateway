@@ -10,139 +10,139 @@ import (
 	"time"
 )
 
-type IndexEntry struct {
-	ID            string           `json:"id"`
-	Path          string           `json:"path"`
-	Area          string           `json:"area"`
-	AgentID       string           `json:"agent_id,omitempty"`
-	Title         string           `json:"title"`
-	Type          string           `json:"type"`
-	Scope         string           `json:"scope"`
-	Status        string           `json:"status"`
-	Tags          []string         `json:"tags,omitempty"`
-	Sources       []string         `json:"sources,omitempty"`
-	ParsedSources []SourceEvidence `json:"parsed_sources,omitempty"`
-	Confidence    string           `json:"confidence,omitempty"`
-	UpdatedAt     string           `json:"updated_at,omitempty"`
-}
-
 type Index struct {
-	Root       string       `json:"root"`
-	BuiltAt    time.Time    `json:"built_at"`
-	Entries    []IndexEntry `json:"entries"`
-	IssueCount int          `json:"issue_count"`
+	SchemaVersion int          `json:"schema_version"`
+	GeneratedAt   string       `json:"generated_at"`
+	Root          string       `json:"root"`
+	Entries       []IndexEntry `json:"entries"`
 }
 
-type RebuildIndexResult struct {
-	Index Index
-	Path  string
+type IndexEntry struct {
+	Path          string   `json:"path"`
+	Type          string   `json:"type,omitempty"`
+	Scope         string   `json:"scope,omitempty"`
+	OwnerAgent    string   `json:"owner_agent,omitempty"`
+	ProjectID     string   `json:"project_id,omitempty"`
+	Visibility    string   `json:"visibility,omitempty"`
+	Status        string   `json:"status,omitempty"`
+	Tags          []string `json:"tags,omitempty"`
+	Aliases       []string `json:"aliases,omitempty"`
+	OpFingerprint string   `json:"op_fingerprint,omitempty"`
+	Sources       []string `json:"sources,omitempty"`
+	Confidence    string   `json:"confidence,omitempty"`
+	CreatedAt     string   `json:"created_at,omitempty"`
+	UpdatedAt     string   `json:"updated_at,omitempty"`
+	ReviewAfter   string   `json:"review_after,omitempty"`
+	Snippet       string   `json:"snippet,omitempty"`
 }
 
-func (s Store) ReadIndex() (RebuildIndexResult, error) {
-	path := filepath.Join(s.Root, "index.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return RebuildIndexResult{}, err
+func RebuildIndex(root string) (Index, []Issue, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return Index{}, nil, fmt.Errorf("memory root is required")
 	}
-	var index Index
-	if err := json.Unmarshal(data, &index); err != nil {
-		return RebuildIndexResult{}, err
+	index := Index{
+		SchemaVersion: 1,
+		GeneratedAt:   time.Now().Format(time.RFC3339),
+		Root:          root,
 	}
-	return RebuildIndexResult{Index: index, Path: path}, nil
-}
-
-func (s Store) RebuildIndex(now time.Time) (RebuildIndexResult, error) {
-	if strings.TrimSpace(s.Root) == "" {
-		return RebuildIndexResult{}, fmt.Errorf("memory root is required")
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	var entries []IndexEntry
-	issueCount := 0
-	err := filepath.WalkDir(s.Root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || filepath.Ext(path) != ".md" {
+	var issues []Issue
+	err := WalkDocuments(root, func(doc Document, docIssues []Issue) error {
+		issues = append(issues, docIssues...)
+		if len(docIssues) > 0 || doc.FrontMatter == nil {
 			return nil
 		}
-		area, agentID, ok := classifyMemoryIndexPath(s.Root, path)
-		if !ok {
+		lintIssues := lintDocument(doc)
+		issues = append(issues, lintIssues...)
+		if hasError(lintIssues) {
 			return nil
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			issueCount++
-			return nil
-		}
-		parsed, err := parseMarkdown(string(data))
-		if err != nil {
-			issueCount++
-		}
-		rel, _ := filepath.Rel(s.Root, path)
-		entry := IndexEntry{
-			ID:            strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
-			Path:          filepath.ToSlash(rel),
-			Area:          area,
-			AgentID:       agentID,
-			Title:         firstNonEmptyMemory(titleFromMarkdown(string(data)), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))),
-			Type:          parsed.Frontmatter.Type,
-			Scope:         parsed.Frontmatter.Scope,
-			Status:        parsed.Frontmatter.Status,
-			Tags:          cleanList(parsed.Frontmatter.Tags),
-			Sources:       cleanList(parsed.Frontmatter.Sources),
-			ParsedSources: ParseSources(parsed.Frontmatter.Sources),
-			Confidence:    parsed.Frontmatter.Confidence,
-			UpdatedAt:     parsed.Frontmatter.UpdatedAt,
-		}
-		entries = append(entries, entry)
+		index.Entries = append(index.Entries, entryFromDocument(doc))
 		return nil
 	})
-	if err != nil {
-		return RebuildIndexResult{}, err
-	}
-	sort.SliceStable(entries, func(i, j int) bool {
-		return entries[i].Path < entries[j].Path
+	sort.SliceStable(index.Entries, func(i, j int) bool {
+		return index.Entries[i].Path < index.Entries[j].Path
 	})
-	index := Index{Root: s.Root, BuiltAt: now, Entries: entries, IssueCount: issueCount}
-	path := filepath.Join(s.Root, "index.json")
+	sortIssues(issues)
+	return index, issues, err
+}
+
+func WriteIndex(path string, index Index) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("index path is required")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return RebuildIndexResult{}, err
+		return err
 	}
 	data, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
-		return RebuildIndexResult{}, err
+		return err
 	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
-		return RebuildIndexResult{}, err
-	}
-	return RebuildIndexResult{Index: index, Path: path}, nil
+	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-func (s Store) rebuildIndexBestEffort(now time.Time) {
-	_, _ = s.RebuildIndex(now)
+func entryFromDocument(doc Document) IndexEntry {
+	return IndexEntry{
+		Path:          doc.RelPath,
+		Type:          stringValue(doc.FrontMatter["type"]),
+		Scope:         stringValue(doc.FrontMatter["scope"]),
+		OwnerAgent:    stringValue(doc.FrontMatter["owner_agent"]),
+		ProjectID:     stringValue(doc.FrontMatter["project_id"]),
+		Visibility:    stringValue(doc.FrontMatter["visibility"]),
+		Status:        stringValue(doc.FrontMatter["status"]),
+		Tags:          stringSlice(doc.FrontMatter["tags"]),
+		Aliases:       stringSlice(doc.FrontMatter["aliases"]),
+		OpFingerprint: stringValue(doc.FrontMatter["op_fingerprint"]),
+		Sources:       stringSlice(doc.FrontMatter["sources"]),
+		Confidence:    stringValue(doc.FrontMatter["confidence"]),
+		CreatedAt:     stringValue(doc.FrontMatter["created_at"]),
+		UpdatedAt:     stringValue(doc.FrontMatter["updated_at"]),
+		ReviewAfter:   stringValue(doc.FrontMatter["review_after"]),
+		Snippet:       snippet(doc.Body, 240),
+	}
 }
 
-func classifyMemoryIndexPath(root, path string) (string, string, bool) {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return "", "", false
-	}
-	parts := strings.Split(filepath.ToSlash(rel), "/")
-	if len(parts) >= 4 && parts[0] == "agents" {
-		switch parts[2] {
-		case "long", "inbox":
-			return parts[2], parts[1], true
-		default:
-			return "", "", false
+func stringValue(value any) string {
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func stringSlice(value any) []string {
+	var out []string
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			if text := strings.TrimSpace(fmt.Sprint(item)); text != "" {
+				out = append(out, text)
+			}
+		}
+	case []string:
+		for _, item := range typed {
+			if text := strings.TrimSpace(item); text != "" {
+				out = append(out, text)
+			}
+		}
+	case nil:
+	default:
+		if text := strings.TrimSpace(fmt.Sprint(value)); text != "" && text != "[]" {
+			out = append(out, text)
 		}
 	}
-	if len(parts) >= 2 {
-		switch parts[0] {
-		case "user", "org":
-			return parts[0], "", true
+	return out
+}
+
+func snippet(text string, limit int) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return strings.TrimSpace(text[:limit])
+}
+
+func hasError(issues []Issue) bool {
+	for _, issue := range issues {
+		if issue.Severity == "error" {
+			return true
 		}
 	}
-	return "", "", false
+	return false
 }

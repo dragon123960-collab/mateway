@@ -2,966 +2,717 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/memory"
-	"github.com/dongping/mateway/internal/model"
-	"github.com/dongping/mateway/internal/observer"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
-	"github.com/dongping/mateway/internal/skill"
-	"github.com/dongping/mateway/internal/textmatch"
 	"github.com/dongping/mateway/internal/tool"
 )
 
 type Runtime struct {
-	Config    *config.Root
-	Model     model.Planner
-	Tools     *tool.Registry
-	Skills    *skill.Registry
-	Sanitizer ResponseSanitizer
-	Logger    observer.Logger
-	ToolCtx   tool.Context
-	MaxSteps  int
-	Observer  Observer
-	Sessions  session.Store
-	Memory    memory.Store
-	Acceptors *AcceptanceRegistry
-}
-
-type Observer interface {
-	Plan(traceID string, plan model.Plan)
-	ToolStart(traceID string, step model.PlanStep)
-	ToolDone(traceID string, result model.ToolResult)
-	Reply(traceID string, text string, failed bool)
-	Control(traceID string, control string, style string)
-	Failed(traceID string, reason string)
+	Config *config.Root
+	Store  session.Store
+	Tools  *agentcore.ToolRegistry
+	Model  agentcore.Model
+	Pool   AgentPool
+	Hooks  RuntimeHooks
 }
 
 type Response struct {
-	Reply             channel.OutboundMessage
-	TraceID           string
-	Plan              model.Plan
-	Results           []model.ToolResult
-	AwaitConfirm      bool
-	AwaitUserInput    bool
-	Failed            bool
-	FinalAcceptStatus string
-	FinalAcceptReason string
+	Reply     channel.OutboundMessage
+	TraceID   string
+	TracePath string
+	Failed    bool
 }
 
-func New(cfg *config.Root, planner model.Planner, registry *tool.Registry, logger observer.Logger, projectRoot string) Runtime {
-	if registry == nil {
-		registry = tool.NewBuiltinRegistry()
-	}
-	ctx := BuildToolContext(cfg, projectRoot)
-	home := firstNonEmpty(ctx.Home, config.DefaultHome())
-	skills, err := skill.LoadRegistry(ctx.Workspace, "main")
-	if err != nil {
-		skills = skill.NewBuiltinRegistry()
-	}
+func New(cfg *config.Root) Runtime {
+	hooks := defaultRuntimeHooks()
+	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
+	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
+	hooks.Providers = append(hooks.Providers, ruleFollowupHookProvider{})
+	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
+	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
+	hooks.Providers = append(hooks.Providers, defaultResponseHookProvider{})
 	return Runtime{
-		Config:    cfg,
-		Model:     planner,
-		Tools:     registry,
-		Skills:    skills,
-		Sanitizer: DefaultSanitizer{},
-		Logger:    logger,
-		ToolCtx:   ctx,
-		MaxSteps:  6,
-		Sessions:  session.NewFileStore(filepath.Join(home, "run", "sessions")),
-		Memory:    memory.NewStore(ctx.Workspace),
-		Acceptors: NewAcceptanceRegistry(),
+		Config: cfg,
+		Store:  session.NewStore(cfg.App.Home),
+		Tools:  tool.NewRegistry(cfg),
+		Model:  HeuristicModel{},
+		Pool:   NewAgentPool(cfg),
+		Hooks:  hooks,
 	}
 }
 
-func BuildToolContext(cfg *config.Root, projectRoot string) tool.Context {
-	if projectRoot == "" {
-		projectRoot, _ = filepath.Abs(".")
+func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Response, error) {
+	start := time.Now()
+	state, err := rt.Store.Load(msg.SessionKey)
+	if err != nil {
+		return Response{}, err
 	}
-	var home, workspace string
-	var allowed []string
-	var search tool.SearchConfig
-	if cfg != nil {
-		home = cfg.App.Home
-		workspace = cfg.App.Workspace
-		allowed = append(allowed, cfg.Security.AccessiblePaths...)
-		search = tool.SearchConfig{
-			CacheDir:                 filepath.Join(firstNonEmpty(cfg.App.Workspace, cfg.App.Home, config.DefaultHome()), "web-cache"),
-			CacheEnabled:             cfg.Search.CacheEnabled,
-			CacheTTLHours:            cfg.Search.CacheTTLHours,
-			FreshCacheTTLHours:       cfg.Search.FreshCacheTTLHours,
-			ProviderOrder:            append([]string(nil), cfg.Search.ProviderOrder...),
-			TavilyEnabled:            cfg.Search.Providers.Tavily.Enabled,
-			TavilyBaseURL:            cfg.Search.Providers.Tavily.BaseURL,
-			TavilyAPIKey:             cfg.Search.Providers.Tavily.ResolvedAPIKey(),
-			TavilyTimeoutSeconds:     cfg.Search.Providers.Tavily.TimeoutSeconds,
-			TavilyMaxResults:         cfg.Search.Providers.Tavily.MaxResults,
-			TavilyDailyBudget:        cfg.Search.Providers.Tavily.DailyBudget,
-			TavilyMonthlyBudget:      cfg.Search.Providers.Tavily.MonthlyBudget,
-			TavilySearchDepth:        cfg.Search.Providers.Tavily.SearchDepth,
-			TavilyTopic:              cfg.Search.Providers.Tavily.Topic,
-			DuckDuckGoEnabled:        cfg.Search.Providers.DuckDuckGo.Enabled,
-			DuckDuckGoTimeoutSeconds: cfg.Search.Providers.DuckDuckGo.TimeoutSeconds,
-			DuckDuckGoMaxResults:     cfg.Search.Providers.DuckDuckGo.MaxResults,
-			DuckDuckGoRegion:         cfg.Search.Providers.DuckDuckGo.Region,
+	trace, err := newTraceRecorder(rt.Config)
+	if err != nil {
+		return Response{}, err
+	}
+	_ = trace.write(map[string]any{"type": "request", "session_key": msg.SessionKey, "channel": msg.Channel, "text": msg.Text})
+	defer func() {
+		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
+	}()
+	if resp, handled, err := rt.handlePending(ctx, &state, msg, trace); handled || err != nil {
+		if handled && err == nil {
+			resp.TraceID = trace.id
+			resp.TracePath = trace.path
+			_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
+		}
+		return resp, err
+	}
+	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text}, trace)
+	if decision.Kind == followupClarify {
+		task := state.StartTask(msg.Text)
+		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
+		state.BlockActiveTask("await_user_input")
+		if err := rt.Store.Save(state); err != nil {
+			return Response{}, err
+		}
+		resp := reply(msg, decision.ClarifyPrompt, "clarify")
+		resp.TraceID = trace.id
+		resp.TracePath = trace.path
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
+		return resp, nil
+	}
+	userText := strings.TrimSpace(msg.Text)
+	if decision.Kind == followupContinuation {
+		task := state.ActivateTask(decision.TaskID)
+		if task == nil {
+			task = state.StartTask(msg.Text)
+		}
+		if strings.TrimSpace(decision.ResolvedUserText) != "" {
+			userText = decision.ResolvedUserText
+		}
+		return rt.runTask(ctx, msg, &state, task, userText, trace)
+	}
+	task := state.StartTask(msg.Text)
+	return rt.runTask(ctx, msg, &state, task, userText, trace)
+}
+
+func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, trace *traceRecorder) (Response, error) {
+	messages := append([]agentcore.Message(nil), state.Messages...)
+	messages = append(messages, agentcore.Message{Role: agentcore.RoleUser, Content: userText})
+
+	agent := rt.Pool.AgentForSession(msg.SessionKey)
+	if agent == nil {
+		agent = agentcore.NewAgent(rt.Model, rt.Tools)
+	}
+	agent.Messages = messages
+	agent.MaxIterations = 6
+	profile := rt.Pool.ProfileForSession(msg.SessionKey)
+	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+		Message:  msg,
+		State:    *state,
+		TaskID:   task.ID,
+		UserText: userText,
+		Profile:  profile,
+	}, trace))
+	result, err := agent.Continue(ctx)
+	if err != nil {
+		state.BlockActiveTask("failed")
+		if saveErr := rt.Store.Save(*state); saveErr != nil {
+			return Response{}, saveErr
+		}
+		text := friendlyRuntimeError(err)
+		resp := Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     text,
+				Style:    "error",
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+			Failed:    true,
+		}
+		_ = trace.write(map[string]any{"type": "model_error", "error": err.Error(), "friendly": text})
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+		return resp, nil
+	}
+
+	state.Messages = redactMessagesForStorage(result.Messages)
+	taskCompleted := false
+	if state.Pending == nil {
+		if looksLikeInputRequest(result.FinalText) {
+			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
+			state.BlockActiveTask("await_user_input")
+		} else {
+			state.CompleteActiveTask()
+			taskCompleted = true
 		}
 	}
-	return tool.Context{
-		Home:          home,
-		ProjectRoot:   firstNonEmpty(projectRoot, home),
-		Workspace:     workspace,
-		AllowedRoots:  append([]string{projectRoot}, allowed...),
-		ConfigSummary: SafeConfigSummary(cfg),
-		Search:        search,
+	if err := rt.Store.Save(*state); err != nil {
+		return Response{}, err
 	}
-}
-
-func SafeConfigSummary(cfg *config.Root) string {
-	if cfg == nil {
-		return "config: unavailable"
-	}
-	models := make([]string, 0, len(cfg.Models))
-	for _, m := range cfg.Models {
-		models = append(models, fmt.Sprintf("%s(provider=%s, api=%s, model=%s, enabled=%t)", m.Name, m.Provider, m.API, m.Model, m.Enabled))
-	}
-	return strings.Join([]string{
-		"app.name=" + cfg.App.Name,
-		"app.home=" + cfg.App.Home,
-		"app.workspace=" + cfg.App.Workspace,
-		fmt.Sprintf("feishu.enabled=%t websocket=%t", cfg.Channels.Feishu.Enabled, cfg.Channels.Feishu.WebSocket.Enabled),
-		"models=" + strings.Join(models, "; "),
-		fmt.Sprintf("search.tavily.enabled=%t search.duckduckgo.enabled=%t", cfg.Search.Providers.Tavily.Enabled, cfg.Search.Providers.DuckDuckGo.Enabled),
-	}, "\n")
-}
-
-func (r Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Response, error) {
-	loop := NewAgentLoop(r, msg)
-	return loop.Run(ctx)
-}
-
-func (r Runtime) currentSkills() *skill.Registry {
-	if strings.TrimSpace(r.ToolCtx.Workspace) != "" {
-		if reg, err := skill.LoadRegistry(r.ToolCtx.Workspace, "main"); err == nil && reg != nil {
-			return reg
+	if scheduleID := pendingScheduleID(result.Messages); scheduleID != "" {
+		state.Pending = &session.PendingAction{
+			Kind:       "schedule_review",
+			TaskID:     task.ID,
+			ScheduleID: scheduleID,
+			Question:   "定时任务已记录为待试运行。回复“执行”现在试运行；试运行成功后我会激活它。也可以稍后手动执行：`mateway schedule test " + scheduleID + "`。",
 		}
-	}
-	return r.Skills
-}
-
-func (r Runtime) executePlan(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string, previousSteps map[string]session.StepState, previousResults []model.ToolResult) ([]model.ToolResult, string) {
-	var results []model.ToolResult
-	approvalConsumed := false
-	steps := plan.Steps
-	if r.MaxSteps > 0 && len(steps) > r.MaxSteps {
-		steps = steps[:r.MaxSteps]
-	}
-	reuseAllowed := true
-	for _, prev := range previousSteps {
-		if strings.TrimSpace(prev.Status) == "failed" {
-			reuseAllowed = false
-			break
+		state.BlockActiveTask("await_schedule_test")
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, err
 		}
+		resp := reply(msg, state.Pending.Question, "schedule_review_pending")
+		resp.TraceID = trace.id
+		resp.TracePath = trace.path
+		_ = trace.write(map[string]any{"type": "schedule_review_pending", "schedule_id": scheduleID})
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+		return resp, nil
 	}
-	completed := reusableResultsMap(previousSteps, previousResults, reuseAllowed)
-	for i := 0; i < len(steps); {
-		if failedDep := firstFailedDependency(steps[i], completed); failedDep != "" {
-			result := dependencyFailedResult(steps[i], failedDep)
-			results = append(results, result)
-			completed[result.StepID] = result
-			r.Logger.Event("runtime.step_skipped", map[string]any{"trace_id": traceID, "step_id": steps[i].ID, "tool": steps[i].Tool, "reason": result.Error, "dependency": failedDep})
-			if r.Observer != nil {
-				r.Observer.ToolDone(traceID, result)
+
+	var learningResult *memory.LearningResult
+	if taskCompleted {
+		home := rt.home()
+		observe := rt.Hooks.observe(ctx, ObserveHookInput{
+			Kind:       "task_completed",
+			Home:       home,
+			SessionKey: state.Key,
+			State:      *state,
+			TaskID:     task.ID,
+			FinalText:  result.FinalText,
+			TraceID:    trace.id,
+			TracePath:  trace.path,
+		}, trace)
+		learningResult = observe.LearningResult
+		if learningResult != nil {
+			_ = trace.write(map[string]any{
+				"type":            "self_learning",
+				"diary_path":      learningResult.DiaryPath,
+				"reflection_path": learningResult.ReflectionPath,
+				"proposal_id":     proposalID(learningResult.Proposal),
+			})
+			if learningResult.Proposal != nil {
+				state.Pending = &session.PendingAction{
+					Kind:       "memory_proposal_review",
+					TaskID:     task.ID,
+					ProposalID: learningResult.Proposal.ID,
+					Question:   "回复“保存”写入长期记忆，或回复“忽略”放弃这条候选。",
+				}
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, err
+				}
 			}
-			i++
-			continue
 		}
-		if reused, ok := reuseStepResult(steps[i], completed, r.Tools); ok {
-			results = append(results, reused)
-			completed[reused.StepID] = reused
-			i++
-			continue
-		}
-		batch, next := executableBatch(steps, i, completed, r.Tools)
-		if len(batch) == 0 {
-			batch = []model.PlanStep{steps[i]}
-			next = i + 1
-		}
-		batchResults, control, consumed := r.executeStepBatch(ctx, traceID, batch, approvalGranted, approvedStepID, approvalConsumed)
-		if consumed {
-			approvalConsumed = true
-		}
-		results = append(results, batchResults...)
-		for _, result := range batchResults {
-			completed[result.StepID] = result
-		}
-		if control != "" {
-			return results, control
-		}
-		i = next
 	}
-	return results, ""
+	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
+	resp := Response{
+		Reply: channel.OutboundMessage{
+			Channel:  msg.Channel,
+			ThreadID: msg.ThreadID,
+			Text:     text,
+		},
+		TraceID:   trace.id,
+		TracePath: trace.path,
+	}
+	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text})
+	return resp, nil
 }
 
-func executableBatch(steps []model.PlanStep, start int, completed map[string]model.ToolResult, registry *tool.Registry) ([]model.PlanStep, int) {
-	if start >= len(steps) {
-		return nil, start
+func (rt Runtime) home() string {
+	home := config.DefaultHome()
+	if rt.Config != nil && strings.TrimSpace(rt.Config.App.Home) != "" {
+		home = rt.Config.App.Home
 	}
-	first := steps[start]
-	if !stepDependenciesSatisfied(first, completed) || !stepCanRunParallel(first, registry) {
-		return []model.PlanStep{first}, start + 1
-	}
-	batch := []model.PlanStep{first}
-	scopes := map[string]struct{}{parallelScope(first, registry): {}}
-	for i := start + 1; i < len(steps) && len(batch) < 3; i++ {
-		step := steps[i]
-		if !stepDependenciesSatisfied(step, completed) || !stepCanRunParallel(step, registry) {
-			break
-		}
-		scope := parallelScope(step, registry)
-		if scope == "" {
-			scope = "step:" + step.ID
-		}
-		if _, exists := scopes[scope]; exists {
-			break
-		}
-		batch = append(batch, step)
-		scopes[scope] = struct{}{}
-	}
-	if len(batch) == 1 {
-		return batch, start + 1
-	}
-	return batch, start + len(batch)
+	return home
 }
 
-func stepDependenciesSatisfied(step model.PlanStep, completed map[string]model.ToolResult) bool {
-	for _, dep := range step.DependsOn {
-		result, ok := completed[strings.TrimSpace(dep)]
-		if !ok || !result.OK {
-			return false
-		}
+func proposalID(proposal *memory.Proposal) string {
+	if proposal == nil {
+		return ""
 	}
-	return true
+	return proposal.ID
 }
 
-func firstFailedDependency(step model.PlanStep, completed map[string]model.ToolResult) string {
-	for _, dep := range step.DependsOn {
-		dep = strings.TrimSpace(dep)
-		if dep == "" {
+func pendingScheduleID(messages []agentcore.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != agentcore.RoleAssistant {
 			continue
 		}
-		result, ok := completed[dep]
-		if ok && !result.OK {
-			return dep
+		for _, call := range msg.ToolCalls {
+			if call.Name != "schedule.create" {
+				continue
+			}
+			if raw := strings.TrimSpace(fmt.Sprint(call.Args["require_test"])); strings.EqualFold(raw, "false") || strings.EqualFold(raw, "no") {
+				return ""
+			}
+			if id := scheduleIDFromFollowingToolResult(messages, i, call.ID); id != "" {
+				return id
+			}
 		}
 	}
 	return ""
 }
 
-func dependencyFailedResult(step model.PlanStep, dep string) model.ToolResult {
-	reason := "dependency_failed: " + dep
-	return model.ToolResult{
-		StepID: step.ID,
-		Tool:   step.Tool,
-		OK:     false,
-		Error:  "dependency_failed",
-		Output: reason,
-		Evidence: map[string]any{
-			"kind":       "dependency_failed",
-			"dependency": dep,
+func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIndex int, toolCallID string) string {
+	for _, msg := range messages[assistantIndex+1:] {
+		if msg.Role == agentcore.RoleAssistant {
+			break
+		}
+		if msg.Role != agentcore.RoleTool || msg.ToolCallID != toolCallID {
+			continue
+		}
+		fields := strings.Fields(msg.Content)
+		for i, field := range fields {
+			if field == "scheduled" && i+1 < len(fields) {
+				return strings.TrimSpace(fields[i+1])
+			}
+		}
+	}
+	return ""
+}
+
+func appendMemoryReviewBlock(text string, proposal memory.Proposal) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(text))
+	b.WriteString("\n\n我发现一条可能值得保存的长期记忆。\n")
+	b.WriteString("这只是候选，还没有写入长期记忆。你可以选择保存，或忽略这次建议。\n\n")
+	b.WriteString("建议保存：")
+	b.WriteString(proposal.Type)
+	b.WriteString(" - ")
+	b.WriteString(proposal.Title)
+	if len(proposal.Sources) > 0 {
+		b.WriteString("\n来源：")
+		b.WriteString(summarize(strings.Join(proposal.Sources, ", ")))
+	}
+	b.WriteString("\n\n保存到长期记忆：\n`mateway memory proposal commit ")
+	b.WriteString(proposal.ID)
+	b.WriteString("`\n\n忽略这条候选：\n`mateway memory proposal reject ")
+	b.WriteString(proposal.ID)
+	b.WriteString("`\n\n判断口径：如果这是以后会反复用到的项目经验、偏好、流程或工具用法，就保存；如果只是一次性测试或临时结果，就忽略。")
+	return b.String()
+}
+
+func fallbackFinalReply(raw string) string {
+	if strings.Contains(strings.ToUpper(raw), "[TOOL_CALL]") {
+		return "模型生成了无效的工具调用格式，已停止执行，避免误操作。请重试或把任务说得更具体。"
+	}
+	return "我还没有生成可用回复。"
+}
+
+func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+	steeringSent := false
+	return agentcore.Hooks{
+		Emit: trace.emit,
+		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
+			if steeringSent {
+				return nil, nil
+			}
+			steeringSent = true
+			return append([]agentcore.Message(nil), steering...), nil
+		},
+		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
+			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)
+			if policy.Block {
+				state.Pending = &session.PendingAction{
+					Kind:       "confirm_tool",
+					TaskID:     taskID,
+					ToolCall:   input.ToolCall,
+					ResumeText: policy.ResumeText,
+				}
+				state.BlockActiveTask("await_confirm")
+				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
+			}
+			return agentcore.BeforeToolCallResult{}, nil
+		},
+		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
+			observe := rt.Hooks.observe(context.Background(), ObserveHookInput{
+				Kind:       "tool_result",
+				State:      *state,
+				TaskID:     taskID,
+				ToolCall:   input.ToolCall,
+				Tool:       input.Tool,
+				ToolResult: input.ToolResult,
+			}, trace)
+			if observe.TaskStep != nil {
+				state.AddStep(taskID, *observe.TaskStep)
+			}
+			return agentcore.AfterToolCallResult{}, nil
 		},
 	}
 }
 
-func stepCanRunParallel(step model.PlanStep, registry *tool.Registry) bool {
-	def, ok := registry.Get(step.Tool)
-	if !ok {
-		return false
+func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
+	if state.Pending == nil {
+		return Response{}, false, nil
 	}
-	if def.Risk != tool.RiskSafeRead {
-		return false
-	}
-	switch def.Metadata.ParallelMode {
-	case tool.ParallelReadOnlyOK, tool.ParallelIsolatedOnly:
-		return true
+	text := strings.TrimSpace(msg.Text)
+	switch state.Pending.Kind {
+	case "confirm_tool":
+		if isCancel(text) {
+			state.Pending = nil
+			state.BlockActiveTask("cancelled")
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return reply(msg, "已取消。", "cancelled"), true, nil
+		}
+		if !isConfirm(text) {
+			return reply(msg, "这个操作还在等待确认。回复“确认”继续，或回复“取消”放弃。", "approval_pending"), true, nil
+		}
+		call := state.Pending.ToolCall
+		state.Pending = nil
+		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
+		result := rt.Tools.Execute(ctx, call)
+		toolDef, _ := rt.Tools.Get(call.Name)
+		observe := rt.Hooks.observe(ctx, ObserveHookInput{
+			Kind:       "tool_result",
+			State:      *state,
+			TaskID:     state.ActiveTask,
+			ToolCall:   call,
+			Tool:       toolDef,
+			ToolResult: result,
+		}, trace)
+		status := ""
+		evidence := map[string]any{}
+		if observe.TaskStep != nil {
+			state.AddStep(state.ActiveTask, *observe.TaskStep)
+			status = observe.TaskStep.Status
+			evidence = observe.TaskStep.Evidence
+		}
+		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": redactToolResult(result), "acceptance": status, "evidence": redactSecrets(evidence)})
+		state.Messages = append(state.Messages,
+			agentcore.Message{Role: agentcore.RoleUser, Content: text},
+			agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content},
+		)
+		if !result.IsError {
+			state.CompleteActiveTask()
+		}
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		if result.IsError {
+			return reply(msg, result.Content, "error"), true, nil
+		}
+		return reply(msg, result.Content, "completed"), true, nil
+	case "memory_proposal_review":
+		action, ok := parseMemoryProposalReviewAction(text)
+		if !ok {
+			if shouldBypassMemoryProposalReview(text) {
+				_ = trace.write(map[string]any{"type": "memory_proposal_review_bypassed", "proposal_id": state.Pending.ProposalID, "text": text})
+				state.Pending = nil
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, true, err
+				}
+				return Response{}, false, nil
+			}
+			return reply(msg, "这条长期记忆候选还在等待处理。回复“保存”写入长期记忆，回复“忽略”放弃；也可以直接发新任务。", "memory_review_pending"), true, nil
+		}
+		proposalID := state.Pending.ProposalID
+		state.Pending = nil
+		store := memory.ProposalStore{Home: rt.home(), MemoryRoot: memoryRootForConfig(rt.Config)}
+		if action == "commit" {
+			proposal, target, err := store.Commit(proposalID)
+			if err != nil {
+				if saveErr := rt.Store.Save(*state); saveErr != nil {
+					return Response{}, true, saveErr
+				}
+				return reply(msg, "保存长期记忆失败："+err.Error(), "error"), true, nil
+			}
+			_ = trace.write(map[string]any{"type": "memory_proposal_review_committed", "proposal_id": proposal.ID, "target": target})
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return reply(msg, "已保存到长期记忆："+target, "completed"), true, nil
+		}
+		proposal, err := store.Reject(proposalID, "user ignored from conversation")
+		if err != nil {
+			if saveErr := rt.Store.Save(*state); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return reply(msg, "忽略长期记忆候选失败："+err.Error(), "error"), true, nil
+		}
+		_ = trace.write(map[string]any{"type": "memory_proposal_review_rejected", "proposal_id": proposal.ID})
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		return reply(msg, "已忽略这条长期记忆候选。", "completed"), true, nil
+	case "schedule_review":
+		action, ok := parseScheduleReviewAction(text)
+		if !ok {
+			if shouldBypassScheduleReview(text) {
+				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
+				state.Pending = nil
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, true, err
+				}
+				return Response{}, false, nil
+			}
+			return reply(msg, "这个定时任务还在等待试运行。回复“执行”现在试运行，回复“取消”放弃；也可以稍后手动执行 `mateway schedule test "+state.Pending.ScheduleID+"`。", "schedule_review_pending"), true, nil
+		}
+		scheduleID := state.Pending.ScheduleID
+		taskID := state.Pending.TaskID
+		state.Pending = nil
+		if action == "cancel" {
+			store := schedule.Store{Home: rt.home()}
+			if _, err := store.Pause(scheduleID); err != nil {
+				if saveErr := rt.Store.Save(*state); saveErr != nil {
+					return Response{}, true, saveErr
+				}
+				return reply(msg, "取消定时任务失败："+err.Error(), "error"), true, nil
+			}
+			blockTask(state, taskID, "cancelled")
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return reply(msg, "已取消这个待试运行的定时任务。", "cancelled"), true, nil
+		}
+		task, record, err := rt.testAndActivateSchedule(ctx, scheduleID)
+		if err != nil {
+			if saveErr := rt.Store.Save(*state); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return reply(msg, "试运行失败，定时任务没有激活："+err.Error(), "error"), true, nil
+		}
+		state.ActivateTask(taskID)
+		state.CompleteActiveTask()
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		_ = trace.write(map[string]any{"type": "schedule_review_tested", "schedule_id": task.ID, "run_id": record.ID, "status": record.Status})
+		return reply(msg, "试运行成功，已添加定时任务："+task.ID+"，下次运行时间："+task.RunAt, "completed"), true, nil
+	case "user_input":
+		if shouldBypassUserInputPending(state.Pending, text) {
+			taskID := state.Pending.TaskID
+			state.Pending = nil
+			blockTask(state, taskID, "interrupted")
+			if state.ActiveTask == taskID {
+				state.ActiveTask = ""
+			}
+			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": "standalone task request"})
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return Response{}, false, nil
+		}
+		taskID := state.Pending.TaskID
+		state.Pending = nil
+		state.Messages = append(state.Messages,
+			agentcore.Message{Role: agentcore.RoleUser, Content: text},
+		)
+		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text})
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		return Response{}, false, nil
 	default:
-		return false
+		state.Pending = nil
+		return Response{}, false, nil
 	}
 }
 
-func parallelScope(step model.PlanStep, registry *tool.Registry) string {
-	def, ok := registry.Get(step.Tool)
-	if !ok {
-		return ""
+func parseMemoryProposalReviewAction(text string) (string, bool) {
+	normalized := normalizeFollowupText(text)
+	switch normalized {
+	case "保存", "保存记忆", "保存到长期记忆", "写入", "写入记忆", "commit", "yes", "ok":
+		return "commit", true
+	case "忽略", "不保存", "不要保存", "跳过", "放弃", "reject", "no":
+		return "reject", true
+	default:
+		return "", false
 	}
-	scope := strings.TrimSpace(def.Metadata.ResourceScope)
-	if strings.Contains(scope, "filesystem") {
-		if path := strings.TrimSpace(step.Args["path"]); path != "" {
-			return scope + ":" + path
-		}
-	}
-	if strings.Contains(scope, "query") {
-		if q := strings.TrimSpace(firstNonEmpty(step.Args["query"], step.Args["q"])); q != "" {
-			return scope + ":" + q
-		}
-	}
-	return scope
 }
 
-func (r Runtime) executeStepBatch(ctx context.Context, traceID string, batch []model.PlanStep, approvalGranted bool, approvedStepID string, approvalConsumed bool) ([]model.ToolResult, string, bool) {
-	if len(batch) == 1 {
-		result, control, consumed := r.executeSingleStep(ctx, traceID, batch[0], approvalGranted, approvedStepID, approvalConsumed)
-		return []model.ToolResult{result}, control, consumed
-	}
-	type item struct {
-		index    int
-		result   model.ToolResult
-		control  string
-		consumed bool
-	}
-	out := make([]item, len(batch))
-	var wg sync.WaitGroup
-	for i, step := range batch {
-		wg.Add(1)
-		go func(index int, current model.PlanStep) {
-			defer wg.Done()
-			result, control, consumed := r.executeSingleStep(ctx, traceID, current, approvalGranted, approvedStepID, approvalConsumed)
-			out[index] = item{index: index, result: result, control: control, consumed: consumed}
-		}(i, step)
-	}
-	wg.Wait()
-	sort.Slice(out, func(i, j int) bool { return out[i].index < out[j].index })
-	results := make([]model.ToolResult, 0, len(out))
-	consumed := approvalConsumed
-	for _, item := range out {
-		results = append(results, item.result)
-		if item.consumed {
-			consumed = true
-		}
-	}
-	for _, item := range out {
-		if item.control != "" {
-			return results, item.control, consumed
-		}
-	}
-	return results, "", consumed
+func shouldBypassMemoryProposalReview(text string) bool {
+	normalized := normalizeFollowupText(text)
+	return looksLikeStandaloneTaskRequest(normalized)
 }
 
-func (r Runtime) executeSingleStep(ctx context.Context, traceID string, step model.PlanStep, approvalGranted bool, approvedStepID string, approvalConsumed bool) (model.ToolResult, string, bool) {
-	consumed := approvalConsumed
-	if strings.TrimSpace(step.Tool) == "" {
-		tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "tool is required", Output: "tool is required"}
-		if r.Observer != nil {
-			r.Observer.ToolDone(traceID, tr)
-		}
-		return tr, "", consumed
+func parseScheduleReviewAction(text string) (string, bool) {
+	normalized := normalizeFollowupText(text)
+	switch normalized {
+	case "执行", "试运行", "现在执行", "现在试运行", "跑一下", "运行", "确认", "继续", "yes", "ok":
+		return "test", true
+	case "取消", "放弃", "不要", "不执行", "暂停", "cancel", "no":
+		return "cancel", true
+	default:
+		return "", false
 	}
-	r.Logger.Event("runtime.tool_start", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "goal": step.Goal, "risk": step.Risk, "requires_confirm": step.RequiresConfirm})
-	if r.Observer != nil {
-		r.Observer.ToolStart(traceID, step)
+}
+
+func shouldBypassScheduleReview(text string) bool {
+	normalized := normalizeFollowupText(text)
+	return looksLikeStandaloneTaskRequest(normalized)
+}
+
+func (rt Runtime) testAndActivateSchedule(ctx context.Context, scheduleID string) (schedule.Task, schedule.RunRecord, error) {
+	store := schedule.Store{Home: rt.home()}
+	task, err := store.Read(scheduleID)
+	if err != nil {
+		return task, schedule.RunRecord{}, err
 	}
-	def, ok := r.Tools.Get(step.Tool)
-	if !ok {
-		tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "unknown tool", Output: "unknown tool: " + step.Tool}
-		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "error": tr.Error})
-		if r.Observer != nil {
-			r.Observer.ToolDone(traceID, tr)
-		}
-		return tr, "", consumed
+	startedAt := time.Now()
+	sessionKey := strings.TrimSpace(task.SessionKey)
+	if sessionKey == "" {
+		sessionKey = "schedule:" + task.ID
 	}
-	args := copyArgs(step.Args)
-	delete(args, "confirmed")
-	delete(args, "confirm")
-	needsConfirm := tool.RequireConfirmForTool(step.Tool, args)
-	stepApproved := false
-	if approvalGranted {
-		switch {
-		case approvedStepID != "" && strings.TrimSpace(step.ID) == strings.TrimSpace(approvedStepID):
-			stepApproved = true
-		case approvedStepID == "" && needsConfirm && !approvalConsumed:
-			stepApproved = true
-		}
-	}
-	if needsConfirm && !stepApproved {
-		tr := model.ToolResult{StepID: step.ID, Tool: step.Tool, OK: false, Error: "await_confirm", Output: confirmPromptForStep(step, args), Evidence: map[string]any{"kind": "step_confirm", "goal": step.Goal, "tool": step.Tool, "step_id": step.ID}}
-		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm"})
-		if r.Observer != nil {
-			r.Observer.ToolDone(traceID, tr)
-		}
-		return tr, "await_confirm", consumed
-	}
-	call := tool.Call{Name: step.Tool, Args: args, Confirmed: stepApproved, Context: r.ToolCtx}
-	if stepApproved {
-		consumed = true
-	}
-	result := def.Run(ctx, call)
-	tr := model.ToolResult{
-		StepID:   step.ID,
-		Tool:     step.Tool,
-		OK:       result.OK,
-		Output:   tool.Truncate(result.Output, tool.DefaultOutputLimit),
-		Evidence: result.Evidence,
-		Error:    result.Error,
-	}
-	if result.RequiresConfirm {
-		tr.Error = "await_confirm"
-		tr.Output = result.ConfirmMessage
-		r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": false, "control": "await_confirm", "evidence": result.Evidence})
-		if r.Observer != nil {
-			r.Observer.ToolDone(traceID, tr)
-		}
-		return tr, "await_confirm", consumed
-	}
-	accept := codeAcceptStep(step, tr, def, r.Acceptors)
-	if shouldLLMAcceptStep(step, def, accept, nil) {
-		accept = llmAcceptStep(ctx, r.Model, step.Goal, step, tr, def, r.Acceptors)
-	}
-	r.Logger.Event("runtime.step_accept", map[string]any{
-		"trace_id": traceID,
-		"step_id":  step.ID,
-		"tool":     step.Tool,
-		"status":   accept.Status,
-		"reason":   accept.Reason,
-		"source":   accept.Source,
+	runRuntime := New(rt.Config)
+	resp, runErr := runRuntime.Handle(ctx, channel.InboundMessage{
+		ID:         task.ID,
+		Channel:    "schedule",
+		SessionKey: sessionKey,
+		Text:       task.Text,
+		Metadata:   map[string]string{"scheduled_task_id": task.ID, "scheduled_run_kind": "test"},
 	})
-	if accept.Status == AcceptanceHardFail {
-		tr.OK = false
-		tr.Error = "step_verification_failed"
-		tr.Output = strings.TrimSpace(tr.Output + "\n\nverification failed:\n" + firstNonEmpty(accept.Reason, "step rejected"))
-		r.Logger.Event("runtime.execution_drift", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "errors": []string{accept.Reason}})
-		if r.Observer != nil {
-			r.Observer.ToolDone(traceID, tr)
+	status := "success"
+	errText := ""
+	output := ""
+	tracePath := ""
+	if runErr != nil {
+		status = "error"
+		errText = runErr.Error()
+	} else {
+		output = strings.TrimSpace(resp.Reply.Text)
+		tracePath = resp.TracePath
+		if resp.Failed {
+			status = "error"
+			errText = strings.TrimSpace(resp.Reply.Text)
 		}
-		return tr, "", consumed
 	}
-	if accept.Status == AcceptanceUsable {
-		tr.OK = true
-		tr.Error = ""
-		r.Logger.Event("runtime.execution_usable", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "reason": accept.Reason})
+	record, recordErr := store.RecordRun(schedule.RunRecord{
+		TaskID:     task.ID,
+		Kind:       "test",
+		Status:     status,
+		StartedAt:  startedAt.Format(time.RFC3339),
+		FinishedAt: time.Now().Format(time.RFC3339),
+		SessionKey: sessionKey,
+		Output:     output,
+		TracePath:  tracePath,
+		Error:      errText,
+	})
+	if recordErr != nil {
+		return task, record, recordErr
 	}
-	if accept.Status == AcceptanceSuspect {
-		tr.OK = false
-		tr.Error = "step_acceptance_suspect"
-		if accept.Reason != "" {
-			tr.Output = strings.TrimSpace(tr.Output + "\n\nacceptance suspect:\n" + accept.Reason)
+	if status != "success" {
+		if markErr := store.MarkError(task, time.Now(), record); markErr != nil {
+			return task, record, markErr
 		}
-		r.Logger.Event("runtime.execution_drift", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "errors": []string{accept.Reason}})
-		if r.Observer != nil {
-			r.Observer.ToolDone(traceID, tr)
-		}
-		return tr, "", consumed
+		return task, record, fmt.Errorf(firstNonEmpty(errText, "scheduled task test failed"))
 	}
-	r.Logger.Event("runtime.tool_done", map[string]any{"trace_id": traceID, "step_id": step.ID, "tool": step.Tool, "ok": tr.OK, "error": tr.Error, "output_chars": len(tr.Output), "evidence": tr.Evidence})
-	if r.Observer != nil {
-		r.Observer.ToolDone(traceID, tr)
+	if err := store.MarkTested(task, time.Now(), record); err != nil {
+		return task, record, err
 	}
-	return tr, "", consumed
+	task, err = store.Read(scheduleID)
+	return task, record, err
 }
 
-func (r Runtime) ExecutePlanForEval(ctx context.Context, traceID string, plan model.Plan, approvalGranted bool, approvedStepID string) ([]model.ToolResult, string) {
-	return r.executePlan(ctx, traceID, plan, approvalGranted, approvedStepID, nil, nil)
-}
-
-func reusableResultsMap(previousSteps map[string]session.StepState, previousResults []model.ToolResult, allowReuse bool) map[string]model.ToolResult {
-	out := map[string]model.ToolResult{}
-	if !allowReuse {
-		return out
+func blockTask(state *session.State, taskID, status string) {
+	if state == nil || strings.TrimSpace(taskID) == "" {
+		return
 	}
-	for id, prev := range previousSteps {
-		if prev.Status != "passed" && prev.Status != "usable" {
-			continue
-		}
-		out[id] = model.ToolResult{
-			StepID:   prev.ID,
-			Tool:     prev.Tool,
-			OK:       prev.ResultOK,
-			Output:   prev.ResultSummary,
-			Evidence: prev.Evidence,
-			Error:    prev.ResultError,
+	for i := range state.Tasks {
+		if state.Tasks[i].ID == taskID {
+			state.Tasks[i].Status = status
+			state.Tasks[i].UpdatedAt = time.Now()
+			return
 		}
 	}
-	for _, prev := range previousResults {
-		if !prev.OK {
-			continue
-		}
-		out[strings.TrimSpace(prev.StepID)] = prev
-	}
-	return out
 }
 
-func reuseStepResult(step model.PlanStep, reusable map[string]model.ToolResult, registry *tool.Registry) (model.ToolResult, bool) {
-	if reusable == nil {
-		return model.ToolResult{}, false
-	}
-	id := strings.TrimSpace(step.ID)
-	if id == "" {
-		return model.ToolResult{}, false
-	}
-	prev, ok := reusable[id]
-	if !ok {
-		return model.ToolResult{}, false
-	}
-	if strings.TrimSpace(prev.Tool) != strings.TrimSpace(step.Tool) || !prev.OK {
-		return model.ToolResult{}, false
-	}
-	if !stepReusable(step, prev, registry) {
-		return model.ToolResult{}, false
-	}
-	return prev, true
-}
-
-func stepReusable(step model.PlanStep, result model.ToolResult, registry *tool.Registry) bool {
-	if registry != nil {
-		if def, ok := registry.Get(strings.TrimSpace(step.Tool)); ok {
-			if def.Metadata.ReusePolicy == tool.ReuseStableRead {
-				return len(result.Evidence) > 0
-			}
-			if def.Metadata.ReusePolicy == "" || def.Metadata.ReusePolicy == tool.ReuseNever {
-				return stableReadEvidence(result.Evidence)
-			}
-			return false
-		}
-	}
-	return stableReadEvidence(result.Evidence)
-}
-
-func stableReadEvidence(evidence map[string]any) bool {
-	if len(evidence) == 0 {
+func shouldBypassUserInputPending(pending *session.PendingAction, text string) bool {
+	if pending == nil || pending.Kind != "user_input" {
 		return false
 	}
-	kind, _ := evidence["kind"].(string)
-	switch strings.TrimSpace(kind) {
-	case "file_read", "file_summary", "project_index", "web_search", "web_fetch", "memory_search", "memory_index":
-		return true
-	default:
+	normalized := normalizeFollowupText(text)
+	if normalized == "" || isConfirm(normalized) || isCancel(normalized) {
 		return false
 	}
+	if isFollowupCue(normalized) || isHistoricalCue(normalized) || isRetryCue(normalized) || isShortContextDependent(normalized) {
+		return false
+	}
+	return looksLikeStandaloneTaskRequest(normalized)
 }
 
-func (r Runtime) failure(msg channel.InboundMessage, plan *model.Plan, results []model.ToolResult, err error) Response {
-	var p model.Plan
-	if plan != nil {
-		p = *plan
+func looksLikeStandaloneTaskRequest(text string) bool {
+	taskVerbs := []string{
+		"请读取", "请总结", "请查看", "请检查", "请搜索", "请创建", "请生成", "请列出",
+		"帮我读取", "帮我总结", "帮我查看", "帮我检查", "帮我搜索", "帮我创建", "帮我生成",
+		"读取", "总结", "查看", "检查", "搜索", "创建", "生成", "列出",
+		"read", "summarize", "check", "search", "create", "generate", "list",
 	}
-	return Response{
-		Reply:   r.sanitizeReply(channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: userFacingError(err), Style: "error"}),
-		TraceID: traceIDForMessage(msg),
-		Plan:    p, Results: results, Failed: true,
-		FinalAcceptStatus: string(AcceptanceRejected),
-		FinalAcceptReason: err.Error(),
-	}
-}
-
-func userFacingError(err error) string {
-	if err == nil {
-		return "任务失败了，我已经停在安全位置。"
-	}
-	text := err.Error()
-	lower := strings.ToLower(text)
-	if strings.Contains(lower, "insufficient tool evidence") {
-		return "我没有拿到足够的工具证据，所以先停下，避免给出没有依据的结论。你可以稍后重试，或补充可用来源/文件路径后让我继续。"
-	}
-	if strings.Contains(lower, "plan contract verification") {
-		return "我生成的执行计划没有通过合同校验，已经尝试自动修复一次，但仍缺少必要工具参数、依赖或证据设计，所以先停下。"
-	}
-	if strings.Contains(lower, "unexpected eof") ||
-		strings.Contains(lower, "model request") ||
-		strings.Contains(lower, "api.minimaxi.com") ||
-		strings.Contains(lower, "/anthropic/") ||
-		strings.Contains(lower, "connection reset") ||
-		strings.Contains(lower, "timeout") ||
-		strings.Contains(lower, "context deadline exceeded") {
-		return "模型服务请求临时失败，所以任务没有继续。稍后可以重试；如果一直出现，再看 trace 日志。"
-	}
-	return "任务失败了，我已经停在安全位置。可以查看报告或 trace 了解细节。"
-}
-
-func confirmPromptForStep(step model.PlanStep, args map[string]string) string {
-	switch step.Tool {
-	case "shell.run", "terminal.run":
-		command := strings.TrimSpace(args["command"])
-		if command != "" {
-			return "这个命令可能会修改或删除本地内容，执行前需要你确认。\n\n命令：`" + command + "`\n\n回复“确认”继续执行，或回复“取消”放弃。"
-		}
-	case "file.write", "file.patch":
-		path := strings.TrimSpace(args["path"])
-		if path != "" {
-			return "这个文件操作会修改本地文件，执行前需要你确认。\n\n文件：" + path + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
-		}
-	case "skill.install":
-		name := firstNonEmpty(args["name"], args["url"], args["query"])
-		if name != "" {
-			text := "这个操作会安装一个 agent skill，执行前需要你确认。\n\n技能：" + name
-			if source := strings.TrimSpace(args["url"]); source != "" {
-				text += "\n来源：" + source
-			}
-			return text + "\n目标：Mateway workspace 的 skills 目录\n\n回复“确认”继续执行，或回复“取消”放弃。"
-		}
-	case "software.install":
-		command := strings.TrimSpace(args["command"])
-		verify := strings.TrimSpace(args["verify_command"])
-		if verify == "" {
-			verify = softwareInstallVerifyCommand(args["executable"])
-		}
-		if command != "" {
-			text := "这个安装操作会修改本地环境，执行前需要你确认。\n\n安装命令：`" + command + "`"
-			if verify != "" {
-				text += "\n验证命令：`" + verify + "`"
-			}
-			if source := strings.TrimSpace(args["source_url"]); source != "" {
-				text += "\n来源：" + source
-			}
-			return text + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
-		}
-	case "memory.commit":
-		proposal := firstNonEmpty(args["proposal"], args["id"], args["path"])
-		kind := strings.TrimSpace(args["type"])
-		target := strings.TrimSpace(args["target_hint"])
-		if proposal != "" {
-			text := "这条长期记忆提交可能会影响后续默认记忆注入，执行前需要你确认。\n\nProposal：" + proposal
-			if kind != "" {
-				text += "\n类型：" + kind
-			}
-			if target != "" {
-				text += "\n推荐落点：" + target
-			}
-			return text + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
+	hasVerb := false
+	for _, verb := range taskVerbs {
+		if strings.Contains(text, verb) {
+			hasVerb = true
+			break
 		}
 	}
-	goal := strings.TrimSpace(step.Goal)
-	if goal == "" {
-		goal = step.Tool
+	if !hasVerb {
+		return false
 	}
-	return "这一步需要你确认后我才能继续。\n\n操作：" + goal + "\n\n回复“确认”继续执行，或回复“取消”放弃。"
-}
-
-func softwareInstallVerifyCommand(executable string) string {
-	executable = strings.TrimSpace(executable)
-	if executable == "" {
-		return ""
-	}
-	quoted := "'" + strings.ReplaceAll(executable, "'", "'\\''") + "'"
-	return "command -v " + quoted + " && " + quoted + " --version"
-}
-
-func (r Runtime) sanitizeReply(reply channel.OutboundMessage) channel.OutboundMessage {
-	if r.Sanitizer == nil {
-		return DefaultSanitizer{}.Sanitize(reply)
-	}
-	return r.Sanitizer.Sanitize(reply)
-}
-
-func hasRepairableFailure(results []model.ToolResult) bool {
-	for _, result := range results {
-		if !result.OK && result.Error != "await_confirm" {
+	for _, marker := range []string{"readme", ".md", ".txt", ".json", ".yaml", ".yml", "/", "~", "项目", "文件", "目录", "邮件", "网页", "网站"} {
+		if strings.Contains(text, marker) {
 			return true
 		}
 	}
 	return false
 }
 
-func needsGroundingEvidence(user string, results []model.ToolResult) bool {
-	if !requiresGroundingEvidence(user) {
-		return false
+func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string, map[string]any) {
+	evidence := map[string]any{}
+	for key, value := range result.Evidence {
+		evidence[key] = value
 	}
-	return !hasGroundingEvidence(results)
-}
-
-func requiresGroundingEvidence(user string) bool {
-	normalized := normalizeIntentText(user)
-	if normalized == "" {
-		return false
-	}
-	hasLocalSubject := strings.Contains(normalized, "mateway") ||
-		textmatch.ContainsGroup(normalized, "project_subject")
-	hasKnowledgeAction := textmatch.ContainsGroup(normalized, "project_action")
-	if hasLocalSubject && hasKnowledgeAction {
-		return true
-	}
-	if strings.Contains(normalized, "文件") || strings.Contains(normalized, "文档") || strings.Contains(normalized, "readme") {
-		return strings.Contains(normalized, "总结") || strings.Contains(normalized, "读取") || strings.Contains(normalized, "内容")
-	}
-	if strings.Contains(normalized, "安装") || strings.Contains(normalized, "install") {
-		return true
-	}
-	if strings.Contains(normalized, "最新") || strings.Contains(normalized, "current") || strings.Contains(normalized, "today") {
-		return true
-	}
-	return false
-}
-
-func hasGroundingEvidence(results []model.ToolResult) bool {
-	for _, result := range results {
-		if !result.OK {
-			continue
-		}
-		switch strings.TrimSpace(result.Tool) {
-		case "file.read", "file.summary", "project.index", "web.search", "web.fetch", "software.search", "skill.search", "software.install", "skill.install", "terminal.run":
-			return true
-		}
-		if kind, _ := result.Evidence["kind"].(string); groundingEvidenceKind(kind) {
-			return true
+	if tool != nil {
+		contract := agentcore.ContractFor(tool)
+		if contract.Acceptance != "" {
+			evidence["acceptance_criteria"] = contract.Acceptance
 		}
 	}
-	return false
+	if result.IsError {
+		evidence["acceptance"] = "failed"
+		return "failed", evidence
+	}
+	if len(result.Evidence) == 0 && strings.TrimSpace(result.Content) == "" {
+		evidence["acceptance"] = "suspect"
+		return "suspect", evidence
+	}
+	evidence["acceptance"] = "accepted"
+	return "accepted", evidence
 }
 
-func groundingEvidenceKind(kind string) bool {
-	switch strings.TrimSpace(kind) {
-	case "file_read", "file_summary", "project_index", "web_search", "web_fetch", "software_search", "skill_search", "software_install", "skill_install", "terminal", "shell", "memory_search", "memory_index", "schedule_create", "schedule_list", "schedule_show", "schedule_pause", "schedule_resume", "schedule_update", "schedule_delete":
+func reply(msg channel.InboundMessage, text, style string) Response {
+	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style}}
+}
+
+func isConfirm(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "确认", "同意", "继续", "yes", "y", "ok":
 		return true
 	default:
 		return false
 	}
 }
 
-func repairReasonFromResults(results []model.ToolResult) string {
-	for _, result := range results {
-		if result.OK {
-			continue
-		}
-		if result.Error != "" {
-			return result.Error
-		}
-		if strings.TrimSpace(result.Output) != "" {
-			return strings.TrimSpace(result.Output)
-		}
-	}
-	return ""
-}
-
-func normalizeIntentText(text string) string {
-	replacer := strings.NewReplacer("，", "", "。", "", "？", "", "！", "", "：", "", "\n", "")
-	return strings.ToLower(strings.TrimSpace(replacer.Replace(text)))
-}
-
-func anyFailed(results []model.ToolResult) bool {
-	for _, result := range results {
-		if !result.OK {
-			return true
-		}
-	}
-	return false
-}
-
-func fallbackSynthesis(results []model.ToolResult) string {
-	var b strings.Builder
-	for _, result := range results {
-		status := "OK"
-		if !result.OK {
-			status = "WAIT/FAILED"
-		}
-		fmt.Fprintf(&b, "- %s %s via %s\n%s\n", result.StepID, status, result.Tool, strings.TrimSpace(result.Output))
-		if result.Error != "" && result.Error != "await_confirm" {
-			fmt.Fprintf(&b, "error: %s\n", result.Error)
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func styleForFailed(failed bool) string {
-	if failed {
-		return "error"
-	}
-	return "reply"
-}
-
-func copyArgs(in map[string]string) map[string]string {
-	out := map[string]string{}
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func collectArtifacts(results []model.ToolResult) []session.Artifact {
-	var artifacts []session.Artifact
-	seen := map[string]struct{}{}
-	for _, result := range results {
-		evidence := result.Evidence
-		if evidence == nil {
-			continue
-		}
-		if path, _ := evidence["path"].(string); strings.TrimSpace(path) != "" {
-			key := "path:" + path
-			if _, ok := seen[key]; !ok {
-				seen[key] = struct{}{}
-				artifacts = append(artifacts, session.Artifact{
-					Kind:      firstNonEmpty(stringValue(evidence["kind"]), "file"),
-					Path:      path,
-					StartLine: intValue(evidence["start_line"]),
-					EndLine:   intValue(evidence["end_line"]),
-					Label:     result.Tool,
-					Summary:   shortenReply(result.Output, 180),
-				})
-			}
-		}
-		if url, _ := evidence["url"].(string); strings.TrimSpace(url) != "" {
-			key := "url:" + url
-			if _, ok := seen[key]; !ok {
-				seen[key] = struct{}{}
-				artifacts = append(artifacts, session.Artifact{
-					Kind:      firstNonEmpty(stringValue(evidence["kind"]), "link"),
-					SourceURL: url,
-					Label:     result.Tool,
-					Summary:   shortenReply(result.Output, 180),
-				})
-			}
-		}
-		if urls, ok := evidence["urls"].([]string); ok {
-			for _, item := range urls {
-				key := "url:" + item
-				if _, exists := seen[key]; exists || strings.TrimSpace(item) == "" {
-					continue
-				}
-				seen[key] = struct{}{}
-				artifacts = append(artifacts, session.Artifact{Kind: firstNonEmpty(stringValue(evidence["kind"]), "link"), SourceURL: item, Label: result.Tool})
-			}
-		}
-		if more := artifactsFromOutput(result); len(more) > 0 {
-			for _, artifact := range more {
-				key := artifact.Kind + ":" + firstNonEmpty(artifact.Path, artifact.SourceURL, artifact.Label)
-				if _, ok := seen[key]; ok || strings.TrimSpace(key) == ":" {
-					continue
-				}
-				seen[key] = struct{}{}
-				artifacts = append(artifacts, artifact)
-			}
-		}
-	}
-	return artifacts
-}
-
-func intValue(value any) int {
-	switch v := value.(type) {
-	case int:
-		return v
-	case int64:
-		return int(v)
-	case float64:
-		return int(v)
-	case json.Number:
-		n, _ := v.Int64()
-		return int(n)
-	default:
-		return 0
-	}
-}
-
-var urlPattern = regexp.MustCompile(`https?://[^\s]+`)
-
-func artifactsFromOutput(result model.ToolResult) []session.Artifact {
-	text := strings.TrimSpace(result.Output)
-	if text == "" {
-		return nil
-	}
-	var out []session.Artifact
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		urls := urlPattern.FindAllString(trimmed, -1)
-		for _, item := range urls {
-			label := ""
-			if i > 0 {
-				prev := strings.TrimSpace(lines[i-1])
-				if prev != "" && !strings.HasPrefix(prev, "http") {
-					label = prev
-				}
-			}
-			out = append(out, session.Artifact{
-				Kind:      "link",
-				SourceURL: strings.TrimRight(item, ".,);"),
-				Label:     firstNonEmpty(label, result.Tool),
-				Summary:   shortenReply(trimmed, 120),
-			})
-		}
-		if looksFilesystemPath(trimmed) {
-			out = append(out, session.Artifact{
-				Kind:    "file",
-				Path:    strings.Trim(trimmed, "` "),
-				Label:   result.Tool,
-				Summary: shortenReply(trimmed, 120),
-			})
-		}
-	}
-	if strings.Contains(text, "Search results for:") {
-		query := ""
-		if lines := strings.SplitN(text, "\n", 2); len(lines) > 0 {
-			query = strings.TrimPrefix(strings.TrimSpace(lines[0]), "Search results for:")
-		}
-		if strings.TrimSpace(query) != "" {
-			out = append(out, session.Artifact{
-				Kind:    "search_query",
-				Label:   result.Tool,
-				Summary: strings.TrimSpace(query),
-			})
-		}
-	}
-	return out
-}
-
-func looksFilesystemPath(text string) bool {
-	text = strings.TrimSpace(strings.Trim(text, "`"))
-	if text == "" {
-		return false
-	}
-	if strings.HasPrefix(text, "/") || strings.HasPrefix(text, "~/") {
-		return true
-	}
-	if strings.Contains(text, string(filepath.Separator)) && strings.Contains(text, ".") {
-		return true
-	}
-	return false
-}
-
-func stringValue(v any) string {
-	if v == nil {
-		return ""
-	}
-	return strings.TrimSpace(fmt.Sprint(v))
-}
-
-func parseBool(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "y", "confirmed":
+func isCancel(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "取消", "不要", "放弃", "no", "n", "cancel":
 		return true
 	default:
 		return false
 	}
 }
 
-func DebugJSON(v any) string {
-	data, _ := json.MarshalIndent(v, "", "  ")
-	return string(data)
-}
-
-func traceIDForMessage(msg channel.InboundMessage) string {
-	if strings.TrimSpace(msg.ID) != "" {
-		return msg.Channel + "-" + msg.ID
+func summarize(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= 160 {
+		return text
 	}
-	if strings.TrimSpace(msg.SessionKey) != "" {
-		return msg.SessionKey + "-" + time.Now().Format("20060102T150405.000000000")
-	}
-	return msg.Channel + "-" + time.Now().Format("20060102T150405.000000000")
-}
-
-func planToolNames(plan model.Plan) []string {
-	out := make([]string, 0, len(plan.Steps))
-	for _, step := range plan.Steps {
-		out = append(out, step.Tool)
-	}
-	return out
+	return text[:160] + fmt.Sprintf("... (%d chars)", len(text))
 }
 
 func firstNonEmpty(values ...string) string {
@@ -973,8 +724,80 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func fallbackSessionKey(msg channel.InboundMessage) string {
-	channelName := firstNonEmpty(msg.Channel, "unknown")
-	threadID := firstNonEmpty(msg.ThreadID, msg.UserID, msg.ID, "default")
-	return channelName + ":" + threadID
+type HeuristicModel struct{}
+
+func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	last := lastConversationMessage(ctx.Messages)
+	if last.Role == agentcore.RoleTool {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: last.Content}, nil
+	}
+	text := strings.TrimSpace(last.Content)
+	if path, ok := strings.CutPrefix(text, "/read "); ok {
+		return agentcore.Message{
+			Role: agentcore.RoleAssistant,
+			ToolCalls: []agentcore.ToolCall{{
+				ID:   "call_1",
+				Name: "file.read",
+				Args: map[string]any{"path": strings.TrimSpace(path)},
+			}},
+		}, nil
+	}
+	if path, ok := strings.CutPrefix(text, "/index "); ok {
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": strings.TrimSpace(path)}}}}, nil
+	}
+	if rest, ok := strings.CutPrefix(text, "/write "); ok {
+		path, content, _ := strings.Cut(rest, " ")
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": strings.TrimSpace(path), "content": strings.TrimSpace(content)}}}}, nil
+	}
+	if command, ok := strings.CutPrefix(text, "/run "); ok {
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": strings.TrimSpace(command)}}}}, nil
+	}
+	if query, ok := strings.CutPrefix(text, "/search "); ok {
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": strings.TrimSpace(query)}}}}, nil
+	}
+	if rest, ok := strings.CutPrefix(text, "/schedule "); ok {
+		parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
+		if len(parts) == 2 {
+			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.create", Args: map[string]any{"run_at": parts[0], "text": parts[1], "session_key": "cli:scheduled"}}}}, nil
+		}
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "收到：" + text}, nil
+}
+
+func lastConversationMessage(messages []agentcore.Message) agentcore.Message {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != agentcore.RoleSystem {
+			return messages[i]
+		}
+	}
+	return agentcore.Message{}
+}
+
+func looksLikeInputRequest(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	if strings.Contains(trimmed, "需要你") || strings.Contains(trimmed, "请提供") || strings.Contains(trimmed, "请补充") {
+		return true
+	}
+	return strings.HasSuffix(trimmed, "？") && (strings.Contains(trimmed, "哪个") || strings.Contains(trimmed, "什么") || strings.Contains(trimmed, "是否"))
+}
+
+func friendlyRuntimeError(err error) string {
+	raw := strings.TrimSpace(fmt.Sprint(err))
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout"):
+		return "模型服务这次响应超时了，任务已经停在安全位置。你可以直接回复“重试”或把问题再发一遍，我会接着当前上下文继续。"
+	case strings.Contains(lower, "model api key is empty"):
+		return "当前模型配置缺少 API Key，任务没有继续执行。请检查模型配置后重试。"
+	case strings.Contains(lower, "all models failed"):
+		return "当前可用模型都调用失败了，任务已经停在安全位置。你可以稍后回复“重试”，或切换/检查 fallback 模型配置。"
+	default:
+		if raw == "" {
+			return "任务执行失败了，已经停在安全位置。你可以补充信息后重试。"
+		}
+		return "任务执行失败了，已经停在安全位置。你可以补充信息后重试。"
+	}
 }

@@ -47,6 +47,12 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 		OnP2MessageReadV1(func(eventCtx context.Context, event *larkim.P2MessageReadV1) error {
 			return nil
 		}).
+		OnP2MessageReactionCreatedV1(func(eventCtx context.Context, event *larkim.P2MessageReactionCreatedV1) error {
+			return nil
+		}).
+		OnP2MessageReactionDeletedV1(func(eventCtx context.Context, event *larkim.P2MessageReactionDeletedV1) error {
+			return nil
+		}).
 		OnP2ChatAccessEventBotP2pChatEnteredV1(func(eventCtx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
 			return nil
 		})
@@ -94,6 +100,12 @@ func NormalizeCardAction(event *callback.CardActionTriggerEvent) channel.Inbound
 	if decision := extractCardActionDecision(event.Event.Action); decision != "" {
 		msg.Metadata["card_action"] = decision
 	}
+	if sessionKey := extractCardActionString(event.Event.Action, "mateway_session_key"); sessionKey != "" {
+		msg.SessionKey = sessionKey
+	}
+	if threadID := extractCardActionString(event.Event.Action, "mateway_thread_id"); threadID != "" {
+		msg.ThreadID = threadID
+	}
 	if event.Event.Operator != nil {
 		msg.UserID = firstNonEmpty(event.Event.Operator.OpenID, value(event.Event.Operator.UserID))
 	}
@@ -138,8 +150,15 @@ func extractCardActionDecision(action *callback.CallBackAction) string {
 	if action == nil {
 		return ""
 	}
-	if decision, _ := action.Value["decision"].(string); strings.TrimSpace(decision) != "" {
-		return strings.TrimSpace(decision)
+	return extractCardActionString(action, "decision")
+}
+
+func extractCardActionString(action *callback.CallBackAction, key string) string {
+	if action == nil {
+		return ""
+	}
+	if value, _ := action.Value[key].(string); strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
 	}
 	return ""
 }

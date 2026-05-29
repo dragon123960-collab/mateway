@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -103,16 +104,41 @@ func TestRenderReplyMessageStripsBareJSONToolPlan(t *testing.T) {
 }
 
 func TestRenderReplyMessageBuildsApprovalCardActions(t *testing.T) {
+	t.Setenv("MATEWAY_FEISHU_APPROVAL_BUTTONS", "1")
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
-		Style: "approval_pending",
-		Title: "Mateway 等待确认",
-		Text:  "这个操作会修改本地环境，执行前需要你确认。",
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "approval_pending",
+		Title:    "Mateway 等待确认",
+		Text:     "这个操作会修改本地环境，执行前需要你确认。",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(content, `"tag":"action"`) || !strings.Contains(content, `"decision":"confirm"`) || !strings.Contains(content, `"decision":"cancel"`) {
 		t.Fatalf("expected approval buttons, got %s", content)
+	}
+	if !strings.Contains(content, `"mateway_session_key":"feishu:thread_123"`) {
+		t.Fatalf("expected approval button to preserve session key, got %s", content)
+	}
+}
+
+func TestRenderReplyMessageDisablesApprovalButtonsByDefault(t *testing.T) {
+	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "approval_pending",
+		Text:     "这个操作会修改外部系统，执行前需要你确认。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, `"tag":"button"`) || strings.Contains(content, `"tag":"action"`) {
+		t.Fatalf("expected no approval buttons by default, got %s", content)
+	}
+	if !strings.Contains(content, "直接回复") {
+		t.Fatalf("expected text confirmation fallback, got %s", content)
 	}
 }
 
@@ -129,8 +155,10 @@ func TestNormalizeCardActionMapsToConfirmMessage(t *testing.T) {
 			},
 			Action: &callback.CallBackAction{
 				Value: map[string]any{
-					"decision":     "confirm",
-					"mateway_text": "确认",
+					"decision":            "confirm",
+					"mateway_text":        "确认",
+					"mateway_thread_id":   "thread_123",
+					"mateway_session_key": "feishu:thread_123",
 				},
 			},
 		},
@@ -139,8 +167,11 @@ func TestNormalizeCardActionMapsToConfirmMessage(t *testing.T) {
 	if msg.Text != "确认" {
 		t.Fatalf("expected confirm text, got %q", msg.Text)
 	}
-	if msg.ThreadID != openChatID {
-		t.Fatalf("expected thread id %q, got %q", openChatID, msg.ThreadID)
+	if msg.ThreadID != "thread_123" {
+		t.Fatalf("expected thread id from card value, got %q", msg.ThreadID)
+	}
+	if msg.SessionKey != "feishu:thread_123" {
+		t.Fatalf("expected session key from card value, got %q", msg.SessionKey)
 	}
 	if msg.UserID != userID {
 		t.Fatalf("expected user id %q, got %q", userID, msg.UserID)

@@ -19,10 +19,90 @@ type Root struct {
 	Model     ModelSelection  `yaml:"model"`
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
+	Skills    SkillsConfig    `yaml:"skills"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
 	Models    []ModelConfig   `yaml:"-"`
 	Channels  ChannelsConfig  `yaml:"-"`
+}
+
+func DefaultRoot() Root {
+	root := Root{
+		App: AppConfig{Name: "mateway"},
+		Model: ModelSelection{
+			Default:   "minimax",
+			Fallbacks: []string{},
+		},
+		Memory: MemoryConfig{
+			Enabled:           true,
+			RecentDays:        3,
+			AutoPropose:       true,
+			AutoCommitLowRisk: false,
+			RequireConfirmFor: []string{"user_preference", "org_knowledge", "long_memory", "skill_candidate"},
+		},
+		Learning: LearningConfig{Enabled: true, SkillCrystallization: SkillCrystallizationConfig{
+			Enabled:            true,
+			SuccessThreshold:   3,
+			MinConfidence:      "medium",
+			RequireUserConfirm: true,
+			AskTiming:          "next_interaction",
+		}},
+		Scheduler: SchedulerConfig{
+			Enabled:  false,
+			Timezone: "Asia/Shanghai",
+			Interval: "30s",
+		},
+		Security: SecurityConfig{
+			EnforceWorkspacePaths:       true,
+			RequireApprovalForRiskyTool: true,
+			AccessiblePaths:             []string{},
+			TerminalSandbox: TerminalSandboxConfig{
+				Enabled:        false,
+				Mode:           "restricted",
+				TimeoutSeconds: 20,
+				CommandPrefix:  []string{},
+			},
+		},
+		Search: SearchConfig{
+			DefaultTool:        "tavily",
+			ProviderOrder:      []string{"tavily", "searxng", "duckduckgo"},
+			CacheEnabled:       true,
+			CacheTTLHours:      168,
+			FreshCacheTTLHours: 6,
+			Providers: SearchProvidersConfig{
+				Tavily:     SearchProviderConfig{Enabled: false, BaseURL: "https://api.tavily.com/search", APIKeyEnv: "TAVILY_API_KEY", TimeoutSeconds: 8, MaxResults: 5, DailyBudget: 20, MonthlyBudget: 900, SearchDepth: "basic", Topic: "general"},
+				SearXNG:    SearchProviderConfig{Enabled: false, BaseURL: "http://127.0.0.1:8088", TimeoutSeconds: 8, MaxResults: 5},
+				DuckDuckGo: SearchProviderConfig{Enabled: true, TimeoutSeconds: 4, MaxResults: 5, Region: "cn-zh"},
+			},
+		},
+	}
+	root.Skills.Catalogs = []SkillCatalogConfig{
+		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", InstallURL: "", TrustLevel: "high"},
+		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", InstallURL: "", TrustLevel: "unknown"},
+		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", InstallURL: "", TrustLevel: "medium"},
+	}
+	root.Agents = AgentsConfig{
+		Default: "main",
+		Profiles: []AgentProfileConfig{{
+			ID:               "main",
+			Name:             "Main Assistant",
+			Default:          true,
+			SessionNamespace: "main",
+			Model:            root.Model,
+			Heartbeat: HeartbeatConfig{
+				Enabled:  false,
+				Interval: "30m",
+				Schedule: HeartbeatSchedule{DailyAt: "03:30"},
+				Jobs:     []string{"memory_lint", "memory_index_rebuild"},
+				QuietHours: HeartbeatQuietHours{
+					Start: "23:00",
+					End:   "08:00",
+				},
+			},
+		}},
+		Bindings: []AgentBindingConfig{{Channel: "cli", AgentID: "main"}, {Channel: "feishu", AgentID: "main"}},
+	}
+	return root
 }
 
 type AppConfig struct {
@@ -32,9 +112,18 @@ type AppConfig struct {
 }
 
 type SecurityConfig struct {
-	EnforceWorkspacePaths       bool     `yaml:"enforce_workspace_paths"`
-	RequireApprovalForRiskyTool bool     `yaml:"require_approval_for_risky_tools"`
-	AccessiblePaths             []string `yaml:"accessible_paths"`
+	EnforceWorkspacePaths       bool                  `yaml:"enforce_workspace_paths"`
+	RequireApprovalForRiskyTool bool                  `yaml:"require_approval_for_risky_tools"`
+	AccessiblePaths             []string              `yaml:"accessible_paths"`
+	TerminalSandbox             TerminalSandboxConfig `yaml:"terminal_sandbox"`
+}
+
+type TerminalSandboxConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	Mode           string   `yaml:"mode"`
+	WorkDir        string   `yaml:"workdir"`
+	TimeoutSeconds int      `yaml:"timeout_seconds"`
+	CommandPrefix  []string `yaml:"command_prefix"`
 }
 
 type SearchConfig struct {
@@ -48,6 +137,7 @@ type SearchConfig struct {
 
 type SearchProvidersConfig struct {
 	Tavily     SearchProviderConfig `yaml:"tavily"`
+	SearXNG    SearchProviderConfig `yaml:"searxng"`
 	DuckDuckGo SearchProviderConfig `yaml:"duckduckgo"`
 }
 
@@ -108,10 +198,24 @@ type SkillCrystallizationConfig struct {
 	AskTiming          string `yaml:"ask_timing"`
 }
 
+type SkillsConfig struct {
+	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
+}
+
+type SkillCatalogConfig struct {
+	Name       string `yaml:"name"`
+	Enabled    bool   `yaml:"enabled"`
+	BaseURL    string `yaml:"base_url"`
+	SearchURL  string `yaml:"search_url"`
+	InstallURL string `yaml:"install_url"`
+	TrustLevel string `yaml:"trust_level"`
+}
+
 type SchedulerConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	Timezone string `yaml:"timezone"`
 	StateDir string `yaml:"state_dir"`
+	Interval string `yaml:"interval"`
 }
 
 type AgentsConfig struct {
@@ -205,11 +309,11 @@ func (c FeishuConfig) ResolveSecrets() FeishuConfig {
 }
 
 func (c SearchProviderConfig) ResolvedAPIKey() string {
-	return firstNonEmpty(c.APIKey, getenv(c.APIKeyEnv))
+	return firstNonEmpty(c.APIKey, getenvWithMatewayFallback(c.APIKeyEnv))
 }
 
 func (c ModelConfig) ResolvedAPIKey() string {
-	return firstNonEmpty(c.APIKey, getenv(c.APIKeyEnv))
+	return firstNonEmpty(c.APIKey, getenvWithMatewayFallback(c.APIKeyEnv))
 }
 
 func DefaultHome() string {
@@ -256,13 +360,145 @@ func (l Loader) Load() (*Root, error) {
 		return nil, err
 	}
 	root.Models = models
-	root.normalizeAgents()
+	root.NormalizeForUse()
 	channels, err := l.loadChannels()
 	if err != nil {
 		return nil, err
 	}
 	root.Channels = channels
 	return root, nil
+}
+
+func (r *Root) NormalizeForUse() {
+	if r == nil {
+		return
+	}
+	r.applyDefaults()
+	r.normalizeSearch()
+	r.normalizeSkills()
+	r.normalizeAgents()
+}
+
+func (r *Root) applyDefaults() {
+	defaults := DefaultRoot()
+	if strings.TrimSpace(r.App.Name) == "" {
+		r.App.Name = defaults.App.Name
+	}
+	if strings.TrimSpace(r.Model.Default) == "" {
+		r.Model.Default = defaults.Model.Default
+	}
+	if r.Model.Fallbacks == nil {
+		r.Model.Fallbacks = defaults.Model.Fallbacks
+	}
+	if r.Model.Roles == nil {
+		r.Model.Roles = map[string]string{}
+	}
+	if r.Memory.RecentDays <= 0 {
+		r.Memory.RecentDays = defaults.Memory.RecentDays
+	}
+	if len(r.Memory.RequireConfirmFor) == 0 {
+		r.Memory.RequireConfirmFor = defaults.Memory.RequireConfirmFor
+	}
+	if strings.TrimSpace(r.Learning.SkillCrystallization.MinConfidence) == "" {
+		r.Learning.SkillCrystallization.MinConfidence = defaults.Learning.SkillCrystallization.MinConfidence
+	}
+	if r.Learning.SkillCrystallization.SuccessThreshold <= 0 {
+		r.Learning.SkillCrystallization.SuccessThreshold = defaults.Learning.SkillCrystallization.SuccessThreshold
+	}
+	if strings.TrimSpace(r.Learning.SkillCrystallization.AskTiming) == "" {
+		r.Learning.SkillCrystallization.AskTiming = defaults.Learning.SkillCrystallization.AskTiming
+	}
+	if strings.TrimSpace(r.Scheduler.Timezone) == "" {
+		r.Scheduler.Timezone = defaults.Scheduler.Timezone
+	}
+	if strings.TrimSpace(r.Scheduler.Interval) == "" {
+		r.Scheduler.Interval = defaults.Scheduler.Interval
+	}
+	if r.Security.AccessiblePaths == nil {
+		r.Security.AccessiblePaths = []string{}
+	}
+	if strings.TrimSpace(r.Security.TerminalSandbox.Mode) == "" {
+		r.Security.TerminalSandbox.Mode = defaults.Security.TerminalSandbox.Mode
+	}
+	if r.Security.TerminalSandbox.TimeoutSeconds <= 0 {
+		r.Security.TerminalSandbox.TimeoutSeconds = defaults.Security.TerminalSandbox.TimeoutSeconds
+	}
+	if r.Security.TerminalSandbox.CommandPrefix == nil {
+		r.Security.TerminalSandbox.CommandPrefix = []string{}
+	}
+	if strings.TrimSpace(r.Search.DefaultTool) == "" {
+		r.Search.DefaultTool = defaults.Search.DefaultTool
+	}
+	if r.Search.CacheTTLHours <= 0 {
+		r.Search.CacheTTLHours = defaults.Search.CacheTTLHours
+	}
+	if r.Search.FreshCacheTTLHours <= 0 {
+		r.Search.FreshCacheTTLHours = defaults.Search.FreshCacheTTLHours
+	}
+	mergeSearchProviderDefaults(&r.Search.Providers.Tavily, defaults.Search.Providers.Tavily)
+	mergeSearchProviderDefaults(&r.Search.Providers.SearXNG, defaults.Search.Providers.SearXNG)
+	mergeSearchProviderDefaults(&r.Search.Providers.DuckDuckGo, defaults.Search.Providers.DuckDuckGo)
+}
+
+func mergeSearchProviderDefaults(dst *SearchProviderConfig, defaults SearchProviderConfig) {
+	if strings.TrimSpace(dst.BaseURL) == "" {
+		dst.BaseURL = defaults.BaseURL
+	}
+	if strings.TrimSpace(dst.APIKeyEnv) == "" {
+		dst.APIKeyEnv = defaults.APIKeyEnv
+	}
+	if dst.TimeoutSeconds <= 0 {
+		dst.TimeoutSeconds = defaults.TimeoutSeconds
+	}
+	if dst.MaxResults <= 0 {
+		dst.MaxResults = defaults.MaxResults
+	}
+	if dst.DailyBudget <= 0 {
+		dst.DailyBudget = defaults.DailyBudget
+	}
+	if dst.MonthlyBudget <= 0 {
+		dst.MonthlyBudget = defaults.MonthlyBudget
+	}
+	if strings.TrimSpace(dst.SearchDepth) == "" {
+		dst.SearchDepth = defaults.SearchDepth
+	}
+	if strings.TrimSpace(dst.Topic) == "" {
+		dst.Topic = defaults.Topic
+	}
+	if strings.TrimSpace(dst.Region) == "" {
+		dst.Region = defaults.Region
+	}
+}
+
+func (r *Root) normalizeSkills() {
+	if len(r.Skills.Catalogs) > 0 {
+		return
+	}
+	r.Skills.Catalogs = []SkillCatalogConfig{
+		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", InstallURL: "", TrustLevel: "high"},
+		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", InstallURL: "", TrustLevel: "unknown"},
+		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", InstallURL: "", TrustLevel: "medium"},
+	}
+}
+
+func (r *Root) normalizeSearch() {
+	if len(r.Search.ProviderOrder) == 0 {
+		if r.Search.Providers.Tavily.Enabled {
+			r.Search.ProviderOrder = append(r.Search.ProviderOrder, "tavily")
+		}
+		if r.Search.Providers.SearXNG.Enabled {
+			r.Search.ProviderOrder = append(r.Search.ProviderOrder, "searxng")
+		}
+		if r.Search.Providers.DuckDuckGo.Enabled {
+			r.Search.ProviderOrder = append(r.Search.ProviderOrder, "duckduckgo")
+		}
+	}
+	if len(r.Search.ProviderOrder) == 0 {
+		r.Search.ProviderOrder = []string{"tavily", "searxng", "duckduckgo"}
+	}
+	if strings.TrimSpace(r.Search.DefaultTool) == "" {
+		r.Search.DefaultTool = "web.search"
+	}
 }
 
 func (r *Root) DefaultAgent() AgentProfileConfig {
@@ -460,4 +696,18 @@ func getenv(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(os.Getenv(strings.TrimSpace(name)))
+}
+
+func getenvWithMatewayFallback(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if value := getenv(name); value != "" {
+		return value
+	}
+	if strings.HasPrefix(name, "MATEWAY_") {
+		return ""
+	}
+	return getenv("MATEWAY_" + name)
 }

@@ -2,98 +2,97 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/dongping/mateway/internal/app"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/heartbeat"
-	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/runtime"
 )
 
-type Gateway struct {
-	App       *app.App
-	Sender    *feishu.Sender
-	inflight  *messageDedupe
-	sessions  *sessionLocks
-	workerCtx context.Context
+type Config struct {
+	Config  *config.Root
+	Runtime runtime.Runtime
 }
 
-func New(a *app.App) Gateway {
-	sender := feishu.NewSender(a.Config.Channels.Feishu)
-	return Gateway{App: a, Sender: sender, inflight: newMessageDedupe(10 * time.Minute), sessions: newSessionLocks()}
-}
-
-func (g Gateway) Serve(ctx context.Context) error {
-	g.workerCtx = ctx
-	heartbeat.NewScheduler(g.App.Config).Start(ctx)
-	schedule.NewScheduler(g.App.Config, func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
-		resp, err := g.App.Runtime.Handle(ctx, msg)
-		return schedule.Response{Reply: resp.Reply, TraceID: resp.TraceID, Failed: resp.Failed}, err
-	}).Start(ctx)
-	return feishu.StartWebSocket(ctx, g.App.Config.Channels.Feishu, g.HandleInbound)
-}
-
-func (g Gateway) HandleInbound(ctx context.Context, msg channel.InboundMessage) error {
-	if shouldIgnore(g.App.Config.Channels.Feishu, msg) {
-		return nil
+func Serve(ctx context.Context, cfg Config) error {
+	if cfg.Config == nil {
+		return fmt.Errorf("gateway config is required")
 	}
-	if msg.SessionKey == "" {
-		msg.SessionKey = SessionKey(msg)
-	}
-	if !g.inflight.Begin(msg.ID) {
-		g.App.Runtime.Logger.Event("gateway.duplicate_message", map[string]any{"channel": msg.Channel, "message_id": msg.ID, "session_key": msg.SessionKey})
-		return nil
-	}
-	workerCtx := g.workerCtx
-	if workerCtx == nil {
-		workerCtx = context.Background()
-	}
-	go g.processInbound(workerCtx, msg)
-	return nil
-}
-
-func (g Gateway) processInbound(ctx context.Context, msg channel.InboundMessage) {
-	defer g.inflight.Done(msg.ID)
-	unlock := g.sessions.Lock(msg.SessionKey)
-	defer unlock()
-	_ = g.Sender.React(ctx, msg.ID, "SMILE")
-	rt := g.App.Runtime
-	rt.Observer = nil
-	resp, err := rt.Handle(ctx, msg)
+	lock, err := AcquireInstanceLock(cfg.Config.App.Home)
 	if err != nil {
-		_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
-		_ = g.Sender.Reply(ctx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
-		return
+		return err
 	}
-	if err := g.Sender.Reply(ctx, msg, resp.Reply); err != nil {
-		_ = g.Sender.React(ctx, msg.ID, "CROSS_MARK")
-		return
+	defer lock.Close()
+	if !cfg.Config.Channels.Feishu.Enabled {
+		return fmt.Errorf("no enabled channel: feishu is disabled")
 	}
-	if strings.TrimSpace(resp.Reply.Style) == "approval_pending" || strings.TrimSpace(resp.Reply.Style) == "input_required" {
-		_ = g.Sender.React(ctx, msg.ID, "EYES")
-	} else {
-		_ = g.Sender.React(ctx, msg.ID, "DONE")
-	}
-}
-
-func shouldIgnore(cfg config.FeishuConfig, msg channel.InboundMessage) bool {
-	if strings.TrimSpace(msg.Text) == "" {
-		return true
-	}
-	if msg.Metadata["message_type"] != "" && msg.Metadata["message_type"] != "text" {
-		return true
-	}
-	if strings.EqualFold(msg.Metadata["sender_type"], "app") {
-		return true
-	}
-	if msg.Channel == "feishu" && cfg.MentionRequiredGroup && msg.Metadata["chat_type"] == "group" && msg.Metadata["is_mentioned"] != "true" {
-		return true
-	}
-	return false
+	sender := feishu.NewSender(cfg.Config.Channels.Feishu)
+	dedupe := newInboundDedupe(30 * time.Minute)
+	return feishu.StartWebSocket(ctx, cfg.Config.Channels.Feishu, func(eventCtx context.Context, msg channel.InboundMessage) error {
+		if msg.SessionKey == "" {
+			msg.SessionKey = SessionKey(msg)
+		}
+		if shouldIgnoreInbound(cfg.Config.Channels.Feishu, msg) || dedupe.Seen(msg) {
+			return nil
+		}
+		go func() {
+			start := time.Now()
+			runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			cardAction := isCardAction(msg)
+			if !cardAction {
+				react(runCtx, sender, msg.ID, "SMILE")
+			}
+			runtimeStart := time.Now()
+			resp, err := cfg.Runtime.Handle(runCtx, msg)
+			runtimeDuration := time.Since(runtimeStart)
+			if err != nil {
+				log.Printf("mateway gateway runtime error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+				if !cardAction {
+					react(runCtx, sender, msg.ID, "CROSS_MARK")
+				}
+				_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
+				return
+			}
+			replyStart := time.Now()
+			if err := sender.Reply(runCtx, msg, resp.Reply); err != nil {
+				log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+				_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+					"type":                "gateway_done",
+					"message_id":          msg.ID,
+					"session_key":         msg.SessionKey,
+					"runtime_duration_ms": runtimeDuration.Milliseconds(),
+					"reply_duration_ms":   time.Since(replyStart).Milliseconds(),
+					"total_duration_ms":   time.Since(start).Milliseconds(),
+					"reply_error":         err.Error(),
+				})
+				if !cardAction {
+					react(runCtx, sender, msg.ID, "CROSS_MARK")
+				}
+				return
+			}
+			replyDuration := time.Since(replyStart)
+			if !cardAction {
+				react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
+			}
+			_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+				"type":                "gateway_done",
+				"message_id":          msg.ID,
+				"session_key":         msg.SessionKey,
+				"runtime_duration_ms": runtimeDuration.Milliseconds(),
+				"reply_duration_ms":   replyDuration.Milliseconds(),
+				"total_duration_ms":   time.Since(start).Milliseconds(),
+				"reply_style":         resp.Reply.Style,
+				"failed":              resp.Failed,
+			})
+		}()
+		return nil
+	})
 }
 
 func SessionKey(msg channel.InboundMessage) string {
@@ -114,74 +113,92 @@ func SessionKey(msg channel.InboundMessage) string {
 	return channelName + ":" + threadID
 }
 
-type messageDedupe struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	entries map[string]dedupeEntry
-}
-
-type dedupeEntry struct {
-	doneAt time.Time
-	active bool
-}
-
-func newMessageDedupe(ttl time.Duration) *messageDedupe {
-	return &messageDedupe{ttl: ttl, entries: map[string]dedupeEntry{}}
-}
-
-func (d *messageDedupe) Begin(id string) bool {
-	id = strings.TrimSpace(id)
-	if id == "" {
+func shouldIgnoreInbound(cfg config.FeishuConfig, msg channel.InboundMessage) bool {
+	if strings.TrimSpace(msg.Text) == "" {
 		return true
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	now := time.Now()
-	for key, entry := range d.entries {
-		if !entry.active && now.Sub(entry.doneAt) > d.ttl {
-			delete(d.entries, key)
-		}
+	if !strings.EqualFold(strings.TrimSpace(msg.Channel), "feishu") {
+		return false
 	}
-	if entry, ok := d.entries[id]; ok {
-		if entry.active || now.Sub(entry.doneAt) <= d.ttl {
-			return false
-		}
+	messageType := strings.TrimSpace(msg.Metadata["message_type"])
+	if messageType != "" && messageType != "text" && !isCardAction(msg) {
+		return true
 	}
-	d.entries[id] = dedupeEntry{active: true}
-	return true
+	senderType := strings.ToLower(strings.TrimSpace(msg.Metadata["sender_type"]))
+	if senderType == "app" || senderType == "bot" || senderType == "self" {
+		return true
+	}
+	return cfg.MentionRequiredGroup && msg.Metadata["chat_type"] == "group" && msg.Metadata["is_mentioned"] != "true"
 }
 
-func (d *messageDedupe) Done(id string) {
-	id = strings.TrimSpace(id)
-	if id == "" {
+func isCardAction(msg channel.InboundMessage) bool {
+	return msg.Metadata["message_type"] == "interactive" && strings.TrimSpace(msg.Metadata["card_action"]) != ""
+}
+
+func reactionForReply(reply channel.OutboundMessage) string {
+	switch strings.TrimSpace(reply.Style) {
+	case "approval_pending", "input_required", "clarify":
+		return "EYES"
+	case "error", "cancelled":
+		return "CROSS_MARK"
+	default:
+		return "DONE"
+	}
+}
+
+func react(ctx context.Context, sender *feishu.Sender, messageID, emoji string) {
+	if sender == nil || strings.TrimSpace(messageID) == "" || strings.TrimSpace(emoji) == "" {
 		return
 	}
+	if err := sender.React(ctx, messageID, emoji); err != nil {
+		log.Printf("mateway gateway reaction error message_id=%s emoji=%s: %v", messageID, emoji, err)
+	}
+}
+
+type inboundDedupe struct {
+	mu   sync.Mutex
+	ttl  time.Duration
+	seen map[string]time.Time
+}
+
+func newInboundDedupe(ttl time.Duration) *inboundDedupe {
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	return &inboundDedupe{ttl: ttl, seen: map[string]time.Time{}}
+}
+
+func (d *inboundDedupe) Seen(msg channel.InboundMessage) bool {
+	key := inboundDedupeKey(msg)
+	if key == "" {
+		return false
+	}
+	now := time.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.entries[id] = dedupeEntry{doneAt: time.Now()}
-}
-
-type sessionLocks struct {
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
-}
-
-func newSessionLocks() *sessionLocks {
-	return &sessionLocks{locks: map[string]*sync.Mutex{}}
-}
-
-func (s *sessionLocks) Lock(sessionKey string) func() {
-	sessionKey = strings.TrimSpace(sessionKey)
-	if sessionKey == "" {
-		sessionKey = "unknown:default"
+	for existing, at := range d.seen {
+		if now.Sub(at) > d.ttl {
+			delete(d.seen, existing)
+		}
 	}
-	s.mu.Lock()
-	lock := s.locks[sessionKey]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		s.locks[sessionKey] = lock
+	if _, ok := d.seen[key]; ok {
+		return true
 	}
-	s.mu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	d.seen[key] = now
+	return false
+}
+
+func inboundDedupeKey(msg channel.InboundMessage) string {
+	channelName := strings.TrimSpace(msg.Channel)
+	if channelName == "" {
+		channelName = "unknown"
+	}
+	id := strings.TrimSpace(msg.ID)
+	if id == "" {
+		return ""
+	}
+	if action := strings.TrimSpace(msg.Metadata["card_action"]); action != "" {
+		id += ":" + action + ":" + strings.TrimSpace(msg.UserID)
+	}
+	return channelName + ":" + id
 }

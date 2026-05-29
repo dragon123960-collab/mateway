@@ -3,65 +3,69 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/dongping/mateway/internal/app"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
-	evalpkg "github.com/dongping/mateway/internal/eval"
 	"github.com/dongping/mateway/internal/gateway"
-	"github.com/dongping/mateway/internal/heartbeat"
 	"github.com/dongping/mateway/internal/memory"
-	"github.com/dongping/mateway/internal/observer"
-	runtimepkg "github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	args := os.Args[1:]
+func run(args []string) error {
 	if len(args) == 0 {
 		printHelp()
 		return nil
 	}
 	switch args[0] {
-	case "doctor":
-		text, err := app.Doctor("")
-		if err != nil {
+	case "init":
+		fs := flag.NewFlagSet("mateway init", flag.ContinueOnError)
+		homeFlag := fs.String("home", "", "override MATEWAY_HOME for initialization")
+		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		fmt.Println(text)
+		home := strings.TrimSpace(*homeFlag)
+		if home == "" {
+			home = config.DefaultHome()
+		}
+		if err := config.EnsureDefaultConfigFiles(home); err != nil {
+			return err
+		}
+		fmt.Println("initialized", home)
 		return nil
 	case "ask":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway ask <message>")
 		}
-		message := strings.Join(args[1:], " ")
-		a, err := app.Build("", false)
+		cfg, err := loadConfig()
 		if err != nil {
 			return err
 		}
+		rt := runtime.New(cfg)
 		msg := channel.InboundMessage{
-			ID: "cli", Channel: "cli", ThreadID: "cli", UserID: "local", Text: message,
+			ID:       "cli",
+			Channel:  "cli",
+			ThreadID: "cli",
+			UserID:   "local",
+			Text:     strings.Join(args[1:], " "),
 		}
 		msg.SessionKey = gateway.SessionKey(msg)
-		resp, err := a.Runtime.Handle(context.Background(), msg)
+		resp, err := rt.Handle(context.Background(), msg)
 		if err != nil {
 			return err
 		}
@@ -69,24 +73,50 @@ func run() error {
 		return nil
 	case "test":
 		return runTest(args[1:])
-	case "eval":
-		return runEval(args[1:], os.Stdout)
-	case "feishu":
-		return runFeishu()
-	case "init":
-		home, err := app.Init("")
+	case "doctor":
+		cfg, err := loadConfig()
 		if err != nil {
 			return err
 		}
-		fmt.Printf("initialized %s\n", home)
+		fmt.Println("home:", cfg.App.Home)
+		fmt.Println("workspace:", cfg.App.Workspace)
+		fmt.Println("model:", cfg.Model.Default)
+		fmt.Println("feishu_enabled:", cfg.Channels.Feishu.Enabled)
 		return nil
+	case "home":
+		return runHome(args[1:])
+	case "trace":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mateway trace <trace-jsonl-path>")
+		}
+		summary, err := runtime.SummarizeTrace(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("trace:", summary.Path)
+		fmt.Println("events:", summary.Events)
+		fmt.Println("model_ms:", summary.ModelDurationMS)
+		fmt.Println("tool_ms:", summary.ToolDurationMS)
+		fmt.Println("runtime_ms:", summary.RuntimeDurationMS)
+		fmt.Println("reply_ms:", summary.ReplyDurationMS)
+		fmt.Println("total_ms:", summary.TotalDurationMS)
+		if len(summary.ToolCalls) > 0 {
+			fmt.Println("tools:", strings.Join(summary.ToolCalls, ", "))
+		}
+		return nil
+	case "memory":
+		return runMemory(args[1:])
+	case "schedule":
+		return runSchedule(args[1:])
+	case "skill":
+		return runSkill(args[1:])
 	case "gateway":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
 		}
 		switch args[1] {
 		case "serve":
-			return runGatewayServe()
+			return serveGateway()
 		case "start":
 			return gateway.NewServiceManager().Start(context.Background())
 		case "restart":
@@ -94,1681 +124,796 @@ func run() error {
 		case "stop":
 			return gateway.NewServiceManager().Stop(context.Background())
 		case "status":
-			text, err := gateway.NewServiceManager().Status(context.Background(), config.DefaultHome())
-			if text != "" {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			text, err := gateway.NewServiceManager().Status(context.Background(), cfg.App.Home)
+			if strings.TrimSpace(text) != "" {
 				fmt.Print(text)
 			}
 			return err
 		default:
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
 		}
-	case "trace":
-		return runTrace(args[1:], os.Stdout)
-	case "memory":
-		return runMemory(args[1:], os.Stdout)
-	case "skill":
-		return runSkill(args[1:], os.Stdout)
-	case "heartbeat":
-		return runHeartbeat(args[1:], os.Stdout)
-	case "schedule":
-		return runSchedule(args[1:], os.Stdout)
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func runSchedule(args []string, out io.Writer) error {
+func runHome(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway schedule <create|propose|list|proposals|show|pause|resume|delete|due|run-due|commit-proposal|reject-proposal>")
+		return fmt.Errorf("usage: mateway home <report>")
 	}
-	a, err := app.Build("", true)
-	if err != nil {
-		return err
-	}
-	store := schedule.NewStore(a.Config.App.Home)
 	switch args[0] {
-	case "create":
-		opts, err := parseScheduleCreateOptions(args[1:])
+	case "report":
+		cfg, err := loadConfig()
 		if err != nil {
 			return err
 		}
-		task, path, err := store.Create(schedule.CreateInput{
-			ID:           opts.ID,
-			Title:        opts.Title,
-			Prompt:       opts.Prompt,
-			AgentID:      opts.AgentID,
-			RunAt:        opts.RunAt,
-			DailyAt:      opts.DailyAt,
-			WeeklyAt:     opts.WeeklyAt,
-			Weekday:      opts.Weekday,
-			Weekdays:     opts.Weekdays,
-			MonthlyAt:    opts.MonthlyAt,
-			MonthlyDay:   opts.MonthlyDay,
-			Interval:     opts.Interval,
-			Channel:      opts.Channel,
-			ThreadID:     opts.ThreadID,
-			UserID:       opts.UserID,
-			DeliveryMode: opts.DeliveryMode,
-			DeliveryPath: opts.DeliveryPath,
-			AllowedTools: opts.AllowedTools,
+		report, err := buildHomeReport(cfg.App.Home)
+		if err != nil {
+			return err
+		}
+		fmt.Println("home:", report.Home)
+		fmt.Println("expected:")
+		for _, item := range report.Expected {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		fmt.Println("generated:")
+		for _, item := range report.Generated {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		fmt.Println("local:")
+		for _, item := range report.Local {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		fmt.Println("unknown:")
+		for _, item := range report.Unknown {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway home <report>")
+	}
+}
+
+func runSkill(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway skill <list|search|install>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		skills, err := skill.List(cfg.App.Workspace)
+		if err != nil {
+			return err
+		}
+		fmt.Println("skills:", len(skills))
+		for _, item := range skills {
+			fmt.Printf("- %s scope=%s", item.Name, item.Scope)
+			if item.Stage != "" {
+				fmt.Printf(" stage=%s", item.Stage)
+			}
+			if item.Priority != "" {
+				fmt.Printf(" priority=%s", item.Priority)
+			}
+			if item.Description != "" {
+				fmt.Printf(" description=%s", item.Description)
+			}
+			fmt.Printf(" path=%s\n", item.Path)
+		}
+		return nil
+	case "search":
+		fs := flag.NewFlagSet("mateway skill search", flag.ContinueOnError)
+		includeDisabled := fs.Bool("all", false, "include disabled catalogs")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if query == "" {
+			return fmt.Errorf("usage: mateway skill search [--all] <query>")
+		}
+		results := skill.SearchCatalogs(cfg, query)
+		fmt.Println("query:", query)
+		fmt.Println("catalogs:", len(results))
+		for _, result := range results {
+			if !result.Enabled && !*includeDisabled {
+				continue
+			}
+			fmt.Printf("- %s enabled=%v trust=%s url=%s", result.Catalog, result.Enabled, result.TrustLevel, result.URL)
+			if result.InstallURL != "" {
+				fmt.Printf(" install_url=%s", result.InstallURL)
+			}
+			fmt.Println()
+		}
+		return nil
+	case "install":
+		fs := flag.NewFlagSet("mateway skill install", flag.ContinueOnError)
+		name := fs.String("name", "", "override installed skill name")
+		force := fs.Bool("force", false, "overwrite existing installed skill")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway skill install [--name <name>] [--force] <path-or-raw-url>")
+		}
+		result, err := skill.Install(skill.InstallInput{
+			Workspace: cfg.App.Workspace,
+			Source:    fs.Arg(0),
+			Name:      *name,
+			Force:     *force,
 		})
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "Schedule task written: %s\n", path)
-		fmt.Fprintf(out, "id=%s status=%s schedule=%s\n", task.ID, task.Status, scheduleSummary(task.Schedule))
+		fmt.Println("skill:", result.Name)
+		fmt.Println("path:", result.Path)
 		return nil
-	case "propose":
-		opts, err := parseScheduleCreateOptions(args[1:])
+	default:
+		return fmt.Errorf("usage: mateway skill <list|search|install>")
+	}
+}
+
+func runSchedule(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway schedule <create|list|test|activate|pause|run-due|serve>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := schedule.Store{Home: cfg.App.Home}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("mateway schedule create", flag.ContinueOnError)
+		runAtFlag := fs.String("run-at", "", "RFC3339 time to run")
+		intervalFlag := fs.String("interval", "", "optional interval such as 30m or 24h")
+		sessionKeyFlag := fs.String("session-key", "", "optional session key for schedule context")
+		noTestFlag := fs.Bool("no-test", false, "activate without a first test run")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			return fmt.Errorf("usage: mateway schedule create --run-at <RFC3339> [--interval <duration>] [--no-test] <task>")
+		}
+		runAt, err := time.Parse(time.RFC3339, strings.TrimSpace(*runAtFlag))
+		if err != nil {
+			return fmt.Errorf("run-at must be RFC3339: %w", err)
+		}
+		var interval time.Duration
+		if strings.TrimSpace(*intervalFlag) != "" {
+			interval, err = time.ParseDuration(strings.TrimSpace(*intervalFlag))
+			if err != nil {
+				return err
+			}
+		}
+		task, err := store.Create(schedule.CreateInput{
+			SessionKey:  strings.TrimSpace(*sessionKeyFlag),
+			Text:        strings.Join(fs.Args(), " "),
+			RunAt:       runAt,
+			Interval:    interval,
+			RequireTest: !*noTestFlag,
+			Activate:    *noTestFlag,
+		})
 		if err != nil {
 			return err
 		}
-		proposal, path, err := store.Propose(schedule.ProposalInput{CreateInput: schedule.CreateInput{
-			ID:           opts.ID,
-			Title:        opts.Title,
-			Prompt:       opts.Prompt,
-			AgentID:      opts.AgentID,
-			RunAt:        opts.RunAt,
-			DailyAt:      opts.DailyAt,
-			WeeklyAt:     opts.WeeklyAt,
-			Weekday:      opts.Weekday,
-			Weekdays:     opts.Weekdays,
-			MonthlyAt:    opts.MonthlyAt,
-			MonthlyDay:   opts.MonthlyDay,
-			Interval:     opts.Interval,
-			Channel:      opts.Channel,
-			ThreadID:     opts.ThreadID,
-			UserID:       opts.UserID,
-			DeliveryMode: opts.DeliveryMode,
-			DeliveryPath: opts.DeliveryPath,
-			AllowedTools: opts.AllowedTools,
-		}})
-		if err != nil {
-			return err
+		printScheduleTask(task)
+		if task.Status == "pending" {
+			fmt.Println("next:", "mateway schedule test "+task.ID)
 		}
-		fmt.Fprintf(out, "Schedule proposal written: %s\n", path)
-		fmt.Fprintf(out, "id=%s status=%s schedule=%s\n", proposal.Task.ID, proposal.ProposalStatus, scheduleSummary(proposal.Task.Schedule))
 		return nil
 	case "list":
 		tasks, err := store.List()
 		if err != nil {
 			return err
 		}
-		if len(tasks) == 0 {
-			fmt.Fprintln(out, "No schedule tasks found.")
-			return nil
-		}
+		fmt.Println("schedules:", len(tasks))
 		for _, task := range tasks {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n", task.ID, task.Status, task.AgentID, scheduleSummary(task.Schedule), task.Title)
+			fmt.Printf("- %s status=%s run_at=%s interval=%s last=%s text=%s\n", task.ID, task.Status, task.RunAt, task.Interval, task.LastRunStatus, summarizeCLIText(task.Text, 80))
 		}
 		return nil
-	case "proposals":
-		status := ""
-		if len(args) > 1 {
-			var err error
-			status, err = parseScheduleProposalStatus(args[1:])
-			if err != nil {
-				return err
-			}
+	case "test":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway schedule test <task_id>")
 		}
-		items, err := store.ListProposals(status)
+		task, err := store.Read(args[1])
 		if err != nil {
 			return err
 		}
-		if len(items) == 0 {
-			fmt.Fprintln(out, "No schedule proposals found.")
-			return nil
+		record, err := runScheduledTask(context.Background(), cfg, store, task, "test")
+		if err != nil {
+			return err
 		}
-		for _, item := range items {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.ID, item.Status, item.Schedule, item.Title)
+		if err := store.MarkTested(task, time.Now(), record); err != nil {
+			return err
+		}
+		fmt.Println("test:", record.Status)
+		fmt.Println("run:", record.ID)
+		if record.Error != "" {
+			fmt.Println("error:", record.Error)
 		}
 		return nil
-	case "show":
-		id, err := oneIDArg(args[1:], "usage: mateway schedule show <id>")
+	case "activate":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway schedule activate <task_id>")
+		}
+		task, err := store.Activate(args[1])
 		if err != nil {
 			return err
 		}
-		task, path, err := store.Show(id)
-		if err != nil {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(task.ID) == "" {
-			return fmt.Errorf("invalid schedule task: %s", path)
-		}
-		fmt.Fprint(out, string(data))
-		if len(data) == 0 || data[len(data)-1] != '\n' {
-			fmt.Fprintln(out)
-		}
+		printScheduleTask(task)
 		return nil
 	case "pause":
-		id, err := oneIDArg(args[1:], "usage: mateway schedule pause <id>")
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway schedule pause <task_id>")
+		}
+		task, err := store.Pause(args[1])
 		if err != nil {
 			return err
 		}
-		task, _, err := store.SetStatus(id, schedule.StatusPaused)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Schedule task paused: %s\n", task.ID)
-		return nil
-	case "resume":
-		id, err := oneIDArg(args[1:], "usage: mateway schedule resume <id>")
-		if err != nil {
-			return err
-		}
-		task, _, err := store.SetStatus(id, schedule.StatusActive)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Schedule task resumed: %s\n", task.ID)
-		return nil
-	case "delete":
-		id, err := oneIDArg(args[1:], "usage: mateway schedule delete <id>")
-		if err != nil {
-			return err
-		}
-		path, err := store.Delete(id)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Schedule task deleted: %s\n", path)
-		return nil
-	case "due":
-		tasks, err := store.Due(time.Now())
-		if err != nil {
-			return err
-		}
-		if len(tasks) == 0 {
-			fmt.Fprintln(out, "No schedule tasks are due.")
-			return nil
-		}
-		for _, task := range tasks {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", task.ID, task.AgentID, scheduleSummary(task.Schedule), task.Title)
-		}
-		return nil
-	case "commit-proposal":
-		id, err := oneIDArg(args[1:], "usage: mateway schedule commit-proposal <id>")
-		if err != nil {
-			return err
-		}
-		task, path, err := store.CommitProposal(id)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Schedule proposal committed: %s\n", path)
-		fmt.Fprintf(out, "id=%s status=%s schedule=%s\n", task.ID, task.Status, scheduleSummary(task.Schedule))
-		return nil
-	case "reject-proposal":
-		id, reason, err := parseScheduleRejectProposalOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		proposal, path, err := store.RejectProposal(id, reason)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Schedule proposal rejected: %s\n", path)
-		fmt.Fprintf(out, "id=%s status=%s\n", proposal.Task.ID, proposal.ProposalStatus)
+		printScheduleTask(task)
 		return nil
 	case "run-due":
-		results, err := schedule.Runner{Store: store, Handle: scheduleHandler(a.Runtime.Handle)}.RunDue(context.Background(), time.Now())
-		if err != nil {
-			return err
-		}
-		if len(results) == 0 {
-			fmt.Fprintln(out, "No schedule tasks are due.")
-			return nil
-		}
-		for _, result := range results {
-			status := "ok"
-			if result.Failed {
-				status = "failed"
-			}
-			fmt.Fprintf(out, "%s\t%s\ttrace=%s\toutput=%s\n", result.Task.ID, status, result.TraceID, result.OutputPath)
-			if strings.TrimSpace(result.Error) != "" {
-				fmt.Fprintf(out, "  error=%s\n", result.Error)
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf("usage: mateway schedule <create|propose|list|proposals|show|pause|resume|delete|due|run-due|commit-proposal|reject-proposal>")
-	}
-}
-
-type scheduleCreateOptions struct {
-	ID           string
-	Title        string
-	Prompt       string
-	AgentID      string
-	RunAt        string
-	DailyAt      string
-	WeeklyAt     string
-	Weekday      string
-	Weekdays     []string
-	MonthlyAt    string
-	MonthlyDay   int
-	Interval     string
-	Channel      string
-	ThreadID     string
-	UserID       string
-	DeliveryMode string
-	DeliveryPath string
-	AllowedTools []string
-}
-
-func parseScheduleCreateOptions(args []string) (scheduleCreateOptions, error) {
-	opts := scheduleCreateOptions{AgentID: "main", Channel: "cli", DeliveryMode: "artifact"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--id":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.ID, i = value, next
-		case "--title":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Title, i = value, next
-		case "--prompt":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Prompt, i = value, next
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--daily-at":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.DailyAt, i = value, next
-		case "--run-at":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.RunAt, i = value, next
-		case "--weekly-at":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.WeeklyAt, i = value, next
-		case "--weekday":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Weekday, i = value, next
-		case "--weekdays":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Weekdays, i = splitScheduleList(value), next
-		case "--monthly-at":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.MonthlyAt, i = value, next
-		case "--monthly-day":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			day, err := parsePositiveCLIInt(value)
-			if err != nil {
-				return opts, err
-			}
-			opts.MonthlyDay, i = day, next
-		case "--interval":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Interval, i = value, next
-		case "--channel":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Channel, i = value, next
-		case "--thread":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.ThreadID, i = value, next
-		case "--user":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.UserID, i = value, next
-		case "--delivery":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.DeliveryMode, i = value, next
-		case "--delivery-path":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.DeliveryPath, i = value, next
-		case "--tool":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AllowedTools, i = append(opts.AllowedTools, value), next
-		default:
-			return opts, fmt.Errorf("unknown schedule create option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(opts.Title) == "" || strings.TrimSpace(opts.Prompt) == "" {
-		return opts, fmt.Errorf("usage: mateway schedule create --title <title> --prompt <text> (--run-at RFC3339 | --daily-at HH:MM | --weekly-at HH:MM --weekday DAY | --monthly-at HH:MM --monthly-day N | --interval 2h)")
-	}
-	if !opts.hasSchedule() {
-		return opts, fmt.Errorf("schedule time is required: use --run-at for one-shot tasks, or an explicit recurring option such as --daily-at/--interval")
-	}
-	return opts, nil
-}
-
-func (o scheduleCreateOptions) hasSchedule() bool {
-	return strings.TrimSpace(o.RunAt) != "" ||
-		strings.TrimSpace(o.DailyAt) != "" ||
-		strings.TrimSpace(o.WeeklyAt) != "" ||
-		strings.TrimSpace(o.Weekday) != "" ||
-		len(o.Weekdays) > 0 ||
-		strings.TrimSpace(o.MonthlyAt) != "" ||
-		o.MonthlyDay > 0 ||
-		strings.TrimSpace(o.Interval) != ""
-}
-
-func parseScheduleProposalStatus(args []string) (string, error) {
-	status := ""
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--status":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return "", err
-			}
-			status, i = value, next
-		default:
-			return "", fmt.Errorf("unknown schedule proposals option %q", args[i])
-		}
-	}
-	return status, nil
-}
-
-func splitScheduleList(value string) []string {
-	parts := strings.FieldsFunc(value, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t'
-	})
-	var out []string
-	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
-}
-
-func parsePositiveCLIInt(value string) (int, error) {
-	n := 0
-	for _, ch := range strings.TrimSpace(value) {
-		if ch < '0' || ch > '9' {
-			return 0, fmt.Errorf("expected positive integer, got %q", value)
-		}
-		n = n*10 + int(ch-'0')
-	}
-	if n <= 0 {
-		return 0, fmt.Errorf("expected positive integer, got %q", value)
-	}
-	return n, nil
-}
-
-func parseScheduleRejectProposalOptions(args []string) (string, string, error) {
-	if len(args) == 0 {
-		return "", "", fmt.Errorf("usage: mateway schedule reject-proposal <id> [--reason <text>]")
-	}
-	id := ""
-	reason := ""
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--reason":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return "", "", err
-			}
-			reason, i = value, next
-		default:
-			if id == "" && !strings.HasPrefix(args[i], "-") {
-				id = args[i]
-				continue
-			}
-			return "", "", fmt.Errorf("unknown schedule reject-proposal option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(id) == "" {
-		return "", "", fmt.Errorf("usage: mateway schedule reject-proposal <id> [--reason <text>]")
-	}
-	return id, reason, nil
-}
-
-func oneIDArg(args []string, usage string) (string, error) {
-	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return "", fmt.Errorf("%s", usage)
-	}
-	return strings.TrimSpace(args[0]), nil
-}
-
-func scheduleHandler(handle func(context.Context, channel.InboundMessage) (runtimepkg.Response, error)) schedule.Handler {
-	return func(ctx context.Context, msg channel.InboundMessage) (schedule.Response, error) {
-		resp, err := handle(ctx, msg)
-		return schedule.Response{Reply: resp.Reply, TraceID: resp.TraceID, Failed: resp.Failed}, err
-	}
-}
-
-func scheduleSummary(spec schedule.ScheduleSpec) string {
-	return schedule.Summary(spec)
-}
-
-func runHeartbeat(args []string, out io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway heartbeat <status|run>")
-	}
-	a, err := app.Build("", true)
-	if err != nil {
-		return err
-	}
-	runner := heartbeat.NewRunner(a.Config)
-	switch args[0] {
-	case "status":
-		state, path, err := runner.Status()
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Heartbeat state: %s\n", path)
-		if len(state.Jobs) == 0 {
-			fmt.Fprintln(out, "No heartbeat jobs have run yet.")
-			return nil
-		}
-		for _, job := range state.Jobs {
-			fmt.Fprintf(out, "- agent=%s job=%s status=%s last_run_at=%s summary=%s\n", job.AgentID, job.Job, job.Status, job.LastRunAt.Format(time.RFC3339), job.Summary)
-			if strings.TrimSpace(job.LastError) != "" {
-				fmt.Fprintf(out, "  error=%s\n", job.LastError)
-			}
-		}
-		return nil
-	case "run":
-		opts, err := parseHeartbeatRunOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		result, err := runner.Run(heartbeat.RunOptions{AgentID: opts.AgentID, Job: opts.Job})
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Heartbeat job completed: agent=%s job=%s status=%s\n", result.State.AgentID, result.State.Job, result.State.Status)
-		if result.Report != nil {
-			fmt.Fprintf(out, "Memory lint checked %s\n", result.Report.Root)
-			if len(result.Report.Issues) == 0 {
-				fmt.Fprintln(out, "No issues found.")
-			} else {
-				for _, issue := range result.Report.Issues {
-					fmt.Fprintf(out, "- [%s] %s: %s\n", issue.Code, issue.Path, issue.Message)
-				}
-			}
-		}
-		if result.DailyReview != nil {
-			fmt.Fprintf(out, "Daily review written: %s\n", result.DailyReview.Path)
-			fmt.Fprintf(out, "Tasks: %d, completed: %d, open: %d, artifacts: %d, proposed inbox items: %d\n",
-				result.DailyReview.TaskCount,
-				result.DailyReview.Completed,
-				result.DailyReview.OpenTasks,
-				result.DailyReview.Artifacts,
-				result.DailyReview.InboxProposed,
-			)
-		}
-		if result.Compact != nil {
-			fmt.Fprintf(out, "Recent memory compacted: archived=%d kept=%d archive=%s\n", result.Compact.Archived, result.Compact.Kept, result.Compact.ArchivedDir)
-		}
-		if result.Index != nil {
-			fmt.Fprintf(out, "Memory index rebuilt: %s\n", result.Index.Path)
-			fmt.Fprintf(out, "Entries: %d, issues: %d\n", len(result.Index.Index.Entries), result.Index.Index.IssueCount)
-		}
-		return nil
-	default:
-		return fmt.Errorf("usage: mateway heartbeat <status|run>")
-	}
-}
-
-type heartbeatRunOptions struct {
-	AgentID string
-	Job     string
-}
-
-func parseHeartbeatRunOptions(args []string) (heartbeatRunOptions, error) {
-	opts := heartbeatRunOptions{AgentID: "main", Job: heartbeat.JobMemoryLint}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--job":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Job, i = value, next
-		default:
-			return opts, fmt.Errorf("unknown heartbeat run option %q", args[i])
-		}
-	}
-	return opts, nil
-}
-
-func runMemory(args []string, out io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory <lint|index|list|show|propose|commit|reject>")
-	}
-	switch args[0] {
-	case "lint":
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		report, err := memory.Lint(filepath.Join(a.Config.App.Workspace, "memory"))
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Memory lint checked %s\n", report.Root)
-		if len(report.Issues) == 0 {
-			fmt.Fprintln(out, "No issues found.")
-			return nil
-		}
-		for _, issue := range report.Issues {
-			fmt.Fprintf(out, "- [%s] %s: %s\n", issue.Code, issue.Path, issue.Message)
-		}
-		return nil
-	case "index":
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		result, err := memory.NewStore(a.Config.App.Workspace).RebuildIndex(time.Now())
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Memory index written: %s\n", result.Path)
-		fmt.Fprintf(out, "entries=%d issues=%d\n", len(result.Index.Entries), result.Index.IssueCount)
-		return nil
-	case "list":
-		opts, err := parseMemoryListOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		items, err := memory.NewStore(a.Config.App.Workspace).List(memory.ListOptions{AgentID: opts.AgentID, Status: opts.Status, Area: opts.Area})
-		if err != nil {
-			return err
-		}
-		if len(items) == 0 {
-			fmt.Fprintln(out, "No memory items found.")
-			return nil
-		}
-		for _, item := range items {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n", item.ID, item.Status, item.Kind, item.Updated, item.Title)
-		}
-		return nil
-	case "show":
-		opts, err := parseMemoryShowOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		result, err := memory.NewStore(a.Config.App.Workspace).Show(opts.AgentID, opts.ID)
-		if err != nil {
-			return err
-		}
-		fmt.Fprint(out, result.Text)
-		if !strings.HasSuffix(result.Text, "\n") {
-			fmt.Fprintln(out)
-		}
-		return nil
-	case "propose":
-		opts, err := parseMemoryProposeOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		result, err := memory.NewStore(a.Config.App.Workspace).Propose(memory.ProposalInput{
-			AgentID:    opts.AgentID,
-			Scope:      opts.Scope,
-			Type:       opts.Type,
-			Title:      opts.Title,
-			Body:       opts.Body,
-			Sources:    opts.Sources,
-			Tags:       opts.Tags,
-			Confidence: opts.Confidence,
-		})
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Memory proposal written: %s\n", result.Path)
-		return nil
-	case "commit":
-		opts, err := parseMemoryCommitOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		result, err := memory.NewStore(a.Config.App.Workspace).Commit(memory.CommitInput{
-			AgentID:  opts.AgentID,
-			Proposal: opts.Proposal,
-			Title:    opts.Title,
-		})
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Memory committed: %s\n", result.TargetPath)
-		return nil
-	case "reject":
-		opts, err := parseMemoryRejectOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		result, err := memory.NewStore(a.Config.App.Workspace).Reject(memory.RejectInput{
-			AgentID:  opts.AgentID,
-			Proposal: opts.Proposal,
-			Reason:   opts.Reason,
-		})
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Memory proposal rejected: %s\n", result.Path)
-		return nil
-	default:
-		return fmt.Errorf("usage: mateway memory <lint|index|list|show|propose|commit|reject>")
-	}
-}
-
-type memoryListOptions struct {
-	AgentID string
-	Area    string
-	Status  string
-}
-
-type memoryShowOptions struct {
-	AgentID string
-	ID      string
-}
-
-type memoryProposeOptions struct {
-	AgentID    string
-	Scope      string
-	Type       string
-	Title      string
-	Body       string
-	Sources    []string
-	Tags       []string
-	Confidence string
-}
-
-type memoryCommitOptions struct {
-	AgentID  string
-	Proposal string
-	Title    string
-}
-
-type memoryRejectOptions struct {
-	AgentID  string
-	Proposal string
-	Reason   string
-}
-
-func parseMemoryListOptions(args []string) (memoryListOptions, error) {
-	opts := memoryListOptions{AgentID: "main", Area: "inbox"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--area":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Area, i = value, next
-		case "--status":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Status, i = value, next
-		default:
-			return opts, fmt.Errorf("unknown memory list option %q", args[i])
-		}
-	}
-	return opts, nil
-}
-
-func parseMemoryShowOptions(args []string) (memoryShowOptions, error) {
-	opts := memoryShowOptions{AgentID: "main"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--help", "-h":
-			return opts, fmt.Errorf("usage: mateway memory show <id-or-path> [--agent <agent-id>]")
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--id":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.ID, i = value, next
-		default:
-			if strings.TrimSpace(opts.ID) == "" && !strings.HasPrefix(args[i], "-") {
-				opts.ID = args[i]
-				continue
-			}
-			return opts, fmt.Errorf("unknown memory show option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(opts.ID) == "" {
-		return opts, fmt.Errorf("usage: mateway memory show <id-or-path>")
-	}
-	return opts, nil
-}
-
-func parseMemoryProposeOptions(args []string) (memoryProposeOptions, error) {
-	opts := memoryProposeOptions{AgentID: "main", Scope: "agent", Type: "note", Confidence: "medium"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--scope":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Scope, i = value, next
-		case "--type":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Type, i = value, next
-		case "--title":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Title, i = value, next
-		case "--body":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Body, i = value, next
-		case "--source":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Sources, i = append(opts.Sources, value), next
-		case "--tag":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Tags, i = append(opts.Tags, value), next
-		case "--confidence":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Confidence, i = value, next
-		default:
-			return opts, fmt.Errorf("unknown memory propose option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(opts.Title) == "" || strings.TrimSpace(opts.Body) == "" {
-		return opts, fmt.Errorf("usage: mateway memory propose --title <title> --body <text> [--source <source>] [--scope agent|user|org]")
-	}
-	return opts, nil
-}
-
-func parseMemoryCommitOptions(args []string) (memoryCommitOptions, error) {
-	opts := memoryCommitOptions{AgentID: "main"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--proposal":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Proposal, i = value, next
-		case "--title":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Title, i = value, next
-		default:
-			if strings.TrimSpace(opts.Proposal) == "" && !strings.HasPrefix(args[i], "-") {
-				opts.Proposal = args[i]
-				continue
-			}
-			return opts, fmt.Errorf("unknown memory commit option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(opts.Proposal) == "" {
-		return opts, fmt.Errorf("usage: mateway memory commit --proposal <proposal-id-or-path>")
-	}
-	return opts, nil
-}
-
-func parseMemoryRejectOptions(args []string) (memoryRejectOptions, error) {
-	opts := memoryRejectOptions{AgentID: "main"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--proposal":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Proposal, i = value, next
-		case "--reason":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Reason, i = value, next
-		default:
-			if strings.TrimSpace(opts.Proposal) == "" && !strings.HasPrefix(args[i], "-") {
-				opts.Proposal = args[i]
-				continue
-			}
-			return opts, fmt.Errorf("unknown memory reject option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(opts.Proposal) == "" {
-		return opts, fmt.Errorf("usage: mateway memory reject --proposal <proposal-id-or-path>")
-	}
-	return opts, nil
-}
-
-func optionValue(args []string, i int) (string, int, error) {
-	if i+1 >= len(args) {
-		return "", i, fmt.Errorf("%s requires a value", args[i])
-	}
-	return args[i+1], i + 1, nil
-}
-
-type testCommandOptions struct {
-	Title       string
-	Message     string
-	Channel     string
-	SessionKey  string
-	UserID      string
-	ThreadID    string
-	OutDir      string
-	Home        string
-	ProjectRoot string
-}
-
-type taskReport struct {
-	Title             string
-	Question          string
-	Result            string
-	ReplyText         string
-	Failed            bool
-	AwaitConfirm      bool
-	AwaitUserInput    bool
-	FinalAcceptStatus string
-	FinalAcceptReason string
-	TraceID           string
-	TraceFile         string
-	SessionKey        string
-	Channel           string
-	UserID            string
-	ThreadID          string
-	Home              string
-	ProjectRoot       string
-	GeneratedAt       time.Time
-	QualityNotes      []string
-	Skills            []skillEvent
-	Events            []map[string]any
-	Plan              any
-	ToolResults       []any
-}
-
-type skillEvent struct {
-	Stage  string
-	Skills []map[string]any
-}
-
-func uniqueTaskSuffix(title string) string {
-	trimmed := strings.TrimSpace(title)
-	if trimmed == "" {
-		return time.Now().Format("20060102-150405")
-	}
-	if name := slugify(trimmed); name != "" && name != "task" {
-		return name
-	}
-	return trimmed
-}
-
-func runSkill(args []string, out io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway skill <search|install|promote|list>")
-	}
-	a, err := app.Build("", true)
-	if err != nil {
-		return err
-	}
-	switch args[0] {
-	case "search":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: mateway skill search <query>")
-		}
-		query := strings.Join(args[1:], " ")
-		items, err := skill.SearchCatalog(context.Background(), a.Config.App.Workspace, query, skill.CatalogSearchOptions{Limit: 8})
-		if err != nil {
-			return err
-		}
-		if len(items) == 0 {
-			fmt.Fprintf(out, "No matching skills found for: %s\n", query)
-			return nil
-		}
-		for _, item := range items {
-			status := "not-installed"
-			if item.Installed {
-				status = "installed"
-			}
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.Name, item.Source, status, item.URL)
-		}
-		return nil
-	case "install":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: mateway skill install <name-or-url>")
-		}
-		ref := strings.Join(args[1:], " ")
-		result, err := skill.InstallCatalogSkill(context.Background(), a.Config.App.Workspace, ref, skill.CatalogSearchOptions{Limit: 1})
-		if err != nil {
-			return err
-		}
-		if result.AlreadyDone {
-			fmt.Fprintf(out, "Skill already installed: %s\n%s\n", result.Item.Name, result.TargetPath)
-			return nil
-		}
-		fmt.Fprintf(out, "Skill installed: %s\n%s\n", result.Item.Name, result.TargetPath)
-		return nil
-	case "promote":
-		opts, err := parseSkillPromoteOptions(args[1:])
-		if err != nil {
-			return err
-		}
-		result, err := memory.NewStore(a.Config.App.Workspace).PromoteSkillCandidate(memory.SkillPromotionInput{
-			AgentID:   opts.AgentID,
-			Proposal:  opts.Proposal,
-			SkillName: opts.SkillName,
-		})
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Skill promoted: %s\nThis skill will be reloadable from workspace skills on the next planning turn.\n", result.TargetPath)
-		return nil
-	case "list":
-		defs, err := skill.ListInstalled(a.Config.App.Workspace)
-		if err != nil {
-			return err
-		}
-		if len(defs) == 0 {
-			fmt.Fprintln(out, "No installed skills found.")
-			return nil
-		}
-		for _, def := range defs {
-			fmt.Fprintf(out, "%s\t%s\t%s\n", def.Name, def.Stage, def.Dir)
-		}
-		return nil
-	default:
-		return fmt.Errorf("usage: mateway skill <search|install|promote|list>")
-	}
-}
-
-type skillPromoteOptions struct {
-	AgentID   string
-	Proposal  string
-	SkillName string
-}
-
-func parseSkillPromoteOptions(args []string) (skillPromoteOptions, error) {
-	opts := skillPromoteOptions{AgentID: "main"}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--agent":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.AgentID, i = value, next
-		case "--proposal":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.Proposal, i = value, next
-		case "--name":
-			value, next, err := optionValue(args, i)
-			if err != nil {
-				return opts, err
-			}
-			opts.SkillName, i = value, next
-		default:
-			if strings.TrimSpace(opts.Proposal) == "" && !strings.HasPrefix(args[i], "-") {
-				opts.Proposal = args[i]
-				continue
-			}
-			return opts, fmt.Errorf("unknown skill promote option %q", args[i])
-		}
-	}
-	if strings.TrimSpace(opts.Proposal) == "" {
-		return opts, fmt.Errorf("usage: mateway skill promote --proposal <proposal-id-or-path> [--name <skill-name>]")
-	}
-	return opts, nil
-}
-
-func runEval(args []string, out io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway eval <routing>")
-	}
-	switch args[0] {
-	case "routing":
-		outDir := ""
-		focus := false
-		ultraFocus := false
-		for i := 1; i < len(args); i++ {
-			switch args[i] {
-			case "--out":
-				if i+1 >= len(args) {
-					return fmt.Errorf("--out requires a value")
-				}
-				outDir = args[i+1]
-				i++
-			case "--focus":
-				focus = true
-			case "--ultra-focus":
-				ultraFocus = true
-			default:
-				return fmt.Errorf("usage: mateway eval routing [--out <dir>] [--focus] [--ultra-focus]")
-			}
-		}
-		a, err := app.Build("", true)
-		if err != nil {
-			return err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		defer cancel()
-		var cases []evalpkg.RoutingCase
-		if ultraFocus {
-			cases = evalpkg.FirstStageUltraFocusCases()
-		} else if focus {
-			cases = evalpkg.FirstStageFocusCases()
-		}
-		summary, err := evalpkg.RunRouting(ctx, a.Model, a.Tools, "", cases)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "Routing eval: %d/%d passed\n", summary.Passed, summary.Total)
-		for _, result := range summary.Results {
-			status := "PASS"
-			if !result.Passed {
-				status = "FAIL"
-			}
-			fmt.Fprintf(out, "%s\t%s\ttools=%s\n", status, result.Name, strings.Join(result.Tools, ","))
-			for _, errText := range result.Errors {
-				fmt.Fprintf(out, "  error: %s\n", errText)
-			}
-			for _, warning := range result.Warnings {
-				fmt.Fprintf(out, "  warning: %s\n", warning)
-			}
-		}
-		if strings.TrimSpace(outDir) != "" {
-			now := time.Now().Format("2006-01-02")
-			dir := filepath.Join(outDir, now)
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+		return runDueSchedules(context.Background(), cfg, store)
+	case "serve":
+		interval := 30 * time.Second
+		if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Scheduler.Interval)); err == nil && parsed > 0 {
+			interval = parsed
+		}
+		fmt.Println("schedule:", "serve")
+		fmt.Println("interval:", interval)
+		for {
+			if err := runDueSchedules(context.Background(), cfg, store); err != nil {
 				return err
 			}
-			name := "routing-eval.md"
-			if ultraFocus {
-				name = "routing-eval-first-stage-ultra.md"
-			} else if focus {
-				name = "routing-eval-first-stage.md"
-			}
-			path := filepath.Join(dir, name)
-			if err := os.WriteFile(path, []byte(evalpkg.RenderRoutingMarkdown(summary)), 0o644); err != nil {
-				return err
-			}
-			fmt.Fprintf(out, "Routing report written: %s\n", path)
+			time.Sleep(interval)
 		}
-		if summary.Passed != summary.Total {
-			return fmt.Errorf("routing eval failed: %d/%d passed", summary.Passed, summary.Total)
-		}
-		return nil
 	default:
-		return fmt.Errorf("usage: mateway eval <routing>")
+		return fmt.Errorf("usage: mateway schedule <create|list|test|activate|pause|run-due|serve>")
 	}
 }
 
-func runTest(args []string) error {
-	for _, arg := range args {
-		if arg == "--help" || arg == "-h" {
-			fmt.Println(testHelpText())
-			return nil
+func runDueSchedules(ctx context.Context, cfg *config.Root, store schedule.Store) error {
+	due, err := store.Due(time.Now())
+	if err != nil {
+		return err
+	}
+	fmt.Println("due:", len(due))
+	for _, task := range due {
+		record, err := runScheduledTask(ctx, cfg, store, task, "scheduled")
+		if err != nil {
+			return err
 		}
+		if err := store.MarkRan(task, time.Now(), record); err != nil {
+			return err
+		}
+		fmt.Println("ran:", task.ID, "status="+record.Status, "run="+record.ID)
 	}
-	opts, err := parseTestOptions(args)
-	if err != nil {
-		return err
-	}
-	a, err := app.Build(opts.Home, true)
-	if err != nil {
-		return err
-	}
-	msg := channel.InboundMessage{
-		ID:         "test-" + uniqueTaskSuffix(opts.Title),
-		Channel:    firstNonEmptyLocal(opts.Channel, "cli"),
-		SessionKey: firstNonEmptyLocal(opts.SessionKey, "test:"+uniqueTaskSuffix(opts.Title)),
-		UserID:     firstNonEmptyLocal(opts.UserID, "local"),
-		ThreadID:   firstNonEmptyLocal(opts.ThreadID, "test:"+uniqueTaskSuffix(opts.Title)),
-		Text:       opts.Message,
-	}
-	resp, err := a.Runtime.Handle(context.Background(), msg)
-	if err != nil {
-		return err
-	}
-	report, err := buildTaskReport(a, opts, msg, resp)
-	if err != nil {
-		return err
-	}
-	path, err := writeTaskReport(report, opts.OutDir)
-	if err != nil {
-		return err
-	}
-	fmt.Println(path)
 	return nil
 }
 
-func parseTestOptions(args []string) (testCommandOptions, error) {
-	opts := testCommandOptions{
-		Title:   "default-test-task",
-		Message: "Run one complete real-model workflow test and report the result, issues found, and execution details.",
-		Channel: "cli",
-		Home:    "",
+func runScheduledTask(ctx context.Context, cfg *config.Root, store schedule.Store, task schedule.Task, kind string) (schedule.RunRecord, error) {
+	startedAt := time.Now()
+	rt := runtime.New(cfg)
+	msg := channel.InboundMessage{
+		ID:         task.ID,
+		Channel:    "schedule",
+		SessionKey: firstNonEmpty(task.SessionKey, "schedule:"+task.ID),
+		Text:       task.Text,
+		Metadata:   map[string]string{"scheduled_task_id": task.ID, "scheduled_run_kind": kind},
 	}
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "--title":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.Title = args[i+1]
-			i++
-		case "--message", "--question":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.Message = args[i+1]
-			i++
-		case "--channel":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.Channel = args[i+1]
-			i++
-		case "--session-key":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.SessionKey = args[i+1]
-			i++
-		case "--user-id":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.UserID = args[i+1]
-			i++
-		case "--thread-id":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.ThreadID = args[i+1]
-			i++
-		case "--out":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.OutDir = args[i+1]
-			i++
-		case "--home":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.Home = args[i+1]
-			i++
-		case "--project-root":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a value", arg)
-			}
-			opts.ProjectRoot = args[i+1]
-			i++
-		case "--help", "-h":
-			return opts, fmt.Errorf(testHelpText())
-		default:
-			return opts, fmt.Errorf("unknown test option %q", arg)
-		}
-	}
-	return opts, nil
-}
-
-func buildTaskReport(a *app.App, opts testCommandOptions, msg channel.InboundMessage, resp runtimepkg.Response) (taskReport, error) {
-	traceID := firstNonEmptyLocal(resp.TraceID, traceIDForMessageLocal(msg))
-	report := taskReport{
-		Title:             opts.Title,
-		Question:          opts.Message,
-		Result:            firstNonEmptyLocal(resp.Reply.Text, ""),
-		ReplyText:         resp.Reply.Text,
-		Failed:            resp.Failed,
-		AwaitConfirm:      resp.AwaitConfirm,
-		AwaitUserInput:    resp.AwaitUserInput,
-		FinalAcceptStatus: resp.FinalAcceptStatus,
-		FinalAcceptReason: resp.FinalAcceptReason,
-		TraceID:           traceID,
-		SessionKey:        msg.SessionKey,
-		Channel:           msg.Channel,
-		UserID:            msg.UserID,
-		ThreadID:          msg.ThreadID,
-		Home:              a.Config.App.Home,
-		ProjectRoot:       firstNonEmptyLocal(opts.ProjectRoot, a.Runtime.ToolCtx.ProjectRoot),
-		GeneratedAt:       time.Now(),
-		QualityNotes:      qualityNotesForReport(opts.Message, resp),
-		Skills:            collectSkillsForReport(traceID, a.Config.App.Home),
-		Plan:              resp.Plan,
-		ToolResults:       make([]any, 0, len(resp.Results)),
-	}
-	for _, result := range resp.Results {
-		report.ToolResults = append(report.ToolResults, result)
-	}
-	report.Events = loadTraceEvents(filepath.Join(a.Config.App.Home, "trace"), traceID)
-	report.TraceFile = traceFileForTime(a.Config.App.Home, report.GeneratedAt)
-	return report, nil
-}
-
-func writeTaskReport(report taskReport, outDir string) (string, error) {
-	if strings.TrimSpace(outDir) == "" {
-		outDir = firstNonEmptyLocal(report.ProjectRoot, ".")
-		outDir = filepath.Join(outDir, "testdata")
-	}
-	dateDir := filepath.Join(outDir, time.Now().Format("2006-01-02"))
-	if err := os.MkdirAll(dateDir, 0o755); err != nil {
-		return "", err
-	}
-	name := uniqueTaskSuffix(report.Title)
-	if name == "" {
-		name = "task"
-	}
-	path := filepath.Join(dateDir, time.Now().Format("150405")+"-"+name+".md")
-	var b strings.Builder
-	writeTaskReportMarkdown(&b, report)
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
-}
-
-func writeTaskReportMarkdown(b *strings.Builder, report taskReport) {
-	fmt.Fprintf(b, "# %s\n\n", report.Title)
-	fmt.Fprintln(b, "## Question")
-	fmt.Fprintln(b, report.Question)
-	fmt.Fprintln(b)
-	fmt.Fprintln(b, "## Result")
-	fmt.Fprintln(b, firstNonEmptyLocal(report.ReplyText, report.Result))
-	fmt.Fprintln(b)
-	fmt.Fprintln(b, "## Conclusion")
-	if report.Failed {
-		if report.FinalAcceptStatus == "partial" {
-			fmt.Fprintln(b, "The task completed partially with useful output and remaining gaps.")
-		} else {
-			fmt.Fprintln(b, "The task did not complete successfully.")
-		}
-	} else if report.AwaitConfirm {
-		fmt.Fprintln(b, "The task is waiting for confirmation.")
-	} else if report.AwaitUserInput {
-		fmt.Fprintln(b, "The task is waiting for additional user input.")
-	} else if report.FinalAcceptStatus == "partial" {
-		fmt.Fprintln(b, "The task completed partially with useful output and remaining gaps.")
-	} else if len(report.QualityNotes) > 0 {
-		fmt.Fprintln(b, "The task mechanism completed, but the answer quality needs human review.")
+	resp, err := rt.Handle(ctx, msg)
+	status := "success"
+	errText := ""
+	output := ""
+	tracePath := ""
+	if err != nil {
+		status = "error"
+		errText = err.Error()
 	} else {
-		fmt.Fprintln(b, "The task completed.")
-	}
-	if strings.TrimSpace(report.FinalAcceptStatus) != "" || strings.TrimSpace(report.FinalAcceptReason) != "" {
-		fmt.Fprintln(b)
-		fmt.Fprintln(b, "## Final Acceptance")
-		if strings.TrimSpace(report.FinalAcceptStatus) != "" {
-			fmt.Fprintf(b, "- status: %s\n", report.FinalAcceptStatus)
-		}
-		if strings.TrimSpace(report.FinalAcceptReason) != "" {
-			fmt.Fprintf(b, "- reason: %s\n", report.FinalAcceptReason)
+		output = strings.TrimSpace(resp.Reply.Text)
+		tracePath = resp.TracePath
+		if resp.Failed {
+			status = "error"
 		}
 	}
-	if len(report.QualityNotes) > 0 {
-		fmt.Fprintln(b)
-		fmt.Fprintln(b, "## Quality Notes")
-		for _, note := range report.QualityNotes {
-			fmt.Fprintf(b, "- %s\n", note)
-		}
+	record, recordErr := store.RecordRun(schedule.RunRecord{
+		TaskID:     task.ID,
+		Kind:       kind,
+		Status:     status,
+		StartedAt:  startedAt.Format(time.RFC3339),
+		FinishedAt: time.Now().Format(time.RFC3339),
+		SessionKey: msg.SessionKey,
+		Output:     output,
+		TracePath:  tracePath,
+		Error:      errText,
+	})
+	if recordErr != nil {
+		return record, recordErr
 	}
-	if len(report.Skills) > 0 {
-		fmt.Fprintln(b)
-		fmt.Fprintln(b, "## Skills")
-		for _, item := range report.Skills {
-			fmt.Fprintf(b, "- stage: %s\n", item.Stage)
-			for _, skillItem := range item.Skills {
-				name := firstNonEmptyLocal(fmt.Sprint(skillItem["name"]))
-				reason := firstNonEmptyLocal(fmt.Sprint(skillItem["reason"]))
-				dir := firstNonEmptyLocal(fmt.Sprint(skillItem["dir"]))
-				fmt.Fprintf(b, "  - %s\n", name)
-				if reason != "" {
-					fmt.Fprintf(b, "    - reason: %s\n", reason)
-				}
-				if dir != "" {
-					fmt.Fprintf(b, "    - dir: %s\n", dir)
-				}
-			}
-		}
-	}
-	fmt.Fprintln(b)
-	fmt.Fprintln(b, "## Execution Metadata")
-	writeTaskMetaLine(b, "trace_id", report.TraceID)
-	writeTaskMetaLine(b, "session_key", report.SessionKey)
-	writeTaskMetaLine(b, "channel", report.Channel)
-	writeTaskMetaLine(b, "user_id", report.UserID)
-	writeTaskMetaLine(b, "thread_id", report.ThreadID)
-	writeTaskMetaLine(b, "home", report.Home)
-	writeTaskMetaLine(b, "project_root", report.ProjectRoot)
-	writeTaskMetaLine(b, "generated_at", report.GeneratedAt.Format(time.RFC3339))
-	if report.TraceFile != "" {
-		writeTaskMetaLine(b, "trace_file", report.TraceFile)
-	}
-	if data, err := json.MarshalIndent(report.Plan, "", "  "); err == nil && string(data) != "null" {
-		fmt.Fprintln(b)
-		fmt.Fprintln(b, "### Plan")
-		fmt.Fprintln(b, "```json")
-		fmt.Fprintln(b, string(data))
-		fmt.Fprintln(b, "```")
-	}
-	if len(report.ToolResults) > 0 {
-		fmt.Fprintln(b)
-		fmt.Fprintln(b, "### Tool Results")
-		if data, err := json.MarshalIndent(report.ToolResults, "", "  "); err == nil {
-			fmt.Fprintln(b, "```json")
-			fmt.Fprintln(b, string(data))
-			fmt.Fprintln(b, "```")
-		}
-	}
-	if len(report.Events) > 0 {
-		fmt.Fprintln(b)
-		fmt.Fprintln(b, "### Trace Events")
-		for _, ev := range report.Events {
-			if data, err := json.Marshal(ev); err == nil {
-				fmt.Fprintf(b, "- %s\n", string(data))
-			}
-		}
-	}
+	return record, err
 }
 
-func writeTaskMetaLine(b *strings.Builder, key, value string) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return
+func printScheduleTask(task schedule.Task) {
+	fmt.Println("schedule:", task.ID)
+	fmt.Println("status:", task.Status)
+	fmt.Println("run_at:", task.RunAt)
+	if task.Interval != "" {
+		fmt.Println("interval:", task.Interval)
 	}
-	fmt.Fprintf(b, "- %s: %s\n", key, value)
+	fmt.Println("session:", task.SessionKey)
 }
 
-func loadTraceEvents(traceDir, traceID string) []map[string]any {
-	if strings.TrimSpace(traceID) == "" {
-		return nil
+func runMemory(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal>")
 	}
-	entries, err := os.ReadDir(traceDir)
-	if err != nil {
-		return nil
-	}
-	var paths []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "events-") || !strings.HasSuffix(name, ".jsonl") {
-			continue
+	switch args[0] {
+	case "lint":
+		fs := flag.NewFlagSet("mateway memory lint", flag.ContinueOnError)
+		rootFlag := fs.String("root", "", "memory root to lint")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
 		}
-		paths = append(paths, filepath.Join(traceDir, name))
-	}
-	sort.Strings(paths)
-	var out []map[string]any
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
+		cfg, err := loadConfig()
 		if err != nil {
-			continue
+			return err
 		}
-		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
+		root := strings.TrimSpace(*rootFlag)
+		if root == "" {
+			root = memoryRoot(cfg)
+		}
+		result, err := memory.LintRoot(root)
+		if err != nil {
+			return err
+		}
+		fmt.Println("memory_root:", result.Root)
+		fmt.Println("files:", result.Files)
+		fmt.Println("issues:", len(result.Issues))
+		for _, issue := range result.Issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if result.HasErrors() {
+			return fmt.Errorf("memory lint failed")
+		}
+		return nil
+	case "index":
+		if len(args) < 2 || args[1] != "rebuild" {
+			return fmt.Errorf("usage: mateway memory index rebuild [--root <path>] [--out <path>]")
+		}
+		fs := flag.NewFlagSet("mateway memory index rebuild", flag.ContinueOnError)
+		rootFlag := fs.String("root", "", "memory root to index")
+		outFlag := fs.String("out", "", "index output path")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		root := strings.TrimSpace(*rootFlag)
+		if root == "" {
+			root = memoryRoot(cfg)
+		}
+		index, issues, err := memory.RebuildIndex(root)
+		if err != nil {
+			return err
+		}
+		for _, issue := range issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if hasMemoryErrors(issues) {
+			return fmt.Errorf("memory index rebuild failed")
+		}
+		out := strings.TrimSpace(*outFlag)
+		if out == "" {
+			out = memoryIndexPath(cfg)
+		}
+		if err := memory.WriteIndex(out, index); err != nil {
+			return err
+		}
+		fmt.Println("memory_root:", index.Root)
+		fmt.Println("entries:", len(index.Entries))
+		fmt.Println("index:", out)
+		return nil
+	case "search":
+		fs := flag.NewFlagSet("mateway memory search", flag.ContinueOnError)
+		rootFlag := fs.String("root", "", "memory root to search")
+		scopeFlag := fs.String("scope", "", "optional scope filter")
+		typeFlag := fs.String("type", "", "optional type filter")
+		limitFlag := fs.Int("limit", 5, "maximum results")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		root := strings.TrimSpace(*rootFlag)
+		if root == "" {
+			root = memoryRoot(cfg)
+		}
+		results, issues, err := memory.SearchRoot(root, memory.SearchOptions{
+			Query: query,
+			Limit: *limitFlag,
+			Scope: strings.TrimSpace(*scopeFlag),
+			Type:  strings.TrimSpace(*typeFlag),
+		})
+		if err != nil {
+			return err
+		}
+		for _, issue := range issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if hasMemoryErrors(issues) {
+			return fmt.Errorf("memory search failed")
+		}
+		fmt.Println("memory_root:", root)
+		fmt.Println("results:", len(results))
+		for i, result := range results {
+			fmt.Printf("%d. %s type=%s scope=%s score=%d\n", i+1, result.Path, result.Type, result.Scope, result.Score)
+			if result.Snippet != "" {
+				fmt.Println("   snippet:", result.Snippet)
 			}
-			var ev map[string]any
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
-				continue
-			}
-			if fmt.Sprint(ev["trace_id"]) == traceID {
-				out = append(out, ev)
+			if len(result.Sources) > 0 {
+				fmt.Println("   sources:", strings.Join(result.Sources, ", "))
 			}
 		}
+		return nil
+	case "proposal":
+		return runMemoryProposal(args[1:])
+	case "distill":
+		return runMemoryDistill(args[1:])
+	case "heartbeat":
+		return runMemoryHeartbeat(args[1:])
+	case "report":
+		return runMemoryReport(args[1:])
+	default:
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill|heartbeat|report>")
 	}
-	return out
 }
 
-func collectSkillsForReport(traceID, home string) []skillEvent {
-	traceFile := traceFileForTime(home, time.Now())
-	data, err := os.ReadFile(traceFile)
+func runMemoryReport(args []string) error {
+	fs := flag.NewFlagSet("mateway memory report", flag.ContinueOnError)
+	rootFlag := fs.String("root", "", "memory root to report")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
 	if err != nil {
-		return nil
+		return err
 	}
-	var out []skillEvent
-	seen := map[string]struct{}{}
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	root := strings.TrimSpace(*rootFlag)
+	if root == "" {
+		root = memoryRoot(cfg)
+	}
+	report, err := memory.BuildReport(memory.ReportInput{Home: cfg.App.Home, MemoryRoot: root})
+	if err != nil {
+		return err
+	}
+	fmt.Println("memory_root:", report.MemoryRoot)
+	fmt.Println("memory_files:", report.MemoryFiles)
+	fmt.Println("index_entries:", report.IndexEntries)
+	fmt.Println("issues:", len(report.Issues))
+	fmt.Println("proposals:")
+	for _, status := range []string{"proposed", "active", "archived", "rejected", "unknown"} {
+		if count := report.Proposals[status]; count > 0 {
+			fmt.Printf("- %s: %d\n", status, count)
 		}
-		var ev map[string]any
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
+	}
+	fmt.Println("observe:")
+	for _, name := range []string{"diary", "reflections", "proposals", "audit"} {
+		fmt.Printf("- %s: %d\n", name, report.Observe[name])
+	}
+	return nil
+}
+
+func runMemoryHeartbeat(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|serve>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "lint-index":
+		result, err := memory.RunLintIndexHeartbeat(memory.HeartbeatInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			IndexPath:  memoryIndexPath(cfg),
+		})
+		if err != nil {
+			return err
 		}
-		if fmt.Sprint(ev["trace_id"]) != traceID {
-			continue
+		fmt.Println("memory_root:", result.Root)
+		fmt.Println("files:", result.Files)
+		fmt.Println("entries:", result.Entries)
+		fmt.Println("issues:", len(result.Issues))
+		for _, issue := range result.Issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
 		}
-		if fmt.Sprint(ev["event"]) != "runtime.skills_selected" {
-			continue
+		if hasMemoryErrors(result.Issues) {
+			return fmt.Errorf("memory heartbeat found lint errors")
 		}
-		stage := fmt.Sprint(ev["stage"])
-		key := stage + "|" + line
-		if _, ok := seen[key]; ok {
-			continue
+		fmt.Println("index:", result.IndexPath)
+		return nil
+	case "serve":
+		fs := flag.NewFlagSet("mateway memory heartbeat serve", flag.ContinueOnError)
+		intervalFlag := fs.String("interval", "", "override heartbeat interval")
+		onceFlag := fs.Bool("once", false, "run one heartbeat cycle and exit")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
 		}
-		seen[key] = struct{}{}
-		group := skillEvent{Stage: stage}
-		if raw, ok := ev["skills"].([]any); ok {
-			for _, item := range raw {
-				if m, ok := item.(map[string]any); ok {
-					group.Skills = append(group.Skills, m)
-				}
+		interval := 30 * time.Minute
+		jobs := []string{"lint-index"}
+		if profile := defaultAgentProfile(cfg); profile != nil {
+			jobs = profile.Heartbeat.Jobs
+			if parsed, err := time.ParseDuration(profile.Heartbeat.Interval); err == nil && parsed > 0 {
+				interval = parsed
 			}
 		}
-		out = append(out, group)
+		if strings.TrimSpace(*intervalFlag) != "" {
+			parsed, err := time.ParseDuration(strings.TrimSpace(*intervalFlag))
+			if err != nil {
+				return err
+			}
+			interval = parsed
+		}
+		runOnce := func() error {
+			result, err := memory.RunLintIndexHeartbeat(memory.HeartbeatInput{
+				Home:       cfg.App.Home,
+				MemoryRoot: memoryRoot(cfg),
+				IndexPath:  memoryIndexPath(cfg),
+			})
+			printHeartbeatResult(result)
+			if err != nil {
+				return err
+			}
+			if hasMemoryErrors(result.Issues) {
+				return fmt.Errorf("memory heartbeat found lint errors")
+			}
+			return nil
+		}
+		if *onceFlag {
+			return runOnce()
+		}
+		fmt.Println("heartbeat:", "serve")
+		fmt.Println("interval:", interval)
+		fmt.Println("jobs:", strings.Join(memory.NormalizeHeartbeatJobs(jobs), ", "))
+		return memory.ServeHeartbeat(context.Background(), memory.HeartbeatServeInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			IndexPath:  memoryIndexPath(cfg),
+			Interval:   interval,
+			Jobs:       jobs,
+			OnResult: func(result memory.HeartbeatResult) {
+				printHeartbeatResult(result)
+			},
+		})
+	default:
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|serve>")
+	}
+}
+
+func printHeartbeatResult(result memory.HeartbeatResult) {
+	fmt.Println("memory_root:", result.Root)
+	fmt.Println("files:", result.Files)
+	fmt.Println("entries:", result.Entries)
+	fmt.Println("issues:", len(result.Issues))
+	for _, issue := range result.Issues {
+		fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+	}
+	if result.IndexPath != "" {
+		fmt.Println("index:", result.IndexPath)
+	}
+}
+
+func defaultAgentProfile(cfg *config.Root) *config.AgentProfileConfig {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.Agents.Profiles {
+		if cfg.Agents.Profiles[i].ID == cfg.Agents.Default {
+			return &cfg.Agents.Profiles[i]
+		}
+	}
+	for i := range cfg.Agents.Profiles {
+		if cfg.Agents.Profiles[i].Default {
+			return &cfg.Agents.Profiles[i]
+		}
+	}
+	if len(cfg.Agents.Profiles) > 0 {
+		return &cfg.Agents.Profiles[0]
+	}
+	return nil
+}
+
+func runMemoryDistill(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory distill <session|project>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "session":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway memory distill session <session_key>")
+		}
+		store := session.NewStore(cfg.App.Home)
+		state, err := store.Load(args[1])
+		if err != nil {
+			return err
+		}
+		result, err := memory.DistillSession(memory.SessionDistillInput{Home: cfg.App.Home, State: state, Reason: "manual"})
+		if err != nil {
+			return err
+		}
+		fmt.Println("session:", state.Key)
+		fmt.Println("distill:", result.Path)
+		return nil
+	case "project":
+		if len(args) != 3 || args[1] != "close" {
+			return fmt.Errorf("usage: mateway memory distill project close <project_id>")
+		}
+		result, err := memory.DistillProject(memory.ProjectDistillInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			ProjectID:  args[2],
+			Reason:     "project_close",
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("project:", args[2])
+		fmt.Println("entries:", result.Entries)
+		fmt.Println("distill:", result.Path)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory distill <session|project>")
+	}
+}
+
+func runMemoryProposal(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := memory.ProposalStore{Home: cfg.App.Home, MemoryRoot: memoryRoot(cfg)}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("mateway memory proposal create", flag.ContinueOnError)
+		title := fs.String("title", "", "proposal title")
+		body := fs.String("body", "", "proposal body")
+		proposalType := fs.String("type", "experience", "proposal type")
+		scope := fs.String("scope", "agent", "proposal scope")
+		source := fs.String("source", "", "comma-separated source refs")
+		confidence := fs.String("confidence", "low", "confidence: high, medium, or low")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		proposal, err := store.Create(memory.CreateProposalInput{
+			Type:       *proposalType,
+			Scope:      *scope,
+			Title:      *title,
+			Body:       *body,
+			Sources:    splitComma(*source),
+			Confidence: *confidence,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("path:", proposal.Path)
+		return nil
+	case "list":
+		proposals, err := store.List()
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposals:", len(proposals))
+		for _, proposal := range proposals {
+			fmt.Printf("- %s status=%s type=%s scope=%s title=%s\n", proposal.ID, proposal.Status, proposal.Type, proposal.Scope, proposal.Title)
+		}
+		return nil
+	case "reject":
+		fs := flag.NewFlagSet("mateway memory proposal reject", flag.ContinueOnError)
+		reason := fs.String("reason", "", "rejection reason")
+		rejectArgs := reorderRejectReasonFlag(args[1:])
+		if err := fs.Parse(rejectArgs); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway memory proposal reject <proposal_id> [--reason <text>]")
+		}
+		proposal, err := store.Reject(fs.Arg(0), *reason)
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		return nil
+	case "commit":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway memory proposal commit <proposal_id>")
+		}
+		proposal, target, err := store.Commit(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		fmt.Println("memory:", target)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
+	}
+}
+
+func reorderRejectReasonFlag(args []string) []string {
+	if len(args) != 3 || args[0] == "--reason" || args[0] == "-reason" {
+		return args
+	}
+	if args[1] != "--reason" && args[1] != "-reason" {
+		return args
+	}
+	return []string{args[1], args[2], args[0]}
+}
+
+func memoryRoot(cfg *config.Root) string {
+	if cfg == nil {
+		return filepath.Join(config.DefaultHome(), "workspace", "memory")
+	}
+	if root := strings.TrimSpace(cfg.Memory.Root); root != "" {
+		return root
+	}
+	workspace := strings.TrimSpace(cfg.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(cfg.App.Home, "workspace")
+	}
+	return filepath.Join(workspace, "memory")
+}
+
+func memoryIndexPath(cfg *config.Root) string {
+	home := config.DefaultHome()
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		home = cfg.App.Home
+	}
+	return filepath.Join(home, "indexes", "memory_index.json")
+}
+
+func hasMemoryErrors(issues []memory.Issue) bool {
+	for _, issue := range issues {
+		if issue.Severity == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+func splitComma(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
 	}
 	return out
 }
 
-func traceFileForTime(home string, t time.Time) string {
-	if strings.TrimSpace(home) == "" {
-		home = config.DefaultHome()
-	}
-	return filepath.Join(home, "trace", "events-"+t.Format("2006-01-02")+".jsonl")
-}
-
-func qualityNotesForReport(question string, resp runtimepkg.Response) []string {
-	if resp.Failed || resp.AwaitConfirm || resp.AwaitUserInput {
-		return nil
-	}
-	var notes []string
-	reply := strings.TrimSpace(resp.Reply.Text)
-	if len([]rune(reply)) < 120 {
-		notes = append(notes, "The final reply is short; the mechanism may have completed without enough analytical depth.")
-	}
-	if len(resp.Results) == 0 {
-		notes = append(notes, "No tool result was captured as evidence; review manually if the task required search, file analysis, or execution.")
-	}
-	if looksAnalyticalTestQuestion(question) && len(resp.Results) <= 1 {
-		notes = append(notes, "The question appears to require analysis or cross-checking, but tool evidence is limited.")
-	}
-	lower := strings.ToLower(reply)
-	if strings.Contains(lower, "echo") || strings.Contains(lower, "tool call") && len([]rune(reply)) < 300 {
-		notes = append(notes, "The reply may contain tool-call residue or an overly formal summary; confirm it answered the original question.")
-	}
-	return notes
-}
-
-func looksAnalyticalTestQuestion(question string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(question))
-	return strings.Contains(normalized, "analysis") ||
-		strings.Contains(normalized, "analyze") ||
-		strings.Contains(normalized, "summary") ||
-		strings.Contains(normalized, "summarize") ||
-		strings.Contains(normalized, "trend") ||
-		strings.Contains(normalized, "evaluate") ||
-		strings.Contains(normalized, "compare") ||
-		strings.Contains(normalized, "review") ||
-		strings.Contains(normalized, "research")
-}
-
-func slugify(text string) string {
-	text = strings.TrimSpace(strings.ToLower(text))
-	if text == "" {
-		return ""
-	}
-	var b strings.Builder
-	lastDash := false
-	for _, r := range text {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-			lastDash = false
-		case r == ' ', r == '-', r == '_', r == '.', r == '/', r == ':':
-			if !lastDash && b.Len() > 0 {
-				b.WriteByte('-')
-				lastDash = true
-			}
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		return "task"
-	}
-	return out
-}
-
-func testHelpText() string {
-	return `usage: mateway test [options]
-
-Run one real-model end-to-end test and write a markdown report under testdata/YYYY-MM-DD/.
-
-Options:
-  --title <name>        task title used as the markdown heading and file name
-  --question <text>     task question / problem statement
-  --message <text>      alias of --question
-  --channel <name>      message channel, default cli
-  --session-key <key>   session key, default test:<title>
-  --user-id <id>        user id, default local
-  --thread-id <id>      thread id, default test:<title>
-  --out <dir>           output root, default ./testdata
-  --home <dir>          mateway home, default ~/.mateway
-  --project-root <dir>  project root used by runtime
-`
-}
-
-func firstNonEmptyLocal(values ...string) string {
+func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			return strings.TrimSpace(value)
@@ -1777,150 +922,272 @@ func firstNonEmptyLocal(values ...string) string {
 	return ""
 }
 
-func traceIDForMessageLocal(msg channel.InboundMessage) string {
-	if strings.TrimSpace(msg.ID) != "" {
-		return msg.Channel + "-" + msg.ID
+func summarizeCLIText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
 	}
-	if strings.TrimSpace(msg.SessionKey) != "" {
-		return msg.SessionKey + "-" + time.Now().Format("20060102T150405.000000000")
-	}
-	return msg.Channel + "-" + time.Now().Format("20060102T150405.000000000")
+	return text[:limit] + fmt.Sprintf("... (%d chars)", len(text))
 }
 
-func runFeishu() error {
-	fmt.Fprintln(os.Stderr, "warning: 'feishu' is a compatibility shortcut; use 'mateway gateway serve'")
-	return runGatewayServe()
+type homeReport struct {
+	Home      string
+	Expected  []homeReportItem
+	Generated []homeReportItem
+	Local     []homeReportItem
+	Unknown   []homeReportItem
 }
 
-func runGatewayServe() error {
-	a, err := app.Build("", false)
+type homeReportItem struct {
+	Name string
+	Kind string
+}
+
+func buildHomeReport(home string) (homeReport, error) {
+	report := homeReport{Home: home}
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return report, err
+	}
+	expected := map[string]string{
+		"config":    "configuration",
+		"workspace": "agent workspace, memory, skills",
+		"sessions":  "runtime session state",
+	}
+	generated := map[string]string{
+		"trace":     "runtime traces",
+		"observe":   "learning diary, proposals, audit",
+		"indexes":   "derived search indexes",
+		"schedules": "scheduled task state",
+		"run":       "process runtime state",
+		"logs":      "service logs",
+		"tmp":       "temporary files",
+	}
+	local := map[string]string{
+		"scripts":        "local user scripts",
+		"docker":         "legacy/local service data",
+		"docker-compose": "legacy/local service data",
+	}
+	for _, entry := range entries {
+		item := homeReportItem{Name: entry.Name()}
+		switch {
+		case expected[entry.Name()] != "":
+			item.Kind = expected[entry.Name()]
+			report.Expected = append(report.Expected, item)
+		case generated[entry.Name()] != "":
+			item.Kind = generated[entry.Name()]
+			report.Generated = append(report.Generated, item)
+		case local[entry.Name()] != "":
+			item.Kind = local[entry.Name()]
+			report.Local = append(report.Local, item)
+		default:
+			item.Kind = "not recognized by current clean layout"
+			report.Unknown = append(report.Unknown, item)
+		}
+	}
+	return report, nil
+}
+
+func runTest(args []string) error {
+	fs := flag.NewFlagSet("mateway test", flag.ContinueOnError)
+	caseName := fs.String("case", "read-readme", "test case: read-readme, project-index, web-search, or custom")
+	message := fs.String("message", "", "custom task message")
+	sessionKey := fs.String("session-key", "", "session key to reuse")
+	home := fs.String("home", "", "override MATEWAY_HOME for this run")
+	record := fs.Bool("record", true, "write test result JSON under testdata/runs")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := loadConfigFromHome(*home)
 	if err != nil {
 		return err
 	}
-	lock, err := gateway.AcquireInstanceLock(a.Config.App.Home)
+	addCurrentWorkingDirectoryForTest(cfg)
+	text := strings.TrimSpace(*message)
+	if text == "" {
+		text, err = testCaseMessage(*caseName, cfg)
+		if err != nil {
+			return err
+		}
+	}
+	key := strings.TrimSpace(*sessionKey)
+	if key == "" {
+		key = "test:" + strings.ReplaceAll(strings.ToLower(strings.TrimSpace(*caseName)), " ", "-") + "-" + time.Now().Format("20060102150405")
+	}
+	rt := runtime.New(cfg)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		ID:         "test",
+		Channel:    "test",
+		ThreadID:   key,
+		UserID:     "local",
+		SessionKey: key,
+		Text:       text,
+	})
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
-	fmt.Fprintln(os.Stderr, "mateway instance lock:", lock.Path)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	return gateway.New(a).Serve(ctx)
+	state, err := rt.Store.Load(key)
+	if err != nil {
+		return err
+	}
+	fmt.Println("case:", *caseName)
+	fmt.Println("session:", key)
+	fmt.Println("message:", text)
+	fmt.Println()
+	fmt.Println(resp.Reply.Text)
+	if resp.TracePath != "" {
+		fmt.Println()
+		fmt.Println("trace:", resp.TracePath)
+	}
+	if len(state.Tasks) > 0 {
+		task := state.Tasks[len(state.Tasks)-1]
+		fmt.Println()
+		fmt.Println("task:", task.ID, task.Status)
+		for _, step := range task.Steps {
+			fmt.Printf("- %s %s", step.Tool, step.Status)
+			if acceptance, ok := step.Evidence["acceptance"]; ok {
+				fmt.Printf(" acceptance=%v", acceptance)
+			}
+			fmt.Println()
+		}
+	}
+	if *record {
+		path, err := writeTestRecord(*caseName, key, text, resp, state)
+		if err != nil {
+			return err
+		}
+		fmt.Println()
+		fmt.Println("record:", path)
+	}
+	return nil
 }
 
-func runTrace(args []string, out io.Writer) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway trace <tail|show>")
+func writeTestRecord(caseName, sessionKey, message string, resp runtime.Response, state any) (string, error) {
+	dir := filepath.Join("testdata", "runs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
 	}
-	traceDir := filepath.Join(config.DefaultHome(), "trace")
-	switch args[0] {
-	case "tail":
-		opts, err := parseTraceTailOptions(args[1:])
-		if err != nil {
-			return err
+	name := time.Now().Format("20060102-150405") + "-" + sanitizeFilePart(caseName) + ".json"
+	path := filepath.Join(dir, name)
+	data, err := json.MarshalIndent(map[string]any{
+		"case":       caseName,
+		"session":    sessionKey,
+		"message":    message,
+		"reply":      resp.Reply,
+		"failed":     resp.Failed,
+		"trace_id":   resp.TraceID,
+		"trace_path": resp.TracePath,
+		"state":      state,
+		"created_at": time.Now().Format(time.RFC3339),
+	}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func sanitizeFilePart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		value = "custom"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-		return observer.TailTrace(ctx, traceDir, opts, out)
-	case "show":
-		opts, traceID, err := parseTraceShowOptions(args[1:])
-		if err != nil {
-			return err
+		b.WriteByte('-')
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func addCurrentWorkingDirectoryForTest(cfg *config.Root) {
+	if cfg == nil {
+		return
+	}
+	cwd, err := os.Getwd()
+	if err != nil || strings.TrimSpace(cwd) == "" {
+		return
+	}
+	for _, existing := range cfg.Security.AccessiblePaths {
+		if existing == cwd {
+			return
 		}
-		return observer.ShowTrace(traceDir, traceID, opts, out)
+	}
+	cfg.Security.AccessiblePaths = append(cfg.Security.AccessiblePaths, cwd)
+}
+
+func testCaseMessage(name string, cfg ...*config.Root) (string, error) {
+	cwd, _ := os.Getwd()
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "read-readme":
+		return "请读取 " + filepath.Join(cwd, "README.md") + "，然后用三句话总结这个项目当前形态。", nil
+	case "project-index":
+		return "请查看 " + cwd + " 的项目结构，并说明最重要的目录各自负责什么。", nil
+	case "web-search":
+		return "请搜索今天 OpenAI API 的最新公开信息，并用两句话总结来源。", nil
+	case "custom":
+		return "", fmt.Errorf("custom case requires --message")
 	default:
-		return fmt.Errorf("usage: mateway trace <tail|show>")
+		return "", fmt.Errorf("unknown test case %q", name)
 	}
 }
 
-func parseTraceTailOptions(args []string) (observer.TraceTailOptions, error) {
-	opts := observer.TraceTailOptions{Lines: 80, Follow: true}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-n", "--lines":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("%s requires a number", args[i])
-			}
-			n, err := strconv.Atoi(args[i+1])
-			if err != nil || n < 0 {
-				return opts, fmt.Errorf("invalid line count %q", args[i+1])
-			}
-			opts.Lines = n
-			i++
-		case "--no-follow":
-			opts.Follow = false
-		case "--raw":
-			opts.Raw = true
-		default:
-			return opts, fmt.Errorf("unknown trace tail option %q", args[i])
-		}
-	}
-	return opts, nil
+func loadConfig() (*config.Root, error) {
+	return loadConfigFromHome("")
 }
 
-func parseTraceShowOptions(args []string) (observer.TraceShowOptions, string, error) {
-	var opts observer.TraceShowOptions
-	var traceID string
-	for _, arg := range args {
-		switch arg {
-		case "--raw":
-			opts.Raw = true
-		default:
-			if strings.HasPrefix(arg, "-") {
-				return opts, "", fmt.Errorf("unknown trace show option %q", arg)
-			}
-			if traceID != "" {
-				return opts, "", fmt.Errorf("usage: mateway trace show <trace_id>")
-			}
-			traceID = arg
-		}
+func loadConfigFromHome(home string) (*config.Root, error) {
+	if strings.TrimSpace(home) == "" {
+		home = config.DefaultHome()
 	}
-	if strings.TrimSpace(traceID) == "" {
-		return opts, "", fmt.Errorf("usage: mateway trace show <trace_id>")
+	if err := config.EnsureDefaultConfigFiles(home); err != nil {
+		return nil, err
 	}
-	return opts, traceID, nil
+	return config.NewLoader(home).Load()
+}
+
+func serveGateway() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	rt := runtime.New(cfg)
+	return gateway.Serve(context.Background(), gateway.Config{
+		Config:  cfg,
+		Runtime: rt,
+	})
 }
 
 func printHelp() {
-	fmt.Print(`mateway
+	fmt.Println(`mateway
 
-Commands:
-  init                   initialize ~/.mateway config, samples, docs, and default skills
-  doctor                 validate config and list tools
-  eval routing           run real-model planner/tool routing evaluation
-  ask <message>          run one CLI task
-  gateway serve          run the configured gateway in foreground; does not install autostart
-  gateway start          start an already-registered OS-managed gateway service
-  gateway restart        restart an already-registered OS-managed gateway service
-  gateway stop           stop an already-registered OS-managed gateway service
-  gateway status         show service and instance-lock status
-  heartbeat status       show heartbeat job state
-  heartbeat run          run one heartbeat job manually
-  schedule create        create one user scheduled task
-  schedule propose       write a pending user scheduled task proposal
-  schedule list          list user scheduled tasks
-  schedule proposals     list pending user scheduled task proposals
-  schedule show <id>     print one user scheduled task
-  schedule due           list user scheduled tasks due now
-  schedule run-due       run due user scheduled tasks through runtime
-  skill search <query>   search installable skills from priority catalogs
-  skill install <ref>    install a skill into ~/.mateway/workspace/skills
-  skill promote          promote a reviewed skill candidate into ~/.mateway/workspace/skills
-  skill list             list installed Mateway workspace skills
-  memory lint            check Markdown memory wiki health without modifying files
-  memory index           rebuild JSON memory index from Markdown
-  memory list            first-class direct command to list inbox or long memory items
-  memory show            first-class direct command to print one memory item
-  memory review          first-class direct command to inspect or write a long-memory review proposal
-  memory propose         write a reviewed memory proposal into inbox
-  memory commit          direct command with confirmation; commit an inbox proposal into long memory
-  memory reject          direct command with confirmation; mark an inbox proposal as rejected
-  trace tail             follow today's structured trace
-  trace show <trace_id>  show events for one trace id
-
-Typical binary setup:
+Usage:
   mateway init
-  edit ~/.mateway/config/mateway.env and ~/.mateway/config/*.yaml
+  mateway ask <message>
+  mateway test [--case read-readme|project-index|web-search] [--message <task>] [--record=false]
+  mateway trace <trace-jsonl-path>
+  mateway memory lint [--root <path>]
+  mateway memory index rebuild [--root <path>] [--out <path>]
+  mateway memory search [--root <path>] [--scope <scope>] [--type <type>] <query>
+  mateway memory proposal create --title <title> --body <body> [--source trace:id]
+  mateway memory proposal list
+  mateway memory proposal reject <proposal_id> [--reason <text>]
+  mateway memory proposal commit <proposal_id>
+  mateway memory distill session <session_key>
+  mateway memory distill project close <project_id>
+  mateway memory heartbeat lint-index
+  mateway memory heartbeat serve [--once] [--interval <duration>]
+  mateway memory report [--root <path>]
+  mateway schedule list
+  mateway schedule run-due
+  mateway schedule serve
+  mateway home report
+  mateway skill list
+  mateway skill search [--all] <query>
+  mateway skill install [--name <name>] [--force] <path-or-raw-url>
   mateway doctor
-`)
+  mateway gateway <serve|start|restart|stop|status>`)
 }

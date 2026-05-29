@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"gopkg.in/yaml.v3"
 )
 
 type templateFile struct {
@@ -20,11 +22,23 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: "mateway.env.sample", Content: envSampleTemplate},
 		{RelPath: filepath.Join("models", "minimax.yaml"), Content: minimaxYAMLTemplate},
 		{RelPath: filepath.Join("models", "minimax.sample.yaml"), Content: minimaxSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "openai-gpt54-mini.yaml"), Content: openAIGPT54MiniYAMLTemplate},
+		{RelPath: filepath.Join("models", "openai-gpt54-mini.sample.yaml"), Content: openAIGPT54MiniSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "local-mlx.yaml"), Content: localMLXYAMLTemplate},
 		{RelPath: filepath.Join("models", "local-mlx.sample.yaml"), Content: localMLXSampleYAMLTemplate},
 		{RelPath: filepath.Join("channels", "_README.md"), Content: channelsReadmeTemplate},
 		{RelPath: filepath.Join("channels", "feishu.yaml"), Content: feishuYAMLTemplate},
 		{RelPath: filepath.Join("channels", "feishu.sample.yaml"), Content: feishuSampleYAMLTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "agent.md"), Content: agentMainTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "soul.md"), Content: agentSoulTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "user.md"), Content: agentUserTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "tools.md"), Content: agentToolsTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "memory.md"), Content: agentMemoryTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "skills", "README.md"), Content: agentSkillsReadmeTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "software-install", "SKILL.md"), Content: skillSoftwareInstallTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "fresh-search", "SKILL.md"), Content: skillFreshSearchTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "source-evaluation", "SKILL.md"), Content: skillSourceEvaluationTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "connector-gap", "SKILL.md"), Content: skillConnectorGapTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "README.md"), Content: memoryReadmeTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "schema.md"), Content: memorySchemaTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "index.md"), Content: memoryIndexTemplate},
@@ -40,7 +54,96 @@ func EnsureDefaultConfigFiles(home string) error {
 			return err
 		}
 	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "config.yaml"), []byte(configYAMLTemplate)); err != nil {
+		return err
+	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "feishu.yaml"), []byte(feishuYAMLTemplate)); err != nil {
+		return err
+	}
 	return nil
+}
+
+func mergeDefaultYAMLFile(path string, defaults []byte) error {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var currentNode yaml.Node
+	if err := yaml.Unmarshal(existing, &currentNode); err != nil {
+		return err
+	}
+	var defaultNode yaml.Node
+	if err := yaml.Unmarshal(defaults, &defaultNode); err != nil {
+		return err
+	}
+	if mergeYAMLMapping(documentMapping(&currentNode), documentMapping(&defaultNode)) {
+		out, err := yaml.Marshal(&currentNode)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(path, out, 0o644)
+	}
+	return nil
+}
+
+func documentMapping(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return node.Content[0]
+	}
+	if node.Kind == yaml.MappingNode {
+		return node
+	}
+	return nil
+}
+
+func mergeYAMLMapping(current, defaults *yaml.Node) bool {
+	if current == nil || defaults == nil || current.Kind != yaml.MappingNode || defaults.Kind != yaml.MappingNode {
+		return false
+	}
+	changed := false
+	for i := 0; i+1 < len(defaults.Content); i += 2 {
+		key := defaults.Content[i]
+		value := defaults.Content[i+1]
+		existing := mappingValue(current, key.Value)
+		if existing == nil {
+			current.Content = append(current.Content, cloneYAMLNode(key), cloneYAMLNode(value))
+			changed = true
+			continue
+		}
+		if existing.Kind == yaml.MappingNode && value.Kind == yaml.MappingNode {
+			if mergeYAMLMapping(existing, value) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	clone.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		clone.Content[i] = cloneYAMLNode(child)
+	}
+	return &clone
 }
 
 func writeFileIfMissing(path, content string) error {
@@ -66,11 +169,6 @@ const configYAMLTemplate = `app:
 model:
   default: minimax
   fallbacks: []
-  roles:
-    planning: minimax
-    repair: minimax
-    synthesis: minimax
-    followup: minimax
 
 memory:
   enabled: true
@@ -93,10 +191,32 @@ learning:
     require_user_confirm: true
     ask_timing: next_interaction
 
+skills:
+  catalogs:
+    - name: skills.sh
+      enabled: true
+      base_url: https://skills.sh
+      search_url: "https://skills.sh/?q={query}"
+      install_url: ""
+      trust_level: high
+    - name: skillhub.cn
+      enabled: false
+      base_url: https://skillhub.cn
+      search_url: "https://skillhub.cn/search?q={query}"
+      install_url: ""
+      trust_level: unknown
+    - name: clawhub.ai
+      enabled: false
+      base_url: https://clawhub.ai
+      search_url: "https://clawhub.ai/search?q={query}"
+      install_url: ""
+      trust_level: medium
+
 scheduler:
   enabled: false
   timezone: Asia/Shanghai
   state_dir: ""
+  interval: 30s
 
 agents:
   default: main
@@ -108,20 +228,14 @@ agents:
       model:
         default: minimax
         fallbacks: []
-        roles:
-          planning: minimax
-          repair: minimax
-          synthesis: minimax
-          followup: minimax
       heartbeat:
         enabled: false
         interval: 30m
         schedule:
           daily_at: "03:30"
         jobs:
-          - memory_daily_review
-          - memory_recent_compact
           - memory_lint
+          - memory_index_rebuild
         auto_send_summary: false
         quiet_hours:
           start: "23:00"
@@ -142,16 +256,23 @@ security:
   enforce_workspace_paths: true
   require_approval_for_risky_tools: true
   accessible_paths: []
+  terminal_sandbox:
+    enabled: false
+    mode: restricted
+    workdir: ""
+    timeout_seconds: 20
+    command_prefix: []
 
 search:
   default_tool: tavily
-  provider_order: [cache, duckduckgo, tavily]
+  provider_order: [tavily, searxng, duckduckgo]
   cache_enabled: true
   cache_ttl_hours: 168
   fresh_cache_ttl_hours: 6
   providers:
     tavily:
       enabled: false
+      base_url: https://api.tavily.com/search
       api_key_env: TAVILY_API_KEY
       timeout_seconds: 8
       max_results: 5
@@ -159,6 +280,11 @@ search:
       monthly_budget: 900
       search_depth: basic
       topic: general
+    searxng:
+      enabled: false
+      base_url: http://127.0.0.1:8088
+      timeout_seconds: 8
+      max_results: 5
     duckduckgo:
       enabled: true
       timeout_seconds: 4
@@ -186,6 +312,23 @@ const minimaxSampleYAMLTemplate = `# Copy this file to minimax.yaml.
 # Put the real key in mateway.env as MINIMAX_API_KEY.
 
 ` + minimaxYAMLTemplate
+
+const openAIGPT54MiniYAMLTemplate = `name: openai-gpt54-mini
+provider: openai
+api: openai
+model: gpt-5.4-mini
+api_base: https://api.openai.com/v1
+api_key: ""
+api_key_env: OPENAI_API_KEY
+strip_reasoning: false
+enabled: false
+description: OpenAI GPT-5.4 mini model for optional planning/repair/synthesis experiments.
+`
+
+const openAIGPT54MiniSampleYAMLTemplate = `# Copy this file to openai-gpt54-mini.yaml.
+# Put the real key in mateway.env as OPENAI_API_KEY.
+
+` + openAIGPT54MiniYAMLTemplate
 
 const localMLXYAMLTemplate = `name: local-mlx
 provider: mlx_lm
@@ -235,6 +378,7 @@ const envSampleTemplate = `# Copy this file to mateway.env.
 # Keep mateway.env private and do not commit it.
 
 MINIMAX_API_KEY=
+OPENAI_API_KEY=
 TAVILY_API_KEY=
 
 MATEWAY_FEISHU_APP_ID=
@@ -248,6 +392,55 @@ const configReadmeTemplate = `# Mateway Configuration
 Default runtime layout:
 
 ` + "```text" + `
+~/.mateway/
+  config/
+    config.yaml
+    config.sample.yaml
+    mateway.env
+    mateway.env.sample
+    models/
+      minimax.yaml
+      minimax.sample.yaml
+      openai-gpt54-mini.yaml
+      openai-gpt54-mini.sample.yaml
+      local-mlx.yaml
+      local-mlx.sample.yaml
+    channels/
+      feishu.yaml
+      feishu.sample.yaml
+  workspace/
+    agents/
+      main/
+        agent.md
+        soul.md
+        user.md
+        tools.md
+        memory.md
+        skills/
+          README.md
+          <optional agent-specific skills>
+    memory/
+      README.md
+      schema.md
+      index.md
+      log.md
+      user/index.md
+      org/index.md
+      agents/main/index.md
+      agents/main/memory.md
+    skills/
+      <optional shared skills>
+  sessions/
+    <runtime session state json>
+  trace/
+    <runtime trace jsonl>
+  run/
+    mateway.lock
+` + "```" + `
+
+Config files only:
+
+` + "```text" + `
 ~/.mateway/config/
   config.yaml
   config.sample.yaml
@@ -256,6 +449,8 @@ Default runtime layout:
   models/
     minimax.yaml
     minimax.sample.yaml
+    openai-gpt54-mini.yaml
+    openai-gpt54-mini.sample.yaml
     local-mlx.yaml
     local-mlx.sample.yaml
   channels/
@@ -271,11 +466,13 @@ Notes:
 - ` + "`mateway.env`" + ` stores local secrets and should not be committed.
 - ` + "`*.sample.yaml`" + ` files are user templates and are ignored by the runtime loader.
 - Top-level ` + "`model`" + ` is the global default template; ` + "`agents.profiles[].model`" + ` overrides it for a specific agent.
-- ` + "`roles.planning/repair/synthesis/followup`" + ` reserves model choices for runtime phases. The default model is used until role routing is implemented.
 - ` + "`security.enforce_workspace_paths: true`" + ` restricts file tools to projectRoot, workspace, and accessible_paths.
-- ` + "`memory`" + ` configures the Markdown/Obsidian-compatible memory wiki and proposal policy.
-- ` + "`learning.skill_crystallization`" + ` controls event-driven skill candidate generation after repeated successful patterns.
-- ` + "`scheduler`" + ` is reserved for best-effort background maintenance; it is not a strict cron.
+- ` + "`workspace/agents/main/*.md`" + ` stores editable prompt-facing profile context.
+- ` + "`workspace/memory`" + ` is reserved for Markdown/Obsidian-compatible memory.
+- ` + "`workspace/agents/main/skills`" + ` is reserved for agent-specific skills.
+- ` + "`workspace/skills`" + ` contains editable shared skills. Init seeds a small default set that users may modify.
+- ` + "`sessions`" + ` and ` + "`trace`" + ` are runtime state directories, created when tasks run.
+- Old directories such as ` + "`skills`" + `, ` + "`schedules`" + `, ` + "`workspace/scheduled`" + `, or ` + "`workspace/web-cache`" + ` may exist from older Mateway builds; the current minimal runtime does not require them.
 
 New users may copy sample files:
 
@@ -283,9 +480,193 @@ New users may copy sample files:
 cp config.sample.yaml config.yaml
 cp mateway.env.sample mateway.env
 cp models/minimax.sample.yaml models/minimax.yaml
+cp models/openai-gpt54-mini.sample.yaml models/openai-gpt54-mini.yaml
 cp models/local-mlx.sample.yaml models/local-mlx.yaml
 cp channels/feishu.sample.yaml channels/feishu.yaml
 ` + "```" + `
+`
+
+const agentMainTemplate = `# main agent
+
+Default behavior:
+
+- Use the user's language unless they request another language.
+- Do not dump raw information without synthesis.
+- Help the user filter, summarize, compare, and decide.
+- When current information matters, prefer official and up-to-date sources.
+- If information may be stale, say so clearly.
+- If a tool call fails, do not invent the result.
+`
+
+const agentSoulTemplate = `# main soul
+
+You are Mateway, a practical personal work assistant agent.
+
+Core objectives:
+
+- Help the user complete concrete work.
+- Organize information into clear, useful conclusions.
+- Use tools safely and only when they materially help.
+- Answer in the user's language unless the user requests another language.
+`
+
+const agentUserTemplate = `# main user
+
+User profile:
+
+- No stable user preferences have been recorded yet.
+- Record preferences only when they are explicit, durable, and useful for future tasks.
+- Keep user preferences human-readable and easy to edit.
+`
+
+const agentToolsTemplate = `# main tools
+
+Tool-use rules:
+
+1. Plan before using tools.
+2. Do not expose raw tool calls, internal arguments, or implementation traces to the user.
+3. Tool results will be supplied by the system.
+4. Final answers must be structured, readable, and written in the user's language unless requested otherwise.
+`
+
+const agentMemoryTemplate = `# main memory
+
+Prompt-facing memory summary for this agent.
+
+Keep this file short because it may be injected into model context.
+
+Use it only for stable, user-approved facts, compact preferences, or links to curated memory wiki pages.
+
+Detailed long-term memory belongs under workspace/memory/agents/main/.
+`
+
+const agentSkillsReadmeTemplate = `# main agent skills
+
+Put agent-specific skills here as:
+
+` + "```text" + `
+skills/<skill-name>/SKILL.md
+` + "```" + `
+
+Shared skills can live under ` + "`workspace/skills`" + `. Agent-specific skills win when names collide.
+
+Mateway discovers skills from both locations:
+
+1. ` + "`workspace/agents/main/skills/<skill-name>/SKILL.md`" + ` for agent-specific overrides.
+2. ` + "`workspace/skills/<skill-name>/SKILL.md`" + ` for shared installed skills.
+
+You do not need to copy or symlink a shared skill into this directory unless you want an agent-specific override.
+`
+
+const skillSoftwareInstallTemplate = `---
+name: software-install
+description: Use when the user asks to install, configure, or verify CLI software or developer tools.
+stage: planning
+priority: 90
+---
+
+# software-install
+
+Goal: complete software installation tasks using the smallest safe path.
+
+Workflow:
+
+1. Identify the official source first.
+   Prefer official docs, GitHub repositories, package manager pages, or release pages.
+   Do not guess repository owners, binary names, package names, or download URLs.
+
+2. Read install instructions before proposing commands.
+   Use web.fetch for README/docs/package pages.
+   Use terminal.run only for local environment checks, guarded installation, verification, and PATH diagnosis.
+
+3. Before installing, summarize:
+   - official_source
+   - install_method
+   - install_command
+   - verify_command
+   - executable_name
+   - why this method fits the current machine
+
+4. If the command is risky or mutates the machine, wait for confirmation through Mateway's guarded tool flow.
+
+5. Verify after installation.
+   Prefer command -v, --version, --help, or a documented quick-start command.
+   If install succeeds but verification fails, diagnose PATH and executable location before switching methods.
+
+Never claim installation succeeded unless a tool command or file write actually completed and verification evidence exists.
+`
+
+const skillFreshSearchTemplate = `---
+name: fresh-search
+description: Use when the user asks for today, latest, current, real-time, prices, weather, releases, or news.
+stage: planning
+priority: 80
+---
+
+# fresh-search
+
+Goal: avoid stale answers.
+
+Rules:
+
+1. Use the runtime current date exactly when building search queries.
+2. Prefer official/primary sources, then reputable secondary sources.
+3. For "today" claims, require a date/time clue from the source or explicitly state that freshness could not be verified.
+4. If a direct source times out, try an official API, mirror, search result, or alternate source before giving up.
+5. Do not silently downgrade "today" into "recent"; say so when only recent evidence is available.
+`
+
+const skillSourceEvaluationTemplate = `---
+name: source-evaluation
+description: Use to rank sources by officialness, freshness, reliability, and actionability.
+stage: synthesis
+priority: 70
+---
+
+# source-evaluation
+
+When comparing sources, score them by:
+
+1. Official or primary source status.
+2. Date freshness and whether the date matches the user request.
+3. Specific evidence: URLs, versions, timestamps, authors, repository activity, or command output.
+4. Risk: whether following the source could mutate local state, leak secrets, or install untrusted code.
+
+If sources disagree, explain the disagreement and choose the safer conclusion.
+`
+
+const skillConnectorGapTemplate = `---
+name: connector-gap
+description: Use when a task needs missing mail, SSH, publishing, calendar, SaaS, or other external connectors.
+stage: planning
+priority: 85
+---
+
+# connector-gap
+
+Goal: still help complete the user's real task when a direct connector is missing.
+
+Workflow:
+
+1. Do not stop at "not supported".
+2. Check safe local capabilities first:
+   - available CLIs with command -v
+   - local app configuration
+   - documented config files
+   - existing scripts under the workspace or ~/.mateway
+3. If a script can bridge the gap, propose or create a small script with:
+   - required inputs
+   - environment variables
+   - safety boundaries
+   - verification command
+4. Before creating a script, verify the target runtime exists.
+   Examples:
+   - Python script: command -v python3 && python3 --version
+   - Node script: command -v node && node --version
+   - Shell script with external tools: command -v for each required executable
+   If the runtime is missing, choose an available runtime or stop with setup instructions.
+5. If real credentials, server hostnames, recipients, or platform choices are missing, ask only for those concrete fields.
+6. Never claim that email was sent, a server was checked, or content was published unless a tool/script/action actually did it.
 `
 
 const memoryReadmeTemplate = `# Mateway Memory Wiki
@@ -306,17 +687,22 @@ Every durable memory page should use YAML frontmatter:
 
 ` + "```yaml" + `
 ---
-type: project | system | preference | playbook | decision | source | skill_candidate
-scope: agent | user | org
+type: preference | decision | experience | skill | pattern | wiki | diary | reflection | proposal
+scope: global | user | org | agent | project
 owner_agent: main
+project_id:
 visibility: private | shared-user | shared-org
-status: active | proposed | deprecated
+status: proposed | active | rejected | deprecated | archived
 tags: []
 aliases: []
-sources: []
+op_fingerprint:
+sources:
+  - trace:<trace_id>
 confidence: high | medium | low
-created_at: 2026-05-20
-updated_at: 2026-05-20
+created_at: 2026-05-29
+updated_at: 2026-05-29
+review_after:
+schema_version: 1
 ---
 ` + "```" + `
 
@@ -347,11 +733,29 @@ const memoryOrgIndexTemplate = `# Shared Organization Memory
 Use this area for organization systems, terminology, workflows, and playbooks.
 `
 
-const memoryAgentEntryTemplate = `# Agent Memory Entry
+const memoryAgentEntryTemplate = `---
+type: wiki
+scope: agent
+owner_agent: main
+project_id:
+visibility: private
+status: proposed
+tags: []
+aliases: []
+op_fingerprint:
+sources: []
+confidence: low
+created_at: 2026-05-29
+updated_at: 2026-05-29
+review_after:
+schema_version: 1
+---
 
-This is the prompt-facing memory entry for the agent.
+# Agent Memory Entry
 
-Keep it short. Link to detailed wiki pages instead of copying everything here.
+This is the long-term memory wiki entry for the agent.
+
+It can link to detailed pages under this memory wiki. Do not assume this whole file is injected into every model prompt.
 
 - Agent memory index: [[index]]
 `
