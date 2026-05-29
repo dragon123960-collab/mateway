@@ -259,13 +259,13 @@ func runMemory(args []string) error {
 
 func runMemoryProposal(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory proposal <create|list|reject>")
+		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	store := memory.ProposalStore{Home: cfg.App.Home}
+	store := memory.ProposalStore{Home: cfg.App.Home, MemoryRoot: memoryRoot(cfg)}
 	switch args[0] {
 	case "create":
 		fs := flag.NewFlagSet("mateway memory proposal create", flag.ContinueOnError)
@@ -318,8 +318,20 @@ func runMemoryProposal(args []string) error {
 		fmt.Println("proposal:", proposal.ID)
 		fmt.Println("status:", proposal.Status)
 		return nil
+	case "commit":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway memory proposal commit <proposal_id>")
+		}
+		proposal, target, err := store.Commit(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		fmt.Println("memory:", target)
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway memory proposal <create|list|reject>")
+		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
 	}
 }
 
@@ -551,6 +563,7 @@ Usage:
   mateway memory proposal create --title <title> --body <body> [--source trace:id]
   mateway memory proposal list
   mateway memory proposal reject <proposal_id> [--reason <text>]
+  mateway memory proposal commit <proposal_id>
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

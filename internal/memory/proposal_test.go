@@ -66,3 +66,51 @@ func TestProposalStoreRequiresTitleAndBody(t *testing.T) {
 		t.Fatal("expected missing body error")
 	}
 }
+
+func TestProposalStoreCommitWritesActiveMemory(t *testing.T) {
+	home := t.TempDir()
+	memoryRoot := filepath.Join(home, "workspace", "memory")
+	store := ProposalStore{Home: home, MemoryRoot: memoryRoot}
+	created, err := store.Create(CreateProposalInput{
+		Type:       "experience",
+		Scope:      "agent",
+		Title:      "README Inspection",
+		Body:       "Use file.read for local README inspection.",
+		Sources:    []string{"trace:abc"},
+		Confidence: "medium",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, target, err := store.Commit(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.Status != "archived" {
+		t.Fatalf("proposal status = %#v", archived)
+	}
+	if target != filepath.Join(memoryRoot, "agents", "main", "experiences", "readme-inspection.md") {
+		t.Fatalf("target = %q", target)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "status: active") || !strings.Contains(string(data), "trace:abc") {
+		t.Fatalf("unexpected active memory:\n%s", data)
+	}
+	proposalData, err := os.ReadFile(created.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(proposalData), "status: archived") {
+		t.Fatalf("expected archived proposal:\n%s", proposalData)
+	}
+	audit, err := os.ReadFile(filepath.Join(home, "observe", "audit", "memory.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(audit), "proposal_committed") || !strings.Contains(string(audit), "readme-inspection.md") {
+		t.Fatalf("unexpected audit:\n%s", audit)
+	}
+}

@@ -13,7 +13,8 @@ import (
 )
 
 type ProposalStore struct {
-	Home string
+	Home       string
+	MemoryRoot string
 }
 
 type Proposal struct {
@@ -130,6 +131,44 @@ func (s ProposalStore) Reject(id, reason string) (Proposal, error) {
 	return proposal, nil
 }
 
+func (s ProposalStore) Commit(id string) (Proposal, string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Proposal{}, "", fmt.Errorf("proposal id is required")
+	}
+	path := filepath.Join(s.Home, "observe", "proposals", id+".md")
+	proposal, err := readProposal(path)
+	if err != nil {
+		return Proposal{}, "", err
+	}
+	if proposal.Status == "rejected" {
+		return Proposal{}, "", fmt.Errorf("rejected proposal cannot be committed")
+	}
+	memoryRoot := strings.TrimSpace(s.MemoryRoot)
+	if memoryRoot == "" {
+		memoryRoot = filepath.Join(s.Home, "workspace", "memory")
+	}
+	target := proposalTargetPath(memoryRoot, proposal)
+	active := proposal
+	active.Status = "active"
+	active.UpdatedAt = time.Now().Format(time.RFC3339)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return Proposal{}, "", err
+	}
+	if err := os.WriteFile(target, []byte(renderCommittedMemory(active)), 0o644); err != nil {
+		return Proposal{}, "", err
+	}
+	proposal.Status = "archived"
+	proposal.UpdatedAt = active.UpdatedAt
+	if err := os.WriteFile(path, []byte(renderProposalMarkdown(proposal)), 0o644); err != nil {
+		return Proposal{}, "", err
+	}
+	if err := s.writeAudit("proposal_committed", proposal, target); err != nil {
+		return Proposal{}, "", err
+	}
+	return proposal, target, nil
+}
+
 func readProposal(path string) (Proposal, error) {
 	doc, issues := ReadDocument(path)
 	if len(issues) > 0 {
@@ -165,6 +204,40 @@ func renderProposalMarkdown(proposal Proposal) string {
 	}
 	data, _ := yaml.Marshal(fm)
 	return "---\n" + string(data) + "---\n\n# " + proposal.Title + "\n\n" + strings.TrimSpace(proposal.Body) + "\n"
+}
+
+func renderCommittedMemory(proposal Proposal) string {
+	fm := map[string]any{
+		"type":           proposal.Type,
+		"scope":          proposal.Scope,
+		"visibility":     "private",
+		"status":         "active",
+		"sources":        proposal.Sources,
+		"confidence":     proposal.Confidence,
+		"created_at":     proposal.CreatedAt,
+		"updated_at":     proposal.UpdatedAt,
+		"schema_version": 1,
+	}
+	data, _ := yaml.Marshal(fm)
+	return "---\n" + string(data) + "---\n\n# " + proposal.Title + "\n\n" + strings.TrimSpace(proposal.Body) + "\n"
+}
+
+func proposalTargetPath(memoryRoot string, proposal Proposal) string {
+	scope := defaultString(proposal.Scope, "agent")
+	typ := defaultString(proposal.Type, "experience")
+	name := sanitizeProposalFileName(proposal.Title)
+	switch scope {
+	case "user":
+		return filepath.Join(memoryRoot, "user", "long", name+".md")
+	case "global":
+		return filepath.Join(memoryRoot, "global", typ+"s", name+".md")
+	case "project":
+		return filepath.Join(memoryRoot, "projects", "general", typ+"s", name+".md")
+	case "org":
+		return filepath.Join(memoryRoot, "org", "long", name+".md")
+	default:
+		return filepath.Join(memoryRoot, "agents", "main", typ+"s", name+".md")
+	}
 }
 
 func (s ProposalStore) writeAudit(event string, proposal Proposal, reason string) error {
@@ -210,4 +283,24 @@ func cleanStrings(values []string) []string {
 		}
 	}
 	return out
+}
+
+func sanitizeProposalFileName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "proposal"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	name := strings.Trim(b.String(), "-")
+	if name == "" {
+		return "proposal"
+	}
+	return name
 }
