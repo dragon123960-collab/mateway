@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/secret"
 )
 
 type Skill struct {
@@ -113,6 +114,9 @@ func Install(input InstallInput) (InstallResult, error) {
 	name = sanitizeName(name)
 	if name == "" {
 		return InstallResult{}, fmt.Errorf("skill name is required")
+	}
+	if err := secret.RejectIfSecretLike(string(data), "SKILL.md"); err != nil {
+		return InstallResult{}, err
 	}
 	target := filepath.Join(workspace, "skills", name, "SKILL.md")
 	if _, err := os.Stat(target); err == nil && !input.Force {

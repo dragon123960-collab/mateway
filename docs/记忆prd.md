@@ -88,6 +88,7 @@ Runtime 负责：
 
 - receive / reply
 - session key
+- gateway channel aggregation / dedupe / async serving
 - task tree / followup
 - transcript loop
 - tool orchestration
@@ -126,6 +127,18 @@ Runtime 只能依赖 hook interface 和 event contract，不直接依赖具体 m
 - `diary / reflection / proposal` 可自动生成。
 - `active long memory / skill / wiki` 默认需要用户确认。
 - experience 自动写入、skill 修改确认策略可以通过低心智负担的 preset 配置。
+
+### 2.7 Secret References Only
+
+Skill、memory、trace、proposal 都不能保存明文用户名、密码、token 或 API key。
+
+默认策略：
+
+- Skill 只声明 `required_secrets`，例如 `mail.smtp_pass`。
+- 凭证保存在 `mateway secret` 本地 secret store。
+- 后续 Script Bridge 执行脚本时，把 secret 注入子进程环境变量。
+- 持久化记录只保存 secret id 或 redacted marker。
+- 不依赖 macOS 专属 secret 机制；基础实现必须跨平台。
 
 ---
 

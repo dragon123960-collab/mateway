@@ -79,6 +79,24 @@ func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
 	}
 }
 
+func TestFileWriteRejectsSkillPlaintextSecret(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	target := filepath.Join(workspace, "skills", "mail", "SKILL.md")
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": "# Mail\npassword: supersecret123\n"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "refusing to write secret-like content") {
+		t.Fatalf("expected secret write rejection, got %#v", result)
+	}
+}
+
 func TestScheduleCreateToolWritesTask(t *testing.T) {
 	home := t.TempDir()
 	runAt := "2026-05-29T16:30:00+08:00"

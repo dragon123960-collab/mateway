@@ -119,6 +119,7 @@ Mateway 目前支持：
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
+- 本地 secret store：`mateway secret set/get/list/delete`
 - trace 中可见 hook events
 - workspace profile 注入
 - 从 `workspace/skills` 和 agent-specific overrides 发现 skills
@@ -352,6 +353,16 @@ workspace/skills/<skill_name>/SKILL.md
 
 同名时 agent-specific skills 优先。
 
+Skills 不能保存明文凭证。凭证应进入本地 secret store，skill frontmatter 里只引用 secret id：
+
+```yaml
+required_secrets:
+  - id: mail.smtp_pass
+    env: SMTP_PASS
+```
+
+`mateway skill install` 和写入 `SKILL.md` 的 `file.write` 会拒绝 password、API key、token、bearer token 等疑似明文 secret。
+
 当前行为：
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
@@ -379,6 +390,12 @@ Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router�
 这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。下一阶段会把这部分产品化，补齐 agent list/report/create/bind 命令、profile lint 和多 profile 验收测试。
 
 边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
+
+## Gateway 边界
+
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。当前 `gateway serve` 已实现的是飞书 WebSocket channel，需要在 `channels/feishu.yaml` 启用。后续新增 channel 应接入同一个 gateway 边界，而不是绕过 runtime。
+
+`gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
 
 ## 当前边界
 
@@ -417,6 +434,7 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 - Tool policy 和 confirmation boundaries
 - JSONL traces
 - Skill discovery 和 context injection
+- 本地 secret store 和 skill secret 扫描
 - Markdown memory lint/search/index
 - Memory proposal commit/reject workflow
 - Self-learning diary/proposal generation

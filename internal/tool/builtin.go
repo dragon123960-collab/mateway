@@ -21,6 +21,7 @@ import (
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/secret"
 )
 
 func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
@@ -89,6 +90,11 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
 	}
 	content := fmt.Sprint(call.Args["content"])
+	if isSkillMarkdownPath(path) {
+		if err := secret.RejectIfSecretLike(content, path); err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
@@ -96,6 +102,11 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: "wrote " + path, Evidence: map[string]any{"path": path, "bytes": len(content)}}
+}
+
+func isSkillMarkdownPath(path string) bool {
+	clean := filepath.Clean(path)
+	return strings.EqualFold(filepath.Base(clean), "SKILL.md")
 }
 
 func (ProjectIndexTool) Name() string        { return "project.index" }

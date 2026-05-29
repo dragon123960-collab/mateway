@@ -128,6 +128,7 @@
   observe/                        # diary、reflection、proposal、audit
   indexes/                        # 可重建索引，如 memory_index.json
   schedules/                      # 定时任务和运行记录
+  secrets/                        # 本机 secret store，供 skill/script 引用凭证
   run/                            # runtime lock 等进程状态文件
 ```
 
@@ -253,6 +254,13 @@
 - `schedules/tasks/`：定时任务定义。任务默认先 pending，试跑成功后 active。
 - `schedules/runs/`：定时任务运行记录，包括 test run 和 due run。
 - scheduler core 是 channel-neutral，不负责自动把结果发回飞书、邮件或 Slack。
+
+### `secrets/`
+
+- `secrets/`：跨平台本地 secret store 目录。
+- `secrets/secrets.json`：`mateway secret set/get/list/delete` 使用的 JSON 存储文件，权限为 `0600`。
+- Skill、Script Bridge 和未来 connector 应引用 secret id，而不是把密码、token、API key 写进 `SKILL.md`、trace 或 memory。
+- 当前实现不依赖 macOS Keychain 或某个特定系统服务，保证 Linux、Windows、macOS 都有一致的基础行为。
 
 ### `run/`
 
