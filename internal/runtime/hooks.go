@@ -530,7 +530,11 @@ func (p memorySafeReadHookProvider) ContextHook(_ context.Context, input Context
 	var lines []string
 	for _, result := range results {
 		refs = append(refs, result.Path)
+		fullPath := filepath.Join(root, filepath.FromSlash(result.Path))
 		line := "- " + result.Path
+		if fullPath != result.Path {
+			line += " [path: " + fullPath + "]"
+		}
 		if result.Type != "" || result.Scope != "" {
 			line += " (" + strings.Trim(strings.TrimSpace(result.Type+" / "+result.Scope), "/ ") + ")"
 		}

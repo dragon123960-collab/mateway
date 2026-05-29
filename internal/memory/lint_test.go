@@ -94,6 +94,35 @@ Usable memory.
 	}
 }
 
+func TestLintRootIndexesNestedReadmeMemory(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "README.md"), "# Memory root support doc\n")
+	writeFile(t, filepath.Join(root, "agents", "main", "experiences", "readme.md"), `---
+type: experience
+scope: agent
+visibility: private
+status: active
+sources:
+  - trace:abc
+confidence: high
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Remember README inspection notes.
+`)
+	result, err := LintRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Files != 1 {
+		t.Fatalf("files = %d, issues = %#v", result.Files, result.Issues)
+	}
+	if result.HasErrors() {
+		t.Fatalf("unexpected issues: %#v", result.Issues)
+	}
+}
+
 func TestLintRootWarnsForActiveMemoryWithoutSources(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "global", "preferences", "answer-style.md"), `---

@@ -172,10 +172,13 @@ func isSupportMarkdown(root, path string) bool {
 		return false
 	}
 	base := strings.ToLower(filepath.Base(rel))
-	if base == "readme.md" || base == "schema.md" || base == "index.md" || base == "log.md" {
+	if base == "index.md" {
 		return true
 	}
-	return false
+	if strings.Contains(filepath.ToSlash(rel), "/") {
+		return false
+	}
+	return base == "readme.md" || base == "schema.md" || base == "log.md"
 }
 
 func shouldSkipMemoryDir(root, path string) bool {

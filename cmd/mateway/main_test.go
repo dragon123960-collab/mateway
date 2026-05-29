@@ -219,6 +219,32 @@ func TestMemoryProposalCreateListRejectCommands(t *testing.T) {
 	}
 }
 
+func TestMemoryProposalRejectAcceptsReasonAfterID(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "proposal", "create", "--title", "README inspection", "--body", "Use file.read for README.", "--source", "trace:abc"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.TrimSuffix(entries[0].Name(), filepath.Ext(entries[0].Name()))
+	if err := run([]string{"memory", "proposal", "reject", id, "--reason", "skip"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "proposals", id+".md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "status: rejected") || !strings.Contains(string(data), "Rejected reason: skip") {
+		t.Fatalf("expected rejected proposal:\n%s", data)
+	}
+}
+
 func TestMemoryProposalCommitCommandWritesMemory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

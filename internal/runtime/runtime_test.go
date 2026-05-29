@@ -732,7 +732,7 @@ Use file.read when inspecting local README files.
 	if resp.Reply.Text != "ok" {
 		t.Fatalf("reply = %q", resp.Reply.Text)
 	}
-	if !contains(model.systemMessages, "memory_safe_read") || !contains(model.systemMessages, "trace:readme") {
+	if !contains(model.systemMessages, "memory_safe_read") || !contains(model.systemMessages, "trace:readme") || !contains(model.systemMessages, memoryPath) {
 		t.Fatalf("expected memory context, got %q", model.systemMessages)
 	}
 	data, err := os.ReadFile(resp.TracePath)

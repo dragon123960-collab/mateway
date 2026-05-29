@@ -429,7 +429,8 @@ func runMemoryProposal(args []string) error {
 	case "reject":
 		fs := flag.NewFlagSet("mateway memory proposal reject", flag.ContinueOnError)
 		reason := fs.String("reason", "", "rejection reason")
-		if err := fs.Parse(args[1:]); err != nil {
+		rejectArgs := reorderRejectReasonFlag(args[1:])
+		if err := fs.Parse(rejectArgs); err != nil {
 			return err
 		}
 		if fs.NArg() != 1 {
@@ -457,6 +458,16 @@ func runMemoryProposal(args []string) error {
 	default:
 		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
 	}
+}
+
+func reorderRejectReasonFlag(args []string) []string {
+	if len(args) != 3 || args[0] == "--reason" || args[0] == "-reason" {
+		return args
+	}
+	if args[1] != "--reason" && args[1] != "-reason" {
+		return args
+	}
+	return []string{args[1], args[2], args[0]}
 }
 
 func memoryRoot(cfg *config.Root) string {

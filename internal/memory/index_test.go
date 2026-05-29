@@ -107,6 +107,35 @@ Usable memory.
 	}
 }
 
+func TestRebuildIndexIncludesNestedReadmeMemory(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "README.md"), "# Memory root support doc\n")
+	writeFile(t, filepath.Join(root, "agents", "main", "experiences", "readme.md"), `---
+type: experience
+scope: agent
+visibility: private
+status: active
+sources:
+  - trace:abc
+confidence: high
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Remember README inspection notes.
+`)
+	index, issues, err := RebuildIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("unexpected issues: %#v", issues)
+	}
+	if len(index.Entries) != 1 || index.Entries[0].Path != "agents/main/experiences/readme.md" {
+		t.Fatalf("unexpected entries: %#v", index.Entries)
+	}
+}
+
 func TestWriteIndexWritesJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "indexes", "memory_index.json")
 	index := Index{SchemaVersion: 1, Root: "/tmp/memory", Entries: []IndexEntry{{Path: "one.md", Type: "wiki"}}}
