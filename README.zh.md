@@ -409,19 +409,6 @@ Mateway 不会把这些能力伪装成已经完成：
 
 当前可用版本聚焦于：稳定小核心 runtime、多 agent profile 基础、hook pipeline、带风险边界的真实工具、飞书/CLI 入口、traceability 和 white-box memory。
 
-## Banner 图片提示词
-
-README banner (`mateway-banner.svg`) 应表达：
-
-```text
-A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
-Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
-Show a compact AgentCore connected to five labeled flows: Profiles, Hooks, Tools, Memory, Traces.
-Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
-Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
-Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
-Text to include: "Mateway" and "Memory-native local agent runtime".
-```
 
 ## Roadmap
 

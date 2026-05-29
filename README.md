@@ -397,20 +397,6 @@ Mateway intentionally does not claim these are finished:
 
 The current usable release is focused on: a stable small-core runtime, multi-agent profile foundations, hook pipeline, real tools with risk boundaries, Feishu/CLI entrypoints, traceability, and white-box memory.
 
-## Image Prompt For The Banner
-
-The README banner (`mateway-banner.svg`) should communicate:
-
-```text
-A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
-Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
-Show a compact AgentCore connected to five labeled flows: Profiles, Hooks, Tools, Memory, Traces.
-Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
-Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
-Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
-Text to include: "Mateway" and "Memory-native local agent runtime".
-```
-
 ## Roadmap
 
 ### Done Enough For Developer Use
