@@ -333,3 +333,24 @@ Use hook-first runtime boundaries.
 		t.Fatalf("unexpected project distill:\n%s", data)
 	}
 }
+
+func TestMemoryHeartbeatLintIndexCommandWritesIndex(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "heartbeat", "lint-index"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "indexes", "memory_index.json")); err != nil {
+		t.Fatalf("expected index: %v", err)
+	}
+	audit, err := os.ReadFile(filepath.Join(home, "observe", "audit", "memory.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(audit), "memory_heartbeat") {
+		t.Fatalf("missing heartbeat audit:\n%s", audit)
+	}
+}

@@ -255,8 +255,45 @@ func runMemory(args []string) error {
 		return runMemoryProposal(args[1:])
 	case "distill":
 		return runMemoryDistill(args[1:])
+	case "heartbeat":
+		return runMemoryHeartbeat(args[1:])
 	default:
-		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill|heartbeat>")
+	}
+}
+
+func runMemoryHeartbeat(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "lint-index":
+		result, err := memory.RunLintIndexHeartbeat(memory.HeartbeatInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			IndexPath:  memoryIndexPath(cfg),
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("memory_root:", result.Root)
+		fmt.Println("files:", result.Files)
+		fmt.Println("entries:", result.Entries)
+		fmt.Println("issues:", len(result.Issues))
+		for _, issue := range result.Issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if hasMemoryErrors(result.Issues) {
+			return fmt.Errorf("memory heartbeat found lint errors")
+		}
+		fmt.Println("index:", result.IndexPath)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index>")
 	}
 }
 
@@ -616,6 +653,7 @@ Usage:
   mateway memory proposal commit <proposal_id>
   mateway memory distill session <session_key>
   mateway memory distill project close <project_id>
+  mateway memory heartbeat lint-index
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }
