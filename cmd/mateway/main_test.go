@@ -287,3 +287,49 @@ func TestMemoryDistillSessionCommandWritesReflection(t *testing.T) {
 		t.Fatalf("distill should not complete task: %#v", loaded.Tasks)
 	}
 }
+
+func TestMemoryDistillProjectCloseCommandWritesReflection(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "memory", "projects", "demo", "decisions", "architecture.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`---
+type: decision
+scope: project
+project_id: demo
+visibility: private
+status: active
+sources:
+  - trace:demo
+confidence: high
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Use hook-first runtime boundaries.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "distill", "project", "close", "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "reflections"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "reflections", entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "project_id: demo") || !strings.Contains(string(data), "hook-first runtime") {
+		t.Fatalf("unexpected project distill:\n%s", data)
+	}
+}

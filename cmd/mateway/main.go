@@ -262,7 +262,7 @@ func runMemory(args []string) error {
 
 func runMemoryDistill(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory distill <session>")
+		return fmt.Errorf("usage: mateway memory distill <session|project>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -285,8 +285,25 @@ func runMemoryDistill(args []string) error {
 		fmt.Println("session:", state.Key)
 		fmt.Println("distill:", result.Path)
 		return nil
+	case "project":
+		if len(args) != 3 || args[1] != "close" {
+			return fmt.Errorf("usage: mateway memory distill project close <project_id>")
+		}
+		result, err := memory.DistillProject(memory.ProjectDistillInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			ProjectID:  args[2],
+			Reason:     "project_close",
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("project:", args[2])
+		fmt.Println("entries:", result.Entries)
+		fmt.Println("distill:", result.Path)
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway memory distill <session>")
+		return fmt.Errorf("usage: mateway memory distill <session|project>")
 	}
 }
 
@@ -598,6 +615,7 @@ Usage:
   mateway memory proposal reject <proposal_id> [--reason <text>]
   mateway memory proposal commit <proposal_id>
   mateway memory distill session <session_key>
+  mateway memory distill project close <project_id>
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }
