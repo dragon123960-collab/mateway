@@ -10,6 +10,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
@@ -154,6 +155,24 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	if err := rt.Store.Save(*state); err != nil {
 		return Response{}, err
 	}
+	if scheduleID := pendingScheduleID(result.Messages); scheduleID != "" {
+		state.Pending = &session.PendingAction{
+			Kind:       "schedule_review",
+			TaskID:     task.ID,
+			ScheduleID: scheduleID,
+			Question:   "定时任务已记录为待试运行。回复“执行”现在试运行；试运行成功后我会激活它。也可以稍后手动执行：`mateway schedule test " + scheduleID + "`。",
+		}
+		state.BlockActiveTask("await_schedule_test")
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, err
+		}
+		resp := reply(msg, state.Pending.Question, "schedule_review_pending")
+		resp.TraceID = trace.id
+		resp.TracePath = trace.path
+		_ = trace.write(map[string]any{"type": "schedule_review_pending", "schedule_id": scheduleID})
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+		return resp, nil
+	}
 
 	var learningResult *memory.LearningResult
 	if taskCompleted {
@@ -216,6 +235,45 @@ func proposalID(proposal *memory.Proposal) string {
 		return ""
 	}
 	return proposal.ID
+}
+
+func pendingScheduleID(messages []agentcore.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != agentcore.RoleAssistant {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			if call.Name != "schedule.create" {
+				continue
+			}
+			if raw := strings.TrimSpace(fmt.Sprint(call.Args["require_test"])); strings.EqualFold(raw, "false") || strings.EqualFold(raw, "no") {
+				return ""
+			}
+			if id := scheduleIDFromFollowingToolResult(messages, i, call.ID); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIndex int, toolCallID string) string {
+	for _, msg := range messages[assistantIndex+1:] {
+		if msg.Role == agentcore.RoleAssistant {
+			break
+		}
+		if msg.Role != agentcore.RoleTool || msg.ToolCallID != toolCallID {
+			continue
+		}
+		fields := strings.Fields(msg.Content)
+		for i, field := range fields {
+			if field == "scheduled" && i+1 < len(fields) {
+				return strings.TrimSpace(fields[i+1])
+			}
+		}
+	}
+	return ""
 }
 
 func appendMemoryReviewBlock(text string, proposal memory.Proposal) string {
@@ -383,6 +441,50 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			return Response{}, true, err
 		}
 		return reply(msg, "已忽略这条长期记忆候选。", "completed"), true, nil
+	case "schedule_review":
+		action, ok := parseScheduleReviewAction(text)
+		if !ok {
+			if shouldBypassScheduleReview(text) {
+				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
+				state.Pending = nil
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, true, err
+				}
+				return Response{}, false, nil
+			}
+			return reply(msg, "这个定时任务还在等待试运行。回复“执行”现在试运行，回复“取消”放弃；也可以稍后手动执行 `mateway schedule test "+state.Pending.ScheduleID+"`。", "schedule_review_pending"), true, nil
+		}
+		scheduleID := state.Pending.ScheduleID
+		taskID := state.Pending.TaskID
+		state.Pending = nil
+		if action == "cancel" {
+			store := schedule.Store{Home: rt.home()}
+			if _, err := store.Pause(scheduleID); err != nil {
+				if saveErr := rt.Store.Save(*state); saveErr != nil {
+					return Response{}, true, saveErr
+				}
+				return reply(msg, "取消定时任务失败："+err.Error(), "error"), true, nil
+			}
+			blockTask(state, taskID, "cancelled")
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return reply(msg, "已取消这个待试运行的定时任务。", "cancelled"), true, nil
+		}
+		task, record, err := rt.testAndActivateSchedule(ctx, scheduleID)
+		if err != nil {
+			if saveErr := rt.Store.Save(*state); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return reply(msg, "试运行失败，定时任务没有激活："+err.Error(), "error"), true, nil
+		}
+		state.ActivateTask(taskID)
+		state.CompleteActiveTask()
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		_ = trace.write(map[string]any{"type": "schedule_review_tested", "schedule_id": task.ID, "run_id": record.ID, "status": record.Status})
+		return reply(msg, "试运行成功，已添加定时任务："+task.ID+"，下次运行时间："+task.RunAt, "completed"), true, nil
 	case "user_input":
 		if shouldBypassUserInputPending(state.Pending, text) {
 			taskID := state.Pending.TaskID
@@ -428,6 +530,84 @@ func parseMemoryProposalReviewAction(text string) (string, bool) {
 func shouldBypassMemoryProposalReview(text string) bool {
 	normalized := normalizeFollowupText(text)
 	return looksLikeStandaloneTaskRequest(normalized)
+}
+
+func parseScheduleReviewAction(text string) (string, bool) {
+	normalized := normalizeFollowupText(text)
+	switch normalized {
+	case "执行", "试运行", "现在执行", "现在试运行", "跑一下", "运行", "确认", "继续", "yes", "ok":
+		return "test", true
+	case "取消", "放弃", "不要", "不执行", "暂停", "cancel", "no":
+		return "cancel", true
+	default:
+		return "", false
+	}
+}
+
+func shouldBypassScheduleReview(text string) bool {
+	normalized := normalizeFollowupText(text)
+	return looksLikeStandaloneTaskRequest(normalized)
+}
+
+func (rt Runtime) testAndActivateSchedule(ctx context.Context, scheduleID string) (schedule.Task, schedule.RunRecord, error) {
+	store := schedule.Store{Home: rt.home()}
+	task, err := store.Read(scheduleID)
+	if err != nil {
+		return task, schedule.RunRecord{}, err
+	}
+	startedAt := time.Now()
+	sessionKey := strings.TrimSpace(task.SessionKey)
+	if sessionKey == "" {
+		sessionKey = "schedule:" + task.ID
+	}
+	runRuntime := New(rt.Config)
+	resp, runErr := runRuntime.Handle(ctx, channel.InboundMessage{
+		ID:         task.ID,
+		Channel:    "schedule",
+		SessionKey: sessionKey,
+		Text:       task.Text,
+		Metadata:   map[string]string{"scheduled_task_id": task.ID, "scheduled_run_kind": "test"},
+	})
+	status := "success"
+	errText := ""
+	output := ""
+	tracePath := ""
+	if runErr != nil {
+		status = "error"
+		errText = runErr.Error()
+	} else {
+		output = strings.TrimSpace(resp.Reply.Text)
+		tracePath = resp.TracePath
+		if resp.Failed {
+			status = "error"
+			errText = strings.TrimSpace(resp.Reply.Text)
+		}
+	}
+	record, recordErr := store.RecordRun(schedule.RunRecord{
+		TaskID:     task.ID,
+		Kind:       "test",
+		Status:     status,
+		StartedAt:  startedAt.Format(time.RFC3339),
+		FinishedAt: time.Now().Format(time.RFC3339),
+		SessionKey: sessionKey,
+		Output:     output,
+		TracePath:  tracePath,
+		Error:      errText,
+	})
+	if recordErr != nil {
+		return task, record, recordErr
+	}
+	if status != "success" {
+		if markErr := store.MarkError(task, time.Now(), record); markErr != nil {
+			return task, record, markErr
+		}
+		return task, record, fmt.Errorf(firstNonEmpty(errText, "scheduled task test failed"))
+	}
+	if err := store.MarkTested(task, time.Now(), record); err != nil {
+		return task, record, err
+	}
+	task, err = store.Read(scheduleID)
+	return task, record, err
 }
 
 func blockTask(state *session.State, taskID, status string) {
@@ -533,6 +713,15 @@ func summarize(text string) string {
 		return text
 	}
 	return text[:160] + fmt.Sprintf("... (%d chars)", len(text))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 type HeuristicModel struct{}

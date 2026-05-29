@@ -7,7 +7,7 @@
 当前正在做：
 
 ```text
-第二轮开发准备：Script Bridge / Skill Search / Skill Proposal
+v0.1.4 定版准备：文档收口 / release workflow / 下一阶段规划
 ```
 
 总路线：
@@ -362,27 +362,29 @@ Hook Skeleton
 
 ## P5：Heartbeat / Schedule
 
-状态：Memory proposal/lint/index 稳定后置
+状态：基础闭环已完成
 
 原则：
 
-- 当前不做定时任务、heartbeat 或 cron runner。
-- M1 可预留接口，但定时 full distill 默认关闭。
-- 先迁 heartbeat 中的 `memory.index_rebuild` 和 `memory.lint`。
-- 用户显式 `schedule.*` 放在 heartbeat 之后。
+- Heartbeat 只做可审计、可回滚的 memory maintenance。
+- Schedule 是 channel-neutral 的任务登记和执行系统，不内置飞书/邮件/Slack 投递。
+- 用户显式创建定时任务时，先记录 pending，再询问是否现在试运行。
+- 用户回复“执行/试运行”后运行一次；成功才激活定时任务。
+- 如需通知用户，通知必须是任务内容的一部分，由已有 tool、脚本、connector 或 skill 完成。
 
 验收：
 
-- heartbeat 默认关闭。
-- heartbeat 失败不影响 Runtime。
-- heartbeat 只处理可审计、可回滚的 memory maintenance。
-- F 组复测：手动 `mateway memory heartbeat lint-index` 已在干净 memory root 通过。
+- `mateway memory heartbeat lint-index` / `serve` 可用。
+- `mateway schedule create/list/test/activate/pause/run-due/serve` 可用。
+- 飞书里创建定时任务后会进入 `schedule_review` pending。
+- 用户回复“执行”会试运行，成功后回复“已添加定时任务”。
+- 到点执行只写 `~/.mateway/schedules/runs/` run record。
 
 ## 当前短 TODO
 
-- 已复测 F004-F008：proposal commit 后新 memory 可 index/search/safe-read，`readme.md` 嵌套记忆索引问题已修复。
-- 已补真实任务测试清单：当前工具、邮件脚本、远程脚本、skill catalog/search/install 候选验收。
-- 下一步优先讨论并实现 Script Bridge 最小规范，再迁回 skill search/install。
+- v0.1.4：合并 main、打 tag、验证 GitHub release workflow 产物。
+- README / README.zh 已更新到当前能力集，后续只做发布措辞微调。
+- 下一阶段优先级：Skill Source Adapter -> Script Bridge -> Sandbox Runner -> Read-only Workspace UI。
 
 ---
 

@@ -41,6 +41,7 @@ type PendingAction struct {
 	Kind       string             `json:"kind"`
 	TaskID     string             `json:"task_id"`
 	ProposalID string             `json:"proposal_id,omitempty"`
+	ScheduleID string             `json:"schedule_id,omitempty"`
 	Question   string             `json:"question,omitempty"`
 	ToolCall   agentcore.ToolCall `json:"tool_call,omitempty"`
 	ResumeText string             `json:"resume_text,omitempty"`

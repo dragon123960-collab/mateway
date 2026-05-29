@@ -12,6 +12,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/model"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -420,6 +421,62 @@ func TestRuntimeSelfLearningSurfacesProposalForToolTask(t *testing.T) {
 	}
 	if state.Pending == nil || state.Pending.Kind != "memory_proposal_review" || state.Pending.ProposalID == "" {
 		t.Fatalf("expected memory proposal review pending, got %#v", state.Pending)
+	}
+}
+
+func TestRuntimeScheduleCreateAsksForTestAndActivatesAfterExecute(t *testing.T) {
+	home := t.TempDir()
+	if err := config.EnsureDefaultConfigFiles(home); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.NewLoader(home).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Security.RequireApprovalForRiskyTool = false
+	rt := New(cfg)
+	runAt := time.Now().Add(time.Hour).Format(time.RFC3339)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "feishu", SessionKey: "feishu:test-schedule", Text: "/schedule " + runAt + " /read workspace/memory/README.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "schedule_review_pending" || !strings.Contains(resp.Reply.Text, "试运行") {
+		t.Fatalf("expected schedule test prompt, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("feishu:test-schedule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != "schedule_review" || state.Pending.ScheduleID == "" {
+		t.Fatalf("expected schedule pending, got %#v", state.Pending)
+	}
+	task, err := schedule.Store{Home: home}.Read(state.Pending.ScheduleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "pending" {
+		t.Fatalf("expected pending schedule, got %#v", task)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "feishu", SessionKey: "feishu:test-schedule", Text: "执行"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !strings.Contains(resp.Reply.Text, "已添加定时任务") {
+		t.Fatalf("expected activated reply, got %#v", resp.Reply)
+	}
+	state, err = rt.Store.Load("feishu:test-schedule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil {
+		t.Fatalf("expected pending cleared, got %#v", state.Pending)
+	}
+	task, err = schedule.Store{Home: home}.Read(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "active" || task.TestedAt == "" || task.LastRunStatus != "success" {
+		t.Fatalf("expected active tested schedule, got %#v", task)
 	}
 }
 

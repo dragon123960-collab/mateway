@@ -171,6 +171,15 @@ func (s Store) MarkTested(task Task, finishedAt time.Time, record RunRecord) err
 	return s.write(task)
 }
 
+func (s Store) MarkError(task Task, finishedAt time.Time, record RunRecord) error {
+	task.LastRunAt = finishedAt.Format(time.RFC3339)
+	task.LastRunStatus = record.Status
+	task.LastRunID = record.ID
+	task.UpdatedAt = task.LastRunAt
+	task.Status = "error"
+	return s.write(task)
+}
+
 func (s Store) MarkRan(task Task, finishedAt time.Time, record RunRecord) error {
 	task.LastRunAt = finishedAt.Format(time.RFC3339)
 	task.LastRunStatus = record.Status
