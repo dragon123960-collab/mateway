@@ -86,14 +86,12 @@ func TestScheduleCreateToolWritesTask(t *testing.T) {
 	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{
 		"text":        "提醒我检查日报",
 		"run_at":      runAt,
-		"channel":     "feishu",
-		"thread_id":   "chat_1",
 		"session_key": "feishu:chat_1",
 	}})
 	if result.IsError {
 		t.Fatalf("unexpected schedule error: %#v", result)
 	}
-	if result.Evidence["channel"] != "feishu" || result.Evidence["thread_id"] != "chat_1" {
+	if result.Evidence["status"] != "pending" || result.Evidence["session_key"] != "feishu:chat_1" {
 		t.Fatalf("unexpected evidence: %#v", result.Evidence)
 	}
 	if entries, err := os.ReadDir(filepath.Join(home, "schedules")); err != nil || len(entries) != 1 {

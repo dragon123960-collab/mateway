@@ -207,10 +207,10 @@ func (ScheduleCreateTool) Schema() agentcore.Schema {
 }
 func (ScheduleCreateTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to run or remind a task later. Include channel/thread/session context when provided by the system prompt.",
+		WhenToUse:            "Use when the user asks to run a task later. Scheduled tasks are channel-neutral and should be tested before activation unless the user explicitly waives testing.",
 		WhenNotToUse:         "Do not use for immediate tasks; execute those directly.",
-		OutputContract:       "Return scheduled task id, run time, interval when any, and channel target evidence.",
-		Evidence:             "Return id, run_at, interval, channel, thread_id, session_key.",
+		OutputContract:       "Return scheduled task id, status, run time, interval when any, and the next test/activate step.",
+		Evidence:             "Return id, status, run_at, interval, session_key.",
 		Acceptance:           "Accepted when the task is persisted under the local schedule store.",
 		SoftFailureSignals:   []string{"invalid run_at", "missing text"},
 		ParallelMode:         "forbid",
@@ -231,31 +231,33 @@ func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agen
 			return agentcore.ToolResult{ToolCallID: call.ID, Content: "interval must be a Go duration such as 30m or 24h", IsError: true}
 		}
 	}
+	requireTest := true
+	if raw := strings.ToLower(toolArgString(call.Args, "require_test")); raw == "false" || raw == "no" {
+		requireTest = false
+	}
 	store := schedule.Store{Home: config.DefaultHome()}
 	if t.Config != nil && strings.TrimSpace(t.Config.App.Home) != "" {
 		store.Home = t.Config.App.Home
 	}
 	task, err := store.Create(schedule.CreateInput{
-		Channel:    toolArgString(call.Args, "channel"),
-		ThreadID:   toolArgString(call.Args, "thread_id"),
-		UserID:     toolArgString(call.Args, "user_id"),
-		SessionKey: toolArgString(call.Args, "session_key"),
-		Text:       toolArgString(call.Args, "text"),
-		RunAt:      runAt,
-		Interval:   interval,
+		SessionKey:  toolArgString(call.Args, "session_key"),
+		Text:        toolArgString(call.Args, "text"),
+		RunAt:       runAt,
+		Interval:    interval,
+		RequireTest: requireTest,
+		Activate:    !requireTest,
 	})
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return agentcore.ToolResult{
 		ToolCallID: call.ID,
-		Content:    fmt.Sprintf("scheduled %s at %s", task.ID, task.RunAt),
+		Content:    fmt.Sprintf("scheduled %s status=%s at %s; test with mateway schedule test %s before activation", task.ID, task.Status, task.RunAt, task.ID),
 		Evidence: map[string]any{
 			"id":          task.ID,
+			"status":      task.Status,
 			"run_at":      task.RunAt,
 			"interval":    task.Interval,
-			"channel":     task.Channel,
-			"thread_id":   task.ThreadID,
 			"session_key": task.SessionKey,
 		},
 	}
@@ -290,7 +292,7 @@ func (t ScheduleListTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 	}
 	var lines []string
 	for _, task := range tasks {
-		lines = append(lines, fmt.Sprintf("%s status=%s run_at=%s interval=%s channel=%s text=%s", task.ID, task.Status, task.RunAt, task.Interval, task.Channel, summarizeToolText(task.Text, 80)))
+		lines = append(lines, fmt.Sprintf("%s status=%s run_at=%s interval=%s last=%s text=%s", task.ID, task.Status, task.RunAt, task.Interval, task.LastRunStatus, summarizeToolText(task.Text, 80)))
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"count": len(tasks)}}
 }

@@ -1,6 +1,6 @@
 # Mateway
 <p align="center">
-  <img src="mateway-banner.svg" alt="Mateway — memory-native local agent runtime" width="100%" />
+  <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
 
 **Mateway 是一个面向真实工作区的本地优先 Agent Runtime，围绕白盒记忆、自我学习和可审计工具使用构建。**
@@ -248,7 +248,34 @@ Review proposals：
 ./build/mateway memory heartbeat lint-index
 ```
 
-这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，并写入 audit entry。目前它是手动命令；后台 scheduler/cron runner 仍是后续工作。
+以前台循环运行 heartbeat 维护：
+
+```bash
+./build/mateway memory heartbeat serve
+```
+
+这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，并写入 audit entry。
+
+## 定时任务
+
+定时任务是 channel-neutral 的。Mateway 负责保存任务、可选试跑、到点执行，并把运行记录写到 `~/.mateway/schedules/runs/`。它不会自动把结果发回飞书、邮件、Slack 或其他渠道。
+
+创建任务。默认会先进入 pending，试跑成功后才激活：
+
+```bash
+./build/mateway schedule create --run-at 2026-05-29T18:00:00+08:00 "检查未读邮件并总结重要事项"
+./build/mateway schedule test <task_id>
+./build/mateway schedule list
+```
+
+执行到期任务一次，或以前台 runner 持续运行：
+
+```bash
+./build/mateway schedule run-due
+./build/mateway schedule serve
+```
+
+如果定时任务需要通知某人，请把通知写进任务本身，通过已有 tool、本地脚本、connector 或 skill 完成。没有可用投递渠道时，agent 应说明缺口，并询问是否需要创建相关脚本或 skill。
 
 ## Trace 命令
 
@@ -342,7 +369,6 @@ Mateway 不会把这些能力伪装成已经完成：
 - 还没有 multi-agent supervisor 或 DAG router
 - 还没有 OS-level sandbox wrapper
 - 还没有通用 mail/SSH/GitHub connector framework
-- 还没有后台 heartbeat scheduler
 - 还没有可视化 workspace UI
 - 还没有外部 skill marketplace installer
 
@@ -377,14 +403,14 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 - Self-learning diary/proposal generation
 - Memory safe-read context injection
 - Session/project distill commands
-- 手动 heartbeat `lint-index`
+- Heartbeat `lint-index` 和前台 heartbeat runner
+- Channel-neutral scheduled task create/test/run-due/serve
 - 持久化 runtime 记录 secret redaction
 
 ### 下一步
 
 - user-provided connectors 的 script bridge specification
-- `mateway skill search/install/list/promote`
-- heartbeat jobs 的后台 scheduler
+- skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers
 - 只读 trace/task/memory workspace UI
 - mail、SSH、GitHub 和 publishing connector packages

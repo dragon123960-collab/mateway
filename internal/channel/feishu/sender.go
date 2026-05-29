@@ -30,32 +30,6 @@ func (s *Sender) Reply(ctx context.Context, original channel.InboundMessage, rep
 	return err
 }
 
-func (s *Sender) Send(ctx context.Context, target channel.OutboundMessage) error {
-	if strings.TrimSpace(target.ThreadID) == "" {
-		return fmt.Errorf("feishu target thread id is required")
-	}
-	msgType, content, err := renderReplyMessage(target)
-	if err != nil {
-		return err
-	}
-	req := larkim.NewCreateMessageReqBuilder().
-		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(target.ThreadID).
-			MsgType(msgType).
-			Content(content).
-			Build()).
-		Build()
-	resp, err := s.client.Im.Message.Create(ctx, req)
-	if err != nil {
-		return err
-	}
-	if !resp.Success() {
-		return fmt.Errorf("feishu send failed: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	return nil
-}
-
 func (s *Sender) ReplyWithID(ctx context.Context, original channel.InboundMessage, reply channel.OutboundMessage, uuid string) (string, error) {
 	if strings.TrimSpace(original.ID) == "" {
 		return "", fmt.Errorf("feishu message id is required")

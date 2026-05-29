@@ -79,7 +79,8 @@ func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentP
 	writeContextLine(&b, "- thread_id: ", msg.ThreadID)
 	writeContextLine(&b, "- user_id: ", msg.UserID)
 	writeContextLine(&b, "- session_key: ", msg.SessionKey)
-	b.WriteString("- When creating scheduled tasks for this conversation, pass these values to schedule.create so the scheduler can deliver the result back to the same place.\n")
+	b.WriteString("- Scheduled tasks are channel-neutral: schedule.create stores the task for later execution, but the scheduler does not automatically send results back to Feishu, email, or other channels.\n")
+	b.WriteString("- If a scheduled task must notify someone, make notification part of the scheduled task itself through an available tool, script, connector, or skill. If no notification channel is configured, explain the gap and ask whether to create a script or skill.\n")
 	return strings.TrimSpace(b.String())
 }
 

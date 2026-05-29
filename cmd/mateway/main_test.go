@@ -472,10 +472,10 @@ func TestScheduleRunDueCommandRunsCliTask(t *testing.T) {
 	}
 	store := schedule.Store{Home: home}
 	_, err := store.Create(schedule.CreateInput{
-		Channel:    "cli",
 		SessionKey: "cli:test-schedule",
 		Text:       "/read workspace/memory/README.md",
 		RunAt:      time.Now().Add(-time.Minute),
+		Activate:   true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -490,6 +490,39 @@ func TestScheduleRunDueCommandRunsCliTask(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].Status != "done" {
 		t.Fatalf("unexpected tasks: %#v", tasks)
+	}
+}
+
+func TestScheduleCreateAndTestCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	runAt := time.Now().Add(time.Hour).Format(time.RFC3339)
+	out := captureStdout(t, func() error {
+		return run([]string{"schedule", "create", "--run-at", runAt, "/read workspace/memory/README.md"})
+	})
+	if !strings.Contains(out, "status: pending") || !strings.Contains(out, "mateway schedule test") {
+		t.Fatalf("unexpected create output:\n%s", out)
+	}
+	tasks, err := schedule.Store{Home: home}.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "pending" {
+		t.Fatalf("unexpected tasks: %#v", tasks)
+	}
+	out = captureStdout(t, func() error { return run([]string{"schedule", "test", tasks[0].ID}) })
+	if !strings.Contains(out, "test: success") {
+		t.Fatalf("unexpected test output:\n%s", out)
+	}
+	tasks, err = schedule.Store{Home: home}.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tasks[0].Status != "active" || tasks[0].TestedAt == "" {
+		t.Fatalf("unexpected tested task: %#v", tasks[0])
 	}
 }
 

@@ -1,6 +1,6 @@
 # Mateway
 <p align="center">
-  <img src="mateway-banner.svg" alt="Mateway — memory-native local agent runtime" width="100%" />
+  <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
 
 **Mateway is a local-first Agent Runtime for real workspaces, built around white-box memory, self-learning, and auditable tool use.**
@@ -236,7 +236,34 @@ Run manual heartbeat maintenance:
 ./build/mateway memory heartbeat lint-index
 ```
 
-The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, and writes an audit entry. It is currently a manual command; a background scheduler/cron runner is still future work.
+Run heartbeat maintenance in a foreground loop:
+
+```bash
+./build/mateway memory heartbeat serve
+```
+
+The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, and writes an audit entry.
+
+## Scheduled Tasks
+
+Scheduled tasks are channel-neutral. Mateway stores the task, optionally test-runs it, runs it when due, and writes a run record under `~/.mateway/schedules/runs/`. It does not automatically send results back to Feishu, email, Slack, or any other channel.
+
+Create a task. By default it is pending until a test run succeeds:
+
+```bash
+./build/mateway schedule create --run-at 2026-05-29T18:00:00+08:00 "check unread mail and summarize important items"
+./build/mateway schedule test <task_id>
+./build/mateway schedule list
+```
+
+Run due tasks once or keep a foreground runner alive:
+
+```bash
+./build/mateway schedule run-due
+./build/mateway schedule serve
+```
+
+If a scheduled task needs notification, make notification part of the task itself through an available tool, local script, connector, or skill. If no delivery channel exists, the agent should explain the gap and ask whether to create the relevant script or skill.
 
 ## Trace Commands
 
@@ -330,7 +357,6 @@ Mateway intentionally does not claim these are finished:
 - no multi-agent supervisor or DAG router
 - no OS-level sandbox wrapper yet
 - no general mail/SSH/GitHub connector framework yet
-- no background heartbeat scheduler yet
 - no visual workspace UI yet
 - no external skill marketplace installer yet
 
@@ -365,14 +391,14 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 - Self-learning diary/proposal generation
 - Memory safe-read context injection
 - Session/project distill commands
-- Manual heartbeat `lint-index`
+- Heartbeat `lint-index` and foreground heartbeat runner
+- Channel-neutral scheduled task create/test/run-due/serve
 - Secret redaction for persistent runtime records
 
 ### Next
 
 - script bridge specification for user-provided connectors
-- `mateway skill search/install/list/promote`
-- background scheduler for heartbeat jobs
+- skill source adapters and promote workflow
 - safer terminal sandbox wrappers
 - read-only trace/task/memory workspace UI
 - connector packages for mail, SSH, GitHub, and publishing
