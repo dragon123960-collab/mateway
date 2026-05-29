@@ -169,3 +169,51 @@ Prefer concise answers with source references.
 		t.Fatalf("unexpected search output:\n%s", text)
 	}
 }
+
+func TestMemoryProposalCreateListRejectCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "proposal", "create", "--title", "README inspection", "--body", "Use file.read for README.", "--source", "trace:abc"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d", len(entries))
+	}
+	id := strings.TrimSuffix(entries[0].Name(), filepath.Ext(entries[0].Name()))
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = run([]string{"memory", "proposal", "list"})
+	_ = write.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(read); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "README inspection") || !strings.Contains(out.String(), "status=proposed") {
+		t.Fatalf("unexpected proposal list:\n%s", out.String())
+	}
+	if err := run([]string{"memory", "proposal", "reject", "--reason", "skip", id}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "proposals", id+".md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "status: rejected") {
+		t.Fatalf("expected rejected proposal:\n%s", data)
+	}
+}

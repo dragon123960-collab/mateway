@@ -1,0 +1,213 @@
+package memory
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+type ProposalStore struct {
+	Home string
+}
+
+type Proposal struct {
+	ID         string
+	Path       string
+	Type       string
+	Scope      string
+	Title      string
+	Status     string
+	Sources    []string
+	Confidence string
+	CreatedAt  string
+	UpdatedAt  string
+	Body       string
+}
+
+type CreateProposalInput struct {
+	Type       string
+	Scope      string
+	Title      string
+	Body       string
+	Sources    []string
+	Confidence string
+}
+
+func (s ProposalStore) Create(input CreateProposalInput) (Proposal, error) {
+	home := strings.TrimSpace(s.Home)
+	if home == "" {
+		home = ".mateway"
+	}
+	now := time.Now().Format(time.RFC3339)
+	id := "prop_" + time.Now().Format("20060102_150405_000000")
+	proposal := Proposal{
+		ID:         id,
+		Path:       filepath.Join(home, "observe", "proposals", id+".md"),
+		Type:       defaultString(input.Type, "experience"),
+		Scope:      defaultString(input.Scope, "agent"),
+		Title:      strings.TrimSpace(input.Title),
+		Status:     "proposed",
+		Sources:    cleanStrings(input.Sources),
+		Confidence: defaultString(input.Confidence, "low"),
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Body:       strings.TrimSpace(input.Body),
+	}
+	if proposal.Title == "" {
+		return Proposal{}, fmt.Errorf("proposal title is required")
+	}
+	if proposal.Body == "" {
+		return Proposal{}, fmt.Errorf("proposal body is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(proposal.Path), 0o755); err != nil {
+		return Proposal{}, err
+	}
+	if err := os.WriteFile(proposal.Path, []byte(renderProposalMarkdown(proposal)), 0o644); err != nil {
+		return Proposal{}, err
+	}
+	if err := s.writeAudit("proposal_created", proposal, ""); err != nil {
+		return Proposal{}, err
+	}
+	return proposal, nil
+}
+
+func (s ProposalStore) List() ([]Proposal, error) {
+	dir := filepath.Join(s.Home, "observe", "proposals")
+	var proposals []Proposal
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
+			return nil
+		}
+		proposal, err := readProposal(path)
+		if err != nil {
+			return err
+		}
+		proposals = append(proposals, proposal)
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(proposals, func(i, j int) bool {
+		return proposals[i].CreatedAt > proposals[j].CreatedAt
+	})
+	return proposals, nil
+}
+
+func (s ProposalStore) Reject(id, reason string) (Proposal, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Proposal{}, fmt.Errorf("proposal id is required")
+	}
+	path := filepath.Join(s.Home, "observe", "proposals", id+".md")
+	proposal, err := readProposal(path)
+	if err != nil {
+		return Proposal{}, err
+	}
+	proposal.Status = "rejected"
+	proposal.UpdatedAt = time.Now().Format(time.RFC3339)
+	if reason = strings.TrimSpace(reason); reason != "" {
+		proposal.Body = strings.TrimSpace(proposal.Body + "\n\nRejected reason: " + reason)
+	}
+	if err := os.WriteFile(path, []byte(renderProposalMarkdown(proposal)), 0o644); err != nil {
+		return Proposal{}, err
+	}
+	if err := s.writeAudit("proposal_rejected", proposal, reason); err != nil {
+		return Proposal{}, err
+	}
+	return proposal, nil
+}
+
+func readProposal(path string) (Proposal, error) {
+	doc, issues := ReadDocument(path)
+	if len(issues) > 0 {
+		return Proposal{}, fmt.Errorf("%s: %s", issues[0].Code, issues[0].Message)
+	}
+	return Proposal{
+		ID:         strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		Path:       path,
+		Type:       stringValue(doc.FrontMatter["type"]),
+		Scope:      stringValue(doc.FrontMatter["scope"]),
+		Title:      stringValue(doc.FrontMatter["title"]),
+		Status:     stringValue(doc.FrontMatter["status"]),
+		Sources:    stringSlice(doc.FrontMatter["sources"]),
+		Confidence: stringValue(doc.FrontMatter["confidence"]),
+		CreatedAt:  stringValue(doc.FrontMatter["created_at"]),
+		UpdatedAt:  stringValue(doc.FrontMatter["updated_at"]),
+		Body:       doc.Body,
+	}, nil
+}
+
+func renderProposalMarkdown(proposal Proposal) string {
+	fm := map[string]any{
+		"type":           proposal.Type,
+		"scope":          proposal.Scope,
+		"title":          proposal.Title,
+		"visibility":     "private",
+		"status":         proposal.Status,
+		"sources":        proposal.Sources,
+		"confidence":     proposal.Confidence,
+		"created_at":     proposal.CreatedAt,
+		"updated_at":     proposal.UpdatedAt,
+		"schema_version": 1,
+	}
+	data, _ := yaml.Marshal(fm)
+	return "---\n" + string(data) + "---\n\n# " + proposal.Title + "\n\n" + strings.TrimSpace(proposal.Body) + "\n"
+}
+
+func (s ProposalStore) writeAudit(event string, proposal Proposal, reason string) error {
+	path := filepath.Join(s.Home, "observe", "audit", "memory.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"type":        event,
+		"proposal_id": proposal.ID,
+		"path":        proposal.Path,
+		"status":      proposal.Status,
+		"time":        time.Now().Format(time.RFC3339Nano),
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(append(data, '\n'))
+	return err
+}
+
+func defaultString(value, fallback string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func cleanStrings(values []string) []string {
+	var out []string
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}

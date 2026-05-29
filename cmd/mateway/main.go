@@ -135,7 +135,7 @@ func run(args []string) error {
 
 func runMemory(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory <lint|index|search>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal>")
 	}
 	switch args[0] {
 	case "lint":
@@ -250,8 +250,76 @@ func runMemory(args []string) error {
 			}
 		}
 		return nil
+	case "proposal":
+		return runMemoryProposal(args[1:])
 	default:
-		return fmt.Errorf("usage: mateway memory <lint|index|search>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal>")
+	}
+}
+
+func runMemoryProposal(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory proposal <create|list|reject>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := memory.ProposalStore{Home: cfg.App.Home}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("mateway memory proposal create", flag.ContinueOnError)
+		title := fs.String("title", "", "proposal title")
+		body := fs.String("body", "", "proposal body")
+		proposalType := fs.String("type", "experience", "proposal type")
+		scope := fs.String("scope", "agent", "proposal scope")
+		source := fs.String("source", "", "comma-separated source refs")
+		confidence := fs.String("confidence", "low", "confidence: high, medium, or low")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		proposal, err := store.Create(memory.CreateProposalInput{
+			Type:       *proposalType,
+			Scope:      *scope,
+			Title:      *title,
+			Body:       *body,
+			Sources:    splitComma(*source),
+			Confidence: *confidence,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("path:", proposal.Path)
+		return nil
+	case "list":
+		proposals, err := store.List()
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposals:", len(proposals))
+		for _, proposal := range proposals {
+			fmt.Printf("- %s status=%s type=%s scope=%s title=%s\n", proposal.ID, proposal.Status, proposal.Type, proposal.Scope, proposal.Title)
+		}
+		return nil
+	case "reject":
+		fs := flag.NewFlagSet("mateway memory proposal reject", flag.ContinueOnError)
+		reason := fs.String("reason", "", "rejection reason")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway memory proposal reject <proposal_id> [--reason <text>]")
+		}
+		proposal, err := store.Reject(fs.Arg(0), *reason)
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory proposal <create|list|reject>")
 	}
 }
 
@@ -284,6 +352,16 @@ func hasMemoryErrors(issues []memory.Issue) bool {
 		}
 	}
 	return false
+}
+
+func splitComma(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func runTest(args []string) error {
@@ -470,6 +548,9 @@ Usage:
   mateway memory lint [--root <path>]
   mateway memory index rebuild [--root <path>] [--out <path>]
   mateway memory search [--root <path>] [--scope <scope>] [--type <type>] <query>
+  mateway memory proposal create --title <title> --body <body> [--source trace:id]
+  mateway memory proposal list
+  mateway memory proposal reject <proposal_id> [--reason <text>]
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }
