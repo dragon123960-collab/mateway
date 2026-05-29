@@ -2,12 +2,12 @@
 <p align="center">
   <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
-
+[English](./README.md) | [中文](./README.zh.md)
 **Mateway is a local-first Agent Runtime for real workspaces, built around white-box memory, self-learning, and auditable tool use.**
 
-It is not a heavy workflow platform and not a toy chatbot demo. Mateway is a small Go runtime that lets a single agent operate across local projects, Feishu, files, terminal commands, web search, skills, traces, and long-term memory while keeping the system inspectable.
+It is not a heavy workflow platform and not a toy chatbot demo. Mateway is a small Go runtime built around one compact AgentCore loop, with multi-agent profile and binding foundations for different work identities, channels, skills, and memory scopes.
 
-> **In a nutshell: Mateway = Single Agent Core + Hook Runtime + Tool Boundaries + Git-like Memory + Self-learning Proposals + Trace Ledger.**
+> **In a nutshell: Mateway = Small AgentCore + Multi-Agent Profiles + Hook Runtime + Tool Boundaries + Git-like Memory + Self-learning Proposals + Trace Ledger.**
 
 ```text
 receive -> followup_hook -> context_hook -> model/tool loop
@@ -23,7 +23,7 @@ Most agent frameworks can produce an impressive first demo. The hard part is mak
 - It should work the same way from CLI, Feishu, tests, and future scheduled jobs.
 - It should keep connector gaps honest instead of pretending it sent an email or logged into a server.
 
-Mateway takes a conservative path: keep the single-agent loop small, then add capability through hooks, skills, tools, and Markdown memory.
+Mateway takes a conservative path: keep the AgentCore loop small, then add capability through profiles, hooks, skills, tools, and Markdown memory.
 
 ## What Is Unique Here?
 
@@ -122,6 +122,7 @@ Mateway currently supports:
 - session and project distill commands
 - manual memory heartbeat: lint + index rebuild
 - secret redaction in persistent runtime records
+- multi-agent profile foundations: `config.agents.profiles[]`, channel bindings, agent-specific skills, and agent-scoped memory directories
 
 ## Quick Start
 
@@ -350,6 +351,21 @@ Not yet implemented:
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
 - automatic skill patch/promotion workflow
 
+## Multi-Agent Profiles
+
+Mateway does not yet include a multi-agent supervisor, subagent spawning, or DAG router. It does already include the foundation for multiple agent profiles:
+
+- `config.agents.default`
+- `config.agents.profiles[]`
+- `config.agents.bindings[]`
+- `workspace/agents/<agent_id>/`
+- `workspace/agents/<agent_id>/skills/`
+- `workspace/memory/agents/<agent_id>/`
+
+This means different channels or session namespaces can select different agent identities, prompt files, skill overrides, and memory scopes while still sharing the same small AgentCore runtime. The next development stage productizes this with agent list/report/create/bind commands, profile linting, and multi-profile acceptance tests.
+
+The boundary is deliberate: profiles and bindings are in scope; autonomous multi-agent orchestration is not part of the current release.
+
 ## Current Limits
 
 Mateway intentionally does not claim these are finished:
@@ -360,7 +376,7 @@ Mateway intentionally does not claim these are finished:
 - no visual workspace UI yet
 - no external skill marketplace installer yet
 
-The current usable release is focused on: a stable single-agent runtime, hook pipeline, real tools with risk boundaries, Feishu/CLI entrypoints, traceability, and white-box memory.
+The current usable release is focused on: a stable small-core runtime, multi-agent profile foundations, hook pipeline, real tools with risk boundaries, Feishu/CLI entrypoints, traceability, and white-box memory.
 
 ## Image Prompt For The Banner
 
@@ -369,7 +385,7 @@ The README banner (`mateway-banner.svg`) should communicate:
 ```text
 A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
 Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
-Show a central single-agent core connected to four labeled flows: Hooks, Tools, Memory, Traces.
+Show a compact AgentCore connected to five labeled flows: Profiles, Hooks, Tools, Memory, Traces.
 Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
 Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
 Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
@@ -380,7 +396,8 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 
 ### Done Enough For Developer Use
 
-- Single agent runtime loop
+- Small AgentCore runtime loop
+- Multi-agent profile and binding foundation
 - CLI / test / Feishu entrypoints
 - Hook pipeline
 - Tool policy and confirmation boundaries
@@ -397,6 +414,7 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 
 ### Next
 
+- multi-agent profile productization: agent list/report/create/bind, profile lint, and multi-profile tests
 - script bridge specification for user-provided connectors
 - skill source adapters and promote workflow
 - safer terminal sandbox wrappers

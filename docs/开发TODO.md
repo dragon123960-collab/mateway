@@ -4,25 +4,152 @@
 
 ## 当前主线
 
-当前正在做：
+当前正在做第二阶段开发准备。第一阶段 baseline 已收口，v0.1.4 准备定版：
 
 ```text
-v0.1.4 定版准备：文档收口 / release workflow / 下一阶段规划
+Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / Sandbox Runner / 只读 Workspace UI
 ```
 
-总路线：
+第二阶段目标不是推翻现有 runtime，而是把已经预留的 profile、binding、skills、memory、schedule 能力产品化：
 
-```text
-Hook Skeleton
--> Memory Safe Read
--> Proposal Workflow
--> Self-learning Worker
--> Distillation Boundaries
--> Heartbeat / Schedule
--> Visualization
-```
+- 多 agent 方向：已有 `config.agents.profiles[]`、`config.agents.bindings[]`、`workspace/agents/<agent_id>/`、`workspace/memory/agents/<agent_id>/`。第二阶段要补 CLI/文档/验证，让多个 agent profile 可创建、检查、绑定 channel/account/peer，并保持 memory/skill/profile 上下文隔离。
+- Skill source adapters：当前已有 `skill list/search/install`，但 search 只生成 catalog URL，install 只接本地目录、本地 `SKILL.md` 或 raw URL。第二阶段要为不同源补 adapter/report/install 边界。
+- Script Bridge：不做重型 connector framework，先定义用户脚本发现、验证、调用、evidence 和确认边界。
+- Sandbox Runner：把现有 terminal sandbox config 接到更明确的本地 runner/wrapper。
+- Read-only Workspace UI：先做 trace/task/memory/schedule/skill 的只读报告或静态页面。
 
 详细设计以 `docs/记忆prd.md` 为准。
+
+## 第二阶段看板
+
+### S2.1 Multi-Agent Profile 产品化
+
+状态：下一阶段优先
+
+目标：
+
+- 保留小 runtime，不做 supervisor/spawn/DAG。
+- 把已存在的 profile/binding/目录结构变成用户可理解、可检查、可维护的能力。
+- 支持多个 agent profile 在不同 channel/account/peer/session namespace 下工作。
+
+已具备：
+
+- `config.agents.default`
+- `config.agents.profiles[]`
+- `config.agents.bindings[]`
+- `workspace/agents/<agent_id>/{agent,user,tools,memory}.md`
+- `workspace/agents/<agent_id>/skills/`
+- `workspace/memory/agents/<agent_id>/`
+- `AgentPool` 按 session/channel binding 选择 profile，并 clone agent 避免 session 状态串线。
+
+待开发：
+
+- `mateway agent list`
+- `mateway agent report <agent_id>`
+- `mateway agent create <agent_id>`，只生成 profile 文件和目录，不自动改复杂路由
+- `mateway agent bind` / `unbind`，编辑 `config.agents.bindings[]`
+- agent profile lint：目录、prompt 文件、skill override、memory root、model fallback 是否齐全
+- 多 agent 真实任务测试：不同 session/channel 选择正确 profile，memory safe-read 不串 agent
+
+验收：
+
+- 两个 agent profile 可以使用不同 model/default prompt/tools guidance。
+- Feishu/CLI session 可以按 binding 进入指定 agent。
+- agent-specific skill 优先级高于 shared skill。
+- agent memory 搜索只召回对应 agent 或共享 scope，不误召回其他 agent 私有经验。
+
+### S2.2 Skill Source Adapter
+
+状态：第二阶段优先
+
+目标：
+
+- 明确 config 里的 catalog 是“搜索入口声明”，不是万能安装协议。
+- 为不同 skill 源提供 adapter，而不是把 HTML/JSON 解析逻辑塞进 YAML。
+
+待开发：
+
+- catalog report：显示 enabled、trust、search_url、install_url、adapter 支持状态
+- adapter 接口：search / resolve / install
+- raw `SKILL.md` 安装继续保留为基础能力
+- 已安装 skill 的 diff/review
+- skill promote 仍走 proposal/diff/audit，不直接改 active skill
+
+验收：
+
+- 搜索结果明确来源、风险和是否可自动安装。
+- 不支持自动安装的源只给 review URL，不伪装成已安装。
+- 安装后下一轮 runtime 能 discover skill。
+
+### S2.3 Script Bridge
+
+状态：第二阶段优先
+
+目标：
+
+- 邮件、远程服务器、自媒体发布等先通过用户脚本/skill 接入。
+- 不做重型 connector framework。
+
+待开发：
+
+- 脚本目录约定：`~/.mateway/scripts/` 和项目内 `scripts/`
+- 脚本 manifest 或 header 协议
+- 脚本 dry-run/help/version/evidence 规范
+- guarded mutation 确认边界
+- trace 记录脚本路径、命令、exit code、stdout/stderr 摘要
+
+验收：
+
+- Agent 能发现邮件收发脚本并基于真实输出总结。
+- 缺少脚本或参数时追问，不编造完成。
+- 可复用脚本能沉淀为 skill candidate。
+
+### S2.4 Sandbox Runner
+
+状态：第二阶段候选
+
+目标：
+
+- 把现有 `security.terminal_sandbox` 从配置能力升级为可验证 runner。
+
+待开发：
+
+- runner report：当前 mode/workdir/timeout/prefix
+- wrapper/prefix 示例
+- 命令运行 evidence 中明确 sandbox 状态
+- macOS/Linux 不同 runner 的文档边界
+
+验收：
+
+- sandbox 开启后 terminal.run 的 workdir/timeout/prefix 可验证。
+- 失败时安全降级，不影响 file/search/memory 基础能力。
+
+### S2.5 Read-only Workspace UI
+
+状态：第二阶段候选
+
+目标：
+
+- 不先做完整 Web 平台。
+- 先做只读报告或静态 HTML。
+
+待开发：
+
+- trace timeline
+- task tree
+- memory ledger
+- schedule runs
+- skill shelf
+- agent profile report
+
+验收：
+
+- 本地一条命令生成可读报告。
+- 不写入业务状态，不需要后台服务。
+
+---
+
+## 第一阶段归档
 
 ---
 
@@ -384,7 +511,7 @@ Hook Skeleton
 
 - v0.1.4：合并 main、打 tag、验证 GitHub release workflow 产物。
 - README / README.zh 已更新到当前能力集，后续只做发布措辞微调。
-- 下一阶段优先级：Skill Source Adapter -> Script Bridge -> Sandbox Runner -> Read-only Workspace UI。
+- 下一阶段优先级：Multi-Agent Profile 产品化 -> Skill Source Adapter -> Script Bridge -> Sandbox Runner -> Read-only Workspace UI。
 
 ---
 
