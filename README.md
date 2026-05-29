@@ -1,242 +1,127 @@
 # Mateway
 <p align="center">
-  <img src="mateway-banner.svg" alt="Mateway — local agent runtime for real workspaces" width="100%" />
+  <img src="mateway-banner.svg" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
 
-**Mateway is a local-first Agent Runtime designed for real workspaces.**
+**Mateway is a local-first Agent Runtime for real workspaces, built around white-box memory, self-learning, and auditable tool use.**
 
-It is not a heavyweight workflow platform, nor just a demo Agent for showcase. Mateway aims to transform large language models (LLMs) into "trusted executors" that can operate long-term within local projects, team instant messaging (IM) systems, file systems, toolchains, and task contexts.
+It is not a heavy workflow platform and not a toy chatbot demo. Mateway is a small Go runtime that lets a single agent operate across local projects, Feishu, files, terminal commands, web search, skills, traces, and long-term memory while keeping the system inspectable.
 
-> **In a nutshell: Mateway = Single Agent Main Loop + Hook-based Extension + Tool Security Boundaries + White-box Memory + Trace Observability.**
+> **In a nutshell: Mateway = Single Agent Core + Hook Runtime + Tool Boundaries + Git-like Memory + Self-learning Proposals + Trace Ledger.**
 
 ```text
-receive -> context_hook -> model/tool loop -> tool_policy_hook
-        -> observe_hook -> response_hook -> reply
+receive -> followup_hook -> context_hook -> model/tool loop
+        -> tool_policy_hook -> observe_hook -> response_hook -> reply
 ```
 
 ## Why Mateway?
-Many Agent projects impress in their first demo but face critical issues when integrated into daily work:
+Most agent frameworks can produce an impressive first demo. The hard part is making an agent trustworthy after it has worked with you for weeks:
 
-- **Powerful but uncontrollable**: Lack of clear boundaries for tool invocation, file writing, and terminal command execution.
-- **Convenient but untrustworthy memory**: Long-term memory origins are opaque, and modification, rollback, or audit are difficult.
-- **Fragmented runtimes across frontends**: CLI, IM, scheduled tasks, and script entrypoints operate independently with inconsistent behaviors.
-- **Bulky frameworks with slow deployment**: Complex platforms are built before solving real-world tasks.
-- **Non-reproducible execution**: Hard to track *why* a task was executed a certain way, *which* tools were used, or *where* time was spent.
+- It should remember useful experience without silently rewriting its own beliefs.
+- It should learn from completed tasks, but still ask before committing durable memory.
+- It should explain which tools it used, what evidence it saw, and where a result came from.
+- It should work the same way from CLI, Feishu, tests, and future scheduled jobs.
+- It should keep connector gaps honest instead of pretending it sent an email or logged into a server.
 
-Mateway takes the opposite approach:
+Mateway takes a conservative path: keep the single-agent loop small, then add capability through hooks, skills, tools, and Markdown memory.
 
-> First, build a clean, transparent, and extensible closed-loop for a single Agent's execution; then let capabilities naturally emerge through hooks, skills, tools, and memory.
+## What Is Unique Here?
 
-## Core Features
-
-### 1. Pi-style, Optimized for Local Workspaces
-Mateway draws inspiration from Pi Agent's runtime philosophy: instead of hardcoding all capabilities into a monolithic Agent, it centers on a stable main loop with well-defined extension points.
-
-Mateway adheres to these principles today:
-- Prioritize a single Agent main thread
-- Avoid rushing into supervisor/sub-agent routing
-- Do not force memory into the main loop
-- Prevent premature bloat of the connector ecosystem
-- Unify tools, skills, hooks, and traces under a single runtime protocol
-
-This makes it ideal for individuals and small teams to deploy first, then scale gradually.
-
----
-
-### 2. Hook-first Runtime
-The new core of Mateway is a hook-based runtime:
+### 1. Git-like Memory
+Mateway treats memory as a reviewable working tree, not a black-box vector blob.
 
 ```text
-receive
-  -> context_hook
-  -> model/tool loop
-  -> tool_policy_hook
-  -> observe_hook
-  -> response_hook
-  -> reply
+task / trace / tool evidence
+  -> diary
+  -> proposal
+  -> save or ignore
+  -> Markdown long-term memory
+  -> rebuildable index
+  -> safe-read injection
 ```
 
-Each hook has a clear responsibility:
+The agent can propose a durable memory after a useful task. The user can reply `保存` to commit it or `忽略` to reject it. Under the hood this mirrors a lightweight Git flow:
+
+| Memory step | Git-like idea |
+|---|---|
+| diary | working notes |
+| proposal | staged candidate |
+| save / commit | durable long-term memory |
+| reject | discard candidate |
+| audit log | commit history |
+| index rebuild | derived index, never source of truth |
+
+Long-term memory is stored as Markdown with YAML frontmatter under `~/.mateway/workspace/memory/`, so it can be opened in Obsidian, edited by hand, linted, searched, rebuilt, and audited.
+
+### 2. Self-learning Without Silent Mutation
+After task completion, `observe_hook` records task steps and may generate a memory proposal. The proposal is shown in the final answer as a human decision:
+
+```text
+保存到长期记忆:
+mateway memory proposal commit <proposal_id>
+
+忽略这条候选:
+mateway memory proposal reject <proposal_id>
+```
+
+In chat channels, the user can also reply `保存` or `忽略`. Mateway stores that as a pending `memory_proposal_review`, so a short reply is interpreted by runtime state, not guessed by the model.
+
+### 3. Hook-first Runtime
+The core loop stays small. Extension points are explicit:
 
 | Hook | Purpose |
 |---|---|
-| `context_hook` | Inject workspace profiles, user/tool summaries, lightweight memory refs, and real-time policies |
-| `tool_policy_hook` | Unified handling of tool risks, path policies, dangerous commands, and confirmation boundaries |
-| `observe_hook` | Write traces, task steps, acceptance evidence, and candidates for future memory proposals |
-| `response_hook` | Sanitize final responses to adapt to different channels (CLI/Feishu, etc.) |
-| `followup_hook` | Handle context continuation (e.g., "continue", "retry", "What about Tianjin?") |
+| `followup_hook` | Bind "continue", "retry", "what about Tianjin?" to the right task, or ask for clarification |
+| `context_hook` | Inject runtime context, workspace profile, discovered skills, and relevant memory snippets |
+| `tool_policy_hook` | Enforce tool risk, confirmation boundaries, and dangerous command checks |
+| `observe_hook` | Record accepted tool steps, task evidence, diary entries, and memory proposals |
+| `response_hook` | Sanitize final replies and add memory review prompts |
 
-The value of hooks: **Enhance capabilities without polluting the main loop; centralize security policies; avoid runtime fragmentation during future expansion.**
+### 4. Trace Ledger With Secret Redaction
+Every run writes a JSONL trace:
 
----
+- request and channel
+- model turns
+- tool calls and tool results
+- hook events
+- pending confirmations
+- final reply
+- runtime timings
 
-### 3. One Runtime, Multiple Entrypoints
-Mateway is not limited to CLI or chatbots—**the same Agent runtime integrates with**:
+Persistent traces, session transcripts, and task step summaries redact secret-like fields such as `api_key`, `token`, `password`, `smtp_pass`, `imap_pass`, and bearer tokens. The model still sees live tool output for the current task; persistent logs avoid storing obvious credentials.
 
-- CLI: `mateway ask`
-- Real task testing: `mateway test`
-- Trace review: `mateway trace`
-- Feishu WebSocket Gateway
-- Future schedule/heartbeat/workspace UI
+### 5. Skills As Editable Behavior, Not Magic Tools
+Mateway discovers local `SKILL.md` files and injects concise guidance into the runtime context. Current default skills include:
 
-This means: **Capabilities validated in the terminal can be seamlessly ported to Feishu, scheduled tasks, and automation scenarios.**
+- `software-install`
+- `fresh-search`
+- `source-evaluation`
+- `connector-gap`
 
----
-
-### 4. Boundaries for Tool Usage
-Mateway allows Agents to use real tools without fully ceding control to the model.
-
-Current built-in tool categories:
-- `file.read`
-- `file.write`
-- `project.index`
-- `terminal.run`
-- `web.search`
-- `web.fetch`
-- Future integration: `memory.search`
-- Future integration: `schedule.*`
-
-Security principles:
-- File read/write operations are constrained by workspace path policies
-- File writing, patching, and dangerous shell commands require confirmation
-- Model-declared `confirmed=true` is not trusted
-- Large files, binary files, and dangerous commands are guarded
-- Final Feishu responses are sanitized to prevent leakage of tool protocol blocks
-
-Mateway’s goal is not to let Agents "do everything"—but to let them operate within understandable, confirmable, and reproducible boundaries.
-
----
-
-### 5. White-box Memory (No Black-boxes)
-Mateway’s long-term memory is not an opaque blob of embeddings or auto-generated chat summaries.
-
-The new memory design adheres to:
-
-```text
-task/trace/source evidence
-  -> memory proposal
-  -> user review
-  -> commit / reject
-  -> searchable Markdown memory
-```
-
-Memory directories use Markdown as the source of truth:
-
-```text
-~/.mateway/workspace/
-  agents/
-    main/
-      memory.md                 # Prompt-facing short summary
-  memory/
-    user/
-      long/
-      inbox/
-    org/
-      long/
-      inbox/
-    agents/
-      main/
-        memory.md               # Long-term memory entry
-        long/
-        inbox/
-        diary/
-```
-
-Core principles:
-- Auto-generated content first enters `inbox/` or `diary/`
-- No automatic commits to long-term memory
-- Facts must include source evidence
-- `index.json`, SQLite, and embeddings are only rebuildable indexes
-- Markdown remains the readable, editable, and auditable source of truth
-
----
-
-### 6. Trace-first Observability
-Mateway treats Agent execution as a first-class citizen.
-
-Each task is recorded as a JSONL trace, including:
-- Request
-- Model events
-- Tool calls
-- Tool results
-- Pending confirmations
-- Replies
-- Runtime timing
-
-Use this command to analyze traces:
-```bash
-mateway trace <trace-jsonl-path>
-```
-
-Quickly identify:
-- Model latency
-- Tool latency
-- Runtime latency
-- Feishu response latency
-- Failed or suspicious steps
-
-This is far more valuable for debugging Agents than just "checking the final answer."
-
----
+Skills are guidance, not executable capabilities by themselves. If a task needs a real action, the agent must still use an actual tool or script and show evidence.
 
 ## What It Can Do Today
-Mateway has achieved a complete first-version closed loop:
-- CLI task entrypoint
-- Feishu WebSocket Gateway
-- LaunchAgent gateway (serve/start/restart/stop/status)
-- Single-instance locking
-- Task trees
-- Follow-up context continuation
-- Pending confirmations
-- JSONL trace logging
-- Basic file/project/terminal/web tools
-- Model fallback
-- Workspace profile/tool/skill summary injection
-- First-version skills discovery
-- Real task test entrypoint: `mateway test`
 
-Tasks ready for immediate testing:
-```bash
-mateway ask "Read README.md and summarize the project architecture."
+Mateway currently supports:
 
-mateway ask "Inspect the current project directory structure and identify the runtime entrypoint."
-
-mateway test --message "Search for today's latest AI news and provide 5 high-value summaries."
-
-mateway test --message "Review internal/tool/builtin.go and highlight risks and untested points."
-```
-
----
-
-## Capabilities Not Yet Completed (No False Claims)
-Mateway is evolving rapidly. These features are designed but **not fully implemented** (and will not be misrepresented in this README):
-- Complete memory write/proposal/commit/reject workflow
-- `memory.search` safe-read tool
-- Automated heartbeat maintenance
-- User-explicit schedule runners
-- Connector framework for mail/SSH/GitHub/social media publishing
-- OS-level sandboxing
-- Visual workspace UI
-- Multi-Agent supervisor/sub-agent routing
-
-Current strategy:
-> Stabilize the single Agent Runtime first, then integrate memory, schedule, connectors, and visualization into the hook/trace system.
-
----
-
-## Differentiation from Other Agent Frameworks
-
-| Aspect | Common Agent Frameworks | Mateway |
-|---|---|---|
-| Core Goal | Rapid orchestration of complex Agent workflows | Reliable operation of a single Agent in real workspaces |
-| Architecture Bias | Multi-Agent / workflow / graph | Single Agent main loop + hooks |
-| Memory | Auto-summaries or black-box vector databases | Markdown-first, proposal-based, auditable |
-| Tools | "Anything goes" invocation | Tool contracts + risk boundaries + confirmation |
-| Observability | Focus on final results | Traces / task steps / evidence as first-class citizens |
-| Frontends | Fragmented (CLI/chat/automation separate) | Unified runtime for CLI/Feishu/test/schedule |
-| Extension | Plugins or platform-centric | Skills + tools + hooks + external scripts |
-
----
+- CLI task entrypoint: `mateway ask`
+- Feishu WebSocket gateway
+- real runtime tests: `mateway test`
+- trace review: `mateway trace`
+- task tree and follow-up binding
+- pending confirmation for risky tools
+- safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
+- hook events in trace
+- workspace profile injection
+- skill discovery from `workspace/skills` and agent-specific skill overrides
+- Markdown memory lint/search/index
+- memory proposal create/list/commit/reject
+- automatic diary/proposal generation after useful completed tasks
+- conversation reply handling for memory proposal `保存` / `忽略`
+- memory safe-read injection through `context_hook`
+- session and project distill commands
+- manual memory heartbeat: lint + index rebuild
+- secret redaction in persistent runtime records
 
 ## Quick Start
 
@@ -254,7 +139,8 @@ go build -o build/mateway ./cmd/mateway
 ./build/mateway init
 ```
 
-Initialization creates this structure:
+This creates:
+
 ```text
 ~/.mateway/
   config/
@@ -264,6 +150,8 @@ Initialization creates this structure:
     memory/
   sessions/
   trace/
+  observe/
+  indexes/
   run/
 ```
 
@@ -275,15 +163,16 @@ vim ~/.mateway/config/config.yaml
 ```
 
 Validate configuration:
+
 ```bash
 ./build/mateway doctor
 ```
 
-### Ask from CLI
+### Ask From CLI
 ```bash
-./build/mateway ask "What time is it?"
 ./build/mateway ask "Read README.md and summarize this project."
-./build/mateway ask "Run pwd, then explain the current working directory."
+./build/mateway ask "Inspect the current project directory and identify the runtime entrypoint."
+./build/mateway ask "Search today's latest AI news and summarize 5 high-value items."
 ```
 
 ### Run Real Runtime Tests
@@ -293,42 +182,92 @@ Validate configuration:
 ./build/mateway test --case web-search
 ```
 
-Custom real-world tasks:
+Custom task:
+
 ```bash
-./build/mateway test --session-key demo:a001 --message "Inspect the current project structure and summarize the runtime entrypoint."
+./build/mateway test --session-key demo:a001 --message "Read README.md and explain the memory system."
 ```
 
-View traces:
-```bash
-./build/mateway trace <trace-jsonl-path>
-```
-
-### Start Gateway
+### Start Feishu Gateway
 ```bash
 ./build/mateway gateway serve
 ```
 
-`gateway serve` runs as a foreground process. Use launchd, systemd, or other service managers to host it as a background service.
+`gateway serve` runs in the foreground. Use launchd, systemd, or another service manager if you want it hosted as a background service.
 
----
+## Memory Commands
+
+Lint memory:
+
+```bash
+./build/mateway memory lint
+```
+
+Rebuild index:
+
+```bash
+./build/mateway memory index rebuild
+```
+
+Search memory:
+
+```bash
+./build/mateway memory search "README experience"
+```
+
+Review proposals:
+
+```bash
+./build/mateway memory proposal list
+./build/mateway memory proposal commit <proposal_id>
+./build/mateway memory proposal reject <proposal_id> --reason "not reusable"
+```
+
+Distill session or project:
+
+```bash
+./build/mateway memory distill session <session_key>
+./build/mateway memory distill project close <project_id>
+```
+
+Run manual heartbeat maintenance:
+
+```bash
+./build/mateway memory heartbeat lint-index
+```
+
+The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, and writes an audit entry. It is currently a manual command; a background scheduler/cron runner is still future work.
+
+## Trace Commands
+
+```bash
+./build/mateway trace <trace-jsonl-path>
+```
+
+Use traces to inspect:
+
+- model/tool/runtime latency
+- hook decisions
+- tool calls and acceptance evidence
+- pending confirmations
+- memory proposal generation
+- Feishu gateway timing
 
 ## HOME Directory Structure
-Mateway uses this default root:
+
 ```text
 ~/.mateway/
+  config/        # config.yaml, env files, model/channel config
+  workspace/     # agent profiles, skills, Markdown memory
+  sessions/      # transcripts, task trees, pending states
+  trace/         # JSONL traces
+  observe/       # diary, proposals, reflections, audit logs
+  indexes/       # rebuildable memory indexes
+  run/           # runtime files such as gateway locks
 ```
 
-Core directories:
-```text
-~/.mateway/
-  config/        # Configuration, models, channels, env samples
-  workspace/     # Agent profiles, skills, memory
-  sessions/      # Transcripts, task trees, pending states
-  trace/         # JSONL traces for each task
-  run/           # Runtime files (e.g., gateway locks)
-```
+Workspace:
 
-Key Workspace structure:
 ```text
 ~/.mateway/workspace/
   agents/
@@ -346,102 +285,115 @@ Key Workspace structure:
     connector-gap/
   memory/
     user/
+      long/
     org/
-    agents/main/
+      long/
+    agents/
+      main/
+        memory.md
+        experiences/
 ```
-
----
 
 ## Skills
-Mateway’s skills are currently "editable behavioral guidelines" (not executable tools by default).
+
+Mateway skills are editable behavioral guidelines stored as:
+
+```text
+workspace/agents/<agent_id>/skills/<skill_name>/SKILL.md
+workspace/skills/<skill_name>/SKILL.md
+```
 
 Discovery order:
+
+1. agent-specific skills
+2. shared workspace skills
+
+Agent-specific skills win when names collide.
+
+Current behavior:
+
+- Runtime discovers local skills and injects short guidance into context.
+- Default initialized shared skills cover fresh search, source evaluation, connector gaps, and software installation workflow.
+- Agents can inspect existing skills and use them as guidance.
+
+Not yet implemented:
+
+- `mateway skill search <query>`
+- `mateway skill install <name-or-url>`
+- external skill catalog integration
+- automatic skill patch/promotion workflow
+
+## Current Limits
+
+Mateway intentionally does not claim these are finished:
+
+- no multi-agent supervisor or DAG router
+- no OS-level sandbox wrapper yet
+- no general mail/SSH/GitHub connector framework yet
+- no background heartbeat scheduler yet
+- no visual workspace UI yet
+- no external skill marketplace installer yet
+
+The current usable release is focused on: a stable single-agent runtime, hook pipeline, real tools with risk boundaries, Feishu/CLI entrypoints, traceability, and white-box memory.
+
+## Image Prompt For The Banner
+
+The README banner (`mateway-banner.svg`) should communicate:
+
 ```text
-workspace/agents/<agent_id>/skills/*/SKILL.md
-workspace/skills/*/SKILL.md
+A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
+Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
+Show a central single-agent core connected to four labeled flows: Hooks, Tools, Memory, Traces.
+Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
+Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
+Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
+Text to include: "Mateway" and "Memory-native local agent runtime".
 ```
-
-Agent-specific skills take priority over global ones with the same name.
-
-Skills can define:
-- Best practices for a domain
-- Tool selection logic
-- Output acceptance criteria
-- Risk reminders for users
-- Paths to formalize as scripts/tools later
-
-Future roadmap for skills:
-```text
-successful task -> trace evidence -> skill candidate -> user review -> promoted skill
-```
-
----
 
 ## Roadmap
 
-### M1 — Hook Skeleton
-- `context_hook`
-- `tool_policy_hook`
-- `observe_hook`
-- `response_hook`
-- `followup_hook`
-- Hook impact visible in traces
+### Done Enough For Developer Use
 
-### M2 — Memory Safe-read
-- Markdown frontmatter
-- Source evidence
-- Index rebuild
-- Linting
-- Keyword search
-- `memory.search` tool
+- Single agent runtime loop
+- CLI / test / Feishu entrypoints
+- Hook pipeline
+- Tool policy and confirmation boundaries
+- JSONL traces
+- Skill discovery and context injection
+- Markdown memory lint/search/index
+- Memory proposal commit/reject workflow
+- Self-learning diary/proposal generation
+- Memory safe-read context injection
+- Session/project distill commands
+- Manual heartbeat `lint-index`
+- Secret redaction for persistent runtime records
 
-### M3 — Memory Proposal
-- `memory.propose`
-- `memory.commit`
-- `memory.reject`
-- Tiered memory (inbox / diary / long)
-- No auto-commit to long-term memory
+### Next
 
-### M4 — Heartbeat / Schedule
-- Memory index rebuild
-- Memory linting
-- User-explicit scheduled tasks
-- Background maintenance tasks (disabled by default)
-
-### M5 — Visualization
-- Trace timeline
-- Task tree
-- Memory ledger
-- Skill shelf
-- Workspace health
-- Static HTML/Markdown reports (prior to long-term Web UI)
-
-### M6 — Safer Terminal Runtime
-- macOS sandbox-exec
-- Linux bubblewrap
-- Optional terminal sandbox wrapper
-- Network/filesystem restriction policies
-
----
+- script bridge specification for user-provided connectors
+- `mateway skill search/install/list/promote`
+- background scheduler for heartbeat jobs
+- safer terminal sandbox wrappers
+- read-only trace/task/memory workspace UI
+- connector packages for mail, SSH, GitHub, and publishing
 
 ## Design Principles
 
 ### Keep the core small
-The main loop remains small and clear. Complex capabilities integrate via hooks and tool contracts—avoid turning the runtime into an unmaintainable monolith.
+The main loop remains small and clear. Complex capabilities integrate through hooks, tool contracts, skills, and scripts.
 
-### Make memory reviewable
-Long-term memory must show origins, support editing/rejection, and allow index reconstruction.
+### Memory must be reviewable
+Long-term memory should show origins, support editing/rejection, and allow index reconstruction.
 
 ### Trust comes from traces
-Agent trustworthiness stems from transparency (what it did, why, and evidence)—not just "plausible answers."
+Agent trustworthiness comes from knowing what happened, which evidence was used, and which boundaries were enforced.
 
 ### Local-first does not mean local-only
-Mateway prioritizes local workspaces and user machines but integrates with larger systems via Feishu, web search, external CLI, scripts, and future connectors.
+Mateway prioritizes local workspaces and user machines, but integrates with Feishu, web search, external CLIs, scripts, and future connectors.
 
-### Don’t fake connectors
-When mail/SSH/GitHub/publishing connectors are missing, Mateway explicitly documents gaps and proposes integration plans (no fabricated execution results).
-
----
+### Do not fake connectors
+When mail, SSH, GitHub, or publishing connectors are missing, Mateway should report the gap, inspect safe local options, and propose an integration path instead of fabricating execution.
 
 ## License
+
 Apache License 2.0.
