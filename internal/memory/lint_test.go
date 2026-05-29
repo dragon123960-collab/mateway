@@ -51,6 +51,49 @@ func TestLintRootReportsMissingFrontmatter(t *testing.T) {
 	}
 }
 
+func TestLintRootSkipsWorkspaceDraftDirs(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "agents", "main", "inbox", "legacy.md"), `---
+type: source
+scope: agent
+visibility:
+status: proposed
+sources: []
+confidence: medium
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Draft only.
+`)
+	writeFile(t, filepath.Join(root, "agents", "main", "recent", "2026-05-29.md"), "# Recent scratch\n")
+	writeFile(t, filepath.Join(root, "agents", "main", "learning", "note.md"), "# Learning scratch\n")
+	writeFile(t, filepath.Join(root, "agents", "main", "experiences", "ok.md"), `---
+type: experience
+scope: agent
+visibility: private
+status: active
+sources:
+  - trace:abc
+confidence: high
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Usable memory.
+`)
+	result, err := LintRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Files != 1 {
+		t.Fatalf("files = %d, issues = %#v", result.Files, result.Issues)
+	}
+	if result.HasErrors() {
+		t.Fatalf("unexpected issues: %#v", result.Issues)
+	}
+}
+
 func TestLintRootWarnsForActiveMemoryWithoutSources(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "global", "preferences", "answer-style.md"), `---

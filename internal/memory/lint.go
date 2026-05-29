@@ -68,7 +68,13 @@ func WalkDocuments(root string, fn func(Document, []Issue) error) error {
 		if err != nil {
 			return err
 		}
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
+		if entry.IsDir() {
+			if shouldSkipMemoryDir(root, path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".md") {
 			return nil
 		}
 		if isSupportMarkdown(root, path) {
@@ -168,6 +174,24 @@ func isSupportMarkdown(root, path string) bool {
 	base := strings.ToLower(filepath.Base(rel))
 	if base == "readme.md" || base == "schema.md" || base == "index.md" || base == "log.md" {
 		return true
+	}
+	return false
+}
+
+func shouldSkipMemoryDir(root, path string) bool {
+	if filepath.Clean(root) == filepath.Clean(path) {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for _, part := range parts {
+		switch strings.ToLower(part) {
+		case ".obsidian", "inbox", "recent", "learning":
+			return true
+		}
 	}
 	return false
 }
