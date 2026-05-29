@@ -414,6 +414,113 @@ func TestRuntimeSelfLearningSurfacesProposalForToolTask(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected one proposal, got %d", len(entries))
 	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != "memory_proposal_review" || state.Pending.ProposalID == "" {
+		t.Fatalf("expected memory proposal review pending, got %#v", state.Pending)
+	}
+}
+
+func TestRuntimeMemoryProposalReviewCommitFromReply(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home, Workspace: workspace},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/read " + file}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "保存"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !contains(resp.Reply.Text, "已保存到长期记忆") {
+		t.Fatalf("expected saved reply, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil {
+		t.Fatalf("expected pending cleared, got %#v", state.Pending)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, "memory", "agents", "main", "experiences", "*.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected committed memory file, got %#v", matches)
+	}
+}
+
+func TestRuntimeMemoryProposalReviewRejectFromReply(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/read " + file}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "忽略"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !contains(resp.Reply.Text, "已忽略") {
+		t.Fatalf("expected ignored reply, got %#v", resp.Reply)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "proposals", entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), "status: rejected") {
+		t.Fatalf("expected rejected proposal, got %s", data)
+	}
+}
+
+func TestRuntimeMemoryProposalReviewBypassesStandaloneTask(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(captureUserTextModel{}, rt.Tools)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/read " + file}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "请读取 README.md，总结项目。"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "请读取 README.md，总结项目。" {
+		t.Fatalf("expected standalone task to run, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil {
+		t.Fatalf("expected memory review pending cleared after new task, got %#v", state.Pending)
+	}
 }
 
 func TestRuntimeSanitizesToolCallBlocks(t *testing.T) {

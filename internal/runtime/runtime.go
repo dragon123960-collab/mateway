@@ -176,6 +176,17 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				"reflection_path": learningResult.ReflectionPath,
 				"proposal_id":     proposalID(learningResult.Proposal),
 			})
+			if learningResult.Proposal != nil {
+				state.Pending = &session.PendingAction{
+					Kind:       "memory_proposal_review",
+					TaskID:     task.ID,
+					ProposalID: learningResult.Proposal.ID,
+					Question:   "回复“保存”写入长期记忆，或回复“忽略”放弃这条候选。",
+				}
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, err
+				}
+			}
 		}
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
@@ -330,6 +341,48 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			return reply(msg, result.Content, "error"), true, nil
 		}
 		return reply(msg, result.Content, "completed"), true, nil
+	case "memory_proposal_review":
+		action, ok := parseMemoryProposalReviewAction(text)
+		if !ok {
+			if shouldBypassMemoryProposalReview(text) {
+				_ = trace.write(map[string]any{"type": "memory_proposal_review_bypassed", "proposal_id": state.Pending.ProposalID, "text": text})
+				state.Pending = nil
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, true, err
+				}
+				return Response{}, false, nil
+			}
+			return reply(msg, "这条长期记忆候选还在等待处理。回复“保存”写入长期记忆，回复“忽略”放弃；也可以直接发新任务。", "memory_review_pending"), true, nil
+		}
+		proposalID := state.Pending.ProposalID
+		state.Pending = nil
+		store := memory.ProposalStore{Home: rt.home(), MemoryRoot: memoryRootForConfig(rt.Config)}
+		if action == "commit" {
+			proposal, target, err := store.Commit(proposalID)
+			if err != nil {
+				if saveErr := rt.Store.Save(*state); saveErr != nil {
+					return Response{}, true, saveErr
+				}
+				return reply(msg, "保存长期记忆失败："+err.Error(), "error"), true, nil
+			}
+			_ = trace.write(map[string]any{"type": "memory_proposal_review_committed", "proposal_id": proposal.ID, "target": target})
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return reply(msg, "已保存到长期记忆："+target, "completed"), true, nil
+		}
+		proposal, err := store.Reject(proposalID, "user ignored from conversation")
+		if err != nil {
+			if saveErr := rt.Store.Save(*state); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return reply(msg, "忽略长期记忆候选失败："+err.Error(), "error"), true, nil
+		}
+		_ = trace.write(map[string]any{"type": "memory_proposal_review_rejected", "proposal_id": proposal.ID})
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		return reply(msg, "已忽略这条长期记忆候选。", "completed"), true, nil
 	case "user_input":
 		if shouldBypassUserInputPending(state.Pending, text) {
 			taskID := state.Pending.TaskID
@@ -358,6 +411,23 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		state.Pending = nil
 		return Response{}, false, nil
 	}
+}
+
+func parseMemoryProposalReviewAction(text string) (string, bool) {
+	normalized := normalizeFollowupText(text)
+	switch normalized {
+	case "保存", "保存记忆", "保存到长期记忆", "写入", "写入记忆", "commit", "yes", "ok":
+		return "commit", true
+	case "忽略", "不保存", "不要保存", "跳过", "放弃", "reject", "no":
+		return "reject", true
+	default:
+		return "", false
+	}
+}
+
+func shouldBypassMemoryProposalReview(text string) bool {
+	normalized := normalizeFollowupText(text)
+	return looksLikeStandaloneTaskRequest(normalized)
 }
 
 func blockTask(state *session.State, taskID, status string) {
