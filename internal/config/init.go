@@ -569,17 +569,22 @@ Every durable memory page should use YAML frontmatter:
 
 ` + "```yaml" + `
 ---
-type: project | system | preference | playbook | decision | source | skill_candidate
-scope: agent | user | org
+type: preference | decision | experience | skill | pattern | wiki | diary | reflection | proposal
+scope: global | user | org | agent | project
 owner_agent: main
+project_id:
 visibility: private | shared-user | shared-org
-status: active | proposed | deprecated
+status: proposed | active | rejected | deprecated | archived
 tags: []
 aliases: []
-sources: []
+op_fingerprint:
+sources:
+  - trace:<trace_id>
 confidence: high | medium | low
-created_at: 2026-05-20
-updated_at: 2026-05-20
+created_at: 2026-05-29
+updated_at: 2026-05-29
+review_after:
+schema_version: 1
 ---
 ` + "```" + `
 
@@ -610,7 +615,25 @@ const memoryOrgIndexTemplate = `# Shared Organization Memory
 Use this area for organization systems, terminology, workflows, and playbooks.
 `
 
-const memoryAgentEntryTemplate = `# Agent Memory Entry
+const memoryAgentEntryTemplate = `---
+type: wiki
+scope: agent
+owner_agent: main
+project_id:
+visibility: private
+status: proposed
+tags: []
+aliases: []
+op_fingerprint:
+sources: []
+confidence: low
+created_at: 2026-05-29
+updated_at: 2026-05-29
+review_after:
+schema_version: 1
+---
+
+# Agent Memory Entry
 
 This is the long-term memory wiki entry for the agent.
 

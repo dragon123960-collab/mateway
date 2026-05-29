@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,5 +66,30 @@ func TestInitSupportsHomeFlag(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(home, rel)); err != nil {
 			t.Fatalf("expected %s under init home: %v", rel, err)
 		}
+	}
+}
+
+func TestMemoryLintCommandUsesHomeConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = run([]string{"memory", "lint"})
+	_ = write.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(read); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "memory_root:") || !strings.Contains(text, "issues: 0") {
+		t.Fatalf("unexpected lint output:\n%s", text)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/runtime"
 )
 
@@ -98,6 +99,8 @@ func run(args []string) error {
 			fmt.Println("tools:", strings.Join(summary.ToolCalls, ", "))
 		}
 		return nil
+	case "memory":
+		return runMemory(args[1:])
 	case "gateway":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
@@ -128,6 +131,58 @@ func run(args []string) error {
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runMemory(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory <lint>")
+	}
+	switch args[0] {
+	case "lint":
+		fs := flag.NewFlagSet("mateway memory lint", flag.ContinueOnError)
+		rootFlag := fs.String("root", "", "memory root to lint")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		root := strings.TrimSpace(*rootFlag)
+		if root == "" {
+			root = memoryRoot(cfg)
+		}
+		result, err := memory.LintRoot(root)
+		if err != nil {
+			return err
+		}
+		fmt.Println("memory_root:", result.Root)
+		fmt.Println("files:", result.Files)
+		fmt.Println("issues:", len(result.Issues))
+		for _, issue := range result.Issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if result.HasErrors() {
+			return fmt.Errorf("memory lint failed")
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory <lint>")
+	}
+}
+
+func memoryRoot(cfg *config.Root) string {
+	if cfg == nil {
+		return filepath.Join(config.DefaultHome(), "workspace", "memory")
+	}
+	if root := strings.TrimSpace(cfg.Memory.Root); root != "" {
+		return root
+	}
+	workspace := strings.TrimSpace(cfg.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(cfg.App.Home, "workspace")
+	}
+	return filepath.Join(workspace, "memory")
 }
 
 func runTest(args []string) error {
@@ -311,6 +366,7 @@ Usage:
   mateway ask <message>
   mateway test [--case read-readme|project-index|web-search] [--message <task>] [--record=false]
   mateway trace <trace-jsonl-path>
+  mateway memory lint [--root <path>]
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }
