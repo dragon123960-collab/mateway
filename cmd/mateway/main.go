@@ -135,7 +135,7 @@ func run(args []string) error {
 
 func runMemory(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory <lint|index>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search>")
 	}
 	switch args[0] {
 	case "lint":
@@ -205,8 +205,53 @@ func runMemory(args []string) error {
 		fmt.Println("entries:", len(index.Entries))
 		fmt.Println("index:", out)
 		return nil
+	case "search":
+		fs := flag.NewFlagSet("mateway memory search", flag.ContinueOnError)
+		rootFlag := fs.String("root", "", "memory root to search")
+		scopeFlag := fs.String("scope", "", "optional scope filter")
+		typeFlag := fs.String("type", "", "optional type filter")
+		limitFlag := fs.Int("limit", 5, "maximum results")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		root := strings.TrimSpace(*rootFlag)
+		if root == "" {
+			root = memoryRoot(cfg)
+		}
+		results, issues, err := memory.SearchRoot(root, memory.SearchOptions{
+			Query: query,
+			Limit: *limitFlag,
+			Scope: strings.TrimSpace(*scopeFlag),
+			Type:  strings.TrimSpace(*typeFlag),
+		})
+		if err != nil {
+			return err
+		}
+		for _, issue := range issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if hasMemoryErrors(issues) {
+			return fmt.Errorf("memory search failed")
+		}
+		fmt.Println("memory_root:", root)
+		fmt.Println("results:", len(results))
+		for i, result := range results {
+			fmt.Printf("%d. %s type=%s scope=%s score=%d\n", i+1, result.Path, result.Type, result.Scope, result.Score)
+			if result.Snippet != "" {
+				fmt.Println("   snippet:", result.Snippet)
+			}
+			if len(result.Sources) > 0 {
+				fmt.Println("   sources:", strings.Join(result.Sources, ", "))
+			}
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway memory <lint|index>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search>")
 	}
 }
 
@@ -424,6 +469,7 @@ Usage:
   mateway trace <trace-jsonl-path>
   mateway memory lint [--root <path>]
   mateway memory index rebuild [--root <path>] [--out <path>]
+  mateway memory search [--root <path>] [--scope <scope>] [--type <type>] <query>
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

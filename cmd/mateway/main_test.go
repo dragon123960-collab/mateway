@@ -121,3 +121,51 @@ func TestMemoryIndexRebuildCommandWritesIndex(t *testing.T) {
 		t.Fatalf("expected index file: %v", err)
 	}
 }
+
+func TestMemorySearchCommandPrintsResults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "memory", "user", "long", "style.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`---
+type: preference
+scope: user
+visibility: private
+status: active
+sources:
+  - trace:style
+confidence: high
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Prefer concise answers with source references.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = run([]string{"memory", "search", "--scope", "user", "concise"})
+	_ = write.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(read); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "results: 1") || !strings.Contains(text, "user/long/style.md") || !strings.Contains(text, "trace:style") {
+		t.Fatalf("unexpected search output:\n%s", text)
+	}
+}
