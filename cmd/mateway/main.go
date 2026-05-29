@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
 )
@@ -110,6 +112,8 @@ func run(args []string) error {
 		return runSchedule(args[1:])
 	case "skill":
 		return runSkill(args[1:])
+	case "secret":
+		return runSecret(args[1:])
 	case "gateway":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
@@ -139,6 +143,81 @@ func run(args []string) error {
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runSecret(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway secret <set|get|list|delete>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := secret.Store{Home: cfg.App.Home}
+	switch args[0] {
+	case "set":
+		if len(args) < 2 || len(args) > 3 {
+			return fmt.Errorf("usage: mateway secret set <id> [value]")
+		}
+		value := ""
+		if len(args) == 3 {
+			value = args[2]
+		} else {
+			data, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return err
+			}
+			value = strings.TrimRight(string(data), "\r\n")
+		}
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("secret value is required; pass it as an argument or via stdin")
+		}
+		if err := store.Set(args[1], value); err != nil {
+			return err
+		}
+		fmt.Println("secret:", strings.ToLower(strings.TrimSpace(args[1])))
+		fmt.Println("stored: true")
+		return nil
+	case "get":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway secret get <id>")
+		}
+		entry, ok, err := store.Get(args[1])
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("secret %q not found", args[1])
+		}
+		fmt.Println(entry.Value)
+		return nil
+	case "list":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: mateway secret list")
+		}
+		entries, err := store.List()
+		if err != nil {
+			return err
+		}
+		fmt.Println("secrets:", len(entries))
+		for _, entry := range entries {
+			fmt.Printf("- %s updated_at=%s\n", entry.ID, entry.UpdatedAt)
+		}
+		return nil
+	case "delete":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway secret delete <id>")
+		}
+		deleted, err := store.Delete(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("secret:", strings.ToLower(strings.TrimSpace(args[1])))
+		fmt.Println("deleted:", deleted)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway secret <set|get|list|delete>")
 	}
 }
 
@@ -1188,6 +1267,10 @@ Usage:
   mateway skill list
   mateway skill search [--all] <query>
   mateway skill install [--name <name>] [--force] <path-or-raw-url>
+  mateway secret set <id> [value]
+  mateway secret get <id>
+  mateway secret list
+  mateway secret delete <id>
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

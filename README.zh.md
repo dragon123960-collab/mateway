@@ -119,6 +119,7 @@ Mateway 目前支持：
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
+- 本地 secret store：`mateway secret set/get/list/delete`
 - trace 中可见 hook events
 - workspace profile 注入
 - 从 `workspace/skills` 和 agent-specific overrides 发现 skills
@@ -352,6 +353,16 @@ workspace/skills/<skill_name>/SKILL.md
 
 同名时 agent-specific skills 优先。
 
+Skills 不能保存明文凭证。凭证应进入本地 secret store，skill frontmatter 里只引用 secret id：
+
+```yaml
+required_secrets:
+  - id: mail.smtp_pass
+    env: SMTP_PASS
+```
+
+`mateway skill install` 和写入 `SKILL.md` 的 `file.write` 会拒绝 password、API key、token、bearer token 等疑似明文 secret。
+
 当前行为：
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
@@ -380,6 +391,12 @@ Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router�
 
 边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
 
+## Gateway 边界
+
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。当前 `gateway serve` 已实现的是飞书 WebSocket channel，需要在 `channels/feishu.yaml` 启用。后续新增 channel 应接入同一个 gateway 边界，而不是绕过 runtime。
+
+`gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
+
 ## 当前边界
 
 Mateway 不会把这些能力伪装成已经完成：
@@ -392,19 +409,6 @@ Mateway 不会把这些能力伪装成已经完成：
 
 当前可用版本聚焦于：稳定小核心 runtime、多 agent profile 基础、hook pipeline、带风险边界的真实工具、飞书/CLI 入口、traceability 和 white-box memory。
 
-## Banner 图片提示词
-
-README banner (`mateway-banner.svg`) 应表达：
-
-```text
-A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
-Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
-Show a compact AgentCore connected to five labeled flows: Profiles, Hooks, Tools, Memory, Traces.
-Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
-Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
-Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
-Text to include: "Mateway" and "Memory-native local agent runtime".
-```
 
 ## Roadmap
 
@@ -417,6 +421,7 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 - Tool policy 和 confirmation boundaries
 - JSONL traces
 - Skill discovery 和 context injection
+- 本地 secret store 和 skill secret 扫描
 - Markdown memory lint/search/index
 - Memory proposal commit/reject workflow
 - Self-learning diary/proposal generation

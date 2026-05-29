@@ -440,6 +440,28 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 	}
 }
 
+func TestSecretCommandsStoreAndListWithoutValue(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"secret", "set", "mail.smtp_pass", "supersecret123"}); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"secret", "list"}) })
+	if !strings.Contains(out, "mail.smtp_pass") {
+		t.Fatalf("missing secret id:\n%s", out)
+	}
+	if strings.Contains(out, "supersecret123") {
+		t.Fatalf("secret value leaked in list:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"secret", "get", "mail.smtp_pass"}) })
+	if strings.TrimSpace(out) != "supersecret123" {
+		t.Fatalf("unexpected get output %q", out)
+	}
+}
+
 func TestHomeReportCommandClassifiesDirectories(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

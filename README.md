@@ -113,6 +113,7 @@ Mateway currently supports:
 - task tree and follow-up binding
 - pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
+- local secret store: `mateway secret set/get/list/delete`
 - hook events in trace
 - workspace profile injection
 - skill discovery from `workspace/skills` and agent-specific skill overrides
@@ -340,6 +341,16 @@ Discovery order:
 
 Agent-specific skills win when names collide.
 
+Skills must not store plaintext credentials. Put credentials in the local secret store and reference secret ids from skill frontmatter:
+
+```yaml
+required_secrets:
+  - id: mail.smtp_pass
+    env: SMTP_PASS
+```
+
+`mateway skill install` and `file.write` writes to `SKILL.md` reject secret-like plaintext such as passwords, API keys, tokens, and bearer tokens.
+
 Current behavior:
 
 - Runtime discovers local skills and injects short guidance into context.
@@ -368,6 +379,12 @@ This means different channels or session namespaces can select different agent i
 
 The boundary is deliberate: profiles and bindings are in scope; autonomous multi-agent orchestration is not part of the current release.
 
+## Gateway Boundary
+
+Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. The current `gateway serve` implementation starts the Feishu WebSocket channel when `channels/feishu.yaml` enables it. Future channels should plug into the same gateway boundary rather than bypassing runtime.
+
+`gateway serve` uses the same config loader as CLI commands, so it reads `~/.mateway/config/mateway.env`. Existing process environment variables still win over values from that file.
+
 ## Current Limits
 
 Mateway intentionally does not claim these are finished:
@@ -380,20 +397,6 @@ Mateway intentionally does not claim these are finished:
 
 The current usable release is focused on: a stable small-core runtime, multi-agent profile foundations, hook pipeline, real tools with risk boundaries, Feishu/CLI entrypoints, traceability, and white-box memory.
 
-## Image Prompt For The Banner
-
-The README banner (`mateway-banner.svg`) should communicate:
-
-```text
-A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
-Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
-Show a compact AgentCore connected to five labeled flows: Profiles, Hooks, Tools, Memory, Traces.
-Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
-Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
-Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
-Text to include: "Mateway" and "Memory-native local agent runtime".
-```
-
 ## Roadmap
 
 ### Done Enough For Developer Use
@@ -405,6 +408,7 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 - Tool policy and confirmation boundaries
 - JSONL traces
 - Skill discovery and context injection
+- Local secret store and skill secret scanning
 - Markdown memory lint/search/index
 - Memory proposal commit/reject workflow
 - Self-learning diary/proposal generation

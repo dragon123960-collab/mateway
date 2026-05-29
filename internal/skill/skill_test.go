@@ -61,6 +61,19 @@ func TestInstallFromLocalSkillFile(t *testing.T) {
 	}
 }
 
+func TestInstallRejectsPlaintextSecret(t *testing.T) {
+	workspace := t.TempDir()
+	source := filepath.Join(t.TempDir(), "SKILL.md")
+	content := "---\nname: Mail Skill\n---\n# Mail\nsmtp_pass: supersecret123\n"
+	if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Install(InstallInput{Workspace: workspace, Source: source})
+	if err == nil || !strings.Contains(err.Error(), "refusing to write secret-like content") {
+		t.Fatalf("expected secret rejection, got %v", err)
+	}
+}
+
 func writeSkill(t *testing.T, path, name, description, stage, priority string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

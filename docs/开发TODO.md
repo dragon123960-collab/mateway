@@ -17,6 +17,7 @@ Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / S
 - Script Bridge：不做重型 connector framework，先定义用户脚本发现、验证、调用、evidence 和确认边界。
 - Sandbox Runner：把现有 terminal sandbox config 接到更明确的本地 runner/wrapper。
 - Read-only Workspace UI：先做 trace/task/memory/schedule/skill 的只读报告或静态页面。
+- Secret 机制：skill 创建/安装时不允许写入明文 secret；凭证进入 `mateway secret` 本地存储，后续由 Script Bridge 执行时注入。
 
 详细设计以 `docs/记忆prd.md` 为准。
 
@@ -103,6 +104,13 @@ Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / S
 - Agent 能发现邮件收发脚本并基于真实输出总结。
 - 缺少脚本或参数时追问，不编造完成。
 - 可复用脚本能沉淀为 skill candidate。
+
+Secret 边界：
+
+- Skill 和脚本 manifest 只能声明 `required_secrets`。
+- 明文用户名、密码、token、API key 不写入 `SKILL.md`。
+- 执行时由 Script Bridge 从 `mateway secret` 读取并注入子进程环境变量。
+- trace、memory、proposal 只记录 secret id 和 redacted marker。
 
 ### S2.4 Sandbox Runner
 
