@@ -3,11 +3,13 @@
   <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
 
+[English](./README.md) | [中文](./README.zh.md)
+
 **Mateway 是一个面向真实工作区的本地优先 Agent Runtime，围绕白盒记忆、自我学习和可审计工具使用构建。**
 
-它不是重型工作流平台，也不是只能演示的聊天机器人。Mateway 是一个小型 Go 运行时，让单个 Agent 能在本地项目、飞书、文件、终端命令、网页搜索、skills、trace 和长期记忆之间工作，同时保持系统可检查、可复盘。
+它不是重型工作流平台，也不是只能演示的聊天机器人。Mateway 是一个围绕小型 AgentCore 主循环构建的 Go 运行时，同时已经预留多 agent profile 和 binding 基础，用于不同工作身份、渠道、skills 和记忆作用域。
 
-> **一句话：Mateway = 单 Agent 核心 + Hook Runtime + 工具边界 + 类 Git 记忆 + 自学习 Proposal + Trace Ledger。**
+> **一句话：Mateway = 小型 AgentCore + 多 Agent Profile + Hook Runtime + 工具边界 + 类 Git 记忆 + 自学习 Proposal + Trace Ledger。**
 
 ```text
 receive -> followup_hook -> context_hook -> model/tool loop
@@ -24,7 +26,7 @@ receive -> followup_hook -> context_hook -> model/tool loop
 - 它应该在 CLI、飞书、测试和未来的定时任务中使用同一套运行时。
 - 它应该诚实说明 connector 缺口，而不是假装已经发了邮件或登录了服务器。
 
-Mateway 选择保守路径：先保持单 Agent 主循环足够小，再通过 hooks、skills、tools 和 Markdown memory 自然增长能力。
+Mateway 选择保守路径：先保持 AgentCore 主循环足够小，再通过 profiles、hooks、skills、tools 和 Markdown memory 自然增长能力。
 
 ## 独特之处
 
@@ -128,6 +130,7 @@ Mateway 目前支持：
 - session 和 project distill 命令
 - 手动 memory heartbeat：lint + index rebuild
 - 持久化 runtime 记录中的 secret 脱敏
+- 多 agent profile 基础：`config.agents.profiles[]`、channel bindings、agent-specific skills 和 agent-scoped memory directories
 
 ## 快速开始
 
@@ -362,6 +365,21 @@ workspace/skills/<skill_name>/SKILL.md
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
 - 自动 skill patch / promotion 工作流
 
+## 多 Agent Profiles
+
+Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router。但它已经具备多个 agent profile 的底座：
+
+- `config.agents.default`
+- `config.agents.profiles[]`
+- `config.agents.bindings[]`
+- `workspace/agents/<agent_id>/`
+- `workspace/agents/<agent_id>/skills/`
+- `workspace/memory/agents/<agent_id>/`
+
+这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。下一阶段会把这部分产品化，补齐 agent list/report/create/bind 命令、profile lint 和多 profile 验收测试。
+
+边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
+
 ## 当前边界
 
 Mateway 不会把这些能力伪装成已经完成：
@@ -372,7 +390,7 @@ Mateway 不会把这些能力伪装成已经完成：
 - 还没有可视化 workspace UI
 - 还没有外部 skill marketplace installer
 
-当前可用版本聚焦于：稳定单 Agent runtime、hook pipeline、带风险边界的真实工具、飞书/CLI 入口、traceability 和 white-box memory。
+当前可用版本聚焦于：稳定小核心 runtime、多 agent profile 基础、hook pipeline、带风险边界的真实工具、飞书/CLI 入口、traceability 和 white-box memory。
 
 ## Banner 图片提示词
 
@@ -381,7 +399,7 @@ README banner (`mateway-banner.svg`) 应表达：
 ```text
 A wide 1600x520 technical product banner for "Mateway", a local-first AI agent runtime.
 Visual metaphor: an illuminated memory ledger / commit graph / agent runtime pipeline.
-Show a central single-agent core connected to four labeled flows: Hooks, Tools, Memory, Traces.
+Show a compact AgentCore connected to five labeled flows: Profiles, Hooks, Tools, Memory, Traces.
 Memory should feel like a Git-like commit ledger: proposals, commits, audit trail, Markdown pages.
 Style: precise, developer-tool, dark background, crisp vector geometry, subtle cyan/amber/green accents.
 Avoid cute robots, generic chat bubbles, clouds, and abstract blobs.
@@ -392,7 +410,8 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 
 ### 足以给开发者试用的部分
 
-- 单 Agent runtime loop
+- 小型 AgentCore runtime loop
+- 多 agent profile 和 binding 基础
 - CLI / test / Feishu entrypoints
 - Hook pipeline
 - Tool policy 和 confirmation boundaries
@@ -409,6 +428,7 @@ Text to include: "Mateway" and "Memory-native local agent runtime".
 
 ### 下一步
 
+- 多 agent profile 产品化：agent list/report/create/bind、profile lint 和多 profile 测试
 - user-provided connectors 的 script bridge specification
 - skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers

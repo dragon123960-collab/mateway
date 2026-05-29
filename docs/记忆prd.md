@@ -17,6 +17,7 @@ CLI / Feishu-ready gateway
 + transcript-driven AgentCore
 + small ToolRegistry
 + task tree / followup / trace
++ multi-agent profile / binding foundation
 + ~/.mateway config and workspace layout
 ```
 
@@ -31,7 +32,7 @@ Hook Skeleton
 -> Channel-neutral Schedule
 ```
 
-下一阶段转入增强：skill source adapters、script bridge、sandbox runner、只读 workspace visualization。
+下一阶段转入增强：Multi-Agent Profile 产品化、skill source adapters、script bridge、sandbox runner、只读 workspace visualization。
 
 本 PRD 是 Hook、Memory、自我学习和 HOME 目录的唯一主设计文档。旧的分叉设计内容已合并到本文，不再作为独立实现依据。
 
@@ -164,7 +165,7 @@ Hook Skeleton 开发必须先兼容当前实现，而不是重写一套平行机
   - `workspace/agents/<agent>/user.md`
   - `workspace/agents/<agent>/tools.md`
   - `workspace/memory/user/index.md`
-- 当前尚未正式读取 `workspace/agents/<agent>/memory.md`，也没有按需检索 `workspace/memory/agents/<agent>/**`。
+- 当前已把 `workspace/agents/<agent>/memory.md` 纳入 prompt-facing memory card；按需检索 `workspace/memory/agents/<agent>/**` 由 `context_hook` 的 memory safe-read 负责，不在 AgentPool 初始化阶段做。
 - 当前读取规则是小文件静态注入：文件不存在、为空、超出大小限制或看起来包含敏感字段时跳过。
 
 Hook 迁移要求：
@@ -174,6 +175,21 @@ Hook 迁移要求：
 - 不要把按需 memory search 做进 AgentPool 初始化；AgentPool 只适合静态 profile 级上下文。
 - 每轮动态 memory 检索应发生在 `context_hook`，作为 steering/system context section 注入当前 turn。
 - Hook 化后，静态 profile context 与动态 memory context 要在 trace 中可区分。
+
+### 3.0.1 多 Agent Profile 边界
+
+Mateway 不是单一固定 agent 项目；当前已经在 config、HOME 目录和 AgentPool 层保留多 agent profile 能力：
+
+- `config.agents.default`
+- `config.agents.profiles[]`
+- `config.agents.bindings[]`
+- `workspace/agents/<agent_id>/{agent,user,tools,memory}.md`
+- `workspace/agents/<agent_id>/skills/`
+- `workspace/memory/agents/<agent_id>/`
+
+第二阶段的多 agent 工作是 profile 产品化：让用户能创建、查看、检查、绑定和验证多个 agent profile，并确保 prompt、skill、memory 的上下文隔离。
+
+本文中的非目标 `multi-agent supervisor / spawn / DAG routing` 指自主多 agent 编排，不否定已有的 profile/binding 能力。第二阶段不引入 supervisor，不让 gateway 自动做复杂业务分派，不让 memory search 驱动 runtime routing。
 
 ### 3.1 context_hook
 
