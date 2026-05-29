@@ -2,7 +2,9 @@
 <p align="center">
   <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
+
 [English](./README.md) | [中文](./README.zh.md)
+
 **Mateway 是一个面向真实工作区的本地优先 Agent Runtime，围绕白盒记忆、自我学习和可审计工具使用构建。**
 
 它不是重型工作流平台，也不是只能演示的聊天机器人。Mateway 是一个围绕小型 AgentCore 主循环构建的 Go 运行时，同时已经预留多 agent profile 和 binding 基础，用于不同工作身份、渠道、skills 和记忆作用域。

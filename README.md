@@ -2,7 +2,9 @@
 <p align="center">
   <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
 </p>
+
 [English](./README.md) | [中文](./README.zh.md)
+
 **Mateway is a local-first Agent Runtime for real workspaces, built around white-box memory, self-learning, and auditable tool use.**
 
 It is not a heavy workflow platform and not a toy chatbot demo. Mateway is a small Go runtime built around one compact AgentCore loop, with multi-agent profile and binding foundations for different work identities, channels, skills, and memory scopes.
