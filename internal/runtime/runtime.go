@@ -32,6 +32,7 @@ type Response struct {
 func New(cfg *config.Root) Runtime {
 	hooks := defaultRuntimeHooks()
 	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
+	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
 	return Runtime{
 		Config: cfg,
 		Store:  session.NewStore(cfg.App.Home),

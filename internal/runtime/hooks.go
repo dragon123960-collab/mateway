@@ -3,12 +3,14 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -180,4 +182,85 @@ func (p staticContextHookProvider) ContextHook(_ context.Context, input ContextH
 		Source:  "buildRuntimeSystemContext",
 		Content: contextText,
 	}}}, nil
+}
+
+type memorySafeReadHookProvider struct {
+	config *config.Root
+}
+
+func (memorySafeReadHookProvider) Name() string { return "memory_safe_read" }
+
+func (p memorySafeReadHookProvider) ContextHook(_ context.Context, input ContextHookInput) (ContextHookResult, error) {
+	if !shouldSearchMemory(input.UserText) {
+		return ContextHookResult{}, nil
+	}
+	root := memoryRootForConfig(p.config)
+	results, issues, err := memory.SearchRoot(root, memory.SearchOptions{Query: input.UserText, Limit: 3})
+	if err != nil {
+		return ContextHookResult{}, err
+	}
+	if hasMemoryLintErrors(issues) || len(results) == 0 {
+		return ContextHookResult{}, nil
+	}
+	var refs []string
+	var lines []string
+	for _, result := range results {
+		refs = append(refs, result.Path)
+		line := "- " + result.Path
+		if result.Type != "" || result.Scope != "" {
+			line += " (" + strings.Trim(strings.TrimSpace(result.Type+" / "+result.Scope), "/ ") + ")"
+		}
+		if result.Snippet != "" {
+			line += ": " + result.Snippet
+		}
+		if len(result.Sources) > 0 {
+			line += " [sources: " + strings.Join(result.Sources, ", ") + "]"
+		}
+		lines = append(lines, line)
+	}
+	return ContextHookResult{
+		SystemContextSections: []ContextSection{{
+			Name:    "memory_safe_read",
+			Source:  root,
+			Content: "Relevant memory snippets:\n" + strings.Join(lines, "\n"),
+		}},
+		MemoryRefs: refs,
+	}, nil
+}
+
+func shouldSearchMemory(text string) bool {
+	text = strings.TrimSpace(text)
+	if len([]rune(text)) >= 12 {
+		return true
+	}
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"memory", "remember", "preference", "project", "readme", "tool", "记忆", "偏好", "项目", "工具"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func memoryRootForConfig(cfg *config.Root) string {
+	if cfg == nil {
+		return filepath.Join(config.DefaultHome(), "workspace", "memory")
+	}
+	if root := strings.TrimSpace(cfg.Memory.Root); root != "" {
+		return root
+	}
+	workspace := strings.TrimSpace(cfg.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(cfg.App.Home, "workspace")
+	}
+	return filepath.Join(workspace, "memory")
+}
+
+func hasMemoryLintErrors(issues []memory.Issue) bool {
+	for _, issue := range issues {
+		if issue.Severity == "error" {
+			return true
+		}
+	}
+	return false
 }

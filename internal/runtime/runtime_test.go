@@ -602,6 +602,81 @@ func TestRuntimeContextHookInjectsStaticContextAsSystemMessage(t *testing.T) {
 	}
 }
 
+func TestRuntimeContextHookInjectsMemorySafeRead(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	memoryPath := filepath.Join(workspace, "memory", "agents", "main", "experience", "read-local-readme.md")
+	if err := os.MkdirAll(filepath.Dir(memoryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(memoryPath, []byte(`---
+type: experience
+scope: agent
+owner_agent: main
+visibility: private
+status: active
+sources:
+  - trace:readme
+confidence: high
+created_at: 2026-05-29
+updated_at: 2026-05-29
+schema_version: 1
+---
+Use file.read when inspecting local README files.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home, Workspace: workspace},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	model := &captureRuntimeContextModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "请总结 README"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "ok" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	if !contains(model.systemMessages, "memory_safe_read") || !contains(model.systemMessages, "trace:readme") {
+		t.Fatalf("expected memory context, got %q", model.systemMessages)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"provider":"memory_safe_read"`) || !contains(string(data), `"memory_refs":["agents/main/experience/read-local-readme.md"]`) {
+		t.Fatalf("expected memory refs trace, got %s", data)
+	}
+}
+
+func TestRuntimeMemorySafeReadFailureContinues(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home, Workspace: workspace},
+		Memory: config.MemoryConfig{Root: filepath.Join(home, "missing", "memory")},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "请总结 README"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "收到：请总结 README") {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"hook_warning"`) || !contains(string(data), `"provider":"memory_safe_read"`) {
+		t.Fatalf("expected memory hook warning, got %s", data)
+	}
+}
+
 func TestDiscoverSkillsReadsSkillFrontMatter(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
