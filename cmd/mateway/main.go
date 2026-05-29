@@ -16,6 +16,7 @@ import (
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/skill"
 )
 
 func main() {
@@ -102,6 +103,8 @@ func run(args []string) error {
 		return nil
 	case "memory":
 		return runMemory(args[1:])
+	case "skill":
+		return runSkill(args[1:])
 	case "gateway":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
@@ -131,6 +134,82 @@ func run(args []string) error {
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runSkill(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway skill <list|search|install>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		skills, err := skill.List(cfg.App.Workspace)
+		if err != nil {
+			return err
+		}
+		fmt.Println("skills:", len(skills))
+		for _, item := range skills {
+			fmt.Printf("- %s scope=%s", item.Name, item.Scope)
+			if item.Stage != "" {
+				fmt.Printf(" stage=%s", item.Stage)
+			}
+			if item.Priority != "" {
+				fmt.Printf(" priority=%s", item.Priority)
+			}
+			if item.Description != "" {
+				fmt.Printf(" description=%s", item.Description)
+			}
+			fmt.Printf(" path=%s\n", item.Path)
+		}
+		return nil
+	case "search":
+		fs := flag.NewFlagSet("mateway skill search", flag.ContinueOnError)
+		includeDisabled := fs.Bool("all", false, "include disabled catalogs")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if query == "" {
+			return fmt.Errorf("usage: mateway skill search [--all] <query>")
+		}
+		results := skill.SearchCatalogs(cfg, query)
+		fmt.Println("query:", query)
+		fmt.Println("catalogs:", len(results))
+		for _, result := range results {
+			if !result.Enabled && !*includeDisabled {
+				continue
+			}
+			fmt.Printf("- %s enabled=%v trust=%s url=%s\n", result.Catalog, result.Enabled, result.TrustLevel, result.URL)
+		}
+		return nil
+	case "install":
+		fs := flag.NewFlagSet("mateway skill install", flag.ContinueOnError)
+		name := fs.String("name", "", "override installed skill name")
+		force := fs.Bool("force", false, "overwrite existing installed skill")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway skill install [--name <name>] [--force] <path-or-raw-url>")
+		}
+		result, err := skill.Install(skill.InstallInput{
+			Workspace: cfg.App.Workspace,
+			Source:    fs.Arg(0),
+			Name:      *name,
+			Force:     *force,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("skill:", result.Name)
+		fmt.Println("path:", result.Path)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway skill <list|search|install>")
 	}
 }
 
@@ -703,6 +782,9 @@ Usage:
   mateway memory distill project close <project_id>
   mateway memory heartbeat lint-index
   mateway memory report [--root <path>]
+  mateway skill list
+  mateway skill search [--all] <query>
+  mateway skill install [--name <name>] [--force] <path-or-raw-url>
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

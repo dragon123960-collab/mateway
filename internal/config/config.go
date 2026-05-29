@@ -19,6 +19,7 @@ type Root struct {
 	Model     ModelSelection  `yaml:"model"`
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
+	Skills    SkillsConfig    `yaml:"skills"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
 	Models    []ModelConfig   `yaml:"-"`
@@ -107,6 +108,18 @@ type SkillCrystallizationConfig struct {
 	MinConfidence      string `yaml:"min_confidence"`
 	RequireUserConfirm bool   `yaml:"require_user_confirm"`
 	AskTiming          string `yaml:"ask_timing"`
+}
+
+type SkillsConfig struct {
+	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
+}
+
+type SkillCatalogConfig struct {
+	Name       string `yaml:"name"`
+	Enabled    bool   `yaml:"enabled"`
+	BaseURL    string `yaml:"base_url"`
+	SearchURL  string `yaml:"search_url"`
+	TrustLevel string `yaml:"trust_level"`
 }
 
 type SchedulerConfig struct {
@@ -258,6 +271,7 @@ func (l Loader) Load() (*Root, error) {
 	}
 	root.Models = models
 	root.normalizeSearch()
+	root.normalizeSkills()
 	root.normalizeAgents()
 	channels, err := l.loadChannels()
 	if err != nil {
@@ -265,6 +279,26 @@ func (l Loader) Load() (*Root, error) {
 	}
 	root.Channels = channels
 	return root, nil
+}
+
+func (r *Root) NormalizeForUse() {
+	if r == nil {
+		return
+	}
+	r.normalizeSearch()
+	r.normalizeSkills()
+	r.normalizeAgents()
+}
+
+func (r *Root) normalizeSkills() {
+	if len(r.Skills.Catalogs) > 0 {
+		return
+	}
+	r.Skills.Catalogs = []SkillCatalogConfig{
+		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", TrustLevel: "high"},
+		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", TrustLevel: "unknown"},
+		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", TrustLevel: "medium"},
+	}
 }
 
 func (r *Root) normalizeSearch() {

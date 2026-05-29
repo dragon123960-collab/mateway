@@ -100,6 +100,24 @@ learning:
     require_user_confirm: true
     ask_timing: next_interaction
 
+skills:
+  catalogs:
+    - name: skills.sh
+      enabled: true
+      base_url: https://skills.sh
+      search_url: "https://skills.sh/?q={query}"
+      trust_level: high
+    - name: skillhub.cn
+      enabled: false
+      base_url: https://skillhub.cn
+      search_url: "https://skillhub.cn/search?q={query}"
+      trust_level: unknown
+    - name: clawhub.ai
+      enabled: false
+      base_url: https://clawhub.ai
+      search_url: "https://clawhub.ai/search?q={query}"
+      trust_level: medium
+
 scheduler:
   enabled: false
   timezone: Asia/Shanghai

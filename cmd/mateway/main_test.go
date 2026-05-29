@@ -410,3 +410,51 @@ func TestMemoryReportCommandPrintsReadOnlySummary(t *testing.T) {
 		}
 	}
 }
+
+func TestSkillListSearchInstallCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "SKILL.md")
+	if err := os.WriteFile(source, []byte("---\nname: Demo Skill\ndescription: Demo install.\n---\n# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"skill", "install", source}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "workspace", "skills", "demo-skill", "SKILL.md")); err != nil {
+		t.Fatalf("expected installed skill: %v", err)
+	}
+
+	out := captureStdout(t, func() error { return run([]string{"skill", "list"}) })
+	if !strings.Contains(out, "demo-skill") || !strings.Contains(out, "software-install") {
+		t.Fatalf("unexpected skill list:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"skill", "search", "--all", "software install"}) })
+	if !strings.Contains(out, "skills.sh") || !strings.Contains(out, "skillhub.cn") || !strings.Contains(out, "clawhub.ai") {
+		t.Fatalf("unexpected skill search:\n%s", out)
+	}
+}
+
+func captureStdout(t *testing.T, fn func() error) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = fn()
+	_ = write.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(read); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
+}
