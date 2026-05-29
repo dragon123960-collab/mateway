@@ -12,6 +12,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/model"
+	"github.com/dongping/mateway/internal/session"
 )
 
 func TestRuntimeAsk(t *testing.T) {
@@ -120,6 +121,51 @@ func TestRuntimeAssistantQuestionFollowupContinuesTask(t *testing.T) {
 	}
 	if !contains(resp.Reply.Text, "请补充") {
 		t.Fatalf("expected continued response, got %#v", resp.Reply)
+	}
+}
+
+func TestRuntimeStandaloneTaskBypassesStaleUserInputPending(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(captureUserTextModel{}, rt.Tools)
+	state := session.State{Key: "feishu:test"}
+	task := state.StartTask("帮我总结 /Users/dongping/project/lianmeng")
+	state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: "要总结哪个目录？"}
+	state.BlockActiveTask("await_user_input")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "feishu", SessionKey: "feishu:test", Text: "请读取 README.md，总结项目。"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "请读取 README.md，总结项目。" {
+		t.Fatalf("expected new standalone task text, got %#v", resp.Reply)
+	}
+	state, err = rt.Store.Load("feishu:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 2 {
+		t.Fatalf("expected stale pending task plus new task, got %#v", state.Tasks)
+	}
+	if state.Tasks[0].Status != "interrupted" {
+		t.Fatalf("expected stale pending task interrupted, got %#v", state.Tasks[0])
+	}
+	if state.Tasks[1].Goal != "请读取 README.md，总结项目。" {
+		t.Fatalf("expected new README task, got %#v", state.Tasks[1])
+	}
+	if contains(lastUserContent(state.Messages), "lianmeng") || contains(lastUserContent(state.Messages), "Original task:") {
+		t.Fatalf("expected stale context not to leak into user text, got %q", lastUserContent(state.Messages))
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"pending_user_input_bypassed"`) {
+		t.Fatalf("expected bypass trace event, got %s", data)
 	}
 }
 
@@ -256,6 +302,29 @@ func TestRuntimeAmbiguousHistoricalFollowupAsksClarify(t *testing.T) {
 	}
 }
 
+func TestRuntimeStaleWeakFollowupAsksClarify(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("帮我查今天最新 AI 资讯，给我 5 条高价值信息。")
+	task.Status = "completed"
+	task.UpdatedAt = time.Now().Add(-24 * time.Hour)
+	task.CreatedAt = task.UpdatedAt
+	state.ActiveTask = task.ID
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "继续上一轮，把那三个点按优先级排一下。"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "clarify" {
+		t.Fatalf("expected clarify for stale weak followup, got %#v", resp.Reply)
+	}
+}
+
 func TestRuntimeDifferentSessionsDoNotShareFollowupContext(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -335,7 +404,7 @@ func TestRuntimeSelfLearningSurfacesProposalForToolTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "可沉淀记忆候选") || !contains(resp.Reply.Text, "mateway memory proposal commit") {
+	if !contains(resp.Reply.Text, "可能值得保存的长期记忆") || !contains(resp.Reply.Text, "保存到长期记忆") || !contains(resp.Reply.Text, "忽略这条候选") {
 		t.Fatalf("expected proposal review block, got %q", resp.Reply.Text)
 	}
 	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
@@ -812,6 +881,8 @@ type staticModel struct {
 	text string
 }
 
+type captureUserTextModel struct{}
+
 type errorModel struct {
 	err error
 }
@@ -868,6 +939,15 @@ func lastUserContent(messages []agentcore.Message) string {
 
 func (m staticModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
+}
+
+func (captureUserTextModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	for i := len(ctx.Messages) - 1; i >= 0; i-- {
+		if ctx.Messages[i].Role == agentcore.RoleUser {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: ctx.Messages[i].Content}, nil
+		}
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: ""}, nil
 }
 
 func (m errorModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {

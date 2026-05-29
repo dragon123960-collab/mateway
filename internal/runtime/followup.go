@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/dongping/mateway/internal/session"
@@ -59,6 +60,9 @@ func resolveFollowup(state session.State, text string) followupDecision {
 	}
 	if isFollowupCue(normalized) {
 		if task := latestTask(state); task != nil {
+			if isStaleWeakFollowup(normalized, *task) {
+				return clarify(current, "stale weak followup cue had no fresh task evidence")
+			}
 			return continueTask(*task, current, "recent task followup cue")
 		}
 		return clarify(current, "followup cue had no prior task")
@@ -76,6 +80,23 @@ func resolveFollowup(state session.State, text string) followupDecision {
 		return clarify(current, "short context-dependent input had no prior task")
 	}
 	return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "standalone input"}
+}
+
+func isStaleWeakFollowup(text string, task session.TaskNode) bool {
+	if time.Since(task.UpdatedAt) <= 6*time.Hour {
+		return false
+	}
+	goal := normalizeFollowupText(task.Goal)
+	if tokenOverlap(text, goal) > 0 {
+		return false
+	}
+	weakCues := []string{"上一轮", "上一个", "上一条", "刚才", "那个", "那三个", "那几点"}
+	for _, cue := range weakCues {
+		if strings.Contains(text, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func continueTask(task session.TaskNode, current, reason string) followupDecision {

@@ -210,25 +210,21 @@ func proposalID(proposal *memory.Proposal) string {
 func appendMemoryReviewBlock(text string, proposal memory.Proposal) string {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(text))
-	b.WriteString("\n\n可沉淀记忆候选：\n")
-	b.WriteString("1. ")
+	b.WriteString("\n\n我发现一条可能值得保存的长期记忆。\n")
+	b.WriteString("这只是候选，还没有写入长期记忆。你可以选择保存，或忽略这次建议。\n\n")
+	b.WriteString("建议保存：")
 	b.WriteString(proposal.Type)
-	b.WriteString("\n")
-	b.WriteString("   建议记忆：")
+	b.WriteString(" - ")
 	b.WriteString(proposal.Title)
-	if proposal.Body != "" {
-		b.WriteString("\n   内容：")
-		b.WriteString(summarize(proposal.Body))
-	}
 	if len(proposal.Sources) > 0 {
-		b.WriteString("\n   来源：")
-		b.WriteString(strings.Join(proposal.Sources, ", "))
+		b.WriteString("\n来源：")
+		b.WriteString(summarize(strings.Join(proposal.Sources, ", ")))
 	}
-	b.WriteString("\n   操作：`mateway memory proposal commit ")
+	b.WriteString("\n\n保存到长期记忆：\n`mateway memory proposal commit ")
 	b.WriteString(proposal.ID)
-	b.WriteString("` 或 `mateway memory proposal reject ")
+	b.WriteString("`\n\n忽略这条候选：\n`mateway memory proposal reject ")
 	b.WriteString(proposal.ID)
-	b.WriteString("`")
+	b.WriteString("`\n\n判断口径：如果这是以后会反复用到的项目经验、偏好、流程或工具用法，就保存；如果只是一次性测试或临时结果，就忽略。")
 	return b.String()
 }
 
@@ -335,6 +331,19 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		}
 		return reply(msg, result.Content, "completed"), true, nil
 	case "user_input":
+		if shouldBypassUserInputPending(state.Pending, text) {
+			taskID := state.Pending.TaskID
+			state.Pending = nil
+			blockTask(state, taskID, "interrupted")
+			if state.ActiveTask == taskID {
+				state.ActiveTask = ""
+			}
+			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": "standalone task request"})
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return Response{}, false, nil
+		}
 		taskID := state.Pending.TaskID
 		state.Pending = nil
 		state.Messages = append(state.Messages,
@@ -349,6 +358,58 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		state.Pending = nil
 		return Response{}, false, nil
 	}
+}
+
+func blockTask(state *session.State, taskID, status string) {
+	if state == nil || strings.TrimSpace(taskID) == "" {
+		return
+	}
+	for i := range state.Tasks {
+		if state.Tasks[i].ID == taskID {
+			state.Tasks[i].Status = status
+			state.Tasks[i].UpdatedAt = time.Now()
+			return
+		}
+	}
+}
+
+func shouldBypassUserInputPending(pending *session.PendingAction, text string) bool {
+	if pending == nil || pending.Kind != "user_input" {
+		return false
+	}
+	normalized := normalizeFollowupText(text)
+	if normalized == "" || isConfirm(normalized) || isCancel(normalized) {
+		return false
+	}
+	if isFollowupCue(normalized) || isHistoricalCue(normalized) || isRetryCue(normalized) || isShortContextDependent(normalized) {
+		return false
+	}
+	return looksLikeStandaloneTaskRequest(normalized)
+}
+
+func looksLikeStandaloneTaskRequest(text string) bool {
+	taskVerbs := []string{
+		"请读取", "请总结", "请查看", "请检查", "请搜索", "请创建", "请生成", "请列出",
+		"帮我读取", "帮我总结", "帮我查看", "帮我检查", "帮我搜索", "帮我创建", "帮我生成",
+		"读取", "总结", "查看", "检查", "搜索", "创建", "生成", "列出",
+		"read", "summarize", "check", "search", "create", "generate", "list",
+	}
+	hasVerb := false
+	for _, verb := range taskVerbs {
+		if strings.Contains(text, verb) {
+			hasVerb = true
+			break
+		}
+	}
+	if !hasVerb {
+		return false
+	}
+	for _, marker := range []string{"readme", ".md", ".txt", ".json", ".yaml", ".yml", "/", "~", "项目", "文件", "目录", "邮件", "网页", "网站"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string, map[string]any) {
