@@ -320,7 +320,7 @@ Not yet implemented:
 
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
-- external skill catalog integration
+- external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
 - automatic skill patch/promotion workflow
 
 ## Current Limits
