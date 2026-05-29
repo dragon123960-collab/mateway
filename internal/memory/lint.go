@@ -35,6 +35,7 @@ func (r LintResult) HasErrors() bool {
 
 type Document struct {
 	Path        string
+	RelPath     string
 	FrontMatter map[string]any
 	Body        string
 }
@@ -45,18 +46,8 @@ func LintRoot(root string) (LintResult, error) {
 		return LintResult{}, fmt.Errorf("memory root is required")
 	}
 	result := LintResult{Root: root}
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
-			return nil
-		}
+	err := WalkDocuments(root, func(doc Document, issues []Issue) error {
 		result.Files++
-		if isSupportMarkdown(root, path) {
-			return nil
-		}
-		doc, issues := ReadDocument(path)
 		result.Issues = append(result.Issues, issues...)
 		if len(issues) > 0 && doc.FrontMatter == nil {
 			return nil
@@ -66,6 +57,29 @@ func LintRoot(root string) (LintResult, error) {
 	})
 	sortIssues(result.Issues)
 	return result, err
+}
+
+func WalkDocuments(root string, fn func(Document, []Issue) error) error {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return fmt.Errorf("memory root is required")
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
+			return nil
+		}
+		if isSupportMarkdown(root, path) {
+			return nil
+		}
+		doc, issues := ReadDocument(path)
+		if rel, err := filepath.Rel(root, path); err == nil {
+			doc.RelPath = filepath.ToSlash(rel)
+		}
+		return fn(doc, issues)
+	})
 }
 
 func ReadDocument(path string) (Document, []Issue) {

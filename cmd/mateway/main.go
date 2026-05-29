@@ -135,7 +135,7 @@ func run(args []string) error {
 
 func runMemory(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory <lint>")
+		return fmt.Errorf("usage: mateway memory <lint|index>")
 	}
 	switch args[0] {
 	case "lint":
@@ -166,8 +166,47 @@ func runMemory(args []string) error {
 			return fmt.Errorf("memory lint failed")
 		}
 		return nil
+	case "index":
+		if len(args) < 2 || args[1] != "rebuild" {
+			return fmt.Errorf("usage: mateway memory index rebuild [--root <path>] [--out <path>]")
+		}
+		fs := flag.NewFlagSet("mateway memory index rebuild", flag.ContinueOnError)
+		rootFlag := fs.String("root", "", "memory root to index")
+		outFlag := fs.String("out", "", "index output path")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		root := strings.TrimSpace(*rootFlag)
+		if root == "" {
+			root = memoryRoot(cfg)
+		}
+		index, issues, err := memory.RebuildIndex(root)
+		if err != nil {
+			return err
+		}
+		for _, issue := range issues {
+			fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+		}
+		if hasMemoryErrors(issues) {
+			return fmt.Errorf("memory index rebuild failed")
+		}
+		out := strings.TrimSpace(*outFlag)
+		if out == "" {
+			out = memoryIndexPath(cfg)
+		}
+		if err := memory.WriteIndex(out, index); err != nil {
+			return err
+		}
+		fmt.Println("memory_root:", index.Root)
+		fmt.Println("entries:", len(index.Entries))
+		fmt.Println("index:", out)
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway memory <lint>")
+		return fmt.Errorf("usage: mateway memory <lint|index>")
 	}
 }
 
@@ -183,6 +222,23 @@ func memoryRoot(cfg *config.Root) string {
 		workspace = filepath.Join(cfg.App.Home, "workspace")
 	}
 	return filepath.Join(workspace, "memory")
+}
+
+func memoryIndexPath(cfg *config.Root) string {
+	home := config.DefaultHome()
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		home = cfg.App.Home
+	}
+	return filepath.Join(home, "indexes", "memory_index.json")
+}
+
+func hasMemoryErrors(issues []memory.Issue) bool {
+	for _, issue := range issues {
+		if issue.Severity == "error" {
+			return true
+		}
+	}
+	return false
 }
 
 func runTest(args []string) error {
@@ -367,6 +423,7 @@ Usage:
   mateway test [--case read-readme|project-index|web-search] [--message <task>] [--record=false]
   mateway trace <trace-jsonl-path>
   mateway memory lint [--root <path>]
+  mateway memory index rebuild [--root <path>] [--out <path>]
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

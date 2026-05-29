@@ -93,3 +93,31 @@ func TestMemoryLintCommandUsesHomeConfig(t *testing.T) {
 		t.Fatalf("unexpected lint output:\n%s", text)
 	}
 }
+
+func TestMemoryIndexRebuildCommandWritesIndex(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = run([]string{"memory", "index", "rebuild"})
+	_ = write.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(read); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "entries: 1") || !strings.Contains(text, "memory_index.json") {
+		t.Fatalf("unexpected index output:\n%s", text)
+	}
+	if _, err := os.Stat(filepath.Join(home, "indexes", "memory_index.json")); err != nil {
+		t.Fatalf("expected index file: %v", err)
+	}
+}
