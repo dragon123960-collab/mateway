@@ -438,6 +438,30 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 	}
 }
 
+func TestHomeReportCommandClassifiesDirectories(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "docker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "mystery"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"home", "report"}) })
+	if !strings.Contains(out, "- workspace: agent workspace, memory, skills") {
+		t.Fatalf("missing expected workspace:\n%s", out)
+	}
+	if !strings.Contains(out, "- docker: legacy/local service data") {
+		t.Fatalf("missing local docker:\n%s", out)
+	}
+	if !strings.Contains(out, "- mystery: not recognized by current clean layout") {
+		t.Fatalf("missing unknown dir:\n%s", out)
+	}
+}
+
 func captureStdout(t *testing.T, fn func() error) string {
 	t.Helper()
 	oldStdout := os.Stdout

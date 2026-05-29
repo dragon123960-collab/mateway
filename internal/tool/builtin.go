@@ -31,7 +31,7 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(FileReadTool{Config: root})
 	registry.Register(FileWriteTool{Config: root})
 	registry.Register(ProjectIndexTool{Config: root})
-	registry.Register(TerminalRunTool{})
+	registry.Register(TerminalRunTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
 	registry.Register(WebFetchTool{})
 	return registry
@@ -142,7 +142,7 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(files, "\n"), Evidence: map[string]any{"path": root, "count": len(files)}}
 }
 
-type TerminalRunTool struct{}
+type TerminalRunTool struct{ Config *config.Root }
 
 func (TerminalRunTool) Name() string        { return "terminal.run" }
 func (TerminalRunTool) Description() string { return "run a local shell command" }
@@ -163,11 +163,20 @@ func (TerminalRunTool) ToolContract() agentcore.ToolContract {
 	}
 }
 func (TerminalRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	command := fmt.Sprint(call.Args["command"])
-	timeoutCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	timeout := terminalTimeout(t.Config)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(timeoutCtx, "/bin/sh", "-lc", command)
+	execName, execArgs := terminalCommand(t.Config, command)
+	cmd := exec.CommandContext(timeoutCtx, execName, execArgs...)
+	workdir, err := terminalWorkdir(t.Config)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"command": command}}
+	}
+	if workdir != "" {
+		cmd.Dir = workdir
+	}
 	output, err := cmd.CombinedOutput()
 	result := strings.TrimSpace(string(output))
 	if err != nil {
@@ -176,7 +185,49 @@ func (TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentco
 		}
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: map[string]any{"command": command}}
 	}
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: map[string]any{"command": command}}
+	evidence := map[string]any{"command": command}
+	if workdir != "" {
+		evidence["workdir"] = workdir
+	}
+	if t.Config != nil && t.Config.Security.TerminalSandbox.Enabled {
+		evidence["sandbox"] = t.Config.Security.TerminalSandbox.Mode
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: evidence}
+}
+
+func terminalTimeout(cfg *config.Root) time.Duration {
+	seconds := 20
+	if cfg != nil && cfg.Security.TerminalSandbox.TimeoutSeconds > 0 {
+		seconds = cfg.Security.TerminalSandbox.TimeoutSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func terminalCommand(cfg *config.Root, command string) (string, []string) {
+	if cfg != nil && cfg.Security.TerminalSandbox.Enabled && len(cfg.Security.TerminalSandbox.CommandPrefix) > 0 {
+		prefix := cfg.Security.TerminalSandbox.CommandPrefix
+		args := append([]string{}, prefix[1:]...)
+		args = append(args, command)
+		return prefix[0], args
+	}
+	return "/bin/sh", []string{"-lc", command}
+}
+
+func terminalWorkdir(cfg *config.Root) (string, error) {
+	if cfg == nil || !cfg.Security.TerminalSandbox.Enabled {
+		return "", nil
+	}
+	raw := strings.TrimSpace(cfg.Security.TerminalSandbox.WorkDir)
+	if raw == "" {
+		raw = strings.TrimSpace(cfg.App.Workspace)
+	}
+	if raw == "" {
+		raw = strings.TrimSpace(cfg.App.Home)
+	}
+	if raw == "" {
+		return "", nil
+	}
+	return ResolveAllowedPath(raw, cfg)
 }
 
 type WebFetchTool struct{}

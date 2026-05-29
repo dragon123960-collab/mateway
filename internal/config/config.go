@@ -33,9 +33,18 @@ type AppConfig struct {
 }
 
 type SecurityConfig struct {
-	EnforceWorkspacePaths       bool     `yaml:"enforce_workspace_paths"`
-	RequireApprovalForRiskyTool bool     `yaml:"require_approval_for_risky_tools"`
-	AccessiblePaths             []string `yaml:"accessible_paths"`
+	EnforceWorkspacePaths       bool                  `yaml:"enforce_workspace_paths"`
+	RequireApprovalForRiskyTool bool                  `yaml:"require_approval_for_risky_tools"`
+	AccessiblePaths             []string              `yaml:"accessible_paths"`
+	TerminalSandbox             TerminalSandboxConfig `yaml:"terminal_sandbox"`
+}
+
+type TerminalSandboxConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	Mode           string   `yaml:"mode"`
+	WorkDir        string   `yaml:"workdir"`
+	TimeoutSeconds int      `yaml:"timeout_seconds"`
+	CommandPrefix  []string `yaml:"command_prefix"`
 }
 
 type SearchConfig struct {

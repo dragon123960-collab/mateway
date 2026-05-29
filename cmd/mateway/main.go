@@ -82,6 +82,8 @@ func run(args []string) error {
 		fmt.Println("model:", cfg.Model.Default)
 		fmt.Println("feishu_enabled:", cfg.Channels.Feishu.Enabled)
 		return nil
+	case "home":
+		return runHome(args[1:])
 	case "trace":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway trace <trace-jsonl-path>")
@@ -134,6 +136,43 @@ func run(args []string) error {
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runHome(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway home <report>")
+	}
+	switch args[0] {
+	case "report":
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		report, err := buildHomeReport(cfg.App.Home)
+		if err != nil {
+			return err
+		}
+		fmt.Println("home:", report.Home)
+		fmt.Println("expected:")
+		for _, item := range report.Expected {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		fmt.Println("generated:")
+		for _, item := range report.Generated {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		fmt.Println("local:")
+		for _, item := range report.Local {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		fmt.Println("unknown:")
+		for _, item := range report.Unknown {
+			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway home <report>")
 	}
 }
 
@@ -380,7 +419,7 @@ func runMemoryReport(args []string) error {
 
 func runMemoryHeartbeat(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|serve>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -408,9 +447,95 @@ func runMemoryHeartbeat(args []string) error {
 		}
 		fmt.Println("index:", result.IndexPath)
 		return nil
+	case "serve":
+		fs := flag.NewFlagSet("mateway memory heartbeat serve", flag.ContinueOnError)
+		intervalFlag := fs.String("interval", "", "override heartbeat interval")
+		onceFlag := fs.Bool("once", false, "run one heartbeat cycle and exit")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		interval := 30 * time.Minute
+		jobs := []string{"lint-index"}
+		if profile := defaultAgentProfile(cfg); profile != nil {
+			jobs = profile.Heartbeat.Jobs
+			if parsed, err := time.ParseDuration(profile.Heartbeat.Interval); err == nil && parsed > 0 {
+				interval = parsed
+			}
+		}
+		if strings.TrimSpace(*intervalFlag) != "" {
+			parsed, err := time.ParseDuration(strings.TrimSpace(*intervalFlag))
+			if err != nil {
+				return err
+			}
+			interval = parsed
+		}
+		runOnce := func() error {
+			result, err := memory.RunLintIndexHeartbeat(memory.HeartbeatInput{
+				Home:       cfg.App.Home,
+				MemoryRoot: memoryRoot(cfg),
+				IndexPath:  memoryIndexPath(cfg),
+			})
+			printHeartbeatResult(result)
+			if err != nil {
+				return err
+			}
+			if hasMemoryErrors(result.Issues) {
+				return fmt.Errorf("memory heartbeat found lint errors")
+			}
+			return nil
+		}
+		if *onceFlag {
+			return runOnce()
+		}
+		fmt.Println("heartbeat:", "serve")
+		fmt.Println("interval:", interval)
+		fmt.Println("jobs:", strings.Join(memory.NormalizeHeartbeatJobs(jobs), ", "))
+		return memory.ServeHeartbeat(context.Background(), memory.HeartbeatServeInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			IndexPath:  memoryIndexPath(cfg),
+			Interval:   interval,
+			Jobs:       jobs,
+			OnResult: func(result memory.HeartbeatResult) {
+				printHeartbeatResult(result)
+			},
+		})
 	default:
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|serve>")
 	}
+}
+
+func printHeartbeatResult(result memory.HeartbeatResult) {
+	fmt.Println("memory_root:", result.Root)
+	fmt.Println("files:", result.Files)
+	fmt.Println("entries:", result.Entries)
+	fmt.Println("issues:", len(result.Issues))
+	for _, issue := range result.Issues {
+		fmt.Printf("%s %s %s: %s\n", issue.Severity, issue.Code, issue.Path, issue.Message)
+	}
+	if result.IndexPath != "" {
+		fmt.Println("index:", result.IndexPath)
+	}
+}
+
+func defaultAgentProfile(cfg *config.Root) *config.AgentProfileConfig {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.Agents.Profiles {
+		if cfg.Agents.Profiles[i].ID == cfg.Agents.Default {
+			return &cfg.Agents.Profiles[i]
+		}
+	}
+	for i := range cfg.Agents.Profiles {
+		if cfg.Agents.Profiles[i].Default {
+			return &cfg.Agents.Profiles[i]
+		}
+	}
+	if len(cfg.Agents.Profiles) > 0 {
+		return &cfg.Agents.Profiles[0]
+	}
+	return nil
 }
 
 func runMemoryDistill(args []string) error {
@@ -588,6 +713,63 @@ func splitComma(value string) []string {
 		}
 	}
 	return out
+}
+
+type homeReport struct {
+	Home      string
+	Expected  []homeReportItem
+	Generated []homeReportItem
+	Local     []homeReportItem
+	Unknown   []homeReportItem
+}
+
+type homeReportItem struct {
+	Name string
+	Kind string
+}
+
+func buildHomeReport(home string) (homeReport, error) {
+	report := homeReport{Home: home}
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		return report, err
+	}
+	expected := map[string]string{
+		"config":    "configuration",
+		"workspace": "agent workspace, memory, skills",
+		"sessions":  "runtime session state",
+	}
+	generated := map[string]string{
+		"trace":   "runtime traces",
+		"observe": "learning diary, proposals, audit",
+		"indexes": "derived search indexes",
+		"run":     "process runtime state",
+		"logs":    "service logs",
+		"tmp":     "temporary files",
+	}
+	local := map[string]string{
+		"scripts":        "local user scripts",
+		"docker":         "legacy/local service data",
+		"docker-compose": "legacy/local service data",
+	}
+	for _, entry := range entries {
+		item := homeReportItem{Name: entry.Name()}
+		switch {
+		case expected[entry.Name()] != "":
+			item.Kind = expected[entry.Name()]
+			report.Expected = append(report.Expected, item)
+		case generated[entry.Name()] != "":
+			item.Kind = generated[entry.Name()]
+			report.Generated = append(report.Generated, item)
+		case local[entry.Name()] != "":
+			item.Kind = local[entry.Name()]
+			report.Local = append(report.Local, item)
+		default:
+			item.Kind = "not recognized by current clean layout"
+			report.Unknown = append(report.Unknown, item)
+		}
+	}
+	return report, nil
 }
 
 func runTest(args []string) error {
@@ -781,7 +963,9 @@ Usage:
   mateway memory distill session <session_key>
   mateway memory distill project close <project_id>
   mateway memory heartbeat lint-index
+  mateway memory heartbeat serve [--once] [--interval <duration>]
   mateway memory report [--root <path>]
+  mateway home report
   mateway skill list
   mateway skill search [--all] <query>
   mateway skill install [--name <name>] [--force] <path-or-raw-url>

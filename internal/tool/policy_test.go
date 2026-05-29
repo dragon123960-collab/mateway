@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,28 @@ func TestIsDangerousCommand(t *testing.T) {
 	}
 	if IsDangerousCommand("go test ./...") {
 		t.Fatal("expected go test to be safe")
+	}
+}
+
+func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tool := TerminalRunTool{Config: &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, TerminalSandbox: config.TerminalSandboxConfig{Enabled: true, Mode: "restricted"}},
+	}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"command": "pwd"}})
+	if result.IsError {
+		t.Fatalf("unexpected terminal error: %#v", result)
+	}
+	if strings.TrimSpace(result.Content) != workspace {
+		t.Fatalf("pwd = %q want %q", result.Content, workspace)
+	}
+	if result.Evidence["sandbox"] != "restricted" {
+		t.Fatalf("missing sandbox evidence: %#v", result.Evidence)
 	}
 }
 

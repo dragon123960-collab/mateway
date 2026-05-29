@@ -1,9 +1,12 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -19,6 +22,17 @@ type HeartbeatResult struct {
 	Files     int
 	Entries   int
 	Issues    []Issue
+}
+
+type HeartbeatServeInput struct {
+	Home       string
+	MemoryRoot string
+	IndexPath  string
+	Interval   time.Duration
+	Jobs       []string
+	Now        func() time.Time
+	Sleep      func(context.Context, time.Duration) error
+	OnResult   func(HeartbeatResult)
 }
 
 func RunLintIndexHeartbeat(input HeartbeatInput) (HeartbeatResult, error) {
@@ -58,6 +72,61 @@ func RunLintIndexHeartbeat(input HeartbeatInput) (HeartbeatResult, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+func ServeHeartbeat(ctx context.Context, input HeartbeatServeInput) error {
+	interval := input.Interval
+	if interval <= 0 {
+		interval = 30 * time.Minute
+	}
+	jobs := NormalizeHeartbeatJobs(input.Jobs)
+	for {
+		for _, job := range jobs {
+			switch job {
+			case "lint-index":
+				result, err := RunLintIndexHeartbeat(HeartbeatInput{Home: input.Home, MemoryRoot: input.MemoryRoot, IndexPath: input.IndexPath})
+				if input.OnResult != nil {
+					input.OnResult(result)
+				}
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("unsupported heartbeat job %q", job)
+			}
+		}
+		if input.Sleep != nil {
+			if err := input.Sleep(ctx, interval); err != nil {
+				return err
+			}
+			continue
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func NormalizeHeartbeatJobs(jobs []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, job := range jobs {
+		switch strings.TrimSpace(job) {
+		case "lint-index", "memory_lint", "memory_index_rebuild", "memory_lint_index":
+			if !seen["lint-index"] {
+				out = append(out, "lint-index")
+				seen["lint-index"] = true
+			}
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"lint-index"}
+	}
+	return out
 }
 
 func writeHeartbeatAudit(home string, result HeartbeatResult) error {

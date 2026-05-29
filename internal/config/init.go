@@ -162,6 +162,12 @@ security:
   enforce_workspace_paths: true
   require_approval_for_risky_tools: true
   accessible_paths: []
+  terminal_sandbox:
+    enabled: false
+    mode: restricted
+    workdir: ""
+    timeout_seconds: 20
+    command_prefix: []
 
 search:
   default_tool: tavily
