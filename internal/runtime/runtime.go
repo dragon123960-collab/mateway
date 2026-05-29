@@ -9,6 +9,7 @@ import (
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
@@ -136,12 +137,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 
 	state.Messages = result.Messages
+	taskCompleted := false
 	if state.Pending == nil {
 		if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 		} else {
 			state.CompleteActiveTask()
+			taskCompleted = true
 		}
 	}
 	if err := rt.Store.Save(*state); err != nil {
@@ -151,6 +154,13 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	text := sanitizeResponse(result.FinalText)
 	if text == "" {
 		text = fallbackFinalReply(result.FinalText)
+	}
+	if taskCompleted {
+		if learningResult, err := rt.recordTaskCompletion(*state, task.ID, text, trace); err != nil {
+			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "observe_hook", "provider": "self_learning", "error": err.Error()})
+		} else if learningResult.Proposal != nil {
+			text = appendMemoryReviewBlock(text, *learningResult.Proposal)
+		}
 	}
 	resp := Response{
 		Reply: channel.OutboundMessage{
@@ -163,6 +173,76 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text})
 	return resp, nil
+}
+
+func (rt Runtime) recordTaskCompletion(state session.State, taskID, finalText string, trace *traceRecorder) (memory.LearningResult, error) {
+	task, ok := taskByID(state, taskID)
+	if !ok {
+		return memory.LearningResult{}, nil
+	}
+	home := config.DefaultHome()
+	if rt.Config != nil && strings.TrimSpace(rt.Config.App.Home) != "" {
+		home = rt.Config.App.Home
+	}
+	result, err := memory.RecordTaskCompletion(memory.LearningEvent{
+		Home:       home,
+		SessionKey: state.Key,
+		Task:       task,
+		FinalText:  finalText,
+		TraceID:    trace.id,
+		TracePath:  trace.path,
+	})
+	if err != nil {
+		return memory.LearningResult{}, err
+	}
+	_ = trace.write(map[string]any{
+		"type":            "self_learning",
+		"diary_path":      result.DiaryPath,
+		"reflection_path": result.ReflectionPath,
+		"proposal_id":     proposalID(result.Proposal),
+	})
+	return result, nil
+}
+
+func taskByID(state session.State, taskID string) (session.TaskNode, bool) {
+	for _, task := range state.Tasks {
+		if task.ID == taskID {
+			return task, true
+		}
+	}
+	return session.TaskNode{}, false
+}
+
+func proposalID(proposal *memory.Proposal) string {
+	if proposal == nil {
+		return ""
+	}
+	return proposal.ID
+}
+
+func appendMemoryReviewBlock(text string, proposal memory.Proposal) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(text))
+	b.WriteString("\n\n可沉淀记忆候选：\n")
+	b.WriteString("1. ")
+	b.WriteString(proposal.Type)
+	b.WriteString("\n")
+	b.WriteString("   建议记忆：")
+	b.WriteString(proposal.Title)
+	if proposal.Body != "" {
+		b.WriteString("\n   内容：")
+		b.WriteString(summarize(proposal.Body))
+	}
+	if len(proposal.Sources) > 0 {
+		b.WriteString("\n   来源：")
+		b.WriteString(strings.Join(proposal.Sources, ", "))
+	}
+	b.WriteString("\n   操作：`mateway memory proposal commit ")
+	b.WriteString(proposal.ID)
+	b.WriteString("` 或 `mateway memory proposal reject ")
+	b.WriteString(proposal.ID)
+	b.WriteString("`")
+	return b.String()
 }
 
 func fallbackFinalReply(raw string) string {

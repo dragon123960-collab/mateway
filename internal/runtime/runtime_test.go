@@ -300,6 +300,53 @@ func TestRuntimeWritesTrace(t *testing.T) {
 	}
 }
 
+func TestRuntimeSelfLearningWritesDiaryForCompletedTask(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(resp.Reply.Text, "可沉淀记忆候选") {
+		t.Fatalf("low-value task should not show proposal: %q", resp.Reply.Text)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "diary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one diary, got %d", len(entries))
+	}
+}
+
+func TestRuntimeSelfLearningSurfacesProposalForToolTask(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/read " + file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "可沉淀记忆候选") || !contains(resp.Reply.Text, "mateway memory proposal commit") {
+		t.Fatalf("expected proposal review block, got %q", resp.Reply.Text)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one proposal, got %d", len(entries))
+	}
+}
+
 func TestRuntimeSanitizesToolCallBlocks(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
