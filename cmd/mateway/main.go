@@ -257,9 +257,46 @@ func runMemory(args []string) error {
 		return runMemoryDistill(args[1:])
 	case "heartbeat":
 		return runMemoryHeartbeat(args[1:])
+	case "report":
+		return runMemoryReport(args[1:])
 	default:
-		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill|heartbeat>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill|heartbeat|report>")
 	}
+}
+
+func runMemoryReport(args []string) error {
+	fs := flag.NewFlagSet("mateway memory report", flag.ContinueOnError)
+	rootFlag := fs.String("root", "", "memory root to report")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	root := strings.TrimSpace(*rootFlag)
+	if root == "" {
+		root = memoryRoot(cfg)
+	}
+	report, err := memory.BuildReport(memory.ReportInput{Home: cfg.App.Home, MemoryRoot: root})
+	if err != nil {
+		return err
+	}
+	fmt.Println("memory_root:", report.MemoryRoot)
+	fmt.Println("memory_files:", report.MemoryFiles)
+	fmt.Println("index_entries:", report.IndexEntries)
+	fmt.Println("issues:", len(report.Issues))
+	fmt.Println("proposals:")
+	for _, status := range []string{"proposed", "active", "archived", "rejected", "unknown"} {
+		if count := report.Proposals[status]; count > 0 {
+			fmt.Printf("- %s: %d\n", status, count)
+		}
+	}
+	fmt.Println("observe:")
+	for _, name := range []string{"diary", "reflections", "proposals", "audit"} {
+		fmt.Printf("- %s: %d\n", name, report.Observe[name])
+	}
+	return nil
 }
 
 func runMemoryHeartbeat(args []string) error {
@@ -654,6 +691,7 @@ Usage:
   mateway memory distill session <session_key>
   mateway memory distill project close <project_id>
   mateway memory heartbeat lint-index
+  mateway memory report [--root <path>]
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

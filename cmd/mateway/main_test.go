@@ -354,3 +354,33 @@ func TestMemoryHeartbeatLintIndexCommandWritesIndex(t *testing.T) {
 		t.Fatalf("missing heartbeat audit:\n%s", audit)
 	}
 }
+
+func TestMemoryReportCommandPrintsReadOnlySummary(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = run([]string{"memory", "report"})
+	_ = write.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(read); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"memory_root:", "memory_files:", "index_entries:", "observe:"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("report missing %q:\n%s", want, text)
+		}
+	}
+}
