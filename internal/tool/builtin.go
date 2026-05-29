@@ -20,6 +20,7 @@ import (
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/schedule"
 )
 
 func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
@@ -32,6 +33,8 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(FileWriteTool{Config: root})
 	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
+	registry.Register(ScheduleCreateTool{Config: root})
+	registry.Register(ScheduleListTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
 	registry.Register(WebFetchTool{})
 	return registry
@@ -143,6 +146,8 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 }
 
 type TerminalRunTool struct{ Config *config.Root }
+type ScheduleCreateTool struct{ Config *config.Root }
+type ScheduleListTool struct{ Config *config.Root }
 
 func (TerminalRunTool) Name() string        { return "terminal.run" }
 func (TerminalRunTool) Description() string { return "run a local shell command" }
@@ -193,6 +198,101 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		evidence["sandbox"] = t.Config.Security.TerminalSandbox.Mode
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: evidence}
+}
+
+func (ScheduleCreateTool) Name() string        { return "schedule.create" }
+func (ScheduleCreateTool) Description() string { return "create a local scheduled task" }
+func (ScheduleCreateTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"text", "run_at"}}
+}
+func (ScheduleCreateTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks to run or remind a task later. Include channel/thread/session context when provided by the system prompt.",
+		WhenNotToUse:         "Do not use for immediate tasks; execute those directly.",
+		OutputContract:       "Return scheduled task id, run time, interval when any, and channel target evidence.",
+		Evidence:             "Return id, run_at, interval, channel, thread_id, session_key.",
+		Acceptance:           "Accepted when the task is persisted under the local schedule store.",
+		SoftFailureSignals:   []string{"invalid run_at", "missing text"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
+	}
+}
+func (ScheduleCreateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	runAt, err := time.Parse(time.RFC3339, toolArgString(call.Args, "run_at"))
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "run_at must be RFC3339", IsError: true}
+	}
+	var interval time.Duration
+	if raw := toolArgString(call.Args, "interval"); raw != "" {
+		interval, err = time.ParseDuration(raw)
+		if err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: "interval must be a Go duration such as 30m or 24h", IsError: true}
+		}
+	}
+	store := schedule.Store{Home: config.DefaultHome()}
+	if t.Config != nil && strings.TrimSpace(t.Config.App.Home) != "" {
+		store.Home = t.Config.App.Home
+	}
+	task, err := store.Create(schedule.CreateInput{
+		Channel:    toolArgString(call.Args, "channel"),
+		ThreadID:   toolArgString(call.Args, "thread_id"),
+		UserID:     toolArgString(call.Args, "user_id"),
+		SessionKey: toolArgString(call.Args, "session_key"),
+		Text:       toolArgString(call.Args, "text"),
+		RunAt:      runAt,
+		Interval:   interval,
+	})
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	return agentcore.ToolResult{
+		ToolCallID: call.ID,
+		Content:    fmt.Sprintf("scheduled %s at %s", task.ID, task.RunAt),
+		Evidence: map[string]any{
+			"id":          task.ID,
+			"run_at":      task.RunAt,
+			"interval":    task.Interval,
+			"channel":     task.Channel,
+			"thread_id":   task.ThreadID,
+			"session_key": task.SessionKey,
+		},
+	}
+}
+
+func (ScheduleListTool) Name() string        { return "schedule.list" }
+func (ScheduleListTool) Description() string { return "list local scheduled tasks" }
+func (ScheduleListTool) Schema() agentcore.Schema {
+	return agentcore.Schema{}
+}
+func (ScheduleListTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks what scheduled tasks exist.",
+		WhenNotToUse:         "Do not use for creating a new scheduled task.",
+		OutputContract:       "Return one line per scheduled task.",
+		Evidence:             "Return scheduled task count.",
+		Acceptance:           "Accepted when the schedule store is read successfully.",
+		ParallelMode:         "read_only_ok",
+		ReusePolicy:          "stable_read",
+		ConfirmationBoundary: "safe read; no confirmation.",
+	}
+}
+func (ScheduleListTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (t ScheduleListTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	store := schedule.Store{Home: config.DefaultHome()}
+	if t.Config != nil && strings.TrimSpace(t.Config.App.Home) != "" {
+		store.Home = t.Config.App.Home
+	}
+	tasks, err := store.List()
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	var lines []string
+	for _, task := range tasks {
+		lines = append(lines, fmt.Sprintf("%s status=%s run_at=%s interval=%s channel=%s text=%s", task.ID, task.Status, task.RunAt, task.Interval, task.Channel, summarizeToolText(task.Text, 80)))
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"count": len(tasks)}}
 }
 
 func terminalTimeout(cfg *config.Root) time.Duration {
@@ -728,6 +828,29 @@ func stripHTML(text string) string {
 
 func compactWhitespace(text string) string {
 	return strings.Join(strings.Fields(text), " ")
+}
+
+func summarizeToolText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + fmt.Sprintf("... (%d chars)", len(text))
+}
+
+func toolArgString(args map[string]any, key string) string {
+	if args == nil {
+		return ""
+	}
+	value, ok := args[key]
+	if !ok || value == nil {
+		return ""
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "<nil>" {
+		return ""
+	}
+	return text
 }
 
 func (EchoTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }

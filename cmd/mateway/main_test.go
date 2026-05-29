@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -459,6 +461,35 @@ func TestHomeReportCommandClassifiesDirectories(t *testing.T) {
 	}
 	if !strings.Contains(out, "- mystery: not recognized by current clean layout") {
 		t.Fatalf("missing unknown dir:\n%s", out)
+	}
+}
+
+func TestScheduleRunDueCommandRunsCliTask(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	store := schedule.Store{Home: home}
+	_, err := store.Create(schedule.CreateInput{
+		Channel:    "cli",
+		SessionKey: "cli:test-schedule",
+		Text:       "/read workspace/memory/README.md",
+		RunAt:      time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"schedule", "run-due"}) })
+	if !strings.Contains(out, "due: 1") || !strings.Contains(out, "ran:") {
+		t.Fatalf("unexpected schedule output:\n%s", out)
+	}
+	tasks, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "done" {
+		t.Fatalf("unexpected tasks: %#v", tasks)
 	}
 }
 

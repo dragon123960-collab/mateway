@@ -566,6 +566,12 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 	if query, ok := strings.CutPrefix(text, "/search "); ok {
 		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": strings.TrimSpace(query)}}}}, nil
 	}
+	if rest, ok := strings.CutPrefix(text, "/schedule "); ok {
+		parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
+		if len(parts) == 2 {
+			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.create", Args: map[string]any{"run_at": parts[0], "text": parts[1], "channel": "cli", "session_key": "cli:scheduled"}}}}, nil
+		}
+	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "收到：" + text}, nil
 }
 

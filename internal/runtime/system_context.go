@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 )
 
@@ -63,6 +64,22 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 		b.WriteString("\n\n")
 		b.WriteString(skills)
 	}
+	return strings.TrimSpace(b.String())
+}
+
+func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentProfileConfig, msg channel.InboundMessage) string {
+	contextText := buildRuntimeSystemContext(cfg, profile)
+	if strings.TrimSpace(msg.Channel) == "" && strings.TrimSpace(msg.ThreadID) == "" && strings.TrimSpace(msg.SessionKey) == "" {
+		return contextText
+	}
+	var b strings.Builder
+	b.WriteString(contextText)
+	b.WriteString("\n\nCurrent channel context:\n")
+	writeContextLine(&b, "- channel: ", msg.Channel)
+	writeContextLine(&b, "- thread_id: ", msg.ThreadID)
+	writeContextLine(&b, "- user_id: ", msg.UserID)
+	writeContextLine(&b, "- session_key: ", msg.SessionKey)
+	b.WriteString("- When creating scheduled tasks for this conversation, pass these values to schedule.create so the scheduler can deliver the result back to the same place.\n")
 	return strings.TrimSpace(b.String())
 }
 

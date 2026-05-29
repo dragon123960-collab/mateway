@@ -497,7 +497,7 @@ type staticContextHookProvider struct {
 func (staticContextHookProvider) Name() string { return "static_context" }
 
 func (p staticContextHookProvider) ContextHook(_ context.Context, input ContextHookInput) (ContextHookResult, error) {
-	contextText := buildRuntimeSystemContext(p.config, input.Profile)
+	contextText := buildRuntimeSystemContextForMessage(p.config, input.Profile, input.Message)
 	if strings.TrimSpace(contextText) == "" {
 		return ContextHookResult{}, nil
 	}
