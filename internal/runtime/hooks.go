@@ -640,7 +640,7 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 		return ObserveHookResult{TaskStep: &session.TaskStep{
 			Tool:     input.ToolCall.Name,
 			Status:   status,
-			Summary:  summarize(input.ToolResult.Content),
+			Summary:  redactedSummary(input.ToolResult.Content),
 			Evidence: evidence,
 		}}, nil
 	case "task_completed":

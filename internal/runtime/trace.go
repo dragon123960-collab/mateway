@@ -47,6 +47,7 @@ func (r *traceRecorder) write(payload map[string]any) error {
 	if r == nil {
 		return nil
 	}
+	payload = redactPayload(payload)
 	payload["trace_id"] = r.id
 	payload["time"] = time.Now().Format(time.RFC3339Nano)
 	return appendTracePayload(r.path, payload)
@@ -56,6 +57,7 @@ func AppendTraceEvent(path string, payload map[string]any) error {
 	if path == "" {
 		return nil
 	}
+	payload = redactPayload(payload)
 	payload["time"] = time.Now().Format(time.RFC3339Nano)
 	return appendTracePayload(path, payload)
 }

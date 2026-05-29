@@ -140,7 +140,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		return resp, nil
 	}
 
-	state.Messages = result.Messages
+	state.Messages = redactMessagesForStorage(result.Messages)
 	taskCompleted := false
 	if state.Pending == nil {
 		if looksLikeInputRequest(result.FinalText) {
@@ -326,7 +326,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			status = observe.TaskStep.Status
 			evidence = observe.TaskStep.Evidence
 		}
-		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": result, "acceptance": status, "evidence": evidence})
+		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": redactToolResult(result), "acceptance": status, "evidence": redactSecrets(evidence)})
 		state.Messages = append(state.Messages,
 			agentcore.Message{Role: agentcore.RoleUser, Content: text},
 			agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content},
