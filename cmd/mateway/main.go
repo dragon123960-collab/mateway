@@ -15,6 +15,7 @@ import (
 	"github.com/dongping/mateway/internal/gateway"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/session"
 )
 
 func main() {
@@ -252,8 +253,40 @@ func runMemory(args []string) error {
 		return nil
 	case "proposal":
 		return runMemoryProposal(args[1:])
+	case "distill":
+		return runMemoryDistill(args[1:])
 	default:
-		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill>")
+	}
+}
+
+func runMemoryDistill(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory distill <session>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "session":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway memory distill session <session_key>")
+		}
+		store := session.NewStore(cfg.App.Home)
+		state, err := store.Load(args[1])
+		if err != nil {
+			return err
+		}
+		result, err := memory.DistillSession(memory.SessionDistillInput{Home: cfg.App.Home, State: state, Reason: "manual"})
+		if err != nil {
+			return err
+		}
+		fmt.Println("session:", state.Key)
+		fmt.Println("distill:", result.Path)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory distill <session>")
 	}
 }
 
@@ -564,6 +597,7 @@ Usage:
   mateway memory proposal list
   mateway memory proposal reject <proposal_id> [--reason <text>]
   mateway memory proposal commit <proposal_id>
+  mateway memory distill session <session_key>
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

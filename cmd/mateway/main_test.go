@@ -9,6 +9,7 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/session"
 )
 
 func TestTestCaseMessage(t *testing.T) {
@@ -242,5 +243,47 @@ func TestMemoryProposalCommitCommandWritesMemory(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "status: active") || !strings.Contains(string(data), "trace:abc") {
 		t.Fatalf("unexpected memory:\n%s", data)
+	}
+}
+
+func TestMemoryDistillSessionCommandWritesReflection(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	store := session.NewStore(home)
+	state := session.State{
+		Key: "cli:test",
+		Tasks: []session.TaskNode{
+			{ID: "task-1", Goal: "未完成任务", Status: "running"},
+		},
+	}
+	if err := store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "distill", "session", "cli:test"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "reflections"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "reflections", entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "task-1 running") {
+		t.Fatalf("unexpected distill:\n%s", data)
+	}
+	loaded, err := store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tasks[0].Status != "running" {
+		t.Fatalf("distill should not complete task: %#v", loaded.Tasks)
 	}
 }
