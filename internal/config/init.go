@@ -236,6 +236,7 @@ agents:
         jobs:
           - memory_lint
           - memory_index_rebuild
+          - memory_distill
         auto_send_summary: false
         quiet_hours:
           start: "23:00"

@@ -61,6 +61,32 @@ func TestRecordTaskCompletionSkipsProposalForPlainReadStep(t *testing.T) {
 	}
 }
 
+func TestRecordTaskCompletionSkipsProposalForPlainWriteStep(t *testing.T) {
+	home := t.TempDir()
+	result, err := RecordTaskCompletion(LearningEvent{
+		Home:       home,
+		SessionKey: "cli:test",
+		Task: session.TaskNode{
+			ID:     "task-write",
+			Goal:   "写入报告",
+			Status: "completed",
+			Steps: []session.TaskStep{{
+				Tool:    "file.write",
+				Status:  "accepted",
+				Summary: "wrote report",
+			}},
+		},
+		FinalText: "完成",
+		TraceID:   "trace-write",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Proposal != nil {
+		t.Fatalf("plain write step should not create immediate proposal: %#v", result.Proposal)
+	}
+}
+
 func TestRecordTaskCompletionCreatesProposalForExplicitMemoryCue(t *testing.T) {
 	home := t.TempDir()
 	result, err := RecordTaskCompletion(LearningEvent{

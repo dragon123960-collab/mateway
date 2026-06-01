@@ -221,6 +221,12 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
+	if learningResult == nil || learningResult.Proposal == nil {
+		if nudge, err := memory.PendingProposalNudge(rt.home(), state.Key, time.Now()); err == nil && nudge != "" {
+			text = strings.TrimSpace(text) + "\n\n" + nudge
+			_ = trace.write(map[string]any{"type": "memory_proposal_nudge", "text": nudge})
+		}
+	}
 	resp := Response{
 		Reply: channel.OutboundMessage{
 			Channel:  msg.Channel,

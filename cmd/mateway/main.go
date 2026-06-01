@@ -16,6 +16,7 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
 	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/secret"
@@ -727,6 +728,14 @@ func runMemoryHeartbeat(args []string) error {
 		}
 		fmt.Println("index:", result.IndexPath)
 		return nil
+	case "distill":
+		result, err := memory.RunDistillHeartbeat(context.Background(), memory.DistillHeartbeatInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			Model:      memoryDistillModel(cfg),
+		})
+		printDistillResult(result)
+		return err
 	case "serve":
 		fs := flag.NewFlagSet("mateway memory heartbeat serve", flag.ContinueOnError)
 		intervalFlag := fs.String("interval", "", "override heartbeat interval")
@@ -750,17 +759,32 @@ func runMemoryHeartbeat(args []string) error {
 			interval = parsed
 		}
 		runOnce := func() error {
-			result, err := memory.RunLintIndexHeartbeat(memory.HeartbeatInput{
-				Home:       cfg.App.Home,
-				MemoryRoot: memoryRoot(cfg),
-				IndexPath:  memoryIndexPath(cfg),
-			})
-			printHeartbeatResult(result)
-			if err != nil {
-				return err
-			}
-			if hasMemoryErrors(result.Issues) {
-				return fmt.Errorf("memory heartbeat found lint errors")
+			for _, job := range memory.NormalizeHeartbeatJobs(jobs) {
+				switch job {
+				case "lint-index":
+					result, err := memory.RunLintIndexHeartbeat(memory.HeartbeatInput{
+						Home:       cfg.App.Home,
+						MemoryRoot: memoryRoot(cfg),
+						IndexPath:  memoryIndexPath(cfg),
+					})
+					printHeartbeatResult(result)
+					if err != nil {
+						return err
+					}
+					if hasMemoryErrors(result.Issues) {
+						return fmt.Errorf("memory heartbeat found lint errors")
+					}
+				case "memory_distill":
+					distill, err := memory.RunDistillHeartbeat(context.Background(), memory.DistillHeartbeatInput{
+						Home:       cfg.App.Home,
+						MemoryRoot: memoryRoot(cfg),
+						Model:      memoryDistillModel(cfg),
+					})
+					printDistillResult(distill)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			return nil
 		}
@@ -776,12 +800,13 @@ func runMemoryHeartbeat(args []string) error {
 			IndexPath:  memoryIndexPath(cfg),
 			Interval:   interval,
 			Jobs:       jobs,
+			Model:      memoryDistillModel(cfg),
 			OnResult: func(result memory.HeartbeatResult) {
 				printHeartbeatResult(result)
 			},
 		})
 	default:
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|serve>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|serve>")
 	}
 }
 
@@ -796,6 +821,64 @@ func printHeartbeatResult(result memory.HeartbeatResult) {
 	if result.IndexPath != "" {
 		fmt.Println("index:", result.IndexPath)
 	}
+	if result.Distill.Scanned > 0 || result.Distill.Created > 0 || result.Distill.Skipped > 0 || result.Distill.Duplicates > 0 || len(result.Distill.Errors) > 0 {
+		printDistillResult(result.Distill)
+	}
+}
+
+func printDistillResult(result memory.DistillHeartbeatResult) {
+	fmt.Println("distill_scanned:", result.Scanned)
+	fmt.Println("distill_created:", result.Created)
+	fmt.Println("distill_skipped:", result.Skipped)
+	fmt.Println("distill_duplicates:", result.Duplicates)
+	if len(result.ProposalIDs) > 0 {
+		fmt.Println("distill_proposals:", strings.Join(result.ProposalIDs, ", "))
+	}
+	for _, errText := range result.Errors {
+		fmt.Println("distill_error:", errText)
+	}
+}
+
+func memoryDistillModel(cfg *config.Root) memory.DistillModel {
+	if cfg == nil {
+		return nil
+	}
+	names := []string{}
+	if role := strings.TrimSpace(cfg.Model.Roles["memory_distill"]); role != "" {
+		names = append(names, role)
+	}
+	if profile := defaultAgentProfile(cfg); profile != nil {
+		if role := strings.TrimSpace(profile.Model.Roles["memory_distill"]); role != "" {
+			names = append(names, role)
+		}
+		if strings.TrimSpace(profile.Model.Default) != "" {
+			names = append(names, profile.Model.Default)
+		}
+		names = append(names, profile.Model.Fallbacks...)
+	}
+	if strings.TrimSpace(cfg.Model.Default) != "" {
+		names = append(names, cfg.Model.Default)
+	}
+	names = append(names, cfg.Model.Fallbacks...)
+	var configs []config.ModelConfig
+	seen := map[string]bool{}
+	for _, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		for _, candidate := range cfg.Models {
+			if candidate.Enabled && strings.EqualFold(candidate.Name, key) && strings.TrimSpace(candidate.ResolvedAPIKey()) != "" {
+				configs = append(configs, candidate)
+				break
+			}
+		}
+	}
+	if len(configs) == 0 {
+		return nil
+	}
+	return model.NewFallbackAgentModel(configs)
 }
 
 func defaultAgentProfile(cfg *config.Root) *config.AgentProfileConfig {

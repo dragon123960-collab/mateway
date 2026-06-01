@@ -448,6 +448,26 @@ func TestMemoryHeartbeatLintIndexCommandWritesIndex(t *testing.T) {
 	}
 }
 
+func TestMemoryHeartbeatDistillCommandNoModel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	writeMainTestFile(t, filepath.Join(home, "observe", "diary", "one.md"), "# Task diary\n\n- Goal: 记住 README 检查流程\n")
+	out := captureStdout(t, func() error { return run([]string{"memory", "heartbeat", "distill"}) })
+	if !strings.Contains(out, "distill_scanned: 1") || !strings.Contains(out, "distill_skipped: 1") {
+		t.Fatalf("unexpected distill output:\n%s", out)
+	}
+	audit, err := os.ReadFile(filepath.Join(home, "observe", "audit", "memory.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(audit), "memory_distill_model_error") {
+		t.Fatalf("missing distill audit:\n%s", audit)
+	}
+}
+
 func TestMemoryReportCommandPrintsReadOnlySummary(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
@@ -632,4 +652,14 @@ func captureStdout(t *testing.T, fn func() error) string {
 		t.Fatal(err)
 	}
 	return out.String()
+}
+
+func writeMainTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }

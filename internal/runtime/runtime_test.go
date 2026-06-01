@@ -11,6 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
@@ -474,7 +475,7 @@ func TestRuntimeMemoryProposalPendingDefersForNewMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Text != "hello again" {
+	if !strings.HasPrefix(resp.Reply.Text, "hello again") {
 		t.Fatalf("expected new message to continue as a task, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("cli:test")
@@ -483,6 +484,43 @@ func TestRuntimeMemoryProposalPendingDefersForNewMessage(t *testing.T) {
 	}
 	if state.Pending != nil {
 		t.Fatalf("expected memory review pending to be cleared, got %#v", state.Pending)
+	}
+}
+
+func TestRuntimeAddsDailyMemoryProposalNudge(t *testing.T) {
+	home := t.TempDir()
+	if _, err := (memory.ProposalStore{Home: home}).Create(memory.CreateProposalInput{
+		Title:      "Pending memory",
+		Type:       "experience",
+		Scope:      "agent",
+		Body:       "Reusable note.",
+		Sources:    []string{"trace:one"},
+		Confidence: "low",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "长期记忆候选待审核") {
+		t.Fatalf("expected nudge, got %q", resp.Reply.Text)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "hello again"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(resp.Reply.Text, "长期记忆候选待审核") {
+		t.Fatalf("expected same-day nudge suppressed, got %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil {
+		t.Fatalf("nudge should not set pending, got %#v", state.Pending)
 	}
 }
 
@@ -631,7 +669,7 @@ func TestRuntimeMemoryProposalReviewBypassesStandaloneTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Text != "请读取 README.md，总结项目。" {
+	if !strings.HasPrefix(resp.Reply.Text, "请读取 README.md，总结项目。") {
 		t.Fatalf("expected standalone task to run, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("cli:test")

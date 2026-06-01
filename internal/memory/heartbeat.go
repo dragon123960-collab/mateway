@@ -22,6 +22,7 @@ type HeartbeatResult struct {
 	Files     int
 	Entries   int
 	Issues    []Issue
+	Distill   DistillHeartbeatResult
 }
 
 type HeartbeatServeInput struct {
@@ -30,6 +31,7 @@ type HeartbeatServeInput struct {
 	IndexPath  string
 	Interval   time.Duration
 	Jobs       []string
+	Model      DistillModel
 	Now        func() time.Time
 	Sleep      func(context.Context, time.Duration) error
 	OnResult   func(HeartbeatResult)
@@ -91,6 +93,14 @@ func ServeHeartbeat(ctx context.Context, input HeartbeatServeInput) error {
 				if err != nil {
 					return err
 				}
+			case "memory_distill":
+				distill, err := RunDistillHeartbeat(ctx, DistillHeartbeatInput{Home: input.Home, MemoryRoot: input.MemoryRoot, Model: input.Model, Now: input.Now})
+				if input.OnResult != nil {
+					input.OnResult(HeartbeatResult{Root: input.MemoryRoot, IndexPath: input.IndexPath, Distill: distill})
+				}
+				if err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("unsupported heartbeat job %q", job)
 			}
@@ -121,10 +131,15 @@ func NormalizeHeartbeatJobs(jobs []string) []string {
 				out = append(out, "lint-index")
 				seen["lint-index"] = true
 			}
+		case "memory_distill", "distill":
+			if !seen["memory_distill"] {
+				out = append(out, "memory_distill")
+				seen["memory_distill"] = true
+			}
 		}
 	}
 	if len(out) == 0 {
-		out = []string{"lint-index"}
+		out = []string{"lint-index", "memory_distill"}
 	}
 	return out
 }

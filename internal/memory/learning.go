@@ -162,30 +162,7 @@ func renderDiary(event LearningEvent, now string) string {
 
 func shouldProposeMemory(event LearningEvent) bool {
 	goal := strings.ToLower(strings.TrimSpace(event.Task.Goal))
-	if containsAny(goal, []string{
-		"记住", "记忆", "长期", "偏好", "规则", "决定", "经验", "流程", "以后",
-		"remember", "memory", "preference", "rule", "decision", "lesson", "workflow", "next time",
-	}) {
-		return true
-	}
-	for _, step := range event.Task.Steps {
-		if step.Status == "accepted" && isMemoryWorthyToolStep(step) {
-			return true
-		}
-	}
-	return false
-}
-
-func isMemoryWorthyToolStep(step session.TaskStep) bool {
-	if step.Evidence != nil && fmt.Sprint(step.Evidence["requires_review"]) == "true" {
-		return false
-	}
-	switch strings.TrimSpace(step.Tool) {
-	case "file.write", "schedule.create":
-		return true
-	default:
-		return false
-	}
+	return HasStrongMemoryCue(goal)
 }
 
 func containsAny(text string, markers []string) bool {
@@ -195,6 +172,14 @@ func containsAny(text string, markers []string) bool {
 		}
 	}
 	return false
+}
+
+func HasStrongMemoryCue(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	return containsAny(text, []string{
+		"记住", "记忆", "长期", "偏好", "规则", "决定", "经验", "流程", "以后",
+		"remember", "memory", "preference", "rule", "decision", "lesson", "workflow", "next time",
+	})
 }
 
 func shouldReflect(event LearningEvent) bool {
