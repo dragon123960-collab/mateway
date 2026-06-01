@@ -2,8 +2,10 @@ package weixin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +15,9 @@ import (
 func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, timeout time.Duration, out io.Writer) (Account, string, error) {
 	cfg = cfg.ResolveSecrets()
 	baseURL := firstNonEmpty(cfg.BaseURL, defaultBaseURL)
+	if strings.TrimSpace(botType) == "" {
+		botType = "3"
+	}
 	client := Client{BaseURL: baseURL}
 	qr, err := client.GetQRCode(ctx, botType)
 	if err != nil {
@@ -20,7 +25,7 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 	}
 	qrCode := strings.TrimSpace(qr.QRCode)
 	if qrCode == "" {
-		return Account{}, "", fmt.Errorf("weixin QR response missing qrcode")
+		return Account{}, "", fmt.Errorf("weixin QR response missing qrcode: ret=%d errcode=%d errmsg=%s qrcode_url=%q", qr.Ret, qr.ErrCode, qr.ErrMsg, qr.QRCodeURL)
 	}
 	qrURL := firstNonEmpty(qr.QRCodeURL, qr.QRCode)
 	if out != nil {
@@ -40,23 +45,25 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 			sleepOrDone(ctx, time.Second)
 			continue
 		}
-		switch strings.TrimSpace(fmt.Sprint(status["status"])) {
-		case "wait":
+		statusText := strings.TrimSpace(fmt.Sprint(status["status"]))
+		errCode := intFromAny(status["errcode"])
+		switch {
+		case statusText == "wait" || errCode == -22:
 			if out != nil {
 				fmt.Fprint(out, ".")
 			}
-		case "scaned":
+		case statusText == "scaned" || errCode == -13:
 			if out != nil {
 				fmt.Fprintln(out, "\n已扫码，请在微信里确认...")
 			}
-		case "scaned_but_redirect":
+		case statusText == "scaned_but_redirect":
 			if host := mapString(status, "redirect_host"); host != "" {
 				currentBaseURL = "https://" + host
 			}
-		case "confirmed":
+		case statusText == "confirmed" || errCode == 0:
 			account := Account{
-				AccountID: firstNonEmpty(mapString(status, "ilink_bot_id"), qr.AccountID),
-				Token:     firstNonEmpty(mapString(status, "bot_token"), qr.Token),
+				AccountID: firstNonEmpty(mapString(status, "ilink_bot_id"), mapString(status, "account_id"), qr.AccountID),
+				Token:     firstNonEmpty(mapString(status, "bot_token"), mapString(status, "token"), qr.Token),
 				BaseURL:   firstNonEmpty(mapString(status, "baseurl"), qr.BaseURL, currentBaseURL),
 				CreatedAt: time.Now().UTC().Format(time.RFC3339),
 			}
@@ -74,7 +81,7 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 				fmt.Fprintln(out, "\n微信连接成功。")
 			}
 			return account, qrURL, nil
-		case "expired":
+		case statusText == "expired":
 			return Account{}, qrURL, fmt.Errorf("weixin QR code expired")
 		}
 		sleepOrDone(ctx, time.Second)
@@ -91,4 +98,23 @@ func mapString(values map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		got, _ := typed.Int64()
+		return int(got)
+	case string:
+		got, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return got
+	default:
+		return 0
+	}
 }

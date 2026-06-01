@@ -117,6 +117,18 @@ func TestMapStringTreatsMissingAndNilAsEmpty(t *testing.T) {
 	}
 }
 
+func TestIntFromAnyHandlesILinkErrcodes(t *testing.T) {
+	if got := intFromAny(float64(-22)); got != -22 {
+		t.Fatalf("float errcode = %d", got)
+	}
+	if got := intFromAny("-13"); got != -13 {
+		t.Fatalf("string errcode = %d", got)
+	}
+	if got := intFromAny(nil); got != 0 {
+		t.Fatalf("nil errcode = %d", got)
+	}
+}
+
 func mustInbound(t *testing.T, raw string) channel.InboundMessage {
 	t.Helper()
 	var msg channel.InboundMessage
