@@ -260,7 +260,9 @@ Authorization: Bearer <MATEWAY_OPENCLAW_COMPAT_TOKEN>
 
 ### Current WeChat Setup Flow
 
-Install the official WeChat ClawBot plugin in the environment that normally runs OpenClaw:
+Important: `@tencent-weixin/openclaw-weixin-cli install` checks for a local OpenClaw installation first. It is an OpenClaw plugin installer, not a standalone Mateway installer. Run it only in an environment where the `openclaw` CLI is already installed and configured.
+
+Install the official WeChat ClawBot plugin in the environment that runs OpenClaw:
 
 ```bash
 npx -y @tencent-weixin/openclaw-weixin-cli@latest install
@@ -268,7 +270,7 @@ npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 
 Scan the QR code shown by the plugin flow in WeChat and enable ClawBot.
 
-To point the plugin at Mateway, configure its backend gateway/base URL to:
+To use Mateway as the backend, configure the plugin/backend gateway URL to:
 
 ```text
 http://127.0.0.1:8790/
