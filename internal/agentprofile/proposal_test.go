@@ -82,4 +82,7 @@ func TestCoreTargetAgentDoesNotProtectAgentSkills(t *testing.T) {
 	if agentID, ok := store.CoreTargetAgent(filepath.Join(workspace, "agents", "ops", "memory.md")); !ok || agentID != "ops" {
 		t.Fatalf("expected ops core profile, got %q %v", agentID, ok)
 	}
+	if agentID, ok := store.CoreTargetAgent(filepath.Join(workspace, "agents", "ops", "soul.md")); !ok || agentID != "ops" {
+		t.Fatalf("expected ops soul core profile, got %q %v", agentID, ok)
+	}
 }

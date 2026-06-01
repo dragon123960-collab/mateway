@@ -16,4 +16,5 @@ type OutboundMessage struct {
 	Text     string
 	Title    string
 	Style    string
+	Locale   string
 }

@@ -170,7 +170,7 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "确认") {
+	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "confirm") {
 		t.Fatalf("expected confirmation response, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("cli:test")
@@ -634,7 +634,7 @@ func TestRuntimeScheduleCreateAsksForTestAndActivatesAfterExecute(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "schedule_review_pending" || !strings.Contains(resp.Reply.Text, "试运行") {
+	if resp.Reply.Style != "schedule_review_pending" || !strings.Contains(resp.Reply.Text, "test") {
 		t.Fatalf("expected schedule test prompt, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("feishu:test-schedule")
@@ -651,11 +651,11 @@ func TestRuntimeScheduleCreateAsksForTestAndActivatesAfterExecute(t *testing.T) 
 	if task.Status != "pending" {
 		t.Fatalf("expected pending schedule, got %#v", task)
 	}
-	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "feishu", SessionKey: "feishu:test-schedule", Text: "执行"})
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "feishu", SessionKey: "feishu:test-schedule", Text: "run"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "completed" || !strings.Contains(resp.Reply.Text, "已添加定时任务") {
+	if resp.Reply.Style != "completed" || !strings.Contains(resp.Reply.Text, "Scheduled task added") {
 		t.Fatalf("expected activated reply, got %#v", resp.Reply)
 	}
 	state, err = rt.Store.Load("feishu:test-schedule")
@@ -710,6 +710,65 @@ func TestRuntimeMemoryProposalReviewCommitFromReply(t *testing.T) {
 	}
 	if len(matches) != 1 {
 		t.Fatalf("expected committed memory file, got %#v", matches)
+	}
+}
+
+func TestRuntimeMemoryProposalReviewCommitFromEnglishReply(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home, Workspace: workspace, Locale: "en-US"},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(readRememberModel{}, rt.Tools)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test-en", Text: "read and remember " + file}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test-en", Text: "save"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !contains(resp.Reply.Text, "Saved to long-term memory") {
+		t.Fatalf("expected English saved reply, got %#v", resp.Reply)
+	}
+}
+
+func TestRuntimeMemoryProposalReviewCommitFromExternalAlias(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	locales := filepath.Join(home, "config", "locales")
+	if err := os.MkdirAll(locales, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locales, "de-DE.yaml"), []byte("aliases.memory_commit:\n  - speichern\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home, Workspace: workspace, Locale: "de-DE", MessageCatalogDir: locales},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(readRememberModel{}, rt.Tools)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test-de", Text: "read and remember " + file}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test-de", Text: "speichern"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !contains(resp.Reply.Text, "Saved to long-term memory") {
+		t.Fatalf("expected saved reply through external alias, got %#v", resp.Reply)
 	}
 }
 
@@ -850,7 +909,7 @@ func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "需要确认") {
+	if !contains(resp.Reply.Text, "confirm") {
 		t.Fatalf("expected tool confirmation first, got %#v", resp.Reply)
 	}
 	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
@@ -989,7 +1048,7 @@ func TestRuntimeDangerousTerminalCommandRequiresConfirmationEvenWhenRiskyAllowed
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "破坏性") {
+	if !contains(resp.Reply.Text, "destructive") {
 		t.Fatalf("expected dangerous command confirmation, got %#v", resp.Reply)
 	}
 }
@@ -1166,6 +1225,9 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 	if err := os.WriteFile(filepath.Join(agentDir, "user.md"), []byte("默认使用中文。"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(agentDir, "soul.md"), []byte("Mission: be steady and practical."), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(agentDir, "memory.md"), []byte("用户偏好：回答先给结论。"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1182,7 +1244,7 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 		Search:   config.SearchConfig{ProviderOrder: []string{"searxng"}},
 	}
 	text := buildRuntimeSystemContext(cfg, config.AgentProfileConfig{ID: "main"})
-	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
+	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
 		if !contains(text, want) {
 			t.Fatalf("context missing %q:\n%s", want, text)
 		}
@@ -1262,7 +1324,7 @@ func TestRuntimeToolPolicyHookFailureFallsBackToLaterProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "确认") {
+	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "confirm") {
 		t.Fatalf("expected later policy provider to require confirmation, got %#v", resp.Reply)
 	}
 	data, err := os.ReadFile(resp.TracePath)
@@ -1546,7 +1608,10 @@ func (readRememberModel) Next(_ context.Context, ctx agentcore.Context) (agentco
 	if lastConversationMessageForTest(ctx.Messages).Role == agentcore.RoleTool {
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "总结完成"}, nil
 	}
-	path := strings.TrimSpace(strings.TrimPrefix(lastUserContent(ctx.Messages), "请读取并记住 "))
+	path := strings.TrimSpace(lastUserContent(ctx.Messages))
+	path = strings.TrimPrefix(path, "请读取并记住 ")
+	path = strings.TrimPrefix(path, "read and remember ")
+	path = strings.TrimSpace(path)
 	return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 		ID:   "call_1",
 		Name: "file.read",

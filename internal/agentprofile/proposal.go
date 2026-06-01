@@ -17,9 +17,14 @@ const MaxPromptContextBytes = 2048
 
 var coreProfileFiles = map[string]bool{
 	"agent.md":  true,
+	"soul.md":   true,
 	"user.md":   true,
 	"tools.md":  true,
 	"memory.md": true,
+}
+
+func CoreProfileFileNames() []string {
+	return []string{"agent.md", "soul.md", "user.md", "tools.md", "memory.md"}
 }
 
 type Store struct {

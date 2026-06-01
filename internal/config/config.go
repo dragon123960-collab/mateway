@@ -107,9 +107,11 @@ func DefaultRoot() Root {
 }
 
 type AppConfig struct {
-	Name      string `yaml:"name"`
-	Home      string `yaml:"home"`
-	Workspace string `yaml:"workspace"`
+	Name              string `yaml:"name"`
+	Home              string `yaml:"home"`
+	Workspace         string `yaml:"workspace"`
+	Locale            string `yaml:"locale"`
+	MessageCatalogDir string `yaml:"message_catalog_dir"`
 }
 
 type SecurityConfig struct {
@@ -389,6 +391,9 @@ func (r *Root) applyDefaults() {
 	defaults := DefaultRoot()
 	if strings.TrimSpace(r.App.Name) == "" {
 		r.App.Name = defaults.App.Name
+	}
+	if strings.TrimSpace(r.App.Locale) == "" {
+		r.App.Locale = "auto"
 	}
 	if strings.TrimSpace(r.Model.Default) == "" {
 		r.Model.Default = defaults.Model.Default

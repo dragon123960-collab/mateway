@@ -142,6 +142,23 @@ func TestRenderReplyMessageDisablesApprovalButtonsByDefault(t *testing.T) {
 	}
 }
 
+func TestRenderReplyMessageUsesEnglishLocale(t *testing.T) {
+	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "approval_pending",
+		Locale:   "en-US",
+		Text:     "This operation needs confirmation.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "Mateway Waiting for Confirmation") || !strings.Contains(content, "confirm") || !strings.Contains(content, "cancel") {
+		t.Fatalf("expected English approval card, got %s", content)
+	}
+}
+
 func TestNormalizeCardActionMapsToConfirmMessage(t *testing.T) {
 	openMessageID := "om_card"
 	openChatID := "oc_card"

@@ -42,7 +42,7 @@ task / trace / tool evidence
   -> safe-read injection
 ```
 
-The agent can propose a durable memory after a useful task. The user can reply `保存` to commit it or `忽略` to reject it. Under the hood this mirrors a lightweight Git flow:
+The agent can propose a durable memory after a useful task. The user can reply `save` to commit it or `ignore` to reject it. Chinese aliases such as `保存` and `忽略` are also supported. Under the hood this mirrors a lightweight Git flow:
 
 | Memory step | Git-like idea |
 |---|---|
@@ -59,14 +59,14 @@ Long-term memory is stored as Markdown with YAML frontmatter under `~/.mateway/w
 After task completion, `observe_hook` records task steps and may generate a memory proposal. The proposal is shown in the final answer as a human decision:
 
 ```text
-保存到长期记忆:
+Save to long-term memory:
 mateway memory proposal commit <proposal_id>
 
-忽略这条候选:
+Ignore this candidate:
 mateway memory proposal reject <proposal_id>
 ```
 
-In chat channels, the user can also reply `保存` or `忽略`. Mateway stores that as a pending `memory_proposal_review`, so a short reply is interpreted by runtime state, not guessed by the model.
+In chat channels, the user can also reply `save` / `ignore` or `保存` / `忽略`. Mateway stores that as a pending `memory_proposal_review`, so a short reply is interpreted by runtime state, not guessed by the model.
 
 ### 3. Hook-first Runtime
 The core loop stays small. Extension points are explicit:
@@ -113,6 +113,24 @@ Mateway discovers local `SKILL.md` files and injects concise guidance into the r
 - `software-install`
 - `fresh-search`
 - `source-evaluation`
+
+### 7. Internationalization Boundary
+
+Mateway keeps internal machine interfaces in English: config keys, trace keys, audit events, pending kinds, JSONL evidence, tool names, and machine-readable CLI output are not localized. Human-facing runtime prompts use a small message catalog.
+
+Default config uses `app.locale: auto`: Chinese user text receives Chinese prompts; other text receives English prompts. You can force a language with `app.locale: en-US` or `app.locale: zh-CN`. Additional locales can be added through `app.message_catalog_dir` by placing files such as `de-DE.yaml` or `fr-FR.yaml` with stable message keys and `aliases.<action>` entries.
+
+Review aliases are locale-independent. For example, tool approval accepts `confirm` / `cancel` and `确认` / `取消`; memory review accepts `save` / `ignore` and `保存` / `忽略`; schedule review accepts `run` / `cancel` and `执行` / `取消`.
+
+Example catalog fragment:
+
+```yaml
+approval.confirm.generic: Bitte bestätigen, um fortzufahren. Antworten Sie mit "confirm" oder "cancel".
+aliases.confirm:
+  - bestätigen
+aliases.memory_commit:
+  - speichern
+```
 - `connector-gap`
 
 Skills are guidance, not executable capabilities by themselves. If a task needs a real action, the agent must still use an actual tool or script and show evidence.
@@ -400,7 +418,9 @@ Mateway does not yet include a multi-agent supervisor, subagent spawning, or DAG
 - `workspace/agents/<agent_id>/skills/`
 - `workspace/memory/agents/<agent_id>/`
 
-This means different channels or session namespaces can select different agent identities, prompt files, skill overrides, and memory scopes while still sharing the same small AgentCore runtime. The next development stage productizes this with agent list/report/create/bind commands, profile linting, and multi-profile acceptance tests.
+Each agent profile uses the same core prompt-facing files: `agent.md`, `soul.md`, `user.md`, `tools.md`, and `memory.md`. New profiles created with `mateway agent create` use English baseline templates and do not overwrite existing files.
+
+This means different channels or session namespaces can select different agent identities, prompt files, skill overrides, and memory scopes while still sharing the same small AgentCore runtime.
 
 The boundary is deliberate: profiles and bindings are in scope; autonomous multi-agent orchestration is not part of the current release.
 

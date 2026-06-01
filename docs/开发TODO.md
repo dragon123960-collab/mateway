@@ -26,7 +26,7 @@ AgentCore / Tool / Trace / Memory / Skill / Script / Schedule / Multi-Agent Prof
 
 ### N1 Internationalization / English-first Productization
 
-状态：下一阶段优先
+状态：第一轮已实现，后续继续补全更多文案
 
 问题：
 
@@ -42,13 +42,19 @@ AgentCore / Tool / Trace / Memory / Skill / Script / Schedule / Multi-Agent Prof
 - 内部标识、trace key、config key、CLI machine output 保持英文。
 - 用户可见自然语言进入可切换 message catalog，不散落在 runtime 逻辑里。
 
-待开发：
+已完成：
 
-- 增加配置：`app.locale: auto | zh-CN | en-US`、`app.default_user_language: auto | zh | en`。
-- 抽出 runtime user-facing messages：approval pending、memory proposal review、agent profile proposal review、schedule review、friendly runtime errors、`/new` reply。
-- 确认词做双语兼容：`确认/继续/yes/y/ok`、`取消/放弃/no/n/cancel`、`保存/save/commit`、`忽略/ignore/reject`。
-- README 英文版避免只展示中文回复词；所有聊天确认示例同时给出 English aliases。
-- 测试覆盖 `en-US` locale 下的 pending prompt、memory proposal prompt、schedule prompt。
+- 增加配置：`app.locale: auto | zh-CN | en-US`、`app.message_catalog_dir`。
+- 新增内置 `en-US` / `zh-CN` message catalog 和 alias catalog，并支持外部 YAML catalog 覆盖或新增 locale / aliases。
+- 首批迁移 approval pending、memory proposal review、agent profile proposal review、schedule review 和 Feishu card 文案。
+- 确认词做 catalog 化兼容：内置中英文 aliases，也支持外部 `aliases.confirm`、`aliases.memory_commit` 等扩展。
+- README 英文版改为英文操作词优先，并说明中文 aliases。
+- 测试覆盖 `en-US` locale 下的 memory proposal、schedule prompt、Feishu card 和 catalog fallback。
+
+后续：
+
+- 继续抽出 friendly runtime errors、`/new` reply、proposal nudge 等剩余用户可见文案。
+- 按需补 `de-DE.yaml`、`fr-FR.yaml` 示例语言包。
 
 验收：
 
@@ -116,7 +122,7 @@ AgentCore / Tool / Trace / Memory / Skill / Script / Schedule / Multi-Agent Prof
 - `config.agents.default`
 - `config.agents.profiles[]`
 - `config.agents.bindings[]`
-- `workspace/agents/<agent_id>/{agent,user,tools,memory}.md`
+- `workspace/agents/<agent_id>/{agent,soul,user,tools,memory}.md`
 - `workspace/agents/<agent_id>/skills/`
 - `workspace/memory/agents/<agent_id>/`
 - `AgentPool` 按 session/channel binding 选择 profile，并 clone agent 避免 session 状态串线。
@@ -125,7 +131,7 @@ AgentCore / Tool / Trace / Memory / Skill / Script / Schedule / Multi-Agent Prof
 
 - `mateway agent list`
 - `mateway agent report <agent_id>`
-- `mateway agent create <agent_id>`，只生成 profile 文件和目录，不引入复杂路由
+- `mateway agent create <agent_id>`，生成 `agent.md/soul.md/user.md/tools.md/memory.md` 和目录，不引入复杂路由
 - `mateway agent bind` / `unbind`，编辑 `config.agents.bindings[]`
 - agent profile lint：目录、prompt 文件、memory root、model fallback 基础检查
 - 多 agent 绑定测试：channel/peer binding 选择正确 profile

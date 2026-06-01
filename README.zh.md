@@ -71,6 +71,8 @@ mateway memory proposal reject <proposal_id>
 
 在聊天入口里，用户也可以直接回复 `保存` 或 `忽略`。Mateway 会把它存成 `memory_proposal_review` pending，所以这种短回复由运行时状态解释，而不是让模型猜。
 
+英文别名同样可用：memory review 可以回复 `save` / `ignore`，工具确认可以回复 `confirm` / `cancel`，定时任务试运行可以回复 `run` / `cancel`。这些别名不依赖当前界面语言。
+
 ### 3. Hook-first Runtime
 
 核心循环保持小而清晰，扩展点显式存在：
@@ -412,6 +414,8 @@ Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router�
 - `workspace/agents/<agent_id>/`
 - `workspace/agents/<agent_id>/skills/`
 - `workspace/memory/agents/<agent_id>/`
+
+每个 agent profile 使用同一组 core prompt 文件：`agent.md`、`soul.md`、`user.md`、`tools.md`、`memory.md`。`mateway agent create` 新建 profile 时会生成英文基线模板，且不会覆盖已有文件。
 
 这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。
 

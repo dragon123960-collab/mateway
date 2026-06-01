@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/dongping/mateway/internal/agenttemplate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -15,6 +16,7 @@ type templateFile struct {
 
 func EnsureDefaultConfigFiles(home string) error {
 	loader := NewLoader(home)
+	mainAgentFiles := agenttemplate.CoreFiles(agenttemplate.Profile{ID: "main", Name: "Main Assistant"})
 	files := []templateFile{
 		{RelPath: "README.md", Content: configReadmeTemplate},
 		{RelPath: "config.yaml", Content: configYAMLTemplate},
@@ -29,11 +31,11 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("channels", "_README.md"), Content: channelsReadmeTemplate},
 		{RelPath: filepath.Join("channels", "feishu.yaml"), Content: feishuYAMLTemplate},
 		{RelPath: filepath.Join("channels", "feishu.sample.yaml"), Content: feishuSampleYAMLTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "agent.md"), Content: agentMainTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "soul.md"), Content: agentSoulTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "user.md"), Content: agentUserTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "tools.md"), Content: agentToolsTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "memory.md"), Content: agentMemoryTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "agent.md"), Content: mainAgentFiles["agent.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "soul.md"), Content: mainAgentFiles["soul.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "user.md"), Content: mainAgentFiles["user.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "tools.md"), Content: mainAgentFiles["tools.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "memory.md"), Content: mainAgentFiles["memory.md"]},
 		{RelPath: filepath.Join("..", "workspace", "agents", "main", "skills", "README.md"), Content: agentSkillsReadmeTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "software-install", "SKILL.md"), Content: skillSoftwareInstallTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "fresh-search", "SKILL.md"), Content: skillFreshSearchTemplate},
@@ -165,6 +167,8 @@ const configYAMLTemplate = `app:
   name: mateway
   home: ""
   workspace: ""
+  locale: auto
+  message_catalog_dir: ""
 
 model:
   default: minimax
@@ -490,60 +494,6 @@ cp models/openai-gpt54-mini.sample.yaml models/openai-gpt54-mini.yaml
 cp models/local-mlx.sample.yaml models/local-mlx.yaml
 cp channels/feishu.sample.yaml channels/feishu.yaml
 ` + "```" + `
-`
-
-const agentMainTemplate = `# main agent
-
-Default behavior:
-
-- Use the user's language unless they request another language.
-- Do not dump raw information without synthesis.
-- Help the user filter, summarize, compare, and decide.
-- When current information matters, prefer official and up-to-date sources.
-- If information may be stale, say so clearly.
-- If a tool call fails, do not invent the result.
-`
-
-const agentSoulTemplate = `# main soul
-
-You are Mateway, a practical personal work assistant agent.
-
-Core objectives:
-
-- Help the user complete concrete work.
-- Organize information into clear, useful conclusions.
-- Use tools safely and only when they materially help.
-- Answer in the user's language unless the user requests another language.
-`
-
-const agentUserTemplate = `# main user
-
-User profile:
-
-- No stable user preferences have been recorded yet.
-- Record preferences only when they are explicit, durable, and useful for future tasks.
-- Keep user preferences human-readable and easy to edit.
-`
-
-const agentToolsTemplate = `# main tools
-
-Tool-use rules:
-
-1. Plan before using tools.
-2. Do not expose raw tool calls, internal arguments, or implementation traces to the user.
-3. Tool results will be supplied by the system.
-4. Final answers must be structured, readable, and written in the user's language unless requested otherwise.
-`
-
-const agentMemoryTemplate = `# main memory
-
-Prompt-facing memory summary for this agent.
-
-Keep this file short because it may be injected into model context.
-
-Use it only for stable, user-approved facts, compact preferences, or links to curated memory wiki pages.
-
-Detailed long-term memory belongs under workspace/memory/agents/main/.
 `
 
 const agentSkillsReadmeTemplate = `# main agent skills

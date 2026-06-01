@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/dongping/mateway/internal/agenttemplate"
 	"github.com/dongping/mateway/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -84,7 +85,7 @@ func (m Manager) Report(agentID string) (AgentReport, error) {
 		ModelDefault: profile.Model.Default,
 		Bindings:     bindingsFor(m.Config, profile.ID),
 	}
-	for _, name := range []string{"agent.md", "user.md", "tools.md", "memory.md"} {
+	for _, name := range CoreProfileFileNames() {
 		report.PromptFiles = append(report.PromptFiles, statFile(filepath.Join(agentDir, name)))
 	}
 	report.Skills = countSkillDirs(filepath.Join(agentDir, "skills"))
@@ -237,12 +238,7 @@ func defaultHeartbeat(cfg *config.Root) config.HeartbeatConfig {
 
 func ensureAgentFiles(workspace string, profile config.AgentProfileConfig) error {
 	agentDir := filepath.Join(workspace, "agents", profile.ID)
-	files := map[string]string{
-		"agent.md":  "# " + profile.Name + "\n\nDescribe this agent's role, tone, and operating rules.\n",
-		"user.md":   "# User Context\n\nAdd user preferences specific to this agent.\n",
-		"tools.md":  "# Tool Guidance\n\nAdd tool usage boundaries specific to this agent.\n",
-		"memory.md": "# Prompt-facing Memory\n\nKeep only short, stable facts worth injecting every turn.\n",
-	}
+	files := agenttemplate.CoreFiles(agenttemplate.Profile{ID: profile.ID, Name: profile.Name})
 	for name, content := range files {
 		path := filepath.Join(agentDir, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -314,7 +310,11 @@ func lintReport(report AgentReport, cfg *config.Root) []Issue {
 	var issues []Issue
 	for _, file := range report.PromptFiles {
 		if !file.Exists {
-			issues = append(issues, Issue{Severity: "error", Code: "missing_prompt_file", Message: file.Path})
+			severity := "error"
+			if filepath.Base(file.Path) == "soul.md" {
+				severity = "warning"
+			}
+			issues = append(issues, Issue{Severity: severity, Code: "missing_prompt_file", Message: file.Path})
 		}
 	}
 	if strings.TrimSpace(report.ModelDefault) == "" {

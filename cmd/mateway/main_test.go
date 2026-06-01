@@ -573,8 +573,10 @@ func TestAgentCommandsCreateBindReport(t *testing.T) {
 	if err := run([]string{"agent", "create", "ops", "--name", "Ops Agent"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(home, "workspace", "agents", "ops", "agent.md")); err != nil {
-		t.Fatalf("missing agent files: %v", err)
+	for _, name := range []string{"agent.md", "soul.md", "user.md", "tools.md", "memory.md"} {
+		if _, err := os.Stat(filepath.Join(home, "workspace", "agents", "ops", name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
 	}
 	if err := run([]string{"agent", "bind", "--channel", "feishu", "--peer-id", "chat-ops", "ops"}); err != nil {
 		t.Fatal(err)

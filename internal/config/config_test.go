@@ -135,6 +135,17 @@ func TestEnsureDefaultConfigFilesCreatesSamplesAndRealConfig(t *testing.T) {
 			t.Fatalf("expected %s to exist: %v", path, err)
 		}
 	}
+	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "agent.md"), []string{"# Main Assistant agent", "## Operating Rules", "Do not claim a tool"})
+	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "soul.md"), []string{"# Main Assistant soul", "You are Main Assistant", "## Boundaries"})
+	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "user.md"), []string{"No stable user preferences recorded yet.", "## Communication Preferences", "Do not store passwords"})
+}
+
+func TestDefaultConfigLocale(t *testing.T) {
+	cfg := DefaultRoot()
+	cfg.NormalizeForUse()
+	if cfg.App.Locale != "auto" {
+		t.Fatalf("expected locale auto, got %q", cfg.App.Locale)
+	}
 }
 
 func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {
@@ -172,6 +183,24 @@ func TestEnsureDefaultConfigFilesPreservesExistingConfigValues(t *testing.T) {
 	text := string(data)
 	if !strings.Contains(text, "name: custom") {
 		t.Fatalf("expected existing config value to stay untouched, got %q", text)
+	}
+}
+
+func TestEnsureDefaultConfigFilesPreservesExistingAgentProfileFiles(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "workspace", "agents", "main", "user.md")
+	writeFile(t, target, "custom user profile")
+
+	if err := EnsureDefaultConfigFiles(home); err != nil {
+		t.Fatalf("ensure default config files: %v", err)
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read user profile: %v", err)
+	}
+	if string(data) != "custom user profile\n" {
+		t.Fatalf("expected custom profile preserved, got %q", string(data))
 	}
 }
 
@@ -267,5 +296,22 @@ func writeFile(t *testing.T, path string, text string) {
 	}
 	if err := os.WriteFile(path, []byte(strings.TrimSpace(text)+"\n"), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertPromptTemplate(t *testing.T, path string, want []string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if len(data) > 2048 {
+		t.Fatalf("expected %s to stay within prompt context limit, got %d bytes", path, len(data))
+	}
+	text := string(data)
+	for _, part := range want {
+		if !strings.Contains(text, part) {
+			t.Fatalf("expected %s to contain %q:\n%s", path, part, text)
+		}
 	}
 }
