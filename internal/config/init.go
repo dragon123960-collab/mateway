@@ -190,6 +190,12 @@ memory:
     - org_knowledge
     - long_memory
     - skill_candidate
+  proposal_nudge:
+    enabled: true
+    interval: 24h
+    channels:
+      - cli
+    max_proposals: 3
 
 learning:
   enabled: true

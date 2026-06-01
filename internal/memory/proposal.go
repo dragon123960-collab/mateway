@@ -107,6 +107,14 @@ func (s ProposalStore) List() ([]Proposal, error) {
 	return proposals, nil
 }
 
+func (s ProposalStore) Get(id string) (Proposal, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Proposal{}, fmt.Errorf("proposal id is required")
+	}
+	return readProposal(filepath.Join(s.Home, "observe", "proposals", id+".md"))
+}
+
 func (s ProposalStore) Reject(id, reason string) (Proposal, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {

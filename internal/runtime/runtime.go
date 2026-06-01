@@ -260,7 +260,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
 	if learningResult == nil || learningResult.Proposal == nil {
-		if nudge, err := memory.PendingProposalNudge(rt.home(), state.Key, time.Now()); err == nil && nudge != "" {
+		if nudge, err := memory.PendingProposalNudge(rt.home(), state.Key, time.Now(), rt.memoryProposalNudgeOptions(msg)); err == nil && nudge != "" {
 			text = strings.TrimSpace(text) + "\n\n" + nudge
 			_ = trace.write(map[string]any{"type": "memory_proposal_nudge", "text": nudge})
 		}
@@ -277,6 +277,37 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text})
 	return resp, nil
+}
+
+func (rt Runtime) memoryProposalNudgeOptions(msg channel.InboundMessage) memory.ProposalNudgeOptions {
+	options := memory.ProposalNudgeOptions{
+		Channel:      msg.Channel,
+		Channels:     []string{"cli"},
+		Interval:     24 * time.Hour,
+		MaxProposals: 3,
+	}
+	if rt.Config == nil {
+		return options
+	}
+	cfg := rt.Config.Memory.ProposalNudge
+	if !cfg.EnabledValue() {
+		if cfg.Enabled == nil && strings.TrimSpace(cfg.Interval) == "" && len(cfg.Channels) == 0 && cfg.MaxProposals == 0 {
+			return options
+		}
+		options.Channels = nil
+		options.Channels = []string{"__disabled__"}
+		return options
+	}
+	if len(cfg.Channels) > 0 {
+		options.Channels = cfg.Channels
+	}
+	if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Interval)); err == nil && parsed > 0 {
+		options.Interval = parsed
+	}
+	if cfg.MaxProposals > 0 {
+		options.MaxProposals = cfg.MaxProposals
+	}
+	return options
 }
 
 func (rt Runtime) saveState(state *session.State, trace *traceRecorder) error {

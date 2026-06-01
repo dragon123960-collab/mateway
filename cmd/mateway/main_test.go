@@ -275,6 +275,28 @@ func TestMemoryProposalCommitCommandWritesMemory(t *testing.T) {
 	}
 }
 
+func TestMemoryProposalShowCommandPrintsDetail(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "proposal", "create", "--title", "README Inspection", "--body", "Use file.read for README.", "--source", "trace:abc", "--confidence", "medium"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.TrimSuffix(entries[0].Name(), filepath.Ext(entries[0].Name()))
+	out := captureStdout(t, func() error { return run([]string{"memory", "proposal", "show", id}) })
+	for _, want := range []string{"proposal: " + id, "confidence: medium", "sources:", "why:", "Use file.read for README.", "actions:", "mateway memory proposal commit " + id} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in proposal detail:\n%s", want, out)
+		}
+	}
+}
+
 func TestAgentProfileProposalCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
@@ -610,6 +632,28 @@ func TestSecretCommandsStoreAndListWithoutValue(t *testing.T) {
 	out = captureStdout(t, func() error { return run([]string{"secret", "get", "mail.smtp_pass"}) })
 	if strings.TrimSpace(out) != "supersecret123" {
 		t.Fatalf("unexpected get output %q", out)
+	}
+}
+
+func TestChannelListReadsRuntimeChannelConfigs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	channelsDir := filepath.Join(home, "config", "channels")
+	writeMainTestFile(t, filepath.Join(channelsDir, "feishu.yaml"), "feishu:\n  enabled: false\n")
+	writeMainTestFile(t, filepath.Join(channelsDir, "weixin.yaml"), "weixin:\n  enabled: true\n")
+	writeMainTestFile(t, filepath.Join(channelsDir, "telegram.sample.yaml"), "telegram:\n  enabled: true\n")
+	out := captureStdout(t, func() error { return run([]string{"channel", "list"}) })
+	if !strings.Contains(out, "feishu") || !strings.Contains(out, "false") {
+		t.Fatalf("expected feishu disabled in channel list:\n%s", out)
+	}
+	if !strings.Contains(out, "weixin") || !strings.Contains(out, "true") {
+		t.Fatalf("expected weixin enabled in channel list:\n%s", out)
+	}
+	if strings.Contains(out, "telegram") {
+		t.Fatalf("sample channel should be skipped:\n%s", out)
 	}
 }
 

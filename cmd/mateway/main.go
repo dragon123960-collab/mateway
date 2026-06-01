@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentprofile"
@@ -24,6 +26,7 @@ import (
 	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -135,6 +138,8 @@ func run(args []string) error {
 		return runSkill(args[1:])
 	case "secret":
 		return runSecret(args[1:])
+	case "channel":
+		return runChannel(args[1:])
 	case "gateway":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
@@ -167,6 +172,91 @@ func run(args []string) error {
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+type channelConfigInfo struct {
+	ID      string
+	Enabled bool
+	Path    string
+}
+
+func runChannel(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway channel <list>")
+	}
+	switch args[0] {
+	case "list":
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		channels, err := listChannelConfigs(filepath.Join(cfg.App.Home, "config", "channels"))
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tENABLED\tCONFIG")
+		for _, ch := range channels {
+			fmt.Fprintf(tw, "%s\t%t\t%s\n", ch.ID, ch.Enabled, ch.Path)
+		}
+		return tw.Flush()
+	default:
+		return fmt.Errorf("usage: mateway channel <list>")
+	}
+}
+
+func listChannelConfigs(dir string) ([]channelConfigInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read channel config dir: %w", err)
+	}
+	var channels []channelConfigInfo
+	for _, entry := range entries {
+		name := entry.Name()
+		if shouldSkipRuntimeConfigFile(entry, name) {
+			continue
+		}
+		id := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".yaml")
+		path := filepath.Join(dir, name)
+		enabled, err := readChannelEnabled(path, id)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, channelConfigInfo{ID: id, Enabled: enabled, Path: path})
+	}
+	sort.Slice(channels, func(i, j int) bool {
+		return channels[i].ID < channels[j].ID
+	})
+	return channels, nil
+}
+
+func shouldSkipRuntimeConfigFile(entry os.DirEntry, name string) bool {
+	if entry.IsDir() {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" || strings.HasPrefix(lower, "_") || !strings.HasSuffix(lower, ".yaml") {
+		return true
+	}
+	base := strings.TrimSuffix(lower, ".yaml")
+	return strings.HasSuffix(base, ".sample") || strings.HasSuffix(base, ".example")
+}
+
+func readChannelEnabled(path, id string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	var root map[string]map[string]any
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return false, fmt.Errorf("parse %s: %w", path, err)
+	}
+	values := root[id]
+	if values == nil {
+		return false, nil
+	}
+	enabled, _ := values["enabled"].(bool)
+	return enabled, nil
 }
 
 func runWeixin(args []string) error {
@@ -1568,7 +1658,7 @@ func runMemoryDistill(args []string) error {
 
 func runMemoryProposal(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
+		return fmt.Errorf("usage: mateway memory proposal <create|list|show|reject|commit>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -1611,6 +1701,16 @@ func runMemoryProposal(args []string) error {
 			fmt.Printf("- %s status=%s type=%s scope=%s title=%s\n", proposal.ID, proposal.Status, proposal.Type, proposal.Scope, proposal.Title)
 		}
 		return nil
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway memory proposal show <proposal_id>")
+		}
+		proposal, err := store.Get(args[1])
+		if err != nil {
+			return err
+		}
+		printMemoryProposalDetail(proposal)
+		return nil
 	case "reject":
 		fs := flag.NewFlagSet("mateway memory proposal reject", flag.ContinueOnError)
 		reason := fs.String("reason", "", "rejection reason")
@@ -1641,8 +1741,54 @@ func runMemoryProposal(args []string) error {
 		fmt.Println("memory:", target)
 		return nil
 	default:
-		return fmt.Errorf("usage: mateway memory proposal <create|list|reject|commit>")
+		return fmt.Errorf("usage: mateway memory proposal <create|list|show|reject|commit>")
 	}
+}
+
+func printMemoryProposalDetail(proposal memory.Proposal) {
+	fmt.Println("proposal:", proposal.ID)
+	fmt.Println("status:", proposal.Status)
+	fmt.Println("type:", proposal.Type)
+	fmt.Println("scope:", proposal.Scope)
+	fmt.Println("title:", proposal.Title)
+	fmt.Println("confidence:", proposal.Confidence)
+	if proposal.CreatedAt != "" {
+		fmt.Println("created_at:", proposal.CreatedAt)
+	}
+	if proposal.UpdatedAt != "" {
+		fmt.Println("updated_at:", proposal.UpdatedAt)
+	}
+	if len(proposal.Sources) > 0 {
+		fmt.Println("sources:")
+		for _, source := range proposal.Sources {
+			fmt.Println("-", source)
+		}
+	}
+	if summary := firstContentLine(proposal.Body, proposal.Title); summary != "" {
+		fmt.Println()
+		fmt.Println("why:")
+		fmt.Println(summary)
+	}
+	fmt.Println()
+	fmt.Println("body:")
+	fmt.Println(strings.TrimSpace(proposal.Body))
+	fmt.Println()
+	fmt.Println("actions:")
+	fmt.Printf("commit: mateway memory proposal commit %s\n", proposal.ID)
+	fmt.Printf("reject: mateway memory proposal reject %s --reason \"...\"\n", proposal.ID)
+}
+
+func firstContentLine(body, title string) string {
+	body = strings.TrimSpace(body)
+	body = strings.TrimPrefix(body, "# "+strings.TrimSpace(title))
+	body = strings.TrimSpace(body)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
+		if line != "" && !strings.HasPrefix(line, "#") {
+			return line
+		}
+	}
+	return ""
 }
 
 func runAgentProfile(args []string) error {
@@ -2053,6 +2199,7 @@ Usage:
   mateway memory search [--root <path>] [--scope <scope>] [--type <type>] <query>
   mateway memory proposal create --title <title> --body <body> [--source trace:id]
   mateway memory proposal list
+  mateway memory proposal show <proposal_id>
   mateway memory proposal reject <proposal_id> [--reason <text>]
   mateway memory proposal commit <proposal_id>
   mateway agent list
@@ -2095,6 +2242,7 @@ Usage:
   mateway secret get <id>
   mateway secret list
   mateway secret delete <id>
+  mateway channel list
   mateway weixin login [--timeout <duration>]
   mateway weixin enable [account_id]
   mateway doctor

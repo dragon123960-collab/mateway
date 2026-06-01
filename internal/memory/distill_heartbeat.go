@@ -37,6 +37,13 @@ type DistillHeartbeatResult struct {
 	ProposalIDs []string
 }
 
+type ProposalNudgeOptions struct {
+	Channel      string
+	Channels     []string
+	Interval     time.Duration
+	MaxProposals int
+}
+
 type distillState struct {
 	Processed map[string]string `json:"processed"`
 	LastNudge map[string]string `json:"last_nudge,omitempty"`
@@ -366,38 +373,126 @@ func writeDistillState(path string, state distillState, now time.Time) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-func PendingProposalNudge(home, sessionKey string, now time.Time) (string, error) {
+func PendingProposalNudge(home, sessionKey string, now time.Time, options ProposalNudgeOptions) (string, error) {
 	home = defaultString(home, ".mateway")
 	sessionKey = strings.TrimSpace(sessionKey)
 	if sessionKey == "" {
 		sessionKey = "default"
+	}
+	if !channelAllowed(options.Channel, options.Channels) {
+		return "", nil
 	}
 	store := ProposalStore{Home: home}
 	proposals, err := store.List()
 	if err != nil {
 		return "", err
 	}
-	count := 0
+	var pending []Proposal
 	for _, proposal := range proposals {
 		if proposal.Status == "proposed" {
-			count++
+			pending = append(pending, proposal)
 		}
 	}
-	if count == 0 {
+	if len(pending) == 0 {
 		return "", nil
 	}
 	statePath := filepath.Join(home, "indexes", "memory_distill_state.json")
 	state := readDistillState(statePath)
-	day := now.Format("2006-01-02")
-	key := strings.ReplaceAll(strings.ReplaceAll(sessionKey, "/", "_"), ":", "_")
-	if state.LastNudge[key] == day {
-		return "", nil
+	interval := options.Interval
+	if interval <= 0 {
+		interval = 24 * time.Hour
 	}
-	state.LastNudge[key] = day
+	key := strings.ReplaceAll(strings.ReplaceAll(sessionKey, "/", "_"), ":", "_")
+	if last := parseNudgeTime(state.LastNudge[key]); !last.IsZero() {
+		if now.Sub(last) < interval {
+			return "", nil
+		}
+	}
+	state.LastNudge[key] = now.Format(time.RFC3339)
 	if err := writeDistillState(statePath, state, now); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("有 %d 条长期记忆候选待审核：`mateway memory proposal list`", count), nil
+	maxProposals := options.MaxProposals
+	if maxProposals <= 0 {
+		maxProposals = 3
+	}
+	return renderProposalNudge(pending, maxProposals), nil
+}
+
+func channelAllowed(channel string, allowed []string) bool {
+	channel = strings.TrimSpace(strings.ToLower(channel))
+	if channel == "" {
+		channel = "cli"
+	}
+	if len(allowed) == 0 {
+		allowed = []string{"cli"}
+	}
+	for _, value := range allowed {
+		if strings.EqualFold(strings.TrimSpace(value), channel) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseNudgeTime(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed
+	}
+	if parsed, err := time.Parse("2006-01-02", value); err == nil {
+		return parsed
+	}
+	return time.Time{}
+}
+
+func renderProposalNudge(proposals []Proposal, maxProposals int) string {
+	if maxProposals > len(proposals) {
+		maxProposals = len(proposals)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "有 %d 条长期记忆候选待审核，我先列 %d 条最值得看的：", len(proposals), maxProposals)
+	for i := 0; i < maxProposals; i++ {
+		proposal := proposals[i]
+		fmt.Fprintf(&b, "\n\n%d. %s %s\n", i+1, proposal.ID, proposal.Title)
+		fmt.Fprintf(&b, "   类型：%s / %s，置信度：%s\n", defaultString(proposal.Type, "experience"), defaultString(proposal.Scope, "agent"), defaultString(proposal.Confidence, "low"))
+		if value := proposalReasonSummary(proposal); value != "" {
+			fmt.Fprintf(&b, "   价值：%s\n", value)
+		}
+		if len(proposal.Sources) > 0 {
+			fmt.Fprintf(&b, "   来源：%s\n", summarizeNudgeText(strings.Join(proposal.Sources, ", "), 90))
+		}
+		fmt.Fprintf(&b, "   查看：`mateway memory proposal show %s`", proposal.ID)
+	}
+	if rest := len(proposals) - maxProposals; rest > 0 {
+		fmt.Fprintf(&b, "\n\n还有 %d 条未展示。查看全部：`mateway memory proposal list`", rest)
+	}
+	return b.String()
+}
+
+func proposalReasonSummary(proposal Proposal) string {
+	body := strings.TrimSpace(proposal.Body)
+	body = strings.TrimPrefix(body, "# "+strings.TrimSpace(proposal.Title))
+	body = strings.TrimSpace(body)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
+		if line != "" && !strings.HasPrefix(line, "#") {
+			return summarizeNudgeText(line, 110)
+		}
+	}
+	return ""
+}
+
+func summarizeNudgeText(text string, limit int) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if limit <= 0 || len([]rune(text)) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:limit]) + "..."
 }
 
 func writeMemoryAudit(home, event string, fields map[string]any) error {

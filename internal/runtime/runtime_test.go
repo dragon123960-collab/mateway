@@ -583,6 +583,7 @@ func TestRuntimeMemoryProposalPendingDefersForNewMessage(t *testing.T) {
 
 func TestRuntimeAddsDailyMemoryProposalNudge(t *testing.T) {
 	home := t.TempDir()
+	enabled := true
 	if _, err := (memory.ProposalStore{Home: home}).Create(memory.CreateProposalInput{
 		Title:      "Pending memory",
 		Type:       "experience",
@@ -593,13 +594,17 @@ func TestRuntimeAddsDailyMemoryProposalNudge(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home},
+		Memory: config.MemoryConfig{ProposalNudge: config.ProposalNudgeConfig{Enabled: &enabled, Interval: "24h", Channels: []string{"cli"}, MaxProposals: 3}},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
 	rt := New(cfg)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "长期记忆候选待审核") {
+	if !contains(resp.Reply.Text, "长期记忆候选待审核") || !contains(resp.Reply.Text, "mateway memory proposal show") {
 		t.Fatalf("expected nudge, got %q", resp.Reply.Text)
 	}
 	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "hello again"})
@@ -615,6 +620,30 @@ func TestRuntimeAddsDailyMemoryProposalNudge(t *testing.T) {
 	}
 	if state.Pending != nil {
 		t.Fatalf("nudge should not set pending, got %#v", state.Pending)
+	}
+}
+
+func TestRuntimeMemoryProposalNudgeRespectsChannels(t *testing.T) {
+	home := t.TempDir()
+	enabled := true
+	if _, err := (memory.ProposalStore{Home: home}).Create(memory.CreateProposalInput{
+		Title: "Pending memory",
+		Body:  "Reusable note.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home},
+		Memory: config.MemoryConfig{ProposalNudge: config.ProposalNudgeConfig{Enabled: &enabled, Interval: "24h", Channels: []string{"cli"}, MaxProposals: 3}},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "weixin", SessionKey: "weixin:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(resp.Reply.Text, "长期记忆候选待审核") {
+		t.Fatalf("expected weixin nudge suppressed, got %q", resp.Reply.Text)
 	}
 }
 

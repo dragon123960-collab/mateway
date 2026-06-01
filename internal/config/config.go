@@ -40,6 +40,12 @@ func DefaultRoot() Root {
 			AutoPropose:       true,
 			AutoCommitLowRisk: false,
 			RequireConfirmFor: []string{"user_preference", "org_knowledge", "long_memory", "skill_candidate"},
+			ProposalNudge: ProposalNudgeConfig{
+				Enabled:      boolPtr(true),
+				Interval:     "24h",
+				Channels:     []string{"cli"},
+				MaxProposals: 3,
+			},
 		},
 		Learning: LearningConfig{Enabled: true, SkillCrystallization: SkillCrystallizationConfig{
 			Enabled:            true,
@@ -180,12 +186,27 @@ type ModelConfig struct {
 }
 
 type MemoryConfig struct {
-	Enabled           bool     `yaml:"enabled"`
-	Root              string   `yaml:"root"`
-	RecentDays        int      `yaml:"recent_days"`
-	AutoPropose       bool     `yaml:"auto_propose"`
-	AutoCommitLowRisk bool     `yaml:"auto_commit_low_risk"`
-	RequireConfirmFor []string `yaml:"require_confirm_for"`
+	Enabled           bool                `yaml:"enabled"`
+	Root              string              `yaml:"root"`
+	RecentDays        int                 `yaml:"recent_days"`
+	AutoPropose       bool                `yaml:"auto_propose"`
+	AutoCommitLowRisk bool                `yaml:"auto_commit_low_risk"`
+	RequireConfirmFor []string            `yaml:"require_confirm_for"`
+	ProposalNudge     ProposalNudgeConfig `yaml:"proposal_nudge"`
+}
+
+type ProposalNudgeConfig struct {
+	Enabled      *bool    `yaml:"enabled"`
+	Interval     string   `yaml:"interval"`
+	Channels     []string `yaml:"channels"`
+	MaxProposals int      `yaml:"max_proposals"`
+}
+
+func (c ProposalNudgeConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 type LearningConfig struct {
@@ -433,6 +454,19 @@ func (r *Root) applyDefaults() {
 	}
 	if len(r.Memory.RequireConfirmFor) == 0 {
 		r.Memory.RequireConfirmFor = defaults.Memory.RequireConfirmFor
+	}
+	proposalNudgeUnset := strings.TrimSpace(r.Memory.ProposalNudge.Interval) == "" && len(r.Memory.ProposalNudge.Channels) == 0 && r.Memory.ProposalNudge.MaxProposals == 0 && r.Memory.ProposalNudge.Enabled == nil
+	if proposalNudgeUnset {
+		r.Memory.ProposalNudge.Enabled = defaults.Memory.ProposalNudge.Enabled
+	}
+	if strings.TrimSpace(r.Memory.ProposalNudge.Interval) == "" {
+		r.Memory.ProposalNudge.Interval = defaults.Memory.ProposalNudge.Interval
+	}
+	if len(r.Memory.ProposalNudge.Channels) == 0 {
+		r.Memory.ProposalNudge.Channels = defaults.Memory.ProposalNudge.Channels
+	}
+	if r.Memory.ProposalNudge.MaxProposals <= 0 {
+		r.Memory.ProposalNudge.MaxProposals = defaults.Memory.ProposalNudge.MaxProposals
 	}
 	if strings.TrimSpace(r.Learning.SkillCrystallization.MinConfidence) == "" {
 		r.Learning.SkillCrystallization.MinConfidence = defaults.Learning.SkillCrystallization.MinConfidence
@@ -732,6 +766,10 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func getenv(name string) string {
