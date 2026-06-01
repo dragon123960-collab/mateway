@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/secret"
@@ -90,6 +91,22 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
 	}
 	content := fmt.Sprint(call.Args["content"])
+	profileStore := agentprofile.NewStore(t.Config)
+	if _, ok := profileStore.CoreTargetAgent(path); ok {
+		proposal, err := profileStore.Create(agentprofile.CreateInput{TargetPath: path, NewContent: content})
+		if err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+		}
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    "profile proposal " + proposal.ID + " created for " + proposal.TargetPath + "; promote with mateway agent-profile proposal promote " + proposal.ID,
+			Evidence: map[string]any{
+				"proposal_id":     proposal.ID,
+				"target_path":     proposal.TargetPath,
+				"requires_review": true,
+			},
+		}
+	}
 	if isSkillMarkdownPath(path) {
 		if err := secret.RejectIfSecretLike(content, path); err != nil {
 			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}

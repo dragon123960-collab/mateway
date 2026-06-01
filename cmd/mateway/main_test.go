@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
@@ -271,6 +272,70 @@ func TestMemoryProposalCommitCommandWritesMemory(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "status: active") || !strings.Contains(string(data), "trace:abc") {
 		t.Fatalf("unexpected memory:\n%s", data)
+	}
+}
+
+func TestAgentProfileProposalCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "workspace", "agents", "main", "user.md")
+	store := agentprofile.NewStore(cfg)
+	proposal, err := store.Create(agentprofile.CreateInput{TargetPath: target, NewContent: "# user\n\nNew preference."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"agent-profile", "proposal", "list"}) })
+	if !strings.Contains(out, proposal.ID) || !strings.Contains(out, "status=proposed") {
+		t.Fatalf("unexpected list output:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"agent-profile", "proposal", "show", proposal.ID}) })
+	if !strings.Contains(out, "diff:") || !strings.Contains(out, "New preference") {
+		t.Fatalf("unexpected show output:\n%s", out)
+	}
+	if err := run([]string{"agent-profile", "proposal", "promote", proposal.ID}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "New preference") {
+		t.Fatalf("target not promoted:\n%s", data)
+	}
+}
+
+func TestAgentProfileProposalRejectCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "workspace", "agents", "main", "tools.md")
+	store := agentprofile.NewStore(cfg)
+	proposal, err := store.Create(agentprofile.CreateInput{TargetPath: target, NewContent: "# tools\n\nUpdated."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"agent-profile", "proposal", "reject", proposal.ID, "--reason", "skip"}); err != nil {
+		t.Fatal(err)
+	}
+	rejected, err := store.Read(proposal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Status != "rejected" || rejected.Reason != "skip" {
+		t.Fatalf("unexpected rejected proposal: %#v", rejected)
 	}
 }
 

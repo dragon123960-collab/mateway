@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
@@ -108,6 +109,8 @@ func run(args []string) error {
 		return nil
 	case "memory":
 		return runMemory(args[1:])
+	case "agent-profile":
+		return runAgentProfile(args[1:])
 	case "schedule":
 		return runSchedule(args[1:])
 	case "skill":
@@ -941,6 +944,83 @@ func runMemoryProposal(args []string) error {
 	}
 }
 
+func runAgentProfile(args []string) error {
+	if len(args) == 0 || args[0] != "proposal" {
+		return fmt.Errorf("usage: mateway agent-profile proposal <list|show|promote|reject>")
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("usage: mateway agent-profile proposal <list|show|promote|reject>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := agentprofile.NewStore(cfg)
+	switch args[1] {
+	case "list":
+		proposals, err := store.List()
+		if err != nil {
+			return err
+		}
+		fmt.Println("agent_profile_proposals:", len(proposals))
+		for _, proposal := range proposals {
+			fmt.Printf("- %s status=%s agent=%s target=%s\n", proposal.ID, proposal.Status, proposal.AgentID, proposal.TargetPath)
+		}
+		return nil
+	case "show":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: mateway agent-profile proposal show <proposal_id>")
+		}
+		proposal, err := store.Read(args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		fmt.Println("agent:", proposal.AgentID)
+		fmt.Println("target:", proposal.TargetPath)
+		fmt.Println("created_at:", proposal.CreatedAt)
+		if proposal.Reason != "" {
+			fmt.Println("reason:", proposal.Reason)
+		}
+		fmt.Println("diff:")
+		fmt.Println(proposal.Diff)
+		return nil
+	case "promote":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: mateway agent-profile proposal promote <proposal_id>")
+		}
+		proposal, backupDir, err := store.Promote(args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		fmt.Println("target:", proposal.TargetPath)
+		fmt.Println("backup:", backupDir)
+		return nil
+	case "reject":
+		fs := flag.NewFlagSet("mateway agent-profile proposal reject", flag.ContinueOnError)
+		reason := fs.String("reason", "", "rejection reason")
+		rejectArgs := reorderRejectReasonFlag(args[2:])
+		if err := fs.Parse(rejectArgs); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway agent-profile proposal reject <proposal_id> [--reason <text>]")
+		}
+		proposal, err := store.Reject(fs.Arg(0), *reason)
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway agent-profile proposal <list|show|promote|reject>")
+	}
+}
+
 func reorderRejectReasonFlag(args []string) []string {
 	if len(args) != 3 || args[0] == "--reason" || args[0] == "-reason" {
 		return args
@@ -1255,6 +1335,10 @@ Usage:
   mateway memory proposal list
   mateway memory proposal reject <proposal_id> [--reason <text>]
   mateway memory proposal commit <proposal_id>
+  mateway agent-profile proposal list
+  mateway agent-profile proposal show <proposal_id>
+  mateway agent-profile proposal promote <proposal_id>
+  mateway agent-profile proposal reject <proposal_id> [--reason <text>]
   mateway memory distill session <session_key>
   mateway memory distill project close <project_id>
   mateway memory heartbeat lint-index

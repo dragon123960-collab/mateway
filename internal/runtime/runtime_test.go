@@ -643,6 +643,172 @@ func TestRuntimeMemoryProposalReviewBypassesStandaloneTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeAgentProfileProposalPromoteFromReply(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "user.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old profile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(writeProfileModel{target: target, content: "new profile"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "更新核心 md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "profile proposal") {
+		t.Fatalf("expected proposal reply, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != "agent_profile_proposal_review" || state.Pending.ProposalID == "" {
+		t.Fatalf("expected profile proposal pending, got %#v", state.Pending)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old profile" {
+		t.Fatalf("target changed before promote: %q", data)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !contains(resp.Reply.Text, "已生效") {
+		t.Fatalf("expected promote reply, got %#v", resp.Reply)
+	}
+	data, err = os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new profile" {
+		t.Fatalf("target not promoted: %q", data)
+	}
+}
+
+func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "agent.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old agent"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, RequireApprovalForRiskyTool: true},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(writeProfileModel{target: target, content: "new agent"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "更新核心 md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "需要确认") {
+		t.Fatalf("expected tool confirmation first, got %#v", resp.Reply)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "profile proposal") {
+		t.Fatalf("expected proposal creation reply, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != "agent_profile_proposal_review" || state.Pending.ProposalID == "" {
+		t.Fatalf("expected profile proposal pending after tool confirmation, got %#v", state.Pending)
+	}
+}
+
+func TestRuntimeAgentProfileProposalRejectFromReply(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "tools.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old tools"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(writeProfileModel{target: target, content: "new tools"}, rt.Tools)
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "更新核心 md"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "忽略"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "completed" || !contains(resp.Reply.Text, "已忽略") {
+		t.Fatalf("expected reject reply, got %#v", resp.Reply)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old tools" {
+		t.Fatalf("target should remain unchanged: %q", data)
+	}
+}
+
+func TestRuntimeAgentProfileProposalPendingDefersForNewMessage(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "memory.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old memory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&writeProfileThenCaptureModel{target: target, content: "new memory"}, rt.Tools)
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "更新核心 md"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "hello next"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "hello next" {
+		t.Fatalf("expected new task to run, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil {
+		t.Fatalf("expected pending cleared, got %#v", state.Pending)
+	}
+}
+
 func TestRuntimeSanitizesToolCallBlocks(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -1145,6 +1311,17 @@ type readRememberThenCaptureModel struct {
 	usedRead bool
 }
 
+type writeProfileModel struct {
+	target  string
+	content string
+}
+
+type writeProfileThenCaptureModel struct {
+	target  string
+	content string
+	used    bool
+}
+
 type captureUserTextModel struct{}
 
 type errorModel struct {
@@ -1228,6 +1405,32 @@ func (m *readRememberThenCaptureModel) Next(_ context.Context, ctx agentcore.Con
 			ID:   "call_1",
 			Name: "file.read",
 			Args: map[string]any{"path": path},
+		}}}, nil
+	}
+	return captureUserTextModel{}.Next(context.Background(), ctx)
+}
+
+func (m writeProfileModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if lastConversationMessageForTest(ctx.Messages).Role == agentcore.RoleTool {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: lastConversationMessageForTest(ctx.Messages).Content}, nil
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": m.target, "content": m.content},
+	}}}, nil
+}
+
+func (m *writeProfileThenCaptureModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if !m.used {
+		if lastConversationMessageForTest(ctx.Messages).Role == agentcore.RoleTool {
+			m.used = true
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: lastConversationMessageForTest(ctx.Messages).Content}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.write",
+			Args: map[string]any{"path": m.target, "content": m.content},
 		}}}, nil
 	}
 	return captureUserTextModel{}.Next(context.Background(), ctx)

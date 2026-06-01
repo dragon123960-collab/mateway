@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/memory"
@@ -155,6 +156,17 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	if err := rt.Store.Save(*state); err != nil {
 		return Response{}, err
 	}
+	if proposalID := pendingAgentProfileProposalID(task); proposalID != "" {
+		state.Pending = &session.PendingAction{
+			Kind:       "agent_profile_proposal_review",
+			TaskID:     task.ID,
+			ProposalID: proposalID,
+			Question:   "检测到 agent 核心 md 修改草稿。回复“确认”让它生效，回复“忽略”放弃；也可以继续发新任务。",
+		}
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, err
+		}
+	}
 	if scheduleID := pendingScheduleID(result.Messages); scheduleID != "" {
 		state.Pending = &session.PendingAction{
 			Kind:       "schedule_review",
@@ -253,6 +265,21 @@ func pendingScheduleID(messages []agentcore.Message) string {
 			if id := scheduleIDFromFollowingToolResult(messages, i, call.ID); id != "" {
 				return id
 			}
+		}
+	}
+	return ""
+}
+
+func pendingAgentProfileProposalID(task *session.TaskNode) string {
+	if task == nil {
+		return ""
+	}
+	for i := len(task.Steps) - 1; i >= 0; i-- {
+		if task.Steps[i].Tool != "file.write" || task.Steps[i].Status != "accepted" {
+			continue
+		}
+		if id := strings.TrimSpace(fmt.Sprint(task.Steps[i].Evidence["proposal_id"])); id != "" {
+			return id
 		}
 	}
 	return ""
@@ -392,6 +419,14 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if !result.IsError {
 			state.CompleteActiveTask()
 		}
+		if proposalID := strings.TrimSpace(fmt.Sprint(evidence["proposal_id"])); proposalID != "" {
+			state.Pending = &session.PendingAction{
+				Kind:       "agent_profile_proposal_review",
+				TaskID:     state.ActiveTask,
+				ProposalID: proposalID,
+				Question:   "检测到 agent 核心 md 修改草稿。回复“确认”让它生效，回复“忽略”放弃；也可以继续发新任务。",
+			}
+		}
 		if err := rt.Store.Save(*state); err != nil {
 			return Response{}, true, err
 		}
@@ -446,6 +481,48 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			return Response{}, true, err
 		}
 		return reply(msg, "已忽略这条长期记忆候选。", "completed"), true, nil
+	case "agent_profile_proposal_review":
+		action, ok := parseAgentProfileProposalReviewAction(text)
+		if !ok {
+			if shouldBypassAgentProfileProposalReview(text) {
+				_ = trace.write(map[string]any{"type": "agent_profile_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
+				state.Pending = nil
+				if err := rt.Store.Save(*state); err != nil {
+					return Response{}, true, err
+				}
+				return Response{}, false, nil
+			}
+			return reply(msg, "这个 agent 核心 md 草稿还在等待审核。回复“确认”生效，回复“忽略”放弃；也可以直接发新任务。", "agent_profile_review_pending"), true, nil
+		}
+		proposalID := state.Pending.ProposalID
+		state.Pending = nil
+		store := agentprofile.NewStore(rt.Config)
+		if action == "promote" {
+			proposal, backupDir, err := store.Promote(proposalID)
+			if err != nil {
+				if saveErr := rt.Store.Save(*state); saveErr != nil {
+					return Response{}, true, saveErr
+				}
+				return reply(msg, "核心 md 草稿生效失败："+err.Error(), "error"), true, nil
+			}
+			_ = trace.write(map[string]any{"type": "agent_profile_proposal_promoted", "proposal_id": proposal.ID, "target": proposal.TargetPath, "backup_dir": backupDir})
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return reply(msg, "已生效 agent 核心 md 草稿："+proposal.TargetPath+"\n备份："+backupDir, "completed"), true, nil
+		}
+		proposal, err := store.Reject(proposalID, "user rejected from conversation")
+		if err != nil {
+			if saveErr := rt.Store.Save(*state); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return reply(msg, "忽略核心 md 草稿失败："+err.Error(), "error"), true, nil
+		}
+		_ = trace.write(map[string]any{"type": "agent_profile_proposal_rejected", "proposal_id": proposal.ID})
+		if err := rt.Store.Save(*state); err != nil {
+			return Response{}, true, err
+		}
+		return reply(msg, "已忽略这个 agent 核心 md 草稿。", "completed"), true, nil
 	case "schedule_review":
 		action, ok := parseScheduleReviewAction(text)
 		if !ok {
@@ -541,6 +618,26 @@ func shouldBypassMemoryProposalReview(text string) bool {
 		return false
 	}
 	if isShortContextDependent(normalized) {
+		return false
+	}
+	return true
+}
+
+func parseAgentProfileProposalReviewAction(text string) (string, bool) {
+	normalized := normalizeFollowupText(text)
+	switch normalized {
+	case "确认", "保存", "生效", "应用", "promote", "commit", "yes", "ok":
+		return "promote", true
+	case "忽略", "取消", "不保存", "不要保存", "跳过", "放弃", "reject", "no":
+		return "reject", true
+	default:
+		return "", false
+	}
+}
+
+func shouldBypassAgentProfileProposalReview(text string) bool {
+	normalized := normalizeFollowupText(text)
+	if normalized == "" || isConfirm(normalized) || isCancel(normalized) || isShortContextDependent(normalized) {
 		return false
 	}
 	return true

@@ -177,6 +177,9 @@ func shouldProposeMemory(event LearningEvent) bool {
 }
 
 func isMemoryWorthyToolStep(step session.TaskStep) bool {
+	if step.Evidence != nil && fmt.Sprint(step.Evidence["requires_review"]) == "true" {
+		return false
+	}
 	switch strings.TrimSpace(step.Tool) {
 	case "file.write", "schedule.create":
 		return true
