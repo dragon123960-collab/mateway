@@ -35,7 +35,7 @@ func TestRecordTaskCompletionWritesDiaryOnlyForLowValueTask(t *testing.T) {
 	}
 }
 
-func TestRecordTaskCompletionCreatesProposalForAcceptedToolStep(t *testing.T) {
+func TestRecordTaskCompletionSkipsProposalForPlainReadStep(t *testing.T) {
 	home := t.TempDir()
 	result, err := RecordTaskCompletion(LearningEvent{
 		Home:       home,
@@ -43,6 +43,32 @@ func TestRecordTaskCompletionCreatesProposalForAcceptedToolStep(t *testing.T) {
 		Task: session.TaskNode{
 			ID:     "task-2",
 			Goal:   "请总结 README",
+			Status: "completed",
+			Steps: []session.TaskStep{{
+				Tool:    "file.read",
+				Status:  "accepted",
+				Summary: "read README",
+			}},
+		},
+		FinalText: "总结完成",
+		TraceID:   "trace-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Proposal != nil {
+		t.Fatalf("plain read step should not create proposal: %#v", result.Proposal)
+	}
+}
+
+func TestRecordTaskCompletionCreatesProposalForExplicitMemoryCue(t *testing.T) {
+	home := t.TempDir()
+	result, err := RecordTaskCompletion(LearningEvent{
+		Home:       home,
+		SessionKey: "cli:test",
+		Task: session.TaskNode{
+			ID:     "task-2",
+			Goal:   "记住 README 总结流程",
 			Status: "completed",
 			Steps: []session.TaskStep{{
 				Tool:    "file.read",

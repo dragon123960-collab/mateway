@@ -138,7 +138,7 @@ func readPromptContextFile(path string, limit int64) string {
 		return ""
 	}
 	text := strings.TrimSpace(string(data))
-	if text == "" || looksSensitivePromptContext(path, text) {
+	if text == "" || looksSensitivePromptContext(path, text) || unsafePromptContext(text) {
 		return ""
 	}
 	return text
@@ -150,4 +150,24 @@ func looksSensitivePromptContext(path, text string) bool {
 		strings.Contains(lower, "app_secret") ||
 		strings.Contains(lower, "token") ||
 		strings.Contains(lower, "password")
+}
+
+func unsafePromptContext(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"[tool_call]",
+		"[/tool_call]",
+		"<system>",
+		"</system>",
+		"role: system",
+		"role: assistant",
+		"ignore previous instructions",
+		"忽略之前",
+		"无视之前",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }

@@ -48,6 +48,19 @@ func Serve(ctx context.Context, cfg Config) error {
 			if !cardAction {
 				react(runCtx, sender, msg.ID, "SMILE")
 			}
+			ackMessageID := ""
+			if !cardAction {
+				id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
+					Channel:  msg.Channel,
+					ThreadID: msg.ThreadID,
+					Text:     "收到，开始处理。需要执行本地检查或安装时，我会在完成后更新这条回复。",
+					Style:    "processing",
+				}, msg.ID+":processing")
+				if ackErr != nil {
+					log.Printf("mateway gateway processing ack error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, ackErr)
+				}
+				ackMessageID = id
+			}
 			runtimeStart := time.Now()
 			resp, err := cfg.Runtime.Handle(runCtx, msg)
 			runtimeDuration := time.Since(runtimeStart)
@@ -60,7 +73,7 @@ func Serve(ctx context.Context, cfg Config) error {
 				return
 			}
 			replyStart := time.Now()
-			if err := sender.Reply(runCtx, msg, resp.Reply); err != nil {
+			if err := sendFinalReply(runCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
 				log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
 				_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
 					"type":                "gateway_done",
@@ -93,6 +106,18 @@ func Serve(ctx context.Context, cfg Config) error {
 		}()
 		return nil
 	})
+}
+
+func sendFinalReply(ctx context.Context, sender *feishu.Sender, msg channel.InboundMessage, ackMessageID string, reply channel.OutboundMessage) error {
+	if sender == nil {
+		return fmt.Errorf("feishu sender is required")
+	}
+	if strings.TrimSpace(ackMessageID) != "" {
+		if err := sender.Update(ctx, ackMessageID, reply); err == nil {
+			return nil
+		}
+	}
+	return sender.Reply(ctx, msg, reply)
 }
 
 func SessionKey(msg channel.InboundMessage) string {

@@ -161,11 +161,33 @@ func renderDiary(event LearningEvent, now string) string {
 }
 
 func shouldProposeMemory(event LearningEvent) bool {
-	if strings.Contains(event.Task.Goal, "记住") || strings.Contains(event.Task.Goal, "偏好") || strings.Contains(event.Task.Goal, "规则") || strings.Contains(event.Task.Goal, "决定") {
+	goal := strings.ToLower(strings.TrimSpace(event.Task.Goal))
+	if containsAny(goal, []string{
+		"记住", "记忆", "长期", "偏好", "规则", "决定", "经验", "流程", "以后",
+		"remember", "memory", "preference", "rule", "decision", "lesson", "workflow", "next time",
+	}) {
 		return true
 	}
 	for _, step := range event.Task.Steps {
-		if step.Status == "accepted" {
+		if step.Status == "accepted" && isMemoryWorthyToolStep(step) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMemoryWorthyToolStep(step session.TaskStep) bool {
+	switch strings.TrimSpace(step.Tool) {
+	case "file.write", "schedule.create":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsAny(text string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
 			return true
 		}
 	}

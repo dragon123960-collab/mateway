@@ -579,7 +579,11 @@ Workflow:
    Use web.fetch for README/docs/package pages.
    Use terminal.run only for local environment checks, guarded installation, verification, and PATH diagnosis.
 
-3. Before installing, summarize:
+3. Before installing, first check whether the executable already exists locally.
+   Prefer command -v <executable> followed by a version/help command when safe.
+   If it is already installed and verified, stop there and report the evidence instead of reinstalling.
+
+4. Before running an install command, summarize:
    - official_source
    - install_method
    - install_command
@@ -587,9 +591,9 @@ Workflow:
    - executable_name
    - why this method fits the current machine
 
-4. If the command is risky or mutates the machine, wait for confirmation through Mateway's guarded tool flow.
+5. If the command is risky or mutates the machine, wait for confirmation through Mateway's guarded tool flow.
 
-5. Verify after installation.
+6. Verify after installation.
    Prefer command -v, --version, --help, or a documented quick-start command.
    If install succeeds but verification fails, diagnose PATH and executable location before switching methods.
 

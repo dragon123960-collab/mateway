@@ -82,6 +82,7 @@ func TestReactionForReply(t *testing.T) {
 		"error":            "CROSS_MARK",
 		"cancelled":        "CROSS_MARK",
 		"completed":        "DONE",
+		"processing":       "DONE",
 		"":                 "DONE",
 	}
 	for style, want := range cases {

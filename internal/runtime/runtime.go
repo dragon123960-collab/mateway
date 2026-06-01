@@ -410,7 +410,12 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 				}
 				return Response{}, false, nil
 			}
-			return reply(msg, "这条长期记忆候选还在等待处理。回复“保存”写入长期记忆，回复“忽略”放弃；也可以直接发新任务。", "memory_review_pending"), true, nil
+			_ = trace.write(map[string]any{"type": "memory_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
+			state.Pending = nil
+			if err := rt.Store.Save(*state); err != nil {
+				return Response{}, true, err
+			}
+			return Response{}, false, nil
 		}
 		proposalID := state.Pending.ProposalID
 		state.Pending = nil
@@ -529,7 +534,16 @@ func parseMemoryProposalReviewAction(text string) (string, bool) {
 
 func shouldBypassMemoryProposalReview(text string) bool {
 	normalized := normalizeFollowupText(text)
-	return looksLikeStandaloneTaskRequest(normalized)
+	if normalized == "" {
+		return false
+	}
+	if isConfirm(normalized) || isCancel(normalized) {
+		return false
+	}
+	if isShortContextDependent(normalized) {
+		return false
+	}
+	return true
 }
 
 func parseScheduleReviewAction(text string) (string, bool) {
