@@ -438,6 +438,8 @@ Bridge 协议刻意保持很小：外部 channel 服务向 `POST /channels/{chan
 
 OpenClaw 兼容适配层暴露 `@tencent-weixin/openclaw-weixin` 所需的最小 HTTP JSON 接口：`sendmessage`、`getupdates`、`getconfig` 和 `sendtyping`。v1 只支持文本，并保留 `context_token`；媒体/CDN 上传暂不纳入范围。
 
+第三方 channel adapter 和微信 ClawBot 的具体接入方式见 [Channel Extension Protocol](docs/channel-extension.md)。
+
 `gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
 
 ## 当前边界

@@ -441,6 +441,8 @@ The bridge protocol is intentionally small: external channel services post norma
 
 The OpenClaw compatibility adapter exposes the minimal HTTP JSON surface used by `@tencent-weixin/openclaw-weixin`: `sendmessage`, `getupdates`, `getconfig`, and `sendtyping`. It supports text only and preserves `context_token`; media/CDN upload is intentionally out of scope for v1.
 
+See [Channel Extension Protocol](docs/channel-extension.md) for third-party channel adapter and WeChat ClawBot setup details.
+
 `gateway serve` uses the same config loader as CLI commands, so it reads `~/.mateway/config/mateway.env`. Existing process environment variables still win over values from that file.
 
 ## Current Limits
