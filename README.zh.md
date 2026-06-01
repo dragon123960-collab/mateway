@@ -432,9 +432,9 @@ Profile 产品化命令：
 
 ## Gateway 边界
 
-Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 可以启动内置飞书 WebSocket、进程外 bridge 协议和 OpenClaw 兼容适配层，前提是 `channels/` 下对应 YAML 已启用。
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket、bridge 协议和 OpenClaw 兼容适配层。
 
-Bridge 协议刻意保持很小：外部 channel 服务向 `POST /channels/{channel}/events` 投递归一化文本事件，可以通过 `GET /channels/{channel}/replies` 拉取回复，也可以用可选 ack 上报发送结果。这样平台登录、SDK 和依赖都留在 Mateway runtime 外部。
+新的稳定 channel 应优先做成内置 channel spec，这样一个 gateway 进程就能统一管理。Bridge 协议保留为很小的原型/重依赖接入口：外部服务向 `POST /channels/{channel}/events` 投递归一化文本事件，可以通过 `GET /channels/{channel}/replies` 拉取回复，也可以用可选 ack 上报发送结果。
 
 OpenClaw 兼容适配层暴露 `@tencent-weixin/openclaw-weixin` 所需的最小 HTTP JSON 接口：`sendmessage`、`getupdates`、`getconfig` 和 `sendtyping`。v1 只支持文本，并保留 `context_token`；媒体/CDN 上传暂不纳入范围。
 

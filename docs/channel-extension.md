@@ -1,23 +1,40 @@
 # Channel Extension Protocol
 
-This document explains how external channels connect to Mateway without being built into the Go runtime. The current implementation is intentionally small: text in, text out, with stable session identity and optional delivery acknowledgements. The protocol reserves an attachment shape so adapters can add image input without changing the event envelope later.
+This document explains how new channels should connect to Mateway. The preferred product shape is built-in channel support: `mateway gateway serve` starts all enabled channels from `~/.mateway/config/channels/`. For fast second-party development, prototypes, or channels with heavy platform dependencies, Mateway also keeps a small bridge protocol.
 
 ## Model
 
 Mateway owns the runtime path:
 
 ```text
-channel adapter -> Mateway gateway -> runtime -> AgentCore -> reply
+built-in channel -> Mateway gateway -> runtime -> AgentCore -> reply
 ```
 
-External channel adapters own platform-specific details:
+Built-in channels own platform-specific details:
 
 - login, QR code, OAuth, SDK setup, webhook verification
 - platform message IDs and delivery retries
-- converting platform messages to Mateway text events
-- sending Mateway replies back to the platform
+- normalizing platform messages to `channel.InboundMessage`
+- sending `channel.OutboundMessage` back to the platform
 
-Mateway v1 only processes text through the bridge protocol. Adapters may include attachment metadata for traceability, but the current runtime will not download or reason over the media yet.
+The bridge protocol mirrors the same boundary over HTTP. It is useful when a channel should live outside the Go binary temporarily, but stable platform channels should eventually become built-in channel specs so one gateway process can manage them.
+
+Mateway v1 only processes text through the bridge protocol. Channels may include attachment metadata for traceability, but the current runtime will not download or reason over the media yet.
+
+## Adding A Built-In Channel
+
+New built-in channels should follow the existing Feishu shape:
+
+1. Add a package under `internal/channel/<name>/`.
+2. Normalize inbound platform events into `channel.InboundMessage`.
+3. Send replies from `channel.OutboundMessage`.
+4. Add `<Name>Config` under `config.ChannelsConfig`.
+5. Add a YAML template under `~/.mateway/config/channels/<name>.yaml`.
+6. Register a `channelSpec` in `internal/gateway/gateway.go`.
+
+The channel should not call runtime directly. It should only hand normalized messages to gateway helpers and let gateway handle session key, dedupe, async execution, and trace events.
+
+Keep channel code focused on I/O and message normalization. Generic planning, tool policy, and AgentCore behavior belong in runtime, not in channel packages.
 
 ## Enable Bridge Protocol
 
@@ -47,7 +64,7 @@ mateway gateway serve
 
 ## Send Events To Mateway
 
-External adapters post normalized events to:
+External bridge integrations post normalized events to:
 
 ```text
 POST http://127.0.0.1:8789/channels/{channel}/events
@@ -140,7 +157,7 @@ There are two supported reply modes.
 
 ### Polling
 
-Adapters can poll:
+Bridge integrations can poll:
 
 ```text
 GET http://127.0.0.1:8789/channels/{channel}/replies
@@ -182,7 +199,7 @@ Mateway will `POST` the reply payload to that URL. If no callback URL is known, 
 
 ## Optional Delivery Ack
 
-Adapters may report delivery result:
+Bridge integrations may report delivery result:
 
 ```text
 POST http://127.0.0.1:8789/channels/{channel}/acks

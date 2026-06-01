@@ -435,9 +435,9 @@ Profile productization commands:
 
 ## Gateway Boundary
 
-Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` can start built-in Feishu WebSocket, the process-external bridge protocol, and the OpenClaw-compatible adapter when their files under `channels/` enable them.
+Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` starts enabled built-in channels from `channels/`, including Feishu WebSocket, the bridge protocol, and the OpenClaw-compatible adapter.
 
-The bridge protocol is intentionally small: external channel services post normalized text events to `POST /channels/{channel}/events`, can poll `GET /channels/{channel}/replies`, and can report optional delivery acks. This keeps platform-specific login and SDK dependencies outside the Mateway runtime.
+New stable channels should be added as built-in channel specs so one gateway process can manage them. The bridge protocol stays intentionally small for prototypes and heavy integrations: external services post normalized text events to `POST /channels/{channel}/events`, can poll `GET /channels/{channel}/replies`, and can report optional delivery acks.
 
 The OpenClaw compatibility adapter exposes the minimal HTTP JSON surface used by `@tencent-weixin/openclaw-weixin`: `sendmessage`, `getupdates`, `getconfig`, and `sendtyping`. It supports text only and preserves `context_token`; media/CDN upload is intentionally out of scope for v1.
 

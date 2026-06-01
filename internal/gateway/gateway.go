@@ -31,49 +31,104 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 	defer lock.Close()
 	dedupe := newInboundDedupe(30 * time.Minute)
-	var starters []func() error
-	if cfg.Config.Channels.Feishu.Enabled {
-		sender := feishu.NewSender(cfg.Config.Channels.Feishu)
+	starters := enabledChannelStarters(ctx, cfg, dedupe)
+	if len(starters) == 0 {
+		return fmt.Errorf("no enabled channel")
+	}
+	return runStarters(ctx, starters)
+}
+
+type channelRuntime struct {
+	Runtime runtime.Runtime
+	Dedupe  *inboundDedupe
+}
+
+type channelStarter func(context.Context, channelRuntime) error
+
+type channelSpec struct {
+	Name    string
+	Enabled bool
+	Start   channelStarter
+}
+
+func enabledChannelStarters(ctx context.Context, cfg Config, dedupe *inboundDedupe) []func() error {
+	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe}
+	specs := builtinChannelSpecs(cfg)
+	starters := make([]func() error, 0, len(specs))
+	for _, spec := range specs {
+		if !spec.Enabled || spec.Start == nil {
+			continue
+		}
+		spec := spec
 		starters = append(starters, func() error {
-			return feishu.StartWebSocket(ctx, cfg.Config.Channels.Feishu, func(eventCtx context.Context, msg channel.InboundMessage) error {
-				if shouldIgnoreInbound(cfg.Config.Channels.Feishu, msg) || prepareInbound(&msg, dedupe) {
-					return nil
-				}
-				go runFeishuMessage(cfg.Runtime, sender, msg)
-				return nil
-			})
+			return spec.Start(ctx, rt)
 		})
 	}
-	if cfg.Config.Channels.Bridge.Enabled {
-		starters = append(starters, func() error {
-			return bridge.Start(ctx, cfg.Config.Channels.Bridge, func(eventCtx context.Context, event bridge.Event) (bridge.Reply, error) {
+	return starters
+}
+
+func builtinChannelSpecs(cfg Config) []channelSpec {
+	if cfg.Config == nil {
+		return nil
+	}
+	return []channelSpec{
+		feishuChannelSpec(cfg.Config.Channels.Feishu),
+		bridgeChannelSpec(cfg.Config.Channels.Bridge),
+		openClawCompatChannelSpec(cfg.Config.Channels.OpenClawCompat),
+	}
+}
+
+func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
+	return channelSpec{
+		Name:    "feishu",
+		Enabled: channelCfg.Enabled,
+		Start: func(ctx context.Context, rt channelRuntime) error {
+			sender := feishu.NewSender(channelCfg)
+			return feishu.StartWebSocket(ctx, channelCfg, func(eventCtx context.Context, msg channel.InboundMessage) error {
+				if shouldIgnoreInbound(channelCfg, msg) || prepareInbound(&msg, rt.Dedupe) {
+					return nil
+				}
+				go runFeishuMessage(rt.Runtime, sender, msg)
+				return nil
+			})
+		},
+	}
+}
+
+func bridgeChannelSpec(channelCfg config.BridgeConfig) channelSpec {
+	return channelSpec{
+		Name:    "bridge",
+		Enabled: channelCfg.Enabled,
+		Start: func(ctx context.Context, rt channelRuntime) error {
+			return bridge.Start(ctx, channelCfg, func(eventCtx context.Context, event bridge.Event) (bridge.Reply, error) {
 				msg := event.ToInbound()
-				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, dedupe) {
+				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
 					return bridge.Reply{}, nil
 				}
-				resp, err := runRuntimeMessage(eventCtx, cfg.Runtime, msg)
+				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
 				if err != nil {
 					return bridge.Reply{}, err
 				}
 				return bridge.OutboundToReply(event, resp.Reply), nil
 			})
-		})
+		},
 	}
-	if cfg.Config.Channels.OpenClawCompat.Enabled {
-		starters = append(starters, func() error {
-			return openclawcompat.Start(ctx, cfg.Config.Channels.OpenClawCompat, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
-				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, dedupe) {
+}
+
+func openClawCompatChannelSpec(channelCfg config.OpenClawCompatConfig) channelSpec {
+	return channelSpec{
+		Name:    "openclaw_compat",
+		Enabled: channelCfg.Enabled,
+		Start: func(ctx context.Context, rt channelRuntime) error {
+			return openclawcompat.Start(ctx, channelCfg, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
+				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
 					return channel.OutboundMessage{}, nil
 				}
-				resp, err := runRuntimeMessage(eventCtx, cfg.Runtime, msg)
+				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
 				return resp.Reply, err
 			})
-		})
+		},
 	}
-	if len(starters) == 0 {
-		return fmt.Errorf("no enabled channel")
-	}
-	return runStarters(ctx, starters)
 }
 
 func runStarters(ctx context.Context, starters []func() error) error {
