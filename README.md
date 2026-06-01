@@ -254,6 +254,8 @@ Run manual heartbeat maintenance:
 
 ```bash
 ./build/mateway memory heartbeat lint-index
+./build/mateway memory heartbeat learning
+./build/mateway memory heartbeat skill
 ```
 
 Run heartbeat maintenance in a foreground loop:
@@ -262,7 +264,7 @@ Run heartbeat maintenance in a foreground loop:
 ./build/mateway memory heartbeat serve
 ```
 
-The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, and writes an audit entry.
+The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, distills learning evidence, proposes skill patches, and writes audit entries.
 
 ## Scheduled Tasks
 
@@ -373,14 +375,19 @@ Current behavior:
 
 - Runtime discovers local skills and injects short guidance into context.
 - Default initialized shared skills cover fresh search, source evaluation, connector gaps, and software installation workflow.
-- Agents can inspect existing skills and use them as guidance.
+- Agents can inspect existing skills, install local/raw skills, and review skill patch proposals before promotion.
 
-Not yet implemented:
+Available:
 
+- `mateway skill catalog report`
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
+- `mateway skill proposal list|show|promote|reject`
+- `mateway skill usage report`
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
-- automatic skill patch/promotion workflow
+- heartbeat-generated skill patch proposal workflow
+
+Script Bridge is intentionally small: executable scripts under `~/.mateway/scripts/`, `workspace/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
 
 ## Multi-Agent Profiles
 

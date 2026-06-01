@@ -61,20 +61,22 @@ Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / S
 
 ### S2.2 Skill Source Adapter
 
-状态：第二阶段优先
+状态：基础 report / adapter status 已完成，外部源深度 adapter 后续增强
 
 目标：
 
 - 明确 config 里的 catalog 是“搜索入口声明”，不是万能安装协议。
 - 为不同 skill 源提供 adapter，而不是把 HTML/JSON 解析逻辑塞进 YAML。
 
-待开发：
+已完成：
 
 - catalog report：显示 enabled、trust、search_url、install_url、adapter 支持状态
-- adapter 接口：search / resolve / install
 - raw `SKILL.md` 安装继续保留为基础能力
-- 已安装 skill 的 diff/review
-- skill promote 仍走 proposal/diff/audit，不直接改 active skill
+- skill patch promote 走 proposal/diff/audit，不直接改 active skill
+
+待开发：
+
+- 外部源深度 adapter：search / resolve / install
 
 验收：
 
@@ -84,20 +86,23 @@ Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / S
 
 ### S2.3 Script Bridge
 
-状态：第二阶段优先
+状态：基础发现 / 执行 / secret 注入已完成，复杂 manifest 后续增强
 
 目标：
 
 - 邮件、远程服务器、自媒体发布等先通过用户脚本/skill 接入。
 - 不做重型 connector framework。
 
+已完成：
+
+- 脚本目录约定：`~/.mateway/scripts/`、`workspace/scripts/` 和 `scripts.dirs`
+- 轻量 header 协议：`mateway.name`、`mateway.description`、`mateway.risk`、`mateway.required_secret`
+- `script.run` tool 走 guarded mutation 确认边界
+- tool evidence 记录脚本路径、参数、exit code、duration
+
 待开发：
 
-- 脚本目录约定：`~/.mateway/scripts/` 和项目内 `scripts/`
-- 脚本 manifest 或 header 协议
-- 脚本 dry-run/help/version/evidence 规范
-- guarded mutation 确认边界
-- trace 记录脚本路径、命令、exit code、stdout/stderr 摘要
+- 脚本 dry-run/help/version 规范
 
 验收：
 
@@ -114,17 +119,20 @@ Secret 边界：
 
 ### S2.4 Sandbox Runner
 
-状态：第二阶段候选
+状态：runner report 已完成，wrapper 示例后续增强
 
 目标：
 
 - 把现有 `security.terminal_sandbox` 从配置能力升级为可验证 runner。
 
-待开发：
+已完成：
 
 - runner report：当前 mode/workdir/timeout/prefix
-- wrapper/prefix 示例
 - 命令运行 evidence 中明确 sandbox 状态
+
+待开发：
+
+- wrapper/prefix 示例
 - macOS/Linux 不同 runner 的文档边界
 
 验收：
@@ -134,12 +142,16 @@ Secret 边界：
 
 ### S2.5 Read-only Workspace UI
 
-状态：第二阶段候选
+状态：CLI workspace report 已完成，静态 HTML 后续增强
 
 目标：
 
 - 不先做完整 Web 平台。
 - 先做只读报告或静态 HTML。
+
+已完成：
+
+- `mateway workspace report` 汇总 trace、memory、learning、skill、script、schedule、sandbox 状态
 
 待开发：
 

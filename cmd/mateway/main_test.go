@@ -520,8 +520,43 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 		t.Fatalf("unexpected skill list:\n%s", out)
 	}
 	out = captureStdout(t, func() error { return run([]string{"skill", "search", "--all", "software install"}) })
-	if !strings.Contains(out, "skills.sh") || !strings.Contains(out, "skillhub.cn") || !strings.Contains(out, "clawhub.ai") {
+	if !strings.Contains(out, "skills.sh") || !strings.Contains(out, "skillhub.cn") || !strings.Contains(out, "clawhub.ai") || !strings.Contains(out, "adapter=search_url_only") {
 		t.Fatalf("unexpected skill search:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"skill", "catalog", "report"}) })
+	if !strings.Contains(out, "skill_catalogs:") || !strings.Contains(out, "can_install=false") {
+		t.Fatalf("unexpected catalog report:\n%s", out)
+	}
+}
+
+func TestScriptSandboxAndWorkspaceReports(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(home, "scripts", "hello")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n# mateway.name: hello\n# mateway.description: says hi\necho hi $1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"script", "list"}) })
+	if !strings.Contains(out, "hello") || !strings.Contains(out, "says hi") {
+		t.Fatalf("unexpected script list:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"script", "run", "hello", "there"}) })
+	if !strings.Contains(out, "exit_code: 0") || !strings.Contains(out, "hi there") {
+		t.Fatalf("unexpected script run:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"sandbox", "report"}) })
+	if !strings.Contains(out, "sandbox_enabled:") || !strings.Contains(out, "timeout_seconds:") {
+		t.Fatalf("unexpected sandbox report:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"workspace", "report"}) })
+	if !strings.Contains(out, "workspace:") || !strings.Contains(out, "skills:") || !strings.Contains(out, "scripts:") {
+		t.Fatalf("unexpected workspace report:\n%s", out)
 	}
 }
 

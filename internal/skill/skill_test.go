@@ -34,6 +34,19 @@ func TestSearchCatalogsBuildsURLs(t *testing.T) {
 	if len(results) != 1 || !strings.Contains(results[0].URL, "software+install") || results[0].TrustLevel != "high" {
 		t.Fatalf("results = %#v", results)
 	}
+	if results[0].Adapter != "search_url_only" || results[0].CanInstall {
+		t.Fatalf("unexpected adapter fields: %#v", results[0])
+	}
+}
+
+func TestCatalogReportsShowAdapterStatus(t *testing.T) {
+	cfg := &config.Root{Skills: config.SkillsConfig{Catalogs: []config.SkillCatalogConfig{{
+		Name: "demo", Enabled: true, SearchURL: "https://example.test?q={query}", InstallURL: "https://example.test/install", TrustLevel: "medium",
+	}}}}
+	reports := CatalogReports(cfg)
+	if len(reports) != 1 || reports[0].Adapter != "declared_install_url" || !reports[0].CanInstall {
+		t.Fatalf("reports = %#v", reports)
+	}
 }
 
 func TestInstallFromLocalSkillFile(t *testing.T) {

@@ -20,6 +20,7 @@ type Root struct {
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
 	Skills    SkillsConfig    `yaml:"skills"`
+	Scripts   ScriptsConfig   `yaml:"scripts"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
 	Models    []ModelConfig   `yaml:"-"`
@@ -93,7 +94,7 @@ func DefaultRoot() Root {
 				Enabled:  false,
 				Interval: "30m",
 				Schedule: HeartbeatSchedule{DailyAt: "03:30"},
-				Jobs:     []string{"memory_lint", "memory_index_rebuild", "memory_distill"},
+				Jobs:     []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning"},
 				QuietHours: HeartbeatQuietHours{
 					Start: "23:00",
 					End:   "08:00",
@@ -200,6 +201,10 @@ type SkillCrystallizationConfig struct {
 
 type SkillsConfig struct {
 	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
+}
+
+type ScriptsConfig struct {
+	Dirs []string `yaml:"dirs"`
 }
 
 type SkillCatalogConfig struct {
@@ -376,6 +381,7 @@ func (r *Root) NormalizeForUse() {
 	r.applyDefaults()
 	r.normalizeSearch()
 	r.normalizeSkills()
+	r.normalizeScripts()
 	r.normalizeAgents()
 }
 
@@ -478,6 +484,12 @@ func (r *Root) normalizeSkills() {
 		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", InstallURL: "", TrustLevel: "high"},
 		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", InstallURL: "", TrustLevel: "unknown"},
 		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", InstallURL: "", TrustLevel: "medium"},
+	}
+}
+
+func (r *Root) normalizeScripts() {
+	if r.Scripts.Dirs == nil {
+		r.Scripts.Dirs = []string{}
 	}
 }
 

@@ -33,6 +33,13 @@ func TestRecordTaskCompletionWritesDiaryOnlyForLowValueTask(t *testing.T) {
 	if !strings.Contains(text, "type: diary") || !strings.Contains(text, "trace:trace-1") || !strings.Contains(text, "task:task-1") {
 		t.Fatalf("unexpected diary:\n%s", text)
 	}
+	ledger, err := os.ReadFile(filepath.Join(home, "observe", "learning", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ledger), `"type":"task_completed"`) || !strings.Contains(string(ledger), `"task_id":"task-1"`) {
+		t.Fatalf("unexpected learning ledger:\n%s", ledger)
+	}
 }
 
 func TestRecordTaskCompletionSkipsProposalForPlainReadStep(t *testing.T) {
@@ -152,5 +159,41 @@ func TestRecordTaskCompletionWritesReflectionForFailedStep(t *testing.T) {
 	text := string(data)
 	if !strings.Contains(text, "type: reflection") || !strings.Contains(text, "file not found") {
 		t.Fatalf("unexpected reflection:\n%s", text)
+	}
+	for _, want := range []string{"Failed or suspect steps", "Likely cause", "Alternative strategy", "Related tools", "Sources"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("reflection missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRecordTaskCompletionWritesSkillUsageLedger(t *testing.T) {
+	home := t.TempDir()
+	_, err := RecordTaskCompletion(LearningEvent{
+		Home:       home,
+		SessionKey: "cli:test",
+		Task: session.TaskNode{
+			ID:     "task-skill",
+			Goal:   "use skill",
+			Status: "completed",
+			Steps: []session.TaskStep{{
+				Tool:    "file.read",
+				Status:  "accepted",
+				Summary: "read file",
+			}},
+		},
+		TraceID: "trace-skill",
+		Skills:  []SkillEvidence{{Name: "fresh-search", Path: filepath.Join(home, "workspace", "skills", "fresh-search", "SKILL.md"), Scope: "shared"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "skill_usage", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"type":"skill_usage"`) || !strings.Contains(text, `"name":"fresh-search"`) || !strings.Contains(text, `"tool_sequence":["file.read"]`) {
+		t.Fatalf("unexpected skill usage ledger:\n%s", text)
 	}
 }

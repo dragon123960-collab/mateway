@@ -87,6 +87,8 @@ type ObserveHookInput struct {
 	FinalText  string
 	TraceID    string
 	TracePath  string
+	Skills     []memory.SkillEvidence
+	UserText   string
 	ToolCall   agentcore.ToolCall
 	Tool       agentcore.Tool
 	ToolResult agentcore.ToolResult
@@ -651,6 +653,8 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 			FinalText:  input.FinalText,
 			TraceID:    input.TraceID,
 			TracePath:  input.TracePath,
+			Skills:     input.Skills,
+			UserText:   input.UserText,
 		})
 		if err != nil {
 			return ObserveHookResult{}, err

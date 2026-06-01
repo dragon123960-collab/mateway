@@ -17,6 +17,8 @@ type LearningEvent struct {
 	FinalText  string
 	TraceID    string
 	TracePath  string
+	Skills     []SkillEvidence
+	UserText   string
 }
 
 type LearningResult struct {
@@ -41,6 +43,8 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 		return LearningResult{}, err
 	}
 	result := LearningResult{DiaryPath: diaryPath}
+	_ = RecordLearningEvidence(event)
+	_ = RecordSkillUsage(event)
 	if shouldReflect(event) {
 		reflectionPath := filepath.Join(home, "observe", "reflections", "reflection_"+time.Now().Format("20060102_150405_000000")+".md")
 		if err := os.MkdirAll(filepath.Dir(reflectionPath), 0o755); err != nil {
@@ -91,7 +95,13 @@ func renderReflection(event LearningEvent, now string) string {
 	b.WriteString("# Task reflection\n\n")
 	b.WriteString("Goal: ")
 	b.WriteString(event.Task.Goal)
-	b.WriteString("\n\nNon-accepted steps:\n")
+	b.WriteString("\n\nOutcome: ")
+	b.WriteString(defaultString(event.Task.Status, "unknown"))
+	if text := strings.TrimSpace(event.FinalText); text != "" {
+		b.WriteString("\n\nFinal summary: ")
+		b.WriteString(text)
+	}
+	b.WriteString("\n\nFailed or suspect steps:\n")
 	for _, step := range event.Task.Steps {
 		if step.Status != "accepted" {
 			b.WriteString("- ")
@@ -104,6 +114,41 @@ func renderReflection(event LearningEvent, now string) string {
 			}
 			b.WriteString("\n")
 		}
+	}
+	b.WriteString("\nLikely cause:\n")
+	b.WriteString("- ")
+	b.WriteString(likelyCause(event))
+	b.WriteString("\n\nAlternative strategy:\n")
+	b.WriteString("- ")
+	b.WriteString(alternativeStrategy(event))
+	b.WriteString("\n\nMissed confirmation boundary:\n")
+	b.WriteString("- ")
+	b.WriteString(missedConfirmationBoundary(event))
+	b.WriteString("\n\nRelated tools:\n")
+	for _, toolName := range relatedTools(event) {
+		b.WriteString("- ")
+		b.WriteString(toolName)
+		b.WriteString("\n")
+	}
+	b.WriteString("\nRelated skills:\n")
+	for _, skill := range event.Skills {
+		if strings.TrimSpace(skill.Name) == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(skill.Name)
+		if skill.Path != "" {
+			b.WriteString(" (")
+			b.WriteString(skill.Path)
+			b.WriteString(")")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\nSources:\n")
+	for _, source := range learningSources(event) {
+		b.WriteString("- ")
+		b.WriteString(source)
+		b.WriteString("\n")
 	}
 	return b.String()
 }
@@ -183,12 +228,88 @@ func HasStrongMemoryCue(text string) bool {
 }
 
 func shouldReflect(event LearningEvent) bool {
+	if HasUserCorrectionCue(event.UserText) || HasUserCorrectionCue(event.FinalText) {
+		return true
+	}
 	for _, step := range event.Task.Steps {
 		if step.Status != "" && step.Status != "accepted" {
 			return true
 		}
 	}
 	return false
+}
+
+func HasUserCorrectionCue(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	return containsAny(text, []string{
+		"不是这样", "不对", "应该", "以后别", "以后不要", "改成", "纠正", "修正",
+		"wrong", "incorrect", "should", "next time don't", "do not do that", "correction",
+	})
+}
+
+func likelyCause(event LearningEvent) string {
+	for _, step := range event.Task.Steps {
+		summary := strings.ToLower(step.Summary)
+		if step.Status != "accepted" && strings.TrimSpace(step.Summary) != "" {
+			if strings.Contains(summary, "not found") || strings.Contains(summary, "missing") || strings.Contains(summary, "不存在") {
+				return "The selected tool or path likely lacked the expected resource."
+			}
+			if strings.Contains(summary, "denied") || strings.Contains(summary, "permission") || strings.Contains(summary, "权限") {
+				return "The action likely crossed a permission or confirmation boundary."
+			}
+			return "A tool step was not accepted and needs a safer alternate path."
+		}
+	}
+	if HasUserCorrectionCue(event.UserText) || HasUserCorrectionCue(event.FinalText) {
+		return "The user corrected the task behavior or expected workflow."
+	}
+	return "No specific cause identified."
+}
+
+func alternativeStrategy(event LearningEvent) string {
+	for _, step := range event.Task.Steps {
+		if step.Status == "accepted" {
+			continue
+		}
+		switch step.Tool {
+		case "file.read", "file.write":
+			return "Verify the target path and workspace boundary before retrying file operations."
+		case "terminal.run":
+			return "Prefer a dry-run or read-only command first, then ask for confirmation before mutation."
+		case "web.search", "web.fetch":
+			return "Retry with fresher or more authoritative sources and cite the retrieved evidence."
+		}
+	}
+	if HasUserCorrectionCue(event.UserText) || HasUserCorrectionCue(event.FinalText) {
+		return "Turn the correction into a future preference or workflow proposal if it is reusable."
+	}
+	return "Review the trace and choose the smallest safer retry."
+}
+
+func missedConfirmationBoundary(event LearningEvent) string {
+	for _, step := range event.Task.Steps {
+		if step.Status != "accepted" && strings.Contains(strings.ToLower(step.Summary), "confirm") {
+			return "A confirmation boundary may have been reached without enough user-facing context."
+		}
+	}
+	return "None detected."
+}
+
+func relatedTools(event LearningEvent) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, step := range event.Task.Steps {
+		name := strings.TrimSpace(step.Tool)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		out = append(out, "none")
+	}
+	return out
 }
 
 func proposalTitle(event LearningEvent) string {

@@ -212,6 +212,9 @@ skills:
       install_url: ""
       trust_level: medium
 
+scripts:
+  dirs: []
+
 scheduler:
   enabled: false
   timezone: Asia/Shanghai
@@ -237,6 +240,8 @@ agents:
           - memory_lint
           - memory_index_rebuild
           - memory_distill
+          - learning_distill
+          - skill_learning
         auto_send_summary: false
         quiet_hours:
           start: "23:00"

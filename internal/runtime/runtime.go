@@ -141,6 +141,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.Messages = messages
 	agent.MaxIterations = 6
 	profile := rt.Pool.ProfileForSession(msg.SessionKey)
+	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
@@ -230,6 +231,8 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			FinalText:  result.FinalText,
 			TraceID:    trace.id,
 			TracePath:  trace.path,
+			Skills:     memorySkills(discoveredSkills),
+			UserText:   userText,
 		}, trace)
 		learningResult = observe.LearningResult
 		if learningResult != nil {
@@ -480,6 +483,22 @@ func fallbackFinalReply(raw string) string {
 		return "模型生成了无效的工具调用格式，已停止执行，避免误操作。请重试或把任务说得更具体。"
 	}
 	return "我还没有生成可用回复。"
+}
+
+func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
+	var out []memory.SkillEvidence
+	for _, skill := range skills {
+		if strings.TrimSpace(skill.Name) == "" {
+			continue
+		}
+		out = append(out, memory.SkillEvidence{
+			Name:        skill.Name,
+			Path:        skill.Path,
+			Scope:       skillScope(skill.Path),
+			Description: skill.Description,
+		})
+	}
+	return out
 }
 
 func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {

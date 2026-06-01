@@ -23,10 +23,13 @@ type HeartbeatResult struct {
 	Entries   int
 	Issues    []Issue
 	Distill   DistillHeartbeatResult
+	Learning  DistillHeartbeatResult
+	Skill     SkillLearningHeartbeatResult
 }
 
 type HeartbeatServeInput struct {
 	Home       string
+	Workspace  string
 	MemoryRoot string
 	IndexPath  string
 	Interval   time.Duration
@@ -101,6 +104,26 @@ func ServeHeartbeat(ctx context.Context, input HeartbeatServeInput) error {
 				if err != nil {
 					return err
 				}
+			case "learning_distill":
+				learning, err := RunLearningDistillHeartbeat(ctx, LearningHeartbeatInput{Home: input.Home, MemoryRoot: input.MemoryRoot, Model: input.Model, Now: input.Now})
+				if input.OnResult != nil {
+					input.OnResult(HeartbeatResult{Root: input.MemoryRoot, IndexPath: input.IndexPath, Learning: learning})
+				}
+				if err != nil {
+					return err
+				}
+			case "skill_learning":
+				workspace := strings.TrimSpace(input.Workspace)
+				if workspace == "" {
+					workspace = filepath.Join(input.Home, "workspace")
+				}
+				skill, err := RunSkillLearningHeartbeat(ctx, SkillLearningHeartbeatInput{Home: input.Home, Workspace: workspace, Model: input.Model, Now: input.Now})
+				if input.OnResult != nil {
+					input.OnResult(HeartbeatResult{Root: input.MemoryRoot, IndexPath: input.IndexPath, Skill: skill})
+				}
+				if err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("unsupported heartbeat job %q", job)
 			}
@@ -136,10 +159,20 @@ func NormalizeHeartbeatJobs(jobs []string) []string {
 				out = append(out, "memory_distill")
 				seen["memory_distill"] = true
 			}
+		case "learning_distill", "learning":
+			if !seen["learning_distill"] {
+				out = append(out, "learning_distill")
+				seen["learning_distill"] = true
+			}
+		case "skill_learning", "skill":
+			if !seen["skill_learning"] {
+				out = append(out, "skill_learning")
+				seen["skill_learning"] = true
+			}
 		}
 	}
 	if len(out) == 0 {
-		out = []string{"lint-index", "memory_distill"}
+		out = []string{"lint-index", "memory_distill", "learning_distill", "skill_learning"}
 	}
 	return out
 }

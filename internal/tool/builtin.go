@@ -22,6 +22,7 @@ import (
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/secret"
 )
 
@@ -35,6 +36,7 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(FileWriteTool{Config: root})
 	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
+	registry.Register(ScriptRunTool{Config: root})
 	registry.Register(ScheduleCreateTool{Config: root})
 	registry.Register(ScheduleListTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
@@ -174,6 +176,7 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 }
 
 type TerminalRunTool struct{ Config *config.Root }
+type ScriptRunTool struct{ Config *config.Root }
 type ScheduleCreateTool struct{ Config *config.Root }
 type ScheduleListTool struct{ Config *config.Root }
 
@@ -358,6 +361,49 @@ func terminalWorkdir(cfg *config.Root) (string, error) {
 		return "", nil
 	}
 	return ResolveAllowedPath(raw, cfg)
+}
+
+func (ScriptRunTool) Name() string        { return "script.run" }
+func (ScriptRunTool) Description() string { return "run a discovered local Mateway script" }
+func (ScriptRunTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"name"}}
+}
+func (ScriptRunTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when a reusable local script exists for a connector-like task such as mail, publishing, or server operations.",
+		WhenNotToUse:         "Do not use if no matching script exists; explain the connector gap instead of fabricating execution.",
+		OutputContract:       "Return script output, exit code, duration, and script path evidence.",
+		Evidence:             "Return script name, path, args, exit_code, and duration_ms.",
+		Acceptance:           "Accepted when the script exits successfully and returns useful output.",
+		SoftFailureSignals:   []string{"script not found", "missing required secret", "non-zero exit", "timeout"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "stable_if_script_unchanged",
+		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
+	}
+}
+func (ScriptRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	args := stringSliceArg(call.Args["args"])
+	result, err := script.Run(ctx, t.Config, script.RunInput{
+		Name: toolArgString(call.Args, "name"),
+		Args: args,
+	})
+	evidence := map[string]any{}
+	if result.Script.Name != "" {
+		evidence["script"] = result.Script.Name
+		evidence["path"] = result.Script.Path
+		evidence["args"] = args
+		evidence["exit_code"] = result.ExitCode
+		evidence["duration_ms"] = result.Duration.Milliseconds()
+	}
+	if err != nil {
+		content := strings.TrimSpace(result.Output)
+		if content == "" {
+			content = err.Error()
+		}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: content, IsError: true, Evidence: evidence}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: result.Output, Evidence: evidence}
 }
 
 type WebFetchTool struct{}
@@ -881,6 +927,28 @@ func toolArgString(args map[string]any, key string) string {
 		return ""
 	}
 	return text
+}
+
+func stringSliceArg(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		var out []string
+		for _, item := range v {
+			if text := strings.TrimSpace(fmt.Sprint(item)); text != "" && text != "<nil>" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		return strings.Fields(v)
+	default:
+		return nil
+	}
 }
 
 func (EchoTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }

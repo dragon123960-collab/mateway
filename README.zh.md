@@ -267,6 +267,8 @@ Review proposals：
 
 ```bash
 ./build/mateway memory heartbeat lint-index
+./build/mateway memory heartbeat learning
+./build/mateway memory heartbeat skill
 ```
 
 以前台循环运行 heartbeat 维护：
@@ -275,7 +277,7 @@ Review proposals：
 ./build/mateway memory heartbeat serve
 ```
 
-这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，并写入 audit entry。
+这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，蒸馏学习 evidence，生成 skill patch proposal，并写入 audit entry。
 
 ## 定时任务
 
@@ -386,14 +388,19 @@ required_secrets:
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
 - 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps 和 software installation workflow。
-- Agent 可以检查已有 skills，并把它们作为行为指导。
+- Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
 
-尚未实现：
+已可用：
 
+- `mateway skill catalog report`
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
+- `mateway skill proposal list|show|promote|reject`
+- `mateway skill usage report`
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
-- 自动 skill patch / promotion 工作流
+- heartbeat 生成 skill patch proposal 的审核工作流
+
+Script Bridge 保持小而硬：`~/.mateway/scripts/`、`workspace/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
 
 ## 多 Agent Profiles
 

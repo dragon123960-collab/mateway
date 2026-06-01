@@ -19,6 +19,7 @@ import (
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
@@ -89,6 +90,8 @@ func run(args []string) error {
 		return nil
 	case "home":
 		return runHome(args[1:])
+	case "workspace":
+		return runWorkspace(args[1:])
 	case "trace":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: mateway trace <trace-jsonl-path>")
@@ -118,6 +121,10 @@ func run(args []string) error {
 		return runMemory(args[1:])
 	case "agent-profile":
 		return runAgentProfile(args[1:])
+	case "script":
+		return runScript(args[1:])
+	case "sandbox":
+		return runSandbox(args[1:])
 	case "schedule":
 		return runSchedule(args[1:])
 	case "skill":
@@ -362,9 +369,40 @@ func runHome(args []string) error {
 	}
 }
 
+func runWorkspace(args []string) error {
+	if len(args) != 1 || args[0] != "report" {
+		return fmt.Errorf("usage: mateway workspace report")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	memReport, _ := memory.BuildReport(memory.ReportInput{Home: cfg.App.Home, MemoryRoot: memoryRoot(cfg)})
+	learningReport, _ := memory.BuildLearningReport(memory.LearningReportInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace})
+	skills, _ := skill.List(cfg.App.Workspace)
+	scripts, _ := script.List(cfg)
+	schedules, _ := schedule.Store{Home: cfg.App.Home}.List()
+	traceCount := countFiles(filepath.Join(cfg.App.Home, "trace"), ".jsonl")
+	fmt.Println("home:", cfg.App.Home)
+	fmt.Println("workspace:", cfg.App.Workspace)
+	fmt.Println("traces:", traceCount)
+	fmt.Println("memory_files:", memReport.MemoryFiles)
+	fmt.Println("memory_index_entries:", memReport.IndexEntries)
+	fmt.Println("memory_pending_proposals:", memReport.Proposals["proposed"])
+	fmt.Println("learning_tasks:", learningReport.Tasks)
+	fmt.Println("learning_failures:", learningReport.Failures)
+	fmt.Println("skill_usage:", learningReport.SkillUsage)
+	fmt.Println("skill_pending_proposals:", learningReport.SkillProposalsPending)
+	fmt.Println("skills:", len(skills))
+	fmt.Println("scripts:", len(scripts))
+	fmt.Println("schedules:", len(schedules))
+	fmt.Println("sandbox_enabled:", cfg.Security.TerminalSandbox.Enabled)
+	return nil
+}
+
 func runSkill(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway skill <list|search|install>")
+		return fmt.Errorf("usage: mateway skill <list|search|install|catalog|proposal|usage>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -409,6 +447,10 @@ func runSkill(args []string) error {
 				continue
 			}
 			fmt.Printf("- %s enabled=%v trust=%s url=%s", result.Catalog, result.Enabled, result.TrustLevel, result.URL)
+			if result.Adapter != "" {
+				fmt.Printf(" adapter=%s", result.Adapter)
+			}
+			fmt.Printf(" can_install=%v", result.CanInstall)
 			if result.InstallURL != "" {
 				fmt.Printf(" install_url=%s", result.InstallURL)
 			}
@@ -437,9 +479,117 @@ func runSkill(args []string) error {
 		fmt.Println("skill:", result.Name)
 		fmt.Println("path:", result.Path)
 		return nil
+	case "catalog":
+		return runSkillCatalog(cfg, args[1:])
+	case "proposal":
+		return runSkillProposal(cfg, args[1:])
+	case "usage":
+		return runSkillUsage(cfg, args[1:])
 	default:
-		return fmt.Errorf("usage: mateway skill <list|search|install>")
+		return fmt.Errorf("usage: mateway skill <list|search|install|catalog|proposal|usage>")
 	}
+}
+
+func runSkillCatalog(cfg *config.Root, args []string) error {
+	if len(args) != 1 || args[0] != "report" {
+		return fmt.Errorf("usage: mateway skill catalog report")
+	}
+	reports := skill.CatalogReports(cfg)
+	fmt.Println("skill_catalogs:", len(reports))
+	for _, report := range reports {
+		fmt.Printf("- %s enabled=%v trust=%s adapter=%s can_install=%v search_url=%s", report.Name, report.Enabled, report.TrustLevel, report.Adapter, report.CanInstall, report.SearchURL)
+		if report.InstallURL != "" {
+			fmt.Printf(" install_url=%s", report.InstallURL)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func runSkillProposal(cfg *config.Root, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway skill proposal <list|show|promote|reject>")
+	}
+	store := skill.NewProposalStore(cfg)
+	switch args[0] {
+	case "list":
+		proposals, err := store.List()
+		if err != nil {
+			return err
+		}
+		fmt.Println("skill_proposals:", len(proposals))
+		for _, proposal := range proposals {
+			fmt.Printf("- %s status=%s skill=%s scope=%s target=%s\n", proposal.ID, proposal.Status, proposal.SkillName, proposal.Scope, proposal.TargetPath)
+		}
+		return nil
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway skill proposal show <proposal_id>")
+		}
+		proposal, err := store.Read(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		fmt.Println("skill:", proposal.SkillName)
+		fmt.Println("scope:", proposal.Scope)
+		fmt.Println("target:", proposal.TargetPath)
+		fmt.Println("created_at:", proposal.CreatedAt)
+		if proposal.Reason != "" {
+			fmt.Println("reason:", proposal.Reason)
+		}
+		if len(proposal.Sources) > 0 {
+			fmt.Println("sources:", strings.Join(proposal.Sources, ", "))
+		}
+		fmt.Println("diff:")
+		fmt.Println(proposal.Diff)
+		return nil
+	case "promote":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway skill proposal promote <proposal_id>")
+		}
+		proposal, backupDir, err := store.Promote(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		fmt.Println("target:", proposal.TargetPath)
+		fmt.Println("backup:", backupDir)
+		return nil
+	case "reject":
+		fs := flag.NewFlagSet("mateway skill proposal reject", flag.ContinueOnError)
+		reason := fs.String("reason", "", "rejection reason")
+		rejectArgs := reorderRejectReasonFlag(args[1:])
+		if err := fs.Parse(rejectArgs); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway skill proposal reject <proposal_id> [--reason <text>]")
+		}
+		proposal, err := store.Reject(fs.Arg(0), *reason)
+		if err != nil {
+			return err
+		}
+		fmt.Println("proposal:", proposal.ID)
+		fmt.Println("status:", proposal.Status)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway skill proposal <list|show|promote|reject>")
+	}
+}
+
+func runSkillUsage(cfg *config.Root, args []string) error {
+	if len(args) != 1 || args[0] != "report" {
+		return fmt.Errorf("usage: mateway skill usage report")
+	}
+	report, err := memory.BuildLearningReport(memory.LearningReportInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace})
+	if err != nil {
+		return err
+	}
+	printLearningReport(report)
+	return nil
 }
 
 func runSchedule(args []string) error {
@@ -560,6 +710,86 @@ func runSchedule(args []string) error {
 	default:
 		return fmt.Errorf("usage: mateway schedule <create|list|test|activate|pause|run-due|serve>")
 	}
+}
+
+func runScript(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway script <list|report|run>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list", "report":
+		scripts, err := script.List(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Println("scripts:", len(scripts))
+		for _, item := range scripts {
+			fmt.Printf("- %s risk=%s path=%s", item.Name, item.Risk, item.Path)
+			if item.Description != "" {
+				fmt.Printf(" description=%s", item.Description)
+			}
+			if len(item.RequiredSecrets) > 0 {
+				var refs []string
+				for _, ref := range item.RequiredSecrets {
+					refs = append(refs, ref.ID+"->"+ref.Env)
+				}
+				fmt.Printf(" required_secrets=%s", strings.Join(refs, ","))
+			}
+			fmt.Println()
+		}
+		return nil
+	case "run":
+		fs := flag.NewFlagSet("mateway script run", flag.ContinueOnError)
+		timeoutFlag := fs.Duration("timeout", 20*time.Second, "script timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() < 1 {
+			return fmt.Errorf("usage: mateway script run <name> [args...]")
+		}
+		result, err := script.Run(context.Background(), cfg, script.RunInput{
+			Name:    fs.Arg(0),
+			Args:    fs.Args()[1:],
+			Timeout: *timeoutFlag,
+		})
+		fmt.Println("script:", result.Script.Name)
+		fmt.Println("path:", result.Script.Path)
+		fmt.Println("exit_code:", result.ExitCode)
+		fmt.Println("duration_ms:", result.Duration.Milliseconds())
+		if result.Output != "" {
+			fmt.Println("output:")
+			fmt.Println(result.Output)
+		}
+		return err
+	default:
+		return fmt.Errorf("usage: mateway script <list|report|run>")
+	}
+}
+
+func runSandbox(args []string) error {
+	if len(args) != 1 || args[0] != "report" {
+		return fmt.Errorf("usage: mateway sandbox report")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	sb := cfg.Security.TerminalSandbox
+	fmt.Println("sandbox_enabled:", sb.Enabled)
+	fmt.Println("mode:", sb.Mode)
+	fmt.Println("workdir:", sb.WorkDir)
+	fmt.Println("timeout_seconds:", sb.TimeoutSeconds)
+	fmt.Println("command_prefix:", strings.Join(sb.CommandPrefix, " "))
+	if sb.Enabled {
+		fmt.Println("evidence:", "terminal.run records sandbox mode and workdir when configured")
+	} else {
+		fmt.Println("evidence:", "terminal sandbox disabled; terminal.run uses direct shell with configured timeout")
+	}
+	return nil
 }
 
 func runDueSchedules(ctx context.Context, cfg *config.Root, store schedule.Store) error {
@@ -756,11 +986,29 @@ func runMemory(args []string) error {
 		return runMemoryDistill(args[1:])
 	case "heartbeat":
 		return runMemoryHeartbeat(args[1:])
+	case "learning":
+		return runMemoryLearning(args[1:])
 	case "report":
 		return runMemoryReport(args[1:])
 	default:
-		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill|heartbeat|report>")
+		return fmt.Errorf("usage: mateway memory <lint|index|search|proposal|distill|heartbeat|learning|report>")
 	}
+}
+
+func runMemoryLearning(args []string) error {
+	if len(args) != 1 || args[0] != "report" {
+		return fmt.Errorf("usage: mateway memory learning report")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	report, err := memory.BuildLearningReport(memory.LearningReportInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace})
+	if err != nil {
+		return err
+	}
+	printLearningReport(report)
+	return nil
 }
 
 func runMemoryReport(args []string) error {
@@ -800,7 +1048,7 @@ func runMemoryReport(args []string) error {
 
 func runMemoryHeartbeat(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|serve>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|learning|skill|serve>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -835,6 +1083,22 @@ func runMemoryHeartbeat(args []string) error {
 			Model:      memoryDistillModel(cfg),
 		})
 		printDistillResult(result)
+		return err
+	case "learning":
+		result, err := memory.RunLearningDistillHeartbeat(context.Background(), memory.LearningHeartbeatInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+			Model:      memoryDistillModel(cfg),
+		})
+		printDistillResult(result)
+		return err
+	case "skill":
+		result, err := memory.RunSkillLearningHeartbeat(context.Background(), memory.SkillLearningHeartbeatInput{
+			Home:      cfg.App.Home,
+			Workspace: cfg.App.Workspace,
+			Model:     memoryDistillModel(cfg),
+		})
+		printSkillLearningResult(result)
 		return err
 	case "serve":
 		fs := flag.NewFlagSet("mateway memory heartbeat serve", flag.ContinueOnError)
@@ -884,6 +1148,26 @@ func runMemoryHeartbeat(args []string) error {
 					if err != nil {
 						return err
 					}
+				case "learning_distill":
+					learning, err := memory.RunLearningDistillHeartbeat(context.Background(), memory.LearningHeartbeatInput{
+						Home:       cfg.App.Home,
+						MemoryRoot: memoryRoot(cfg),
+						Model:      memoryDistillModel(cfg),
+					})
+					printDistillResult(learning)
+					if err != nil {
+						return err
+					}
+				case "skill_learning":
+					skillResult, err := memory.RunSkillLearningHeartbeat(context.Background(), memory.SkillLearningHeartbeatInput{
+						Home:      cfg.App.Home,
+						Workspace: cfg.App.Workspace,
+						Model:     memoryDistillModel(cfg),
+					})
+					printSkillLearningResult(skillResult)
+					if err != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -896,6 +1180,7 @@ func runMemoryHeartbeat(args []string) error {
 		fmt.Println("jobs:", strings.Join(memory.NormalizeHeartbeatJobs(jobs), ", "))
 		return memory.ServeHeartbeat(context.Background(), memory.HeartbeatServeInput{
 			Home:       cfg.App.Home,
+			Workspace:  cfg.App.Workspace,
 			MemoryRoot: memoryRoot(cfg),
 			IndexPath:  memoryIndexPath(cfg),
 			Interval:   interval,
@@ -906,7 +1191,7 @@ func runMemoryHeartbeat(args []string) error {
 			},
 		})
 	default:
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|serve>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|learning|skill|serve>")
 	}
 }
 
@@ -924,6 +1209,12 @@ func printHeartbeatResult(result memory.HeartbeatResult) {
 	if result.Distill.Scanned > 0 || result.Distill.Created > 0 || result.Distill.Skipped > 0 || result.Distill.Duplicates > 0 || len(result.Distill.Errors) > 0 {
 		printDistillResult(result.Distill)
 	}
+	if result.Learning.Scanned > 0 || result.Learning.Created > 0 || result.Learning.Skipped > 0 || result.Learning.Duplicates > 0 || len(result.Learning.Errors) > 0 {
+		printDistillResult(result.Learning)
+	}
+	if result.Skill.Scanned > 0 || result.Skill.Created > 0 || result.Skill.Skipped > 0 || result.Skill.Duplicates > 0 || len(result.Skill.Errors) > 0 {
+		printSkillLearningResult(result.Skill)
+	}
 }
 
 func printDistillResult(result memory.DistillHeartbeatResult) {
@@ -936,6 +1227,32 @@ func printDistillResult(result memory.DistillHeartbeatResult) {
 	}
 	for _, errText := range result.Errors {
 		fmt.Println("distill_error:", errText)
+	}
+}
+
+func printSkillLearningResult(result memory.SkillLearningHeartbeatResult) {
+	fmt.Println("skill_learning_scanned:", result.Scanned)
+	fmt.Println("skill_learning_created:", result.Created)
+	fmt.Println("skill_learning_skipped:", result.Skipped)
+	fmt.Println("skill_learning_duplicates:", result.Duplicates)
+	if len(result.ProposalIDs) > 0 {
+		fmt.Println("skill_learning_proposals:", strings.Join(result.ProposalIDs, ", "))
+	}
+	for _, errText := range result.Errors {
+		fmt.Println("skill_learning_error:", errText)
+	}
+}
+
+func printLearningReport(report memory.LearningReport) {
+	fmt.Println("learning_tasks:", report.Tasks)
+	fmt.Println("learning_failures:", report.Failures)
+	fmt.Println("reflections:", report.Reflections)
+	fmt.Println("skill_usage:", report.SkillUsage)
+	fmt.Println("skill_issues:", report.SkillIssues)
+	fmt.Println("memory_proposals_pending:", report.MemoryProposalsPending)
+	fmt.Println("skill_proposals_pending:", report.SkillProposalsPending)
+	if report.LastLearningAudit != "" {
+		fmt.Println("last_learning_audit:", report.LastLearningAudit)
 	}
 }
 
@@ -1255,6 +1572,20 @@ func splitComma(value string) []string {
 	return out
 }
 
+func countFiles(dir, ext string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && (ext == "" || strings.EqualFold(filepath.Ext(entry.Name()), ext)) {
+			count++
+		}
+	}
+	return count
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1511,6 +1842,7 @@ Usage:
   mateway ask <message>
   mateway test [--case read-readme|project-index|web-search] [--message <task>] [--record=false]
   mateway trace <trace-jsonl-path>
+  mateway workspace report
   mateway session list
   mateway session show <session_key>
   mateway session archive list <session_key>
@@ -1529,15 +1861,29 @@ Usage:
   mateway memory distill session <session_key>
   mateway memory distill project close <project_id>
   mateway memory heartbeat lint-index
+  mateway memory heartbeat distill
+  mateway memory heartbeat learning
+  mateway memory heartbeat skill
   mateway memory heartbeat serve [--once] [--interval <duration>]
+  mateway memory learning report
   mateway memory report [--root <path>]
   mateway schedule list
   mateway schedule run-due
   mateway schedule serve
+  mateway sandbox report
+  mateway script list
+  mateway script report
+  mateway script run <name> [args...]
   mateway home report
   mateway skill list
+  mateway skill catalog report
   mateway skill search [--all] <query>
   mateway skill install [--name <name>] [--force] <path-or-raw-url>
+  mateway skill proposal list
+  mateway skill proposal show <proposal_id>
+  mateway skill proposal promote <proposal_id>
+  mateway skill proposal reject <proposal_id> [--reason <text>]
+  mateway skill usage report
   mateway secret set <id> [value]
   mateway secret get <id>
   mateway secret list
