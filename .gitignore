@@ -11,9 +11,9 @@ coverage.out
 .mateway/
 *.log
 /docs/archive/
+/dev-notes/
 /testdata/
 /bin/
-docs/
 scripts/
 AGENTS.md
 issue.md
