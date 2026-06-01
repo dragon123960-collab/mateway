@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/config"
+	"github.com/mdp/qrterminal/v3"
 )
 
 func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, timeout time.Duration, out io.Writer) (Account, string, error) {
@@ -29,7 +30,13 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 	}
 	qrURL := firstNonEmpty(qr.QRCodeURL, qr.QRCode)
 	if out != nil {
-		fmt.Fprintln(out, "请使用微信扫描以下二维码链接：")
+		fmt.Fprintln(out, "请使用微信扫描以下二维码：")
+		qrterminal.GenerateHalfBlock(qrURL, qrterminal.L, out)
+		if qr.QRCodeURL != "" {
+			fmt.Fprintln(out, "二维码链接：")
+		} else {
+			fmt.Fprintln(out, "二维码 token：")
+		}
 		fmt.Fprintln(out, qrURL)
 		fmt.Fprintln(out, "扫码后请在微信里确认。")
 	}
