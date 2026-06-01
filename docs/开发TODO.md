@@ -4,22 +4,100 @@
 
 ## 当前主线
 
-当前正在做第二阶段开发准备。第一阶段 baseline 已收口，v0.1.4 准备定版：
+当前通用 agent runtime 的基础闭环已经成型，第二阶段第一轮产品化已完成：
 
 ```text
-Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / Sandbox Runner / 只读 Workspace UI
+AgentCore / Tool / Trace / Memory / Skill / Script / Schedule / Multi-Agent Profile
+-> release hardening / dogfooding / internationalization / deeper adapters
 ```
 
-第二阶段目标不是推翻现有 runtime，而是把已经预留的 profile、binding、skills、memory、schedule 能力产品化：
+第二阶段后续目标不是推翻现有 runtime，而是在保持小核心的前提下做增强和优化：
 
-- 多 agent 方向：已有 `config.agents.profiles[]`、`config.agents.bindings[]`、`workspace/agents/<agent_id>/`、`workspace/memory/agents/<agent_id>/`。第二阶段要补 CLI/文档/验证，让多个 agent profile 可创建、检查、绑定 channel/account/peer，并保持 memory/skill/profile 上下文隔离。
-- Skill source adapters：当前已有 `skill list/search/install`，但 search 只生成 catalog URL，install 只接本地目录、本地 `SKILL.md` 或 raw URL。第二阶段要为不同源补 adapter/report/install 边界。
-- Script Bridge：不做重型 connector framework，先定义用户脚本发现、验证、调用、evidence 和确认边界。
-- Sandbox Runner：把现有 terminal sandbox config 接到更明确的本地 runner/wrapper。
-- Read-only Workspace UI：先做 trace/task/memory/schedule/skill 的只读报告或静态页面。
-- Secret 机制：skill 创建/安装时不允许写入明文 secret；凭证进入 `mateway secret` 本地存储，后续由 Script Bridge 执行时注入。
+- Release hardening：真实任务 dogfooding、错误体验、安装/升级、文档和回归测试。
+- Internationalization：避免非中文开发者被中文 runtime prompt、确认词、错误提示和规则判断卡住。
+- Skill source adapters：当前已有 catalog report / adapter status，后续做外部源深度 resolve/install。
+- Script Bridge：当前已有基础发现、执行和 secret 注入，后续补 dry-run/help/version 协议。
+- Sandbox Runner：当前已有 report 和 evidence，后续补 wrapper 示例与跨平台说明。
+- Read-only Workspace UI：当前已有 CLI report，后续补 trace/task/memory/schedule/skill 静态 HTML。
 
 详细设计以 `docs/记忆prd.md` 为准。
+
+## 下一步增强和优化
+
+### N1 Internationalization / English-first Productization
+
+状态：下一阶段优先
+
+问题：
+
+- 当前代码、README、测试中有不少中文用户可见文本，例如“确认/取消/保存/忽略/执行”、memory proposal review block、schedule review prompt、友好错误和 followup cue。
+- 对中文用户很自然，但非中文开发者调试时会遇到两个问题：
+  - 不知道聊天确认应该回复什么。
+  - trace/session/pending 里混入中文提示，难以自动化测试和集成。
+- 内部标识、config key、trace key、machine output 已大多是英文，但 user-facing prompt 还没有语言策略。
+
+目标：
+
+- 默认仍允许中文用户体验自然，但产品化时要让英文开发者可以完整使用和调试。
+- 内部标识、trace key、config key、CLI machine output 保持英文。
+- 用户可见自然语言进入可切换 message catalog，不散落在 runtime 逻辑里。
+
+待开发：
+
+- 增加配置：`app.locale: auto | zh-CN | en-US`、`app.default_user_language: auto | zh | en`。
+- 抽出 runtime user-facing messages：approval pending、memory proposal review、agent profile proposal review、schedule review、friendly runtime errors、`/new` reply。
+- 确认词做双语兼容：`确认/继续/yes/y/ok`、`取消/放弃/no/n/cancel`、`保存/save/commit`、`忽略/ignore/reject`。
+- README 英文版避免只展示中文回复词；所有聊天确认示例同时给出 English aliases。
+- 测试覆盖 `en-US` locale 下的 pending prompt、memory proposal prompt、schedule prompt。
+
+验收：
+
+- 非中文开发者只读英文 README 即可完成 ask、tool confirmation、memory proposal review、schedule review。
+- `app.locale: en-US` 时，runtime 生成英文用户可见提示。
+- trace/session/pending 仍保留英文 kind/status/key，不依赖中文字符串做机器判断。
+
+### N2 Release Hardening / Dogfooding
+
+状态：下一阶段优先
+
+待开发：
+
+- 增加真实任务回归套件：代码阅读、文件编辑、web fresh search、script.run、schedule test、memory proposal、agent binding。
+- `mateway doctor` 扩展：模型、search provider、scripts、skills、sandbox、agents、memory lint 汇总。
+- 文档收口：README 英文版作为默认入口，中文 README 保持完整但不作为唯一说明。
+- 打 tag 前检查：`go test ./...`、真实 `mateway test`、`memory lint`、`workspace report`。
+
+### N3 Learning Quality / Reports
+
+状态：候选增强
+
+待开发：
+
+- skill usage/failure rate 按 agent、skill、tool 统计。
+- trace quality report：任务成功/失败原因、tool retry、confirmation boundary 命中情况。
+- skill patch proposal 去重增强：source hash + target skill + diff key。
+- 多 agent memory safe-read scope 验收：确认 agent A 不召回 agent B 私有 memory。
+
+### N4 Connector / Script Bridge Depth
+
+状态：候选增强
+
+待开发：
+
+- script header 扩展 dry-run/help/version。
+- `mateway script report <name>` 展示 manifest、required secrets、last run evidence。
+- 邮件/SSH/GitHub/publishing 示例 skill + script 模板。
+- 缺少脚本时自动生成 integration proposal，而不是直接失败。
+
+### N5 Read-only Workspace Visualization
+
+状态：候选增强
+
+待开发：
+
+- `mateway workspace export-html` 生成静态 HTML。
+- trace timeline、task tree、memory ledger、schedule runs、skill shelf、agent profile report。
+- 不引入后台服务，不写业务状态。
 
 ## 第二阶段看板
 
