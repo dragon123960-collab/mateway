@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/tool"
@@ -34,6 +35,15 @@ func NewAgentPool(cfg *config.Root) AgentPool {
 
 func (p AgentPool) AgentForSession(sessionKey string) *agentcore.Agent {
 	agentID := p.resolveAgentID(sessionKey)
+	return p.agentForID(agentID)
+}
+
+func (p AgentPool) AgentForMessage(msg channel.InboundMessage) *agentcore.Agent {
+	agentID := p.resolveAgentIDForMessage(msg)
+	return p.agentForID(agentID)
+}
+
+func (p AgentPool) agentForID(agentID string) *agentcore.Agent {
 	if agent, ok := p.agents[agentID]; ok {
 		return cloneAgent(agent)
 	}
@@ -45,6 +55,15 @@ func (p AgentPool) AgentForSession(sessionKey string) *agentcore.Agent {
 
 func (p AgentPool) ProfileForSession(sessionKey string) config.AgentProfileConfig {
 	agentID := p.resolveAgentID(sessionKey)
+	return p.profileForID(agentID)
+}
+
+func (p AgentPool) ProfileForMessage(msg channel.InboundMessage) config.AgentProfileConfig {
+	agentID := p.resolveAgentIDForMessage(msg)
+	return p.profileForID(agentID)
+}
+
+func (p AgentPool) profileForID(agentID string) config.AgentProfileConfig {
 	if profile, ok := p.profileByID(agentID); ok {
 		return profile
 	}
@@ -70,6 +89,46 @@ func (p AgentPool) resolveAgentID(sessionKey string) string {
 		}
 	}
 	return p.config.Agents.Default
+}
+
+func (p AgentPool) resolveAgentIDForMessage(msg channel.InboundMessage) string {
+	if p.config == nil {
+		return ""
+	}
+	channelName := strings.TrimSpace(msg.Channel)
+	if channelName == "" {
+		channelName = msg.SessionKey
+		if i := strings.Index(channelName, ":"); i >= 0 {
+			channelName = channelName[:i]
+		}
+	}
+	accountID := strings.TrimSpace(msg.Metadata["account_id"])
+	peerID := strings.TrimSpace(msg.Metadata["peer_id"])
+	if peerID == "" {
+		peerID = strings.TrimSpace(msg.ThreadID)
+	}
+	for _, binding := range p.config.Agents.Bindings {
+		if !bindingMatches(binding, channelName, accountID, peerID) {
+			continue
+		}
+		if strings.TrimSpace(binding.AgentID) != "" {
+			return strings.TrimSpace(binding.AgentID)
+		}
+	}
+	return p.config.Agents.Default
+}
+
+func bindingMatches(binding config.AgentBindingConfig, channelName, accountID, peerID string) bool {
+	if !strings.EqualFold(strings.TrimSpace(binding.Channel), strings.TrimSpace(channelName)) {
+		return false
+	}
+	if strings.TrimSpace(binding.AccountID) != "" && !strings.EqualFold(strings.TrimSpace(binding.AccountID), strings.TrimSpace(accountID)) {
+		return false
+	}
+	if strings.TrimSpace(binding.PeerID) != "" && !strings.EqualFold(strings.TrimSpace(binding.PeerID), strings.TrimSpace(peerID)) {
+		return false
+	}
+	return true
 }
 
 func (p AgentPool) profileByID(agentID string) (config.AgentProfileConfig, bool) {

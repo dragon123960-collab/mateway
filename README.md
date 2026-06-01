@@ -42,7 +42,7 @@ task / trace / tool evidence
   -> safe-read injection
 ```
 
-The agent can propose a durable memory after a useful task. The user can reply `保存` to commit it or `忽略` to reject it. Under the hood this mirrors a lightweight Git flow:
+The agent can propose a durable memory after a useful task. The user can reply `save` to commit it or `ignore` to reject it. Chinese aliases such as `保存` and `忽略` are also supported. Under the hood this mirrors a lightweight Git flow:
 
 | Memory step | Git-like idea |
 |---|---|
@@ -59,14 +59,14 @@ Long-term memory is stored as Markdown with YAML frontmatter under `~/.mateway/w
 After task completion, `observe_hook` records task steps and may generate a memory proposal. The proposal is shown in the final answer as a human decision:
 
 ```text
-保存到长期记忆:
+Save to long-term memory:
 mateway memory proposal commit <proposal_id>
 
-忽略这条候选:
+Ignore this candidate:
 mateway memory proposal reject <proposal_id>
 ```
 
-In chat channels, the user can also reply `保存` or `忽略`. Mateway stores that as a pending `memory_proposal_review`, so a short reply is interpreted by runtime state, not guessed by the model.
+In chat channels, the user can also reply `save` / `ignore` or `保存` / `忽略`. Mateway stores that as a pending `memory_proposal_review`, so a short reply is interpreted by runtime state, not guessed by the model.
 
 ### 3. Hook-first Runtime
 The core loop stays small. Extension points are explicit:
@@ -84,6 +84,7 @@ Every run writes a JSONL trace:
 
 - request and channel
 - model turns
+- model request count and token usage when the provider returns usage metadata
 - tool calls and tool results
 - hook events
 - pending confirmations
@@ -92,12 +93,44 @@ Every run writes a JSONL trace:
 
 Persistent traces, session transcripts, and task step summaries redact secret-like fields such as `api_key`, `token`, `password`, `smtp_pass`, `imap_pass`, and bearer tokens. The model still sees live tool output for the current task; persistent logs avoid storing obvious credentials.
 
-### 5. Skills As Editable Behavior, Not Magic Tools
+### 5. Bounded Session Context
+Sessions are runtime state, not an ever-growing raw chat log. Before each model call, Mateway builds context from:
+
+- fresh system/runtime context from `context_hook`
+- the current agent profile Markdown files
+- discovered skill guidance
+- relevant long-term memory snippets when `memory_safe_read` triggers
+- the compacted recent session transcript
+- the current user message
+
+System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, trace ids, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt.
+
+Send `/new`, `/新会话`, or `新会话` to archive the current session and clear the active state under the same `session_key`. This is useful for long Feishu threads where the channel session key stays fixed but the agent should start from a clean context.
+
+### 6. Skills As Editable Behavior, Not Magic Tools
 Mateway discovers local `SKILL.md` files and injects concise guidance into the runtime context. Current default skills include:
 
 - `software-install`
 - `fresh-search`
 - `source-evaluation`
+
+### 7. Internationalization Boundary
+
+Mateway keeps internal machine interfaces in English: config keys, trace keys, audit events, pending kinds, JSONL evidence, tool names, and machine-readable CLI output are not localized. Human-facing runtime prompts use a small message catalog.
+
+Default config uses `app.locale: auto`: Chinese user text receives Chinese prompts; other text receives English prompts. You can force a language with `app.locale: en-US` or `app.locale: zh-CN`. Additional locales can be added through `app.message_catalog_dir` by placing files such as `de-DE.yaml` or `fr-FR.yaml` with stable message keys and `aliases.<action>` entries.
+
+Review aliases are locale-independent. For example, tool approval accepts `confirm` / `cancel` and `确认` / `取消`; memory review accepts `save` / `ignore` and `保存` / `忽略`; schedule review accepts `run` / `cancel` and `执行` / `取消`.
+
+Example catalog fragment:
+
+```yaml
+approval.confirm.generic: Bitte bestätigen, um fortzufahren. Antworten Sie mit "confirm" oder "cancel".
+aliases.confirm:
+  - bestätigen
+aliases.memory_commit:
+  - speichern
+```
 - `connector-gap`
 
 Skills are guidance, not executable capabilities by themselves. If a task needs a real action, the agent must still use an actual tool or script and show evidence.
@@ -108,8 +141,11 @@ Mateway currently supports:
 
 - CLI task entrypoint: `mateway ask`
 - Feishu WebSocket gateway
+- native Weixin iLink Bot channel: `mateway weixin login`, `mateway weixin enable`
+- channel discovery from runtime channel config files: `mateway channel list`
 - real runtime tests: `mateway test`
 - trace review: `mateway trace`
+- session inspect/archive commands: `mateway session list`, `mateway session show`, `mateway session archive list/show`
 - task tree and follow-up binding
 - pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
@@ -118,8 +154,9 @@ Mateway currently supports:
 - workspace profile injection
 - skill discovery from `workspace/skills` and agent-specific skill overrides
 - Markdown memory lint/search/index
-- memory proposal create/list/commit/reject
+- memory proposal create/list/show/commit/reject
 - automatic diary/proposal generation after useful completed tasks
+- configurable memory proposal nudges by channel, interval, and max displayed candidates
 - conversation reply handling for memory proposal `保存` / `忽略`
 - memory safe-read injection through `context_hook`
 - session and project distill commands
@@ -192,12 +229,40 @@ Custom task:
 ./build/mateway test --session-key demo:a001 --message "Read README.md and explain the memory system."
 ```
 
-### Start Feishu Gateway
+### Start Gateway
 ```bash
 ./build/mateway gateway serve
 ```
 
-`gateway serve` runs in the foreground. Use launchd, systemd, or another service manager if you want it hosted as a background service.
+`gateway serve` runs enabled built-in channels in the foreground. Use launchd, systemd, or another service manager if you want it hosted as a background service.
+
+List channel ids from local channel config files:
+
+```bash
+./build/mateway channel list
+```
+
+Example:
+
+```text
+ID      ENABLED  CONFIG
+feishu  true     ~/.mateway/config/channels/feishu.yaml
+weixin  true     ~/.mateway/config/channels/weixin.yaml
+```
+
+Use the `ID` column when configuring channel-scoped behavior such as memory proposal nudges.
+
+### Connect Weixin
+
+Mateway's native Weixin channel follows the Hermes-style iLink Bot API path. It supports QR login, saved accounts, long-poll inbound text messages, and text replies.
+
+```bash
+./build/mateway weixin login
+./build/mateway weixin enable
+./build/mateway gateway restart
+```
+
+The login command saves credentials under `~/.mateway/run/weixin/accounts/`. `weixin enable` updates `~/.mateway/config/channels/weixin.yaml` without writing the token into the config file. Media/CDN support is intentionally out of scope for this release.
 
 ## Memory Commands
 
@@ -223,9 +288,24 @@ Review proposals:
 
 ```bash
 ./build/mateway memory proposal list
+./build/mateway memory proposal show <proposal_id>
 ./build/mateway memory proposal commit <proposal_id>
 ./build/mateway memory proposal reject <proposal_id> --reason "not reusable"
 ```
+
+Memory proposal nudges are configurable in `~/.mateway/config/config.yaml`:
+
+```yaml
+memory:
+  proposal_nudge:
+    enabled: true
+    interval: 24h
+    channels:
+      - cli
+    max_proposals: 3
+```
+
+The nudge is generated by runtime, but only for configured channel ids. It shows a small candidate summary and points to `mateway memory proposal show <proposal_id>` for details instead of dumping all pending proposals into chat.
 
 Distill session or project:
 
@@ -238,6 +318,8 @@ Run manual heartbeat maintenance:
 
 ```bash
 ./build/mateway memory heartbeat lint-index
+./build/mateway memory heartbeat learning
+./build/mateway memory heartbeat skill
 ```
 
 Run heartbeat maintenance in a foreground loop:
@@ -246,7 +328,7 @@ Run heartbeat maintenance in a foreground loop:
 ./build/mateway memory heartbeat serve
 ```
 
-The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, and writes an audit entry.
+The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, distills learning evidence, proposes skill patches, and writes audit entries.
 
 ## Scheduled Tasks
 
@@ -278,6 +360,7 @@ If a scheduled task needs notification, make notification part of the task itsel
 Use traces to inspect:
 
 - model/tool/runtime latency
+- model request count and input/output/total tokens
 - hook decisions
 - tool calls and acceptance evidence
 - pending confirmations
@@ -291,6 +374,7 @@ Use traces to inspect:
   config/        # config.yaml, env files, model/channel config
   workspace/     # agent profiles, skills, Markdown memory
   sessions/      # transcripts, task trees, pending states
+    archive/     # archived sessions created by /new
   trace/         # JSONL traces
   observe/       # diary, proposals, reflections, audit logs
   indexes/       # rebuildable memory indexes
@@ -355,14 +439,19 @@ Current behavior:
 
 - Runtime discovers local skills and injects short guidance into context.
 - Default initialized shared skills cover fresh search, source evaluation, connector gaps, and software installation workflow.
-- Agents can inspect existing skills and use them as guidance.
+- Agents can inspect existing skills, install local/raw skills, and review skill patch proposals before promotion.
 
-Not yet implemented:
+Available:
 
+- `mateway skill catalog report`
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
+- `mateway skill proposal list|show|promote|reject`
+- `mateway skill usage report`
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
-- automatic skill patch/promotion workflow
+- heartbeat-generated skill patch proposal workflow
+
+Script Bridge is intentionally small: executable scripts under `~/.mateway/scripts/`, `workspace/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
 
 ## Multi-Agent Profiles
 
@@ -375,13 +464,30 @@ Mateway does not yet include a multi-agent supervisor, subagent spawning, or DAG
 - `workspace/agents/<agent_id>/skills/`
 - `workspace/memory/agents/<agent_id>/`
 
-This means different channels or session namespaces can select different agent identities, prompt files, skill overrides, and memory scopes while still sharing the same small AgentCore runtime. The next development stage productizes this with agent list/report/create/bind commands, profile linting, and multi-profile acceptance tests.
+Each agent profile uses the same core prompt-facing files: `agent.md`, `soul.md`, `user.md`, `tools.md`, and `memory.md`. New profiles created with `mateway agent create` use English baseline templates and do not overwrite existing files.
+
+This means different channels or session namespaces can select different agent identities, prompt files, skill overrides, and memory scopes while still sharing the same small AgentCore runtime.
 
 The boundary is deliberate: profiles and bindings are in scope; autonomous multi-agent orchestration is not part of the current release.
 
+Profile productization commands:
+
+- `mateway agent list`
+- `mateway agent report <agent_id>`
+- `mateway agent lint <agent_id>`
+- `mateway agent create <agent_id> [--name <name>] [--default]`
+- `mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>`
+- `mateway agent unbind --channel <channel> [--account-id <id>] [--peer-id <id>]`
+
 ## Gateway Boundary
 
-Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. The current `gateway serve` implementation starts the Feishu WebSocket channel when `channels/feishu.yaml` enables it. Future channels should plug into the same gateway boundary rather than bypassing runtime.
+Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` starts enabled built-in channels from `channels/`, including Feishu WebSocket and native Weixin long-poll.
+
+New stable channels should be added as built-in channel specs so one gateway process can manage them. A channel package owns platform I/O and message normalization, while gateway owns session key, dedupe, async runtime execution, and trace events.
+
+The native Weixin channel follows the Hermes-style iLink Bot API path: `mateway weixin login` scans a QR code and saves account credentials under `~/.mateway/run/weixin/accounts/`; `gateway serve` then long-polls `getupdates` and sends text replies through `sendmessage`. Media/CDN support is intentionally out of scope for the first Mateway implementation.
+
+Use `mateway channel list` to see canonical channel ids from `~/.mateway/config/channels/*.yaml`. Runtime config should use those ids, for example `feishu` or `weixin`, rather than aliases such as `lark` or `wechat`.
 
 `gateway serve` uses the same config loader as CLI commands, so it reads `~/.mateway/config/mateway.env`. Existing process environment variables still win over values from that file.
 
@@ -403,24 +509,27 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 
 - Small AgentCore runtime loop
 - Multi-agent profile and binding foundation
-- CLI / test / Feishu entrypoints
+- CLI / test / Feishu / Weixin entrypoints
 - Hook pipeline
 - Tool policy and confirmation boundaries
 - JSONL traces
 - Skill discovery and context injection
 - Local secret store and skill secret scanning
 - Markdown memory lint/search/index
-- Memory proposal commit/reject workflow
+- Memory proposal list/show/commit/reject workflow
+- Configurable memory proposal nudges
 - Self-learning diary/proposal generation
 - Memory safe-read context injection
 - Session/project distill commands
 - Heartbeat `lint-index` and foreground heartbeat runner
 - Channel-neutral scheduled task create/test/run-due/serve
+- Built-in channel discovery with `mateway channel list`
 - Secret redaction for persistent runtime records
 
 ### Next
 
-- multi-agent profile productization: agent list/report/create/bind, profile lint, and multi-profile tests
+- more built-in channels such as DingTalk, QQ, WeCom, and Telegram
+- richer media handling for channels that support images/files
 - script bridge specification for user-provided connectors
 - skill source adapters and promote workflow
 - safer terminal sandbox wrappers

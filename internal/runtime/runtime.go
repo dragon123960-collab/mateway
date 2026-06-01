@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
@@ -63,6 +65,9 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
 	}()
+	if isNewSessionCommand(msg.Text) {
+		return rt.resetSession(msg, state, trace, start)
+	}
 	if resp, handled, err := rt.handlePending(ctx, &state, msg, trace); handled || err != nil {
 		if handled && err == nil {
 			resp.TraceID = trace.id
@@ -76,10 +81,10 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		task := state.StartTask(msg.Text)
 		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
 		state.BlockActiveTask("await_user_input")
-		if err := rt.Store.Save(state); err != nil {
+		if err := rt.saveState(&state, trace); err != nil {
 			return Response{}, err
 		}
-		resp := reply(msg, decision.ClarifyPrompt, "clarify")
+		resp := rt.reply(msg, decision.ClarifyPrompt, "clarify")
 		resp.TraceID = trace.id
 		resp.TracePath = trace.path
 		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
@@ -101,16 +106,44 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 }
 
 func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, trace *traceRecorder) (Response, error) {
-	messages := append([]agentcore.Message(nil), state.Messages...)
+	messages, compactStats, err := prepareMessagesForModel(state.Messages)
+	if err != nil {
+		_ = trace.write(map[string]any{
+			"type":         "context_budget_exceeded",
+			"before_chars": compactStats.BeforeChars,
+			"after_chars":  compactStats.AfterChars,
+			"error":        err.Error(),
+		})
+		state.BlockActiveTask("failed")
+		if saveErr := rt.saveState(state, trace); saveErr != nil {
+			return Response{}, saveErr
+		}
+		resp := Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     "当前会话上下文仍然过大，已停止这次请求。请发送 `/new` 开启干净会话，旧会话会自动归档。",
+				Style:    "error",
+				Locale:   runtimeLocale(rt.Config, msg),
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+			Failed:    true,
+		}
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+		return resp, nil
+	}
+	writeCompactTrace(trace, "model_input_compacted", compactStats)
 	messages = append(messages, agentcore.Message{Role: agentcore.RoleUser, Content: userText})
 
-	agent := rt.Pool.AgentForSession(msg.SessionKey)
+	agent := rt.Pool.AgentForMessage(msg)
 	if agent == nil {
 		agent = agentcore.NewAgent(rt.Model, rt.Tools)
 	}
 	agent.Messages = messages
 	agent.MaxIterations = 6
-	profile := rt.Pool.ProfileForSession(msg.SessionKey)
+	profile := rt.Pool.ProfileForMessage(msg)
+	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
@@ -121,7 +154,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	result, err := agent.Continue(ctx)
 	if err != nil {
 		state.BlockActiveTask("failed")
-		if saveErr := rt.Store.Save(*state); saveErr != nil {
+		if saveErr := rt.saveState(state, trace); saveErr != nil {
 			return Response{}, saveErr
 		}
 		text := friendlyRuntimeError(err)
@@ -131,6 +164,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				ThreadID: msg.ThreadID,
 				Text:     text,
 				Style:    "error",
+				Locale:   runtimeLocale(rt.Config, msg),
 			},
 			TraceID:   trace.id,
 			TracePath: trace.path,
@@ -142,31 +176,45 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 
 	state.Messages = redactMessagesForStorage(result.Messages)
+	usage := usageFromMessages(result.Messages)
+	addUsage(&state.Usage, usage)
+	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	if state.Pending == nil {
 		if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 		} else {
-			state.CompleteActiveTask()
+			state.CompleteActiveTaskWithSummary(summarize(result.FinalText), trace.id, trace.path)
 			taskCompleted = true
 		}
 	}
-	if err := rt.Store.Save(*state); err != nil {
+	if err := rt.saveState(state, trace); err != nil {
 		return Response{}, err
+	}
+	if proposalID := pendingAgentProfileProposalID(task); proposalID != "" {
+		state.Pending = &session.PendingAction{
+			Kind:       "agent_profile_proposal_review",
+			TaskID:     task.ID,
+			ProposalID: proposalID,
+			Question:   runtimeText(rt.Config, msg, "agent_profile.review.question", nil),
+		}
+		if err := rt.saveState(state, trace); err != nil {
+			return Response{}, err
+		}
 	}
 	if scheduleID := pendingScheduleID(result.Messages); scheduleID != "" {
 		state.Pending = &session.PendingAction{
 			Kind:       "schedule_review",
 			TaskID:     task.ID,
 			ScheduleID: scheduleID,
-			Question:   "定时任务已记录为待试运行。回复“执行”现在试运行；试运行成功后我会激活它。也可以稍后手动执行：`mateway schedule test " + scheduleID + "`。",
+			Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
 		}
 		state.BlockActiveTask("await_schedule_test")
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
-		resp := reply(msg, state.Pending.Question, "schedule_review_pending")
+		resp := rt.reply(msg, state.Pending.Question, "schedule_review_pending")
 		resp.TraceID = trace.id
 		resp.TracePath = trace.path
 		_ = trace.write(map[string]any{"type": "schedule_review_pending", "schedule_id": scheduleID})
@@ -186,6 +234,8 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			FinalText:  result.FinalText,
 			TraceID:    trace.id,
 			TracePath:  trace.path,
+			Skills:     memorySkills(discoveredSkills),
+			UserText:   userText,
 		}, trace)
 		learningResult = observe.LearningResult
 		if learningResult != nil {
@@ -200,26 +250,177 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 					Kind:       "memory_proposal_review",
 					TaskID:     task.ID,
 					ProposalID: learningResult.Proposal.ID,
-					Question:   "回复“保存”写入长期记忆，或回复“忽略”放弃这条候选。",
+					Question:   runtimeText(rt.Config, msg, "memory.review.question", nil),
 				}
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, err
 				}
 			}
 		}
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
+	if learningResult == nil || learningResult.Proposal == nil {
+		if nudge, err := memory.PendingProposalNudge(rt.home(), state.Key, time.Now(), rt.memoryProposalNudgeOptions(msg)); err == nil && nudge != "" {
+			text = strings.TrimSpace(text) + "\n\n" + nudge
+			_ = trace.write(map[string]any{"type": "memory_proposal_nudge", "text": nudge})
+		}
+	}
 	resp := Response{
 		Reply: channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
 			Text:     text,
+			Locale:   runtimeLocale(rt.Config, msg),
 		},
 		TraceID:   trace.id,
 		TracePath: trace.path,
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text})
 	return resp, nil
+}
+
+func (rt Runtime) memoryProposalNudgeOptions(msg channel.InboundMessage) memory.ProposalNudgeOptions {
+	options := memory.ProposalNudgeOptions{
+		Channel:      msg.Channel,
+		Channels:     []string{"cli"},
+		Interval:     24 * time.Hour,
+		MaxProposals: 3,
+	}
+	if rt.Config == nil {
+		return options
+	}
+	cfg := rt.Config.Memory.ProposalNudge
+	if !cfg.EnabledValue() {
+		if cfg.Enabled == nil && strings.TrimSpace(cfg.Interval) == "" && len(cfg.Channels) == 0 && cfg.MaxProposals == 0 {
+			return options
+		}
+		options.Channels = nil
+		options.Channels = []string{"__disabled__"}
+		return options
+	}
+	if len(cfg.Channels) > 0 {
+		options.Channels = cfg.Channels
+	}
+	if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Interval)); err == nil && parsed > 0 {
+		options.Interval = parsed
+	}
+	if cfg.MaxProposals > 0 {
+		options.MaxProposals = cfg.MaxProposals
+	}
+	return options
+}
+
+func (rt Runtime) saveState(state *session.State, trace *traceRecorder) error {
+	if state == nil {
+		return nil
+	}
+	compacted, stats := compactMessagesForStorage(redactMessagesForStorage(state.Messages))
+	state.Messages = compacted
+	writeCompactTrace(trace, "session_compacted", stats)
+	return rt.Store.Save(*state)
+}
+
+func (rt Runtime) resetSession(msg channel.InboundMessage, state session.State, trace *traceRecorder, start time.Time) (Response, error) {
+	archivePath := ""
+	if hasSessionState(state) {
+		path, err := rt.Store.Archive(state)
+		if err != nil {
+			return Response{}, err
+		}
+		archivePath = path
+		_ = trace.write(map[string]any{"type": "session_archived", "path": path, "session_key": state.Key, "messages": len(state.Messages), "tasks": len(state.Tasks)})
+	}
+	reset := session.State{Key: state.Key}
+	if reset.Key == "" {
+		reset.Key = msg.SessionKey
+	}
+	if err := rt.saveState(&reset, trace); err != nil {
+		return Response{}, err
+	}
+	_ = trace.write(map[string]any{"type": "session_reset", "session_key": reset.Key, "archive_path": archivePath})
+	text := "已开启新会话。"
+	if archivePath != "" {
+		text += "\n旧会话已归档：" + archivePath
+	}
+	resp := rt.reply(msg, text, "session_reset")
+	resp.TraceID = trace.id
+	resp.TracePath = trace.path
+	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
+	return resp, nil
+}
+
+func hasSessionState(state session.State) bool {
+	return len(state.Messages) > 0 || len(state.Tasks) > 0 || state.Pending != nil || state.ActiveTask != "" || state.Usage.Requests > 0
+}
+
+func writeCompactTrace(trace *traceRecorder, eventType string, stats messageCompactStats) {
+	if trace == nil {
+		return
+	}
+	if stats.BeforeMessages == 0 && stats.AfterMessages == 0 {
+		return
+	}
+	_ = trace.write(map[string]any{
+		"type":             eventType,
+		"before_messages":  stats.BeforeMessages,
+		"after_messages":   stats.AfterMessages,
+		"before_chars":     stats.BeforeChars,
+		"after_chars":      stats.AfterChars,
+		"truncated_tools":  stats.TruncatedTools,
+		"dropped_system":   stats.DroppedSystem,
+		"dropped_old_msgs": stats.DroppedOld,
+	})
+}
+
+func isNewSessionCommand(text string) bool {
+	switch strings.TrimSpace(strings.ToLower(text)) {
+	case "/new", "/新会话", "新会话":
+		return true
+	default:
+		return false
+	}
+}
+
+func usageFromMessages(messages []agentcore.Message) session.Usage {
+	var usage session.Usage
+	for _, msg := range messages {
+		if msg.Usage == nil {
+			continue
+		}
+		usage.Requests++
+		usage.InputTokens += msg.Usage.InputTokens
+		usage.OutputTokens += msg.Usage.OutputTokens
+		total := msg.Usage.TotalTokens
+		if total == 0 {
+			total = msg.Usage.InputTokens + msg.Usage.OutputTokens
+		}
+		usage.TotalTokens += total
+	}
+	return usage
+}
+
+func addUsage(total *session.Usage, delta session.Usage) {
+	if total == nil {
+		return
+	}
+	total.Requests += delta.Requests
+	total.InputTokens += delta.InputTokens
+	total.OutputTokens += delta.OutputTokens
+	total.TotalTokens += delta.TotalTokens
+	total.Cost += delta.Cost
+}
+
+func writeUsageTrace(trace *traceRecorder, usage session.Usage) {
+	if trace == nil || usage.Requests == 0 {
+		return
+	}
+	_ = trace.write(map[string]any{
+		"type":          "model_usage",
+		"requests":      usage.Requests,
+		"input_tokens":  usage.InputTokens,
+		"output_tokens": usage.OutputTokens,
+		"total_tokens":  usage.TotalTokens,
+	})
 }
 
 func (rt Runtime) home() string {
@@ -253,6 +454,21 @@ func pendingScheduleID(messages []agentcore.Message) string {
 			if id := scheduleIDFromFollowingToolResult(messages, i, call.ID); id != "" {
 				return id
 			}
+		}
+	}
+	return ""
+}
+
+func pendingAgentProfileProposalID(task *session.TaskNode) string {
+	if task == nil {
+		return ""
+	}
+	for i := len(task.Steps) - 1; i >= 0; i-- {
+		if task.Steps[i].Tool != "file.write" || task.Steps[i].Status != "accepted" {
+			continue
+		}
+		if id := strings.TrimSpace(fmt.Sprint(task.Steps[i].Evidence["proposal_id"])); id != "" {
+			return id
 		}
 	}
 	return ""
@@ -304,6 +520,22 @@ func fallbackFinalReply(raw string) string {
 	return "我还没有生成可用回复。"
 }
 
+func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
+	var out []memory.SkillEvidence
+	for _, skill := range skills {
+		if strings.TrimSpace(skill.Name) == "" {
+			continue
+		}
+		out = append(out, memory.SkillEvidence{
+			Name:        skill.Name,
+			Path:        skill.Path,
+			Scope:       skillScope(skill.Path),
+			Description: skill.Description,
+		})
+	}
+	return out
+}
+
 func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
 	return agentcore.Hooks{
@@ -353,16 +585,16 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 	text := strings.TrimSpace(msg.Text)
 	switch state.Pending.Kind {
 	case "confirm_tool":
-		if isCancel(text) {
+		if rt.isCancel(msg, text) {
 			state.Pending = nil
 			state.BlockActiveTask("cancelled")
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
-			return reply(msg, "已取消。", "cancelled"), true, nil
+			return rt.reply(msg, "已取消。", "cancelled"), true, nil
 		}
-		if !isConfirm(text) {
-			return reply(msg, "这个操作还在等待确认。回复“确认”继续，或回复“取消”放弃。", "approval_pending"), true, nil
+		if !rt.isConfirm(msg, text) {
+			return rt.reply(msg, runtimeText(rt.Config, msg, "approval.confirm.generic", nil), "approval_pending"), true, nil
 		}
 		call := state.Pending.ToolCall
 		state.Pending = nil
@@ -390,27 +622,40 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content},
 		)
 		if !result.IsError {
-			state.CompleteActiveTask()
+			state.CompleteActiveTaskWithSummary(summarize(result.Content), trace.id, trace.path)
 		}
-		if err := rt.Store.Save(*state); err != nil {
+		if proposalID := strings.TrimSpace(fmt.Sprint(evidence["proposal_id"])); proposalID != "" {
+			state.Pending = &session.PendingAction{
+				Kind:       "agent_profile_proposal_review",
+				TaskID:     state.ActiveTask,
+				ProposalID: proposalID,
+				Question:   runtimeText(rt.Config, msg, "agent_profile.review.question", nil),
+			}
+		}
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		if result.IsError {
-			return reply(msg, result.Content, "error"), true, nil
+			return rt.reply(msg, result.Content, "error"), true, nil
 		}
-		return reply(msg, result.Content, "completed"), true, nil
+		return rt.reply(msg, result.Content, "completed"), true, nil
 	case "memory_proposal_review":
-		action, ok := parseMemoryProposalReviewAction(text)
+		action, ok := rt.parseMemoryProposalReviewAction(msg, text)
 		if !ok {
-			if shouldBypassMemoryProposalReview(text) {
+			if rt.shouldBypassMemoryProposalReview(msg, text) {
 				_ = trace.write(map[string]any{"type": "memory_proposal_review_bypassed", "proposal_id": state.Pending.ProposalID, "text": text})
 				state.Pending = nil
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, true, err
 				}
 				return Response{}, false, nil
 			}
-			return reply(msg, "这条长期记忆候选还在等待处理。回复“保存”写入长期记忆，回复“忽略”放弃；也可以直接发新任务。", "memory_review_pending"), true, nil
+			_ = trace.write(map[string]any{"type": "memory_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
+			state.Pending = nil
+			if err := rt.saveState(state, trace); err != nil {
+				return Response{}, true, err
+			}
+			return Response{}, false, nil
 		}
 		proposalID := state.Pending.ProposalID
 		state.Pending = nil
@@ -418,41 +663,83 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if action == "commit" {
 			proposal, target, err := store.Commit(proposalID)
 			if err != nil {
-				if saveErr := rt.Store.Save(*state); saveErr != nil {
+				if saveErr := rt.saveState(state, trace); saveErr != nil {
 					return Response{}, true, saveErr
 				}
-				return reply(msg, "保存长期记忆失败："+err.Error(), "error"), true, nil
+				return rt.reply(msg, runtimeText(rt.Config, msg, "memory.commit.error", textValues("error", err.Error())), "error"), true, nil
 			}
 			_ = trace.write(map[string]any{"type": "memory_proposal_review_committed", "proposal_id": proposal.ID, "target": target})
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
-			return reply(msg, "已保存到长期记忆："+target, "completed"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "memory.commit.done", textValues("target", target)), "completed"), true, nil
 		}
 		proposal, err := store.Reject(proposalID, "user ignored from conversation")
 		if err != nil {
-			if saveErr := rt.Store.Save(*state); saveErr != nil {
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
 				return Response{}, true, saveErr
 			}
-			return reply(msg, "忽略长期记忆候选失败："+err.Error(), "error"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.error", textValues("error", err.Error())), "error"), true, nil
 		}
 		_ = trace.write(map[string]any{"type": "memory_proposal_review_rejected", "proposal_id": proposal.ID})
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
-		return reply(msg, "已忽略这条长期记忆候选。", "completed"), true, nil
-	case "schedule_review":
-		action, ok := parseScheduleReviewAction(text)
+		return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.done", nil), "completed"), true, nil
+	case "agent_profile_proposal_review":
+		action, ok := rt.parseAgentProfileProposalReviewAction(msg, text)
 		if !ok {
-			if shouldBypassScheduleReview(text) {
-				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
+			if rt.shouldBypassAgentProfileProposalReview(msg, text) {
+				_ = trace.write(map[string]any{"type": "agent_profile_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
 				state.Pending = nil
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, true, err
 				}
 				return Response{}, false, nil
 			}
-			return reply(msg, "这个定时任务还在等待试运行。回复“执行”现在试运行，回复“取消”放弃；也可以稍后手动执行 `mateway schedule test "+state.Pending.ScheduleID+"`。", "schedule_review_pending"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.review.pending", nil), "agent_profile_review_pending"), true, nil
+		}
+		proposalID := state.Pending.ProposalID
+		state.Pending = nil
+		store := agentprofile.NewStore(rt.Config)
+		if action == "promote" {
+			proposal, backupDir, err := store.Promote(proposalID)
+			if err != nil {
+				if saveErr := rt.saveState(state, trace); saveErr != nil {
+					return Response{}, true, saveErr
+				}
+				return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.promote.error", textValues("error", err.Error())), "error"), true, nil
+			}
+			_ = trace.write(map[string]any{"type": "agent_profile_proposal_promoted", "proposal_id": proposal.ID, "target": proposal.TargetPath, "backup_dir": backupDir})
+			if err := rt.saveState(state, trace); err != nil {
+				return Response{}, true, err
+			}
+			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.promote.done", textValues("target", proposal.TargetPath, "backup", backupDir)), "completed"), true, nil
+		}
+		proposal, err := store.Reject(proposalID, "user rejected from conversation")
+		if err != nil {
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.reject.error", textValues("error", err.Error())), "error"), true, nil
+		}
+		_ = trace.write(map[string]any{"type": "agent_profile_proposal_rejected", "proposal_id": proposal.ID})
+		if err := rt.saveState(state, trace); err != nil {
+			return Response{}, true, err
+		}
+		return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.reject.done", nil), "completed"), true, nil
+	case "schedule_review":
+		action, ok := rt.parseScheduleReviewAction(msg, text)
+		if !ok {
+			if shouldBypassScheduleReview(text) {
+				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
+				state.Pending = nil
+				if err := rt.saveState(state, trace); err != nil {
+					return Response{}, true, err
+				}
+				return Response{}, false, nil
+			}
+			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.review.pending", textValues("schedule_id", state.Pending.ScheduleID)), "schedule_review_pending"), true, nil
 		}
 		scheduleID := state.Pending.ScheduleID
 		taskID := state.Pending.TaskID
@@ -460,31 +747,31 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if action == "cancel" {
 			store := schedule.Store{Home: rt.home()}
 			if _, err := store.Pause(scheduleID); err != nil {
-				if saveErr := rt.Store.Save(*state); saveErr != nil {
+				if saveErr := rt.saveState(state, trace); saveErr != nil {
 					return Response{}, true, saveErr
 				}
-				return reply(msg, "取消定时任务失败："+err.Error(), "error"), true, nil
+				return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.cancel.error", textValues("error", err.Error())), "error"), true, nil
 			}
 			blockTask(state, taskID, "cancelled")
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
-			return reply(msg, "已取消这个待试运行的定时任务。", "cancelled"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.cancel.done", nil), "cancelled"), true, nil
 		}
 		task, record, err := rt.testAndActivateSchedule(ctx, scheduleID)
 		if err != nil {
-			if saveErr := rt.Store.Save(*state); saveErr != nil {
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
 				return Response{}, true, saveErr
 			}
-			return reply(msg, "试运行失败，定时任务没有激活："+err.Error(), "error"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.test.error", textValues("error", err.Error())), "error"), true, nil
 		}
 		state.ActivateTask(taskID)
-		state.CompleteActiveTask()
-		if err := rt.Store.Save(*state); err != nil {
+		state.CompleteActiveTaskWithSummary("定时任务试运行成功："+task.ID, trace.id, trace.path)
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		_ = trace.write(map[string]any{"type": "schedule_review_tested", "schedule_id": task.ID, "run_id": record.ID, "status": record.Status})
-		return reply(msg, "试运行成功，已添加定时任务："+task.ID+"，下次运行时间："+task.RunAt, "completed"), true, nil
+		return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.test.done", textValues("task_id", task.ID, "run_at", task.RunAt)), "completed"), true, nil
 	case "user_input":
 		if shouldBypassUserInputPending(state.Pending, text) {
 			taskID := state.Pending.TaskID
@@ -494,7 +781,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 				state.ActiveTask = ""
 			}
 			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": "standalone task request"})
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return Response{}, false, nil
@@ -505,7 +792,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			agentcore.Message{Role: agentcore.RoleUser, Content: text},
 		)
 		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text})
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		return Response{}, false, nil
@@ -515,29 +802,58 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 	}
 }
 
-func parseMemoryProposalReviewAction(text string) (string, bool) {
-	normalized := normalizeFollowupText(text)
-	switch normalized {
-	case "保存", "保存记忆", "保存到长期记忆", "写入", "写入记忆", "commit", "yes", "ok":
+func (rt Runtime) parseMemoryProposalReviewAction(msg channel.InboundMessage, text string) (string, bool) {
+	action, ok := runtimeAlias(rt.Config, msg, text, "memory_commit", "memory_reject")
+	switch {
+	case ok && action == "memory_commit":
 		return "commit", true
-	case "忽略", "不保存", "不要保存", "跳过", "放弃", "reject", "no":
+	case ok && action == "memory_reject":
 		return "reject", true
 	default:
 		return "", false
 	}
 }
 
-func shouldBypassMemoryProposalReview(text string) bool {
+func (rt Runtime) shouldBypassMemoryProposalReview(msg channel.InboundMessage, text string) bool {
 	normalized := normalizeFollowupText(text)
-	return looksLikeStandaloneTaskRequest(normalized)
+	if normalized == "" {
+		return false
+	}
+	if rt.isConfirm(msg, normalized) || rt.isCancel(msg, normalized) {
+		return false
+	}
+	if isShortContextDependent(normalized) {
+		return false
+	}
+	return true
 }
 
-func parseScheduleReviewAction(text string) (string, bool) {
+func (rt Runtime) parseAgentProfileProposalReviewAction(msg channel.InboundMessage, text string) (string, bool) {
+	action, ok := runtimeAlias(rt.Config, msg, text, "promote", "reject")
+	switch {
+	case ok && action == "promote":
+		return "promote", true
+	case ok && action == "reject":
+		return "reject", true
+	default:
+		return "", false
+	}
+}
+
+func (rt Runtime) shouldBypassAgentProfileProposalReview(msg channel.InboundMessage, text string) bool {
 	normalized := normalizeFollowupText(text)
-	switch normalized {
-	case "执行", "试运行", "现在执行", "现在试运行", "跑一下", "运行", "确认", "继续", "yes", "ok":
+	if normalized == "" || rt.isConfirm(msg, normalized) || rt.isCancel(msg, normalized) || isShortContextDependent(normalized) {
+		return false
+	}
+	return true
+}
+
+func (rt Runtime) parseScheduleReviewAction(msg channel.InboundMessage, text string) (string, bool) {
+	action, ok := runtimeAlias(rt.Config, msg, text, "run", "cancel")
+	switch {
+	case ok && action == "run":
 		return "test", true
-	case "取消", "放弃", "不要", "不执行", "暂停", "cancel", "no":
+	case ok && action == "cancel":
 		return "cancel", true
 	default:
 		return "", false
@@ -685,26 +1001,28 @@ func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string,
 	return "accepted", evidence
 }
 
-func reply(msg channel.InboundMessage, text, style string) Response {
-	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style}}
+func (rt Runtime) reply(msg channel.InboundMessage, text, style string) Response {
+	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style, Locale: runtimeLocale(rt.Config, msg)}}
+}
+
+func (rt Runtime) isConfirm(msg channel.InboundMessage, text string) bool {
+	_, ok := runtimeAlias(rt.Config, msg, text, "confirm")
+	return ok
+}
+
+func (rt Runtime) isCancel(msg channel.InboundMessage, text string) bool {
+	_, ok := runtimeAlias(rt.Config, msg, text, "cancel")
+	return ok
 }
 
 func isConfirm(text string) bool {
-	switch strings.ToLower(strings.TrimSpace(text)) {
-	case "确认", "同意", "继续", "yes", "y", "ok":
-		return true
-	default:
-		return false
-	}
+	_, ok := i18n.New(i18n.Config{}).MatchAlias("", text, "confirm")
+	return ok
 }
 
 func isCancel(text string) bool {
-	switch strings.ToLower(strings.TrimSpace(text)) {
-	case "取消", "不要", "放弃", "no", "n", "cancel":
-		return true
-	default:
-		return false
-	}
+	_, ok := i18n.New(i18n.Config{}).MatchAlias("", text, "cancel")
+	return ok
 }
 
 func summarize(text string) string {

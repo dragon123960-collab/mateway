@@ -10,6 +10,7 @@ import (
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
@@ -87,6 +88,8 @@ type ObserveHookInput struct {
 	FinalText  string
 	TraceID    string
 	TracePath  string
+	Skills     []memory.SkillEvidence
+	UserText   string
 	ToolCall   agentcore.ToolCall
 	Tool       agentcore.Tool
 	ToolResult agentcore.ToolResult
@@ -606,11 +609,17 @@ type defaultToolPolicyHookProvider struct{}
 func (defaultToolPolicyHookProvider) Name() string { return "default_tool_policy" }
 
 func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input ToolPolicyHookInput) (ToolPolicyHookResult, error) {
+	catalog := i18n.New(i18n.Config{})
+	locale := ""
+	if input.Config != nil {
+		locale = input.Config.App.Locale
+		catalog = i18n.New(i18n.Config{CatalogDir: input.Config.App.MessageCatalogDir})
+	}
 	if input.ToolCall.Name == "terminal.run" && tool.IsDangerousCommand(fmt.Sprint(input.ToolCall.Args["command"])) {
 		return ToolPolicyHookResult{
 			Block:      true,
-			Reason:     "这个命令可能有破坏性。回复“确认”继续，或回复“取消”放弃。",
-			ResumeText: "确认后继续执行危险命令",
+			Reason:     catalog.T(locale, "approval.confirm.reason", nil),
+			ResumeText: catalog.T(locale, "approval.confirm.resume_dangerous", nil),
 		}, nil
 	}
 	if input.Tool == nil {
@@ -622,8 +631,8 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 		}
 		return ToolPolicyHookResult{
 			Block:      true,
-			Reason:     "继续之前需要确认。回复“确认”继续，或回复“取消”放弃。",
-			ResumeText: "确认后继续执行 " + input.Tool.Name(),
+			Reason:     catalog.T(locale, "approval.confirm.generic", nil),
+			ResumeText: catalog.T(locale, "approval.confirm.resume_tool", map[string]string{"tool": input.Tool.Name()}),
 		}, nil
 	}
 	return ToolPolicyHookResult{}, nil
@@ -651,6 +660,8 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 			FinalText:  input.FinalText,
 			TraceID:    input.TraceID,
 			TracePath:  input.TracePath,
+			Skills:     input.Skills,
+			UserText:   input.UserText,
 		})
 		if err != nil {
 			return ObserveHookResult{}, err

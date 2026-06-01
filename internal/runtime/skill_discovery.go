@@ -18,6 +18,17 @@ type discoveredSkill struct {
 	Path        string
 }
 
+func skillScope(path string) string {
+	clean := filepath.ToSlash(path)
+	if strings.Contains(clean, "/workspace/agents/") && strings.Contains(clean, "/skills/") {
+		return "agent"
+	}
+	if strings.Contains(clean, "/workspace/skills/") {
+		return "shared"
+	}
+	return ""
+}
+
 func discoverSkills(cfg *config.Root, limit int) []discoveredSkill {
 	return discoverSkillsForAgent(cfg, "main", limit)
 }

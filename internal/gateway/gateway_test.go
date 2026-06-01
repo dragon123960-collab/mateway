@@ -82,6 +82,7 @@ func TestReactionForReply(t *testing.T) {
 		"error":            "CROSS_MARK",
 		"cancelled":        "CROSS_MARK",
 		"completed":        "DONE",
+		"processing":       "DONE",
 		"":                 "DONE",
 	}
 	for style, want := range cases {
@@ -102,5 +103,22 @@ func TestInboundDedupeUsesMessageID(t *testing.T) {
 	}
 	if dedupe.Seen(channel.InboundMessage{ID: "om_2", Channel: "feishu"}) {
 		t.Fatal("different message should not be duplicate")
+	}
+}
+
+func TestBuiltinChannelSpecsExposeEnabledChannels(t *testing.T) {
+	cfg := Config{Config: &config.Root{}}
+	cfg.Config.Channels.Feishu.Enabled = true
+	cfg.Config.Channels.Weixin.Enabled = true
+	specs := builtinChannelSpecs(cfg)
+	var enabled []string
+	for _, spec := range specs {
+		if spec.Enabled {
+			enabled = append(enabled, spec.Name)
+		}
+	}
+	got := strings.Join(enabled, ",")
+	if got != "feishu,weixin" {
+		t.Fatalf("enabled specs = %q", got)
 	}
 }

@@ -97,6 +97,61 @@ func TestFileWriteRejectsSkillPlaintextSecret(t *testing.T) {
 	}
 }
 
+func TestFileWriteCreatesProposalForAgentCoreProfile(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "user.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": "new"},
+	})
+	if result.IsError || result.Evidence["requires_review"] != true || strings.TrimSpace(result.Evidence["proposal_id"].(string)) == "" {
+		t.Fatalf("expected profile proposal result, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("core profile should not be overwritten before review, got %q", data)
+	}
+	if entries, err := os.ReadDir(filepath.Join(home, "observe", "agent_profile_proposals")); err != nil || len(entries) != 1 {
+		t.Fatalf("expected one proposal entry, entries=%v err=%v", entries, err)
+	}
+}
+
+func TestFileWriteAllowsAgentSkillProfilePath(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "skills", "demo", "SKILL.md")
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": "# Demo\n"},
+	})
+	if result.IsError || result.Evidence["requires_review"] == true {
+		t.Fatalf("expected direct skill write, got %#v", result)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestScheduleCreateToolWritesTask(t *testing.T) {
 	home := t.TempDir()
 	runAt := "2026-05-29T16:30:00+08:00"

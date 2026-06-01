@@ -2,11 +2,11 @@ package feishu
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
 
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/i18n"
 )
 
 func renderReplyMessage(reply channel.OutboundMessage) (string, string, error) {
@@ -52,7 +52,7 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			"actions": actions,
 		})
 	}
-	if note := cardFooterNote(reply.Style); note != "" {
+	if note := cardFooterNote(reply); note != "" {
 		elements = append(elements, map[string]any{
 			"tag": "note",
 			"elements": []map[string]any{
@@ -73,6 +73,8 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 	if !feishuApprovalButtonsEnabled() {
 		return nil
 	}
+	locale := feishuReplyLocale(reply)
+	catalog := i18n.New(i18n.Config{})
 	value := func(decision, text string) map[string]any {
 		out := map[string]any{
 			"mateway_action": "approval",
@@ -91,7 +93,7 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 			"type": "primary",
 			"text": map[string]any{
 				"tag":     "plain_text",
-				"content": "同意",
+				"content": catalog.T(locale, "feishu.button.confirm", nil),
 			},
 			"value": value("confirm", "确认"),
 		},
@@ -100,7 +102,7 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 			"type": "default",
 			"text": map[string]any{
 				"tag":     "plain_text",
-				"content": "拒绝",
+				"content": catalog.T(locale, "feishu.button.cancel", nil),
 			},
 			"value": value("cancel", "取消"),
 		},
@@ -129,28 +131,32 @@ func feishuCardTitle(reply channel.OutboundMessage) string {
 	if title := strings.TrimSpace(reply.Title); title != "" {
 		return title
 	}
+	catalog := i18n.New(i18n.Config{})
+	locale := feishuReplyLocale(reply)
 	switch strings.TrimSpace(reply.Style) {
 	case "approval_pending":
-		return "Mateway 等待确认"
+		return catalog.T(locale, "feishu.title.approval_pending", nil)
 	case "input_required":
-		return "Mateway 需要补充信息"
+		return catalog.T(locale, "feishu.title.input_required", nil)
 	case "error":
-		return "Mateway 执行失败"
+		return catalog.T(locale, "feishu.title.error", nil)
 	default:
-		return "Mateway"
+		return catalog.T(locale, "feishu.title.default", nil)
 	}
 }
 
-func cardFooterNote(style string) string {
-	switch strings.TrimSpace(style) {
+func cardFooterNote(reply channel.OutboundMessage) string {
+	catalog := i18n.New(i18n.Config{})
+	locale := feishuReplyLocale(reply)
+	switch strings.TrimSpace(reply.Style) {
 	case "approval_pending":
-		return "也可以直接回复“确认”或“取消”。"
+		return catalog.T(locale, "feishu.footer.approval_pending", nil)
 	case "input_required":
-		return "请直接回复消息补充所需信息。"
+		return catalog.T(locale, "feishu.footer.input_required", nil)
 	case "error":
-		return "任务已停在安全位置，可以补充信息后重试。"
+		return catalog.T(locale, "feishu.footer.error", nil)
 	default:
-		return fmt.Sprintf("状态：%s", firstNonEmpty(strings.TrimSpace(style), "completed"))
+		return catalog.T(locale, "feishu.footer.default", map[string]string{"status": firstNonEmpty(strings.TrimSpace(reply.Style), "completed")})
 	}
 }
 
@@ -160,7 +166,7 @@ func sanitizeFeishuText(reply channel.OutboundMessage) string {
 		return ""
 	}
 	if looksLikeJSONToolPlan(text) {
-		return fallbackFeishuText(reply.Style)
+		return fallbackFeishuText(reply)
 	}
 	lines := strings.Split(text, "\n")
 	out := make([]string, 0, len(lines))
@@ -191,7 +197,7 @@ func sanitizeFeishuText(reply channel.OutboundMessage) string {
 	}
 	text = strings.TrimSpace(strings.Join(out, "\n"))
 	if text == "" {
-		return fallbackFeishuText(reply.Style)
+		return fallbackFeishuText(reply)
 	}
 	return text
 }
@@ -212,17 +218,23 @@ func looksLikeToolCallDetailLine(lower, trimmed string) bool {
 	return false
 }
 
-func fallbackFeishuText(style string) string {
-	switch strings.TrimSpace(style) {
+func fallbackFeishuText(reply channel.OutboundMessage) string {
+	catalog := i18n.New(i18n.Config{})
+	locale := feishuReplyLocale(reply)
+	switch strings.TrimSpace(reply.Style) {
 	case "approval_pending":
-		return "继续之前需要你确认。回复“确认”继续，或回复“取消”放弃。"
+		return catalog.T(locale, "feishu.fallback.approval_pending", nil)
 	case "input_required":
-		return "我还需要你补充一个信息才能继续。"
+		return catalog.T(locale, "feishu.fallback.input_required", nil)
 	case "error":
-		return "任务失败了，我已经停在安全位置。"
+		return catalog.T(locale, "feishu.fallback.error", nil)
 	default:
-		return "完成。"
+		return catalog.T(locale, "feishu.fallback.default", nil)
 	}
+}
+
+func feishuReplyLocale(reply channel.OutboundMessage) string {
+	return i18n.ResolveLocale(reply.Locale, reply.Text)
 }
 
 func looksLikeJSONToolPlan(text string) bool {

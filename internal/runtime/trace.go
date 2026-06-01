@@ -33,14 +33,20 @@ func (r *traceRecorder) emit(ctx context.Context, event agentcore.Event) error {
 	if r == nil {
 		return nil
 	}
-	return r.write(map[string]any{
+	payload := map[string]any{
 		"type":        event.Type,
 		"iteration":   event.Iteration,
 		"duration_ms": event.Duration.Milliseconds(),
 		"message":     event.Message,
 		"tool_call":   event.ToolCall,
 		"tool_result": event.ToolResult,
-	})
+	}
+	if event.Type == agentcore.EventMessageStart && event.Message.Usage != nil {
+		payload["usage"] = event.Message.Usage
+		payload["model"] = event.Message.Usage.Model
+		payload["provider"] = event.Message.Usage.Provider
+	}
+	return r.write(payload)
 }
 
 func (r *traceRecorder) write(payload map[string]any) error {

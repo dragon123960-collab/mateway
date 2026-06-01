@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 )
@@ -106,13 +107,11 @@ func workspaceProfileContext(cfg *config.Root, profile config.AgentProfileConfig
 	if agentID == "" {
 		agentID = "main"
 	}
-	paths := []string{
-		filepath.Join(workspace, "agents", agentID, "agent.md"),
-		filepath.Join(workspace, "agents", agentID, "user.md"),
-		filepath.Join(workspace, "agents", agentID, "tools.md"),
-		filepath.Join(workspace, "agents", agentID, "memory.md"),
-		filepath.Join(workspace, "memory", "user", "index.md"),
+	var paths []string
+	for _, name := range agentprofile.CoreProfileFileNames() {
+		paths = append(paths, filepath.Join(workspace, "agents", agentID, name))
 	}
+	paths = append(paths, filepath.Join(workspace, "memory", "user", "index.md"))
 	var sections []string
 	for _, path := range paths {
 		if text := readPromptContextFile(path, 2048); text != "" {
@@ -138,7 +137,7 @@ func readPromptContextFile(path string, limit int64) string {
 		return ""
 	}
 	text := strings.TrimSpace(string(data))
-	if text == "" || looksSensitivePromptContext(path, text) {
+	if text == "" || looksSensitivePromptContext(path, text) || agentprofile.UnsafePromptContext(text) {
 		return ""
 	}
 	return text

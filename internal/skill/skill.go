@@ -29,6 +29,18 @@ type SearchResult struct {
 	InstallURL string
 	Enabled    bool
 	TrustLevel string
+	Adapter    string
+	CanInstall bool
+}
+
+type CatalogReport struct {
+	Name       string
+	Enabled    bool
+	TrustLevel string
+	SearchURL  string
+	InstallURL string
+	Adapter    string
+	CanInstall bool
 }
 
 type InstallInput struct {
@@ -88,6 +100,29 @@ func SearchCatalogs(cfg *config.Root, query string) []SearchResult {
 			InstallURL: strings.TrimSpace(catalog.InstallURL),
 			Enabled:    catalog.Enabled,
 			TrustLevel: catalog.TrustLevel,
+			Adapter:    adapterForCatalog(catalog),
+			CanInstall: strings.TrimSpace(catalog.InstallURL) != "",
+		})
+	}
+	return out
+}
+
+func CatalogReports(cfg *config.Root) []CatalogReport {
+	if cfg == nil {
+		cfg = &config.Root{}
+		cfg.Skills.Catalogs = defaultCatalogs()
+	}
+	cfg.NormalizeForUse()
+	var out []CatalogReport
+	for _, catalog := range cfg.Skills.Catalogs {
+		out = append(out, CatalogReport{
+			Name:       catalog.Name,
+			Enabled:    catalog.Enabled,
+			TrustLevel: catalog.TrustLevel,
+			SearchURL:  catalog.SearchURL,
+			InstallURL: catalog.InstallURL,
+			Adapter:    adapterForCatalog(catalog),
+			CanInstall: strings.TrimSpace(catalog.InstallURL) != "",
 		})
 	}
 	return out
@@ -256,4 +291,11 @@ func defaultCatalogs() []config.SkillCatalogConfig {
 		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", InstallURL: "", TrustLevel: "unknown"},
 		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", InstallURL: "", TrustLevel: "medium"},
 	}
+}
+
+func adapterForCatalog(catalog config.SkillCatalogConfig) string {
+	if strings.TrimSpace(catalog.InstallURL) != "" {
+		return "declared_install_url"
+	}
+	return "search_url_only"
 }

@@ -71,6 +71,8 @@ mateway memory proposal reject <proposal_id>
 
 在聊天入口里，用户也可以直接回复 `保存` 或 `忽略`。Mateway 会把它存成 `memory_proposal_review` pending，所以这种短回复由运行时状态解释，而不是让模型猜。
 
+英文别名同样可用：memory review 可以回复 `save` / `ignore`，工具确认可以回复 `confirm` / `cancel`，定时任务试运行可以回复 `run` / `cancel`。这些别名不依赖当前界面语言。
+
 ### 3. Hook-first Runtime
 
 核心循环保持小而清晰，扩展点显式存在：
@@ -89,6 +91,7 @@ mateway memory proposal reject <proposal_id>
 
 - request 和 channel
 - model turns
+- provider 返回时的模型请求数和 token usage
 - tool calls 和 tool results
 - hook events
 - pending confirmations
@@ -97,7 +100,22 @@ mateway memory proposal reject <proposal_id>
 
 持久化 trace、session transcript 和 task step summary 会脱敏明显的 secret 字段，例如 `api_key`、`token`、`password`、`smtp_pass`、`imap_pass` 和 bearer token。模型在当前任务中仍能看到实时工具输出；持久化日志避免保存明显凭证。
 
-### 5. Skills 是可编辑行为，不是魔法工具
+### 5. 有边界的 Session Context
+
+Session 是运行时状态，不是无限增长的原始聊天记录。每次调用模型前，Mateway 会从这些来源临时组装 context：
+
+- `context_hook` 每轮重新生成的 system/runtime context
+- 当前 agent profile 的 Markdown 文件
+- 已发现 skill 的精简 guidance
+- `memory_safe_read` 命中时的相关长期记忆片段
+- 压缩后的最近 session transcript
+- 当前用户消息
+
+System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、trace id 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。
+
+发送 `/new`、`/新会话` 或 `新会话` 会归档当前 session，并在同一个 `session_key` 下清空 active state。飞书长 thread 仍然保持稳定 session key，但 agent 可以从干净上下文重新开始。
+
+### 6. Skills 是可编辑行为，不是魔法工具
 
 Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime context。当前默认 skills 包括：
 
@@ -114,8 +132,11 @@ Mateway 目前支持：
 
 - CLI 任务入口：`mateway ask`
 - 飞书 WebSocket gateway
+- 原生微信 iLink Bot channel：`mateway weixin login`、`mateway weixin enable`
+- 从本地 channel 配置文件发现 channel id：`mateway channel list`
 - 真实 runtime 测试：`mateway test`
 - trace 回看：`mateway trace`
+- session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
@@ -124,8 +145,9 @@ Mateway 目前支持：
 - workspace profile 注入
 - 从 `workspace/skills` 和 agent-specific overrides 发现 skills
 - Markdown memory lint/search/index
-- memory proposal create/list/commit/reject
+- memory proposal create/list/show/commit/reject
 - 有价值任务完成后的自动 diary/proposal 生成
+- 可按 channel、间隔和展示数量配置的候选记忆提醒
 - memory proposal 的聊天回复处理：`保存` / `忽略`
 - 通过 `context_hook` 做 memory safe-read 注入
 - session 和 project distill 命令
@@ -203,13 +225,41 @@ vim ~/.mateway/config/config.yaml
 ./build/mateway test --session-key demo:a001 --message "Read README.md and explain the memory system."
 ```
 
-### 启动飞书 Gateway
+### 启动 Gateway
 
 ```bash
 ./build/mateway gateway serve
 ```
 
-`gateway serve` 以前台进程运行。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
+`gateway serve` 会以前台进程启动已启用的内置 channel。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
+
+查看当前可配置的 channel id：
+
+```bash
+./build/mateway channel list
+```
+
+示例：
+
+```text
+ID      ENABLED  CONFIG
+feishu  true     ~/.mateway/config/channels/feishu.yaml
+weixin  true     ~/.mateway/config/channels/weixin.yaml
+```
+
+配置候选记忆提醒等 channel-scoped 行为时，使用 `ID` 列里的名字。
+
+### 接入微信
+
+Mateway 的原生微信 channel 参考 Hermes 的 iLink Bot API 路线，支持扫码登录、保存账号、长轮询接收文本消息和发送文本回复。
+
+```bash
+./build/mateway weixin login
+./build/mateway weixin enable
+./build/mateway gateway restart
+```
+
+登录凭据保存在 `~/.mateway/run/weixin/accounts/`。`weixin enable` 会更新 `~/.mateway/config/channels/weixin.yaml`，但不会把 token 写进配置文件。媒体/CDN 支持暂不纳入当前版本。
 
 ## Memory 命令
 
@@ -235,9 +285,24 @@ Review proposals：
 
 ```bash
 ./build/mateway memory proposal list
+./build/mateway memory proposal show <proposal_id>
 ./build/mateway memory proposal commit <proposal_id>
 ./build/mateway memory proposal reject <proposal_id> --reason "not reusable"
 ```
+
+候选记忆提醒可以在 `~/.mateway/config/config.yaml` 配置：
+
+```yaml
+memory:
+  proposal_nudge:
+    enabled: true
+    interval: 24h
+    channels:
+      - cli
+    max_proposals: 3
+```
+
+提醒由 runtime 生成，但只会出现在配置的 channel id 中。提醒会展示少量候选摘要，并给出 `mateway memory proposal show <proposal_id>` 查看详情，不会把所有待审核候选一次性塞进聊天窗口。
 
 蒸馏 session 或 project：
 
@@ -250,6 +315,8 @@ Review proposals：
 
 ```bash
 ./build/mateway memory heartbeat lint-index
+./build/mateway memory heartbeat learning
+./build/mateway memory heartbeat skill
 ```
 
 以前台循环运行 heartbeat 维护：
@@ -258,7 +325,7 @@ Review proposals：
 ./build/mateway memory heartbeat serve
 ```
 
-这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，并写入 audit entry。
+这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，蒸馏学习 evidence，生成 skill patch proposal，并写入 audit entry。
 
 ## 定时任务
 
@@ -290,6 +357,7 @@ Review proposals：
 Trace 可用于检查：
 
 - model/tool/runtime latency
+- 模型请求数和 input/output/total tokens
 - hook decisions
 - tool calls 和 acceptance evidence
 - pending confirmations
@@ -303,6 +371,7 @@ Trace 可用于检查：
   config/        # config.yaml, env files, model/channel config
   workspace/     # agent profiles, skills, Markdown memory
   sessions/      # transcripts, task trees, pending states
+    archive/     # /new 创建的旧 session 归档
   trace/         # JSONL traces
   observe/       # diary, proposals, reflections, audit logs
   indexes/       # rebuildable memory indexes
@@ -367,14 +436,19 @@ required_secrets:
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
 - 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps 和 software installation workflow。
-- Agent 可以检查已有 skills，并把它们作为行为指导。
+- Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
 
-尚未实现：
+已可用：
 
+- `mateway skill catalog report`
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
+- `mateway skill proposal list|show|promote|reject`
+- `mateway skill usage report`
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
-- 自动 skill patch / promotion 工作流
+- heartbeat 生成 skill patch proposal 的审核工作流
+
+Script Bridge 保持小而硬：`~/.mateway/scripts/`、`workspace/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
 
 ## 多 Agent Profiles
 
@@ -387,13 +461,30 @@ Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router�
 - `workspace/agents/<agent_id>/skills/`
 - `workspace/memory/agents/<agent_id>/`
 
-这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。下一阶段会把这部分产品化，补齐 agent list/report/create/bind 命令、profile lint 和多 profile 验收测试。
+每个 agent profile 使用同一组 core prompt 文件：`agent.md`、`soul.md`、`user.md`、`tools.md`、`memory.md`。`mateway agent create` 新建 profile 时会生成英文基线模板，且不会覆盖已有文件。
+
+这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。
 
 边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
 
+Profile 产品化命令：
+
+- `mateway agent list`
+- `mateway agent report <agent_id>`
+- `mateway agent lint <agent_id>`
+- `mateway agent create <agent_id> [--name <name>] [--default]`
+- `mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>`
+- `mateway agent unbind --channel <channel> [--account-id <id>] [--peer-id <id>]`
+
 ## Gateway 边界
 
-Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。当前 `gateway serve` 已实现的是飞书 WebSocket channel，需要在 `channels/feishu.yaml` 启用。后续新增 channel 应接入同一个 gateway 边界，而不是绕过 runtime。
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket 和原生微信长轮询。
+
+新的稳定 channel 应优先做成内置 channel spec，这样一个 gateway 进程就能统一管理。channel package 负责平台 I/O 和消息归一化，gateway 负责 session key、dedupe、异步 runtime 执行和 trace。
+
+原生微信 channel 参考 Hermes 的 iLink Bot API 路线：`mateway weixin login` 扫码并把凭据保存到 `~/.mateway/run/weixin/accounts/`；`gateway serve` 之后通过 `getupdates` 长轮询收消息，并通过 `sendmessage` 发送文本回复。媒体/CDN 支持暂不纳入首版。
+
+使用 `mateway channel list` 可以从 `~/.mateway/config/channels/*.yaml` 查看 canonical channel id。runtime 配置应使用这些 id，例如 `feishu` 或 `weixin`，而不是 `lark`、`wechat` 这类别名。
 
 `gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
 
@@ -416,24 +507,27 @@ Mateway 不会把这些能力伪装成已经完成：
 
 - 小型 AgentCore runtime loop
 - 多 agent profile 和 binding 基础
-- CLI / test / Feishu entrypoints
+- CLI / test / Feishu / Weixin entrypoints
 - Hook pipeline
 - Tool policy 和 confirmation boundaries
 - JSONL traces
 - Skill discovery 和 context injection
 - 本地 secret store 和 skill secret 扫描
 - Markdown memory lint/search/index
-- Memory proposal commit/reject workflow
+- Memory proposal list/show/commit/reject workflow
+- 可配置的候选记忆提醒
 - Self-learning diary/proposal generation
 - Memory safe-read context injection
 - Session/project distill commands
 - Heartbeat `lint-index` 和前台 heartbeat runner
 - Channel-neutral scheduled task create/test/run-due/serve
+- 通过 `mateway channel list` 发现内置 channel
 - 持久化 runtime 记录 secret redaction
 
 ### 下一步
 
-- 多 agent profile 产品化：agent list/report/create/bind、profile lint 和多 profile 测试
+- 更多内置 channel：钉钉、QQ、企业微信、Telegram
+- channel 图片/文件等媒体能力
 - user-provided connectors 的 script bridge specification
 - skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers

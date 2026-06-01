@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/dongping/mateway/internal/agenttemplate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -15,6 +16,7 @@ type templateFile struct {
 
 func EnsureDefaultConfigFiles(home string) error {
 	loader := NewLoader(home)
+	mainAgentFiles := agenttemplate.CoreFiles(agenttemplate.Profile{ID: "main", Name: "Main Assistant"})
 	files := []templateFile{
 		{RelPath: "README.md", Content: configReadmeTemplate},
 		{RelPath: "config.yaml", Content: configYAMLTemplate},
@@ -29,11 +31,13 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("channels", "_README.md"), Content: channelsReadmeTemplate},
 		{RelPath: filepath.Join("channels", "feishu.yaml"), Content: feishuYAMLTemplate},
 		{RelPath: filepath.Join("channels", "feishu.sample.yaml"), Content: feishuSampleYAMLTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "agent.md"), Content: agentMainTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "soul.md"), Content: agentSoulTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "user.md"), Content: agentUserTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "tools.md"), Content: agentToolsTemplate},
-		{RelPath: filepath.Join("..", "workspace", "agents", "main", "memory.md"), Content: agentMemoryTemplate},
+		{RelPath: filepath.Join("channels", "weixin.yaml"), Content: weixinYAMLTemplate},
+		{RelPath: filepath.Join("channels", "weixin.sample.yaml"), Content: weixinSampleYAMLTemplate},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "agent.md"), Content: mainAgentFiles["agent.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "soul.md"), Content: mainAgentFiles["soul.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "user.md"), Content: mainAgentFiles["user.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "tools.md"), Content: mainAgentFiles["tools.md"]},
+		{RelPath: filepath.Join("..", "workspace", "agents", "main", "memory.md"), Content: mainAgentFiles["memory.md"]},
 		{RelPath: filepath.Join("..", "workspace", "agents", "main", "skills", "README.md"), Content: agentSkillsReadmeTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "software-install", "SKILL.md"), Content: skillSoftwareInstallTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "fresh-search", "SKILL.md"), Content: skillFreshSearchTemplate},
@@ -58,6 +62,9 @@ func EnsureDefaultConfigFiles(home string) error {
 		return err
 	}
 	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "feishu.yaml"), []byte(feishuYAMLTemplate)); err != nil {
+		return err
+	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "weixin.yaml"), []byte(weixinYAMLTemplate)); err != nil {
 		return err
 	}
 	return nil
@@ -165,6 +172,8 @@ const configYAMLTemplate = `app:
   name: mateway
   home: ""
   workspace: ""
+  locale: auto
+  message_catalog_dir: ""
 
 model:
   default: minimax
@@ -181,6 +190,12 @@ memory:
     - org_knowledge
     - long_memory
     - skill_candidate
+  proposal_nudge:
+    enabled: true
+    interval: 24h
+    channels:
+      - cli
+    max_proposals: 3
 
 learning:
   enabled: true
@@ -212,6 +227,9 @@ skills:
       install_url: ""
       trust_level: medium
 
+scripts:
+  dirs: []
+
 scheduler:
   enabled: false
   timezone: Asia/Shanghai
@@ -236,6 +254,9 @@ agents:
         jobs:
           - memory_lint
           - memory_index_rebuild
+          - memory_distill
+          - learning_distill
+          - skill_learning
         auto_send_summary: false
         quiet_hours:
           start: "23:00"
@@ -385,7 +406,31 @@ MATEWAY_FEISHU_APP_ID=
 MATEWAY_FEISHU_APP_SECRET=
 MATEWAY_FEISHU_VERIFICATION_TOKEN=
 MATEWAY_FEISHU_ENCRYPT_KEY=
+MATEWAY_WEIXIN_BASE_URL=
+MATEWAY_WEIXIN_ACCOUNT_ID=
+MATEWAY_WEIXIN_TOKEN=
 `
+
+const weixinYAMLTemplate = `weixin:
+  enabled: false
+  base_url: ""
+  base_url_env: MATEWAY_WEIXIN_BASE_URL
+  account_id: ""
+  account_id_env: MATEWAY_WEIXIN_ACCOUNT_ID
+  token: ""
+  token_env: MATEWAY_WEIXIN_TOKEN
+  account_dir: ""
+  media_dir: ""
+  bot_agent: Mateway/0.1
+  poll_timeout_ms: 35000
+  retry_interval: 3s
+  mention_required_in_group: true
+`
+
+const weixinSampleYAMLTemplate = `# Copy this file to channels/weixin.yaml.
+# Put real iLink credentials in mateway.env and keep direct token fields empty.
+
+` + weixinYAMLTemplate
 
 const configReadmeTemplate = `# Mateway Configuration
 
@@ -486,60 +531,6 @@ cp channels/feishu.sample.yaml channels/feishu.yaml
 ` + "```" + `
 `
 
-const agentMainTemplate = `# main agent
-
-Default behavior:
-
-- Use the user's language unless they request another language.
-- Do not dump raw information without synthesis.
-- Help the user filter, summarize, compare, and decide.
-- When current information matters, prefer official and up-to-date sources.
-- If information may be stale, say so clearly.
-- If a tool call fails, do not invent the result.
-`
-
-const agentSoulTemplate = `# main soul
-
-You are Mateway, a practical personal work assistant agent.
-
-Core objectives:
-
-- Help the user complete concrete work.
-- Organize information into clear, useful conclusions.
-- Use tools safely and only when they materially help.
-- Answer in the user's language unless the user requests another language.
-`
-
-const agentUserTemplate = `# main user
-
-User profile:
-
-- No stable user preferences have been recorded yet.
-- Record preferences only when they are explicit, durable, and useful for future tasks.
-- Keep user preferences human-readable and easy to edit.
-`
-
-const agentToolsTemplate = `# main tools
-
-Tool-use rules:
-
-1. Plan before using tools.
-2. Do not expose raw tool calls, internal arguments, or implementation traces to the user.
-3. Tool results will be supplied by the system.
-4. Final answers must be structured, readable, and written in the user's language unless requested otherwise.
-`
-
-const agentMemoryTemplate = `# main memory
-
-Prompt-facing memory summary for this agent.
-
-Keep this file short because it may be injected into model context.
-
-Use it only for stable, user-approved facts, compact preferences, or links to curated memory wiki pages.
-
-Detailed long-term memory belongs under workspace/memory/agents/main/.
-`
-
 const agentSkillsReadmeTemplate = `# main agent skills
 
 Put agent-specific skills here as:
@@ -579,7 +570,11 @@ Workflow:
    Use web.fetch for README/docs/package pages.
    Use terminal.run only for local environment checks, guarded installation, verification, and PATH diagnosis.
 
-3. Before installing, summarize:
+3. Before installing, first check whether the executable already exists locally.
+   Prefer command -v <executable> followed by a version/help command when safe.
+   If it is already installed and verified, stop there and report the evidence instead of reinstalling.
+
+4. Before running an install command, summarize:
    - official_source
    - install_method
    - install_command
@@ -587,9 +582,9 @@ Workflow:
    - executable_name
    - why this method fits the current machine
 
-4. If the command is risky or mutates the machine, wait for confirmation through Mateway's guarded tool flow.
+5. If the command is risky or mutates the machine, wait for confirmation through Mateway's guarded tool flow.
 
-5. Verify after installation.
+6. Verify after installation.
    Prefer command -v, --version, --help, or a documented quick-start command.
    If install succeeds but verification fails, diagnose PATH and executable location before switching methods.
 
@@ -773,13 +768,13 @@ const memoryAgentIndexTemplate = `# Main Agent Memory
 
 const channelsReadmeTemplate = `# Channel Configs
 
-` + "`feishu.sample.yaml`" + ` is safe to keep as a user-facing template.
+` + "`feishu.sample.yaml`" + ` and ` + "`weixin.sample.yaml`" + ` are safe to keep as user-facing templates.
 
-Copy it to ` + "`feishu.yaml`" + `, then enable Feishu only after app_id/app_secret are configured.
+Copy a sample to its runtime YAML, then enable the channel only after credentials or tokens are configured.
 
 Recommended:
 
 - Keep direct secret fields empty.
 - Put real secrets in ` + "`../mateway.env`" + `.
-- Use ` + "`*_env`" + ` fields in ` + "`feishu.yaml`" + `.
+- Use ` + "`*_env`" + ` fields in channel YAML files.
 `

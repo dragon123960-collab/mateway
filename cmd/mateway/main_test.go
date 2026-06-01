@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
@@ -274,6 +275,92 @@ func TestMemoryProposalCommitCommandWritesMemory(t *testing.T) {
 	}
 }
 
+func TestMemoryProposalShowCommandPrintsDetail(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "proposal", "create", "--title", "README Inspection", "--body", "Use file.read for README.", "--source", "trace:abc", "--confidence", "medium"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.TrimSuffix(entries[0].Name(), filepath.Ext(entries[0].Name()))
+	out := captureStdout(t, func() error { return run([]string{"memory", "proposal", "show", id}) })
+	for _, want := range []string{"proposal: " + id, "confidence: medium", "sources:", "why:", "Use file.read for README.", "actions:", "mateway memory proposal commit " + id} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in proposal detail:\n%s", want, out)
+		}
+	}
+}
+
+func TestAgentProfileProposalCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "workspace", "agents", "main", "user.md")
+	store := agentprofile.NewStore(cfg)
+	proposal, err := store.Create(agentprofile.CreateInput{TargetPath: target, NewContent: "# user\n\nNew preference."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"agent-profile", "proposal", "list"}) })
+	if !strings.Contains(out, proposal.ID) || !strings.Contains(out, "status=proposed") {
+		t.Fatalf("unexpected list output:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"agent-profile", "proposal", "show", proposal.ID}) })
+	if !strings.Contains(out, "diff:") || !strings.Contains(out, "New preference") {
+		t.Fatalf("unexpected show output:\n%s", out)
+	}
+	if err := run([]string{"agent-profile", "proposal", "promote", proposal.ID}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "New preference") {
+		t.Fatalf("target not promoted:\n%s", data)
+	}
+}
+
+func TestAgentProfileProposalRejectCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "workspace", "agents", "main", "tools.md")
+	store := agentprofile.NewStore(cfg)
+	proposal, err := store.Create(agentprofile.CreateInput{TargetPath: target, NewContent: "# tools\n\nUpdated."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"agent-profile", "proposal", "reject", proposal.ID, "--reason", "skip"}); err != nil {
+		t.Fatal(err)
+	}
+	rejected, err := store.Read(proposal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Status != "rejected" || rejected.Reason != "skip" {
+		t.Fatalf("unexpected rejected proposal: %#v", rejected)
+	}
+}
+
 func TestMemoryDistillSessionCommandWritesReflection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
@@ -383,6 +470,26 @@ func TestMemoryHeartbeatLintIndexCommandWritesIndex(t *testing.T) {
 	}
 }
 
+func TestMemoryHeartbeatDistillCommandNoModel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	writeMainTestFile(t, filepath.Join(home, "observe", "diary", "one.md"), "# Task diary\n\n- Goal: 记住 README 检查流程\n")
+	out := captureStdout(t, func() error { return run([]string{"memory", "heartbeat", "distill"}) })
+	if !strings.Contains(out, "distill_scanned: 1") || !strings.Contains(out, "distill_skipped: 1") {
+		t.Fatalf("unexpected distill output:\n%s", out)
+	}
+	audit, err := os.ReadFile(filepath.Join(home, "observe", "audit", "memory.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(audit), "memory_distill_model_error") {
+		t.Fatalf("missing distill audit:\n%s", audit)
+	}
+}
+
 func TestMemoryReportCommandPrintsReadOnlySummary(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
@@ -435,8 +542,74 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 		t.Fatalf("unexpected skill list:\n%s", out)
 	}
 	out = captureStdout(t, func() error { return run([]string{"skill", "search", "--all", "software install"}) })
-	if !strings.Contains(out, "skills.sh") || !strings.Contains(out, "skillhub.cn") || !strings.Contains(out, "clawhub.ai") {
+	if !strings.Contains(out, "skills.sh") || !strings.Contains(out, "skillhub.cn") || !strings.Contains(out, "clawhub.ai") || !strings.Contains(out, "adapter=search_url_only") {
 		t.Fatalf("unexpected skill search:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"skill", "catalog", "report"}) })
+	if !strings.Contains(out, "skill_catalogs:") || !strings.Contains(out, "can_install=false") {
+		t.Fatalf("unexpected catalog report:\n%s", out)
+	}
+}
+
+func TestScriptSandboxAndWorkspaceReports(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(home, "scripts", "hello")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n# mateway.name: hello\n# mateway.description: says hi\necho hi $1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"script", "list"}) })
+	if !strings.Contains(out, "hello") || !strings.Contains(out, "says hi") {
+		t.Fatalf("unexpected script list:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"script", "run", "hello", "there"}) })
+	if !strings.Contains(out, "exit_code: 0") || !strings.Contains(out, "hi there") {
+		t.Fatalf("unexpected script run:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"sandbox", "report"}) })
+	if !strings.Contains(out, "sandbox_enabled:") || !strings.Contains(out, "timeout_seconds:") {
+		t.Fatalf("unexpected sandbox report:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"workspace", "report"}) })
+	if !strings.Contains(out, "workspace:") || !strings.Contains(out, "skills:") || !strings.Contains(out, "scripts:") {
+		t.Fatalf("unexpected workspace report:\n%s", out)
+	}
+}
+
+func TestAgentCommandsCreateBindReport(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"agent", "list"}) })
+	if !strings.Contains(out, "main") {
+		t.Fatalf("unexpected agent list:\n%s", out)
+	}
+	if err := run([]string{"agent", "create", "ops", "--name", "Ops Agent"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"agent.md", "soul.md", "user.md", "tools.md", "memory.md"} {
+		if _, err := os.Stat(filepath.Join(home, "workspace", "agents", "ops", name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	if err := run([]string{"agent", "bind", "--channel", "feishu", "--peer-id", "chat-ops", "ops"}); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() error { return run([]string{"agent", "report", "ops"}) })
+	if !strings.Contains(out, "agent: ops") || !strings.Contains(out, "peer_id=chat-ops") || !strings.Contains(out, "issues: 0") {
+		t.Fatalf("unexpected agent report:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"agent", "unbind", "--channel", "feishu", "--peer-id", "chat-ops"}) })
+	if !strings.Contains(out, "removed: true") {
+		t.Fatalf("unexpected unbind:\n%s", out)
 	}
 }
 
@@ -459,6 +632,28 @@ func TestSecretCommandsStoreAndListWithoutValue(t *testing.T) {
 	out = captureStdout(t, func() error { return run([]string{"secret", "get", "mail.smtp_pass"}) })
 	if strings.TrimSpace(out) != "supersecret123" {
 		t.Fatalf("unexpected get output %q", out)
+	}
+}
+
+func TestChannelListReadsRuntimeChannelConfigs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	channelsDir := filepath.Join(home, "config", "channels")
+	writeMainTestFile(t, filepath.Join(channelsDir, "feishu.yaml"), "feishu:\n  enabled: false\n")
+	writeMainTestFile(t, filepath.Join(channelsDir, "weixin.yaml"), "weixin:\n  enabled: true\n")
+	writeMainTestFile(t, filepath.Join(channelsDir, "telegram.sample.yaml"), "telegram:\n  enabled: true\n")
+	out := captureStdout(t, func() error { return run([]string{"channel", "list"}) })
+	if !strings.Contains(out, "feishu") || !strings.Contains(out, "false") {
+		t.Fatalf("expected feishu disabled in channel list:\n%s", out)
+	}
+	if !strings.Contains(out, "weixin") || !strings.Contains(out, "true") {
+		t.Fatalf("expected weixin enabled in channel list:\n%s", out)
+	}
+	if strings.Contains(out, "telegram") {
+		t.Fatalf("sample channel should be skipped:\n%s", out)
 	}
 }
 
@@ -567,4 +762,14 @@ func captureStdout(t *testing.T, fn func() error) string {
 		t.Fatal(err)
 	}
 	return out.String()
+}
+
+func writeMainTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }

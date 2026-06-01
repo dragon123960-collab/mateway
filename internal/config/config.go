@@ -20,6 +20,7 @@ type Root struct {
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
 	Skills    SkillsConfig    `yaml:"skills"`
+	Scripts   ScriptsConfig   `yaml:"scripts"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
 	Models    []ModelConfig   `yaml:"-"`
@@ -39,6 +40,12 @@ func DefaultRoot() Root {
 			AutoPropose:       true,
 			AutoCommitLowRisk: false,
 			RequireConfirmFor: []string{"user_preference", "org_knowledge", "long_memory", "skill_candidate"},
+			ProposalNudge: ProposalNudgeConfig{
+				Enabled:      boolPtr(true),
+				Interval:     "24h",
+				Channels:     []string{"cli"},
+				MaxProposals: 3,
+			},
 		},
 		Learning: LearningConfig{Enabled: true, SkillCrystallization: SkillCrystallizationConfig{
 			Enabled:            true,
@@ -93,7 +100,7 @@ func DefaultRoot() Root {
 				Enabled:  false,
 				Interval: "30m",
 				Schedule: HeartbeatSchedule{DailyAt: "03:30"},
-				Jobs:     []string{"memory_lint", "memory_index_rebuild"},
+				Jobs:     []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning"},
 				QuietHours: HeartbeatQuietHours{
 					Start: "23:00",
 					End:   "08:00",
@@ -106,9 +113,11 @@ func DefaultRoot() Root {
 }
 
 type AppConfig struct {
-	Name      string `yaml:"name"`
-	Home      string `yaml:"home"`
-	Workspace string `yaml:"workspace"`
+	Name              string `yaml:"name"`
+	Home              string `yaml:"home"`
+	Workspace         string `yaml:"workspace"`
+	Locale            string `yaml:"locale"`
+	MessageCatalogDir string `yaml:"message_catalog_dir"`
 }
 
 type SecurityConfig struct {
@@ -177,12 +186,27 @@ type ModelConfig struct {
 }
 
 type MemoryConfig struct {
-	Enabled           bool     `yaml:"enabled"`
-	Root              string   `yaml:"root"`
-	RecentDays        int      `yaml:"recent_days"`
-	AutoPropose       bool     `yaml:"auto_propose"`
-	AutoCommitLowRisk bool     `yaml:"auto_commit_low_risk"`
-	RequireConfirmFor []string `yaml:"require_confirm_for"`
+	Enabled           bool                `yaml:"enabled"`
+	Root              string              `yaml:"root"`
+	RecentDays        int                 `yaml:"recent_days"`
+	AutoPropose       bool                `yaml:"auto_propose"`
+	AutoCommitLowRisk bool                `yaml:"auto_commit_low_risk"`
+	RequireConfirmFor []string            `yaml:"require_confirm_for"`
+	ProposalNudge     ProposalNudgeConfig `yaml:"proposal_nudge"`
+}
+
+type ProposalNudgeConfig struct {
+	Enabled      *bool    `yaml:"enabled"`
+	Interval     string   `yaml:"interval"`
+	Channels     []string `yaml:"channels"`
+	MaxProposals int      `yaml:"max_proposals"`
+}
+
+func (c ProposalNudgeConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 type LearningConfig struct {
@@ -200,6 +224,10 @@ type SkillCrystallizationConfig struct {
 
 type SkillsConfig struct {
 	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
+}
+
+type ScriptsConfig struct {
+	Dirs []string `yaml:"dirs"`
 }
 
 type SkillCatalogConfig struct {
@@ -270,6 +298,7 @@ type AgentBindingConfig struct {
 
 type ChannelsConfig struct {
 	Feishu FeishuConfig `yaml:"feishu"`
+	Weixin WeixinConfig `yaml:"weixin"`
 }
 
 type FeishuConfig struct {
@@ -298,6 +327,29 @@ type FeishuWebhookConfig struct {
 
 type FeishuWebSocketConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+type WeixinConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	BaseURL              string `yaml:"base_url"`
+	BaseURLEnv           string `yaml:"base_url_env"`
+	AccountID            string `yaml:"account_id"`
+	AccountIDEnv         string `yaml:"account_id_env"`
+	Token                string `yaml:"token"`
+	TokenEnv             string `yaml:"token_env"`
+	AccountDir           string `yaml:"account_dir"`
+	MediaDir             string `yaml:"media_dir"`
+	BotAgent             string `yaml:"bot_agent"`
+	PollTimeoutMS        int    `yaml:"poll_timeout_ms"`
+	RetryInterval        string `yaml:"retry_interval"`
+	MentionRequiredGroup bool   `yaml:"mention_required_in_group"`
+}
+
+func (c WeixinConfig) ResolveSecrets() WeixinConfig {
+	c.BaseURL = firstNonEmpty(c.BaseURL, getenv(c.BaseURLEnv))
+	c.AccountID = firstNonEmpty(c.AccountID, getenv(c.AccountIDEnv))
+	c.Token = firstNonEmpty(c.Token, getenv(c.TokenEnv))
+	return c
 }
 
 func (c FeishuConfig) ResolveSecrets() FeishuConfig {
@@ -376,6 +428,7 @@ func (r *Root) NormalizeForUse() {
 	r.applyDefaults()
 	r.normalizeSearch()
 	r.normalizeSkills()
+	r.normalizeScripts()
 	r.normalizeAgents()
 }
 
@@ -383,6 +436,9 @@ func (r *Root) applyDefaults() {
 	defaults := DefaultRoot()
 	if strings.TrimSpace(r.App.Name) == "" {
 		r.App.Name = defaults.App.Name
+	}
+	if strings.TrimSpace(r.App.Locale) == "" {
+		r.App.Locale = "auto"
 	}
 	if strings.TrimSpace(r.Model.Default) == "" {
 		r.Model.Default = defaults.Model.Default
@@ -398,6 +454,19 @@ func (r *Root) applyDefaults() {
 	}
 	if len(r.Memory.RequireConfirmFor) == 0 {
 		r.Memory.RequireConfirmFor = defaults.Memory.RequireConfirmFor
+	}
+	proposalNudgeUnset := strings.TrimSpace(r.Memory.ProposalNudge.Interval) == "" && len(r.Memory.ProposalNudge.Channels) == 0 && r.Memory.ProposalNudge.MaxProposals == 0 && r.Memory.ProposalNudge.Enabled == nil
+	if proposalNudgeUnset {
+		r.Memory.ProposalNudge.Enabled = defaults.Memory.ProposalNudge.Enabled
+	}
+	if strings.TrimSpace(r.Memory.ProposalNudge.Interval) == "" {
+		r.Memory.ProposalNudge.Interval = defaults.Memory.ProposalNudge.Interval
+	}
+	if len(r.Memory.ProposalNudge.Channels) == 0 {
+		r.Memory.ProposalNudge.Channels = defaults.Memory.ProposalNudge.Channels
+	}
+	if r.Memory.ProposalNudge.MaxProposals <= 0 {
+		r.Memory.ProposalNudge.MaxProposals = defaults.Memory.ProposalNudge.MaxProposals
 	}
 	if strings.TrimSpace(r.Learning.SkillCrystallization.MinConfidence) == "" {
 		r.Learning.SkillCrystallization.MinConfidence = defaults.Learning.SkillCrystallization.MinConfidence
@@ -478,6 +547,12 @@ func (r *Root) normalizeSkills() {
 		{Name: "skills.sh", Enabled: true, BaseURL: "https://skills.sh", SearchURL: "https://skills.sh/?q={query}", InstallURL: "", TrustLevel: "high"},
 		{Name: "skillhub.cn", Enabled: false, BaseURL: "https://skillhub.cn", SearchURL: "https://skillhub.cn/search?q={query}", InstallURL: "", TrustLevel: "unknown"},
 		{Name: "clawhub.ai", Enabled: false, BaseURL: "https://clawhub.ai", SearchURL: "https://clawhub.ai/search?q={query}", InstallURL: "", TrustLevel: "medium"},
+	}
+}
+
+func (r *Root) normalizeScripts() {
+	if r.Scripts.Dirs == nil {
+		r.Scripts.Dirs = []string{}
 	}
 }
 
@@ -661,12 +736,14 @@ func shouldSkipConfigFile(entry os.DirEntry, name string) bool {
 
 func (l Loader) loadChannels() (ChannelsConfig, error) {
 	var channels ChannelsConfig
-	path := filepath.Join(l.ConfigDir(), "channels", "feishu.yaml")
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return channels, nil
-	}
-	if err := readYAML(path, &channels); err != nil {
-		return channels, err
+	for _, name := range []string{"feishu.yaml", "weixin.yaml"} {
+		path := filepath.Join(l.ConfigDir(), "channels", name)
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := readYAML(path, &channels); err != nil {
+			return channels, err
+		}
 	}
 	return channels, nil
 }
@@ -689,6 +766,10 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func getenv(name string) string {
