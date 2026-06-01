@@ -1,6 +1,6 @@
 # Channel Extension Protocol
 
-This document explains how external channels connect to Mateway without being built into the Go runtime. The current protocol is intentionally small: text in, text out, with stable session identity and optional delivery acknowledgements.
+This document explains how external channels connect to Mateway without being built into the Go runtime. The current implementation is intentionally small: text in, text out, with stable session identity and optional delivery acknowledgements. The protocol reserves an attachment shape so adapters can add image input without changing the event envelope later.
 
 ## Model
 
@@ -17,7 +17,7 @@ External channel adapters own platform-specific details:
 - converting platform messages to Mateway text events
 - sending Mateway replies back to the platform
 
-Mateway v1 only supports text through the bridge protocol. Images, voice, files, cards, and platform-native reactions should be kept in the adapter until the protocol grows explicit media support.
+Mateway v1 only processes text through the bridge protocol. Adapters may include attachment metadata for traceability, but the current runtime will not download or reason over the media yet.
 
 ## Enable Bridge Protocol
 
@@ -71,6 +71,7 @@ Example:
     "sender_name": "Alice",
     "is_mentioned": "true"
   },
+  "attachments": [],
   "created_at": "2026-06-01T16:00:00+08:00"
 }
 ```
@@ -88,6 +89,7 @@ Recommended fields:
 - `thread_id`: conversation identity; defaults to `peer_id` if omitted.
 - `user_id`: sender identity.
 - `chat_type`: usually `dm` or `group`.
+- `attachments`: reserved list of media references; current implementation rejects non-empty attachments until media handling lands.
 
 Session identity is derived as:
 
@@ -100,6 +102,37 @@ If `account_id` is empty, Mateway uses:
 ```text
 {channel}:{peer_id}
 ```
+
+## Attachment Shape
+
+The bridge event already reserves `attachments` so channel adapters can converge on one media envelope. Use this shape when implementing image support:
+
+```json
+{
+  "type": "image",
+  "url": "https://adapter.local/media/msg-001/image-1",
+  "name": "image-1.jpg"
+}
+```
+
+Planned fields:
+
+- `type`: `image`, `voice`, `file`, or `video`.
+- `url`: adapter-hosted download URL or signed platform URL.
+- `name`: optional display filename.
+
+Current behavior:
+
+- `attachments: []` is accepted.
+- Non-empty `attachments` are rejected in bridge v1.
+- OpenClaw compatibility currently ignores non-text `MessageItem` values.
+
+Recommended image implementation path:
+
+1. Let the adapter download or proxy the platform image.
+2. Expose a short-lived local or signed URL in `attachments[].url`.
+3. Keep platform credentials inside the adapter.
+4. Extend Mateway runtime to store media as evidence before passing it to tools or models.
 
 ## Receive Replies
 

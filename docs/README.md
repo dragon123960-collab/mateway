@@ -10,4 +10,4 @@ Current docs:
 - `总规划.md`: project direction and architecture plan.
 - `记忆prd.md`: hook and memory runtime product/design notes.
 
-Local development notes, work-in-progress TODOs, progress logs, and dogfooding task lists belong in `dev-notes/`, which is ignored by git.
+Local development notes, work-in-progress TODOs, progress logs, dogfooding task lists, and archived planning material belong in `dev-notes/`, which is ignored by git.

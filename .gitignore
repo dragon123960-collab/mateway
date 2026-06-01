@@ -10,8 +10,8 @@ coverage.out
 # Local runtime state lives outside the repo.
 .mateway/
 *.log
-/docs/archive/
 /dev-notes/
+/dev-notes/archive/
 /testdata/
 /bin/
 scripts/
