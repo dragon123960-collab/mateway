@@ -129,6 +129,19 @@ func TestIntFromAnyHandlesILinkErrcodes(t *testing.T) {
 	}
 }
 
+func TestLoginStartResponseParsesQRCodeImgContent(t *testing.T) {
+	var resp LoginStartResponse
+	if err := json.Unmarshal([]byte(`{"qrcode":"token","qrcode_img_content":"weixin://scan-url"}`), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.QRCode != "token" || resp.QRCodeImgContent != "weixin://scan-url" {
+		t.Fatalf("response = %#v", resp)
+	}
+	if got := firstNonEmpty(resp.QRCodeImgContent, resp.QRCodeURL, resp.QRCode); got != "weixin://scan-url" {
+		t.Fatalf("qr scan data = %q", got)
+	}
+}
+
 func mustInbound(t *testing.T, raw string) channel.InboundMessage {
 	t.Helper()
 	var msg channel.InboundMessage

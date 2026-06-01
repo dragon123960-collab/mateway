@@ -28,11 +28,11 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 	if qrCode == "" {
 		return Account{}, "", fmt.Errorf("weixin QR response missing qrcode: ret=%d errcode=%d errmsg=%s qrcode_url=%q", qr.Ret, qr.ErrCode, qr.ErrMsg, qr.QRCodeURL)
 	}
-	qrURL := firstNonEmpty(qr.QRCodeURL, qr.QRCode)
+	qrURL := firstNonEmpty(qr.QRCodeImgContent, qr.QRCodeURL, qr.QRCode)
 	if out != nil {
 		fmt.Fprintln(out, "请使用微信扫描以下二维码：")
 		qrterminal.GenerateHalfBlock(qrURL, qrterminal.L, out)
-		if qr.QRCodeURL != "" {
+		if qr.QRCodeImgContent != "" || qr.QRCodeURL != "" {
 			fmt.Fprintln(out, "二维码链接：")
 		} else {
 			fmt.Fprintln(out, "二维码 token：")

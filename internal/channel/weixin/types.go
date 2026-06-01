@@ -54,14 +54,15 @@ type TextItem struct {
 }
 
 type LoginStartResponse struct {
-	Ret       int    `json:"ret"`
-	ErrCode   int    `json:"errcode,omitempty"`
-	ErrMsg    string `json:"errmsg,omitempty"`
-	AccountID string `json:"account_id,omitempty"`
-	Token     string `json:"token,omitempty"`
-	BaseURL   string `json:"base_url,omitempty"`
-	QRCodeURL string `json:"qrcode_url,omitempty"`
-	QRCode    string `json:"qrcode,omitempty"`
+	Ret              int    `json:"ret"`
+	ErrCode          int    `json:"errcode,omitempty"`
+	ErrMsg           string `json:"errmsg,omitempty"`
+	AccountID        string `json:"account_id,omitempty"`
+	Token            string `json:"token,omitempty"`
+	BaseURL          string `json:"base_url,omitempty"`
+	QRCodeURL        string `json:"qrcode_url,omitempty"`
+	QRCodeImgContent string `json:"qrcode_img_content,omitempty"`
+	QRCode           string `json:"qrcode,omitempty"`
 }
 
 type Account struct {
