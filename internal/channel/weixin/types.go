@@ -36,6 +36,7 @@ type Message struct {
 	MessageID    int64  `json:"message_id,omitempty"`
 	FromUserID   string `json:"from_user_id,omitempty"`
 	ToUserID     string `json:"to_user_id,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
 	CreateTimeMS int64  `json:"create_time_ms,omitempty"`
 	SessionID    string `json:"session_id,omitempty"`
 	MessageType  int    `json:"message_type,omitempty"`
@@ -100,9 +101,13 @@ func (m Message) ToInbound(accountID string) (channel.InboundMessage, bool) {
 
 func ReplyToMessage(original channel.InboundMessage, reply channel.OutboundMessage) Message {
 	return Message{
+		FromUserID:   "",
 		ToUserID:     firstNonEmpty(original.Metadata["peer_id"], original.UserID, original.ThreadID),
+		ClientID:     "mateway-weixin-" + time.Now().Format("20060102150405.000000000"),
 		ContextToken: original.Metadata["context_token"],
 		CreateTimeMS: time.Now().UnixMilli(),
+		MessageType:  2,
+		MessageState: 2,
 		ItemList: []Item{{
 			Type:     1,
 			TextItem: &TextItem{Text: reply.Text},

@@ -171,7 +171,7 @@ func run(args []string) error {
 
 func runWeixin(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway weixin <login>")
+		return fmt.Errorf("usage: mateway weixin <login|enable>")
 	}
 	switch args[0] {
 	case "login":
@@ -196,8 +196,30 @@ func runWeixin(args []string) error {
 		}
 		fmt.Println("saved_to:", filepath.Join(cfg.App.Home, "run", "weixin", "accounts", account.AccountID+".json"))
 		return nil
+	case "enable":
+		fs := flag.NewFlagSet("mateway weixin enable", flag.ContinueOnError)
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		accountID := ""
+		if fs.NArg() > 0 {
+			accountID = fs.Arg(0)
+		}
+		account, err := weixin.EnableSavedAccount(cfg.Channels.Weixin, cfg.App.Home, accountID)
+		if err != nil {
+			return err
+		}
+		fmt.Println("weixin_enabled:", true)
+		fmt.Println("weixin_account_id:", account.AccountID)
+		fmt.Println("weixin_base_url:", account.BaseURL)
+		fmt.Println("config:", filepath.Join(cfg.App.Home, "config", "channels", "weixin.yaml"))
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway weixin <login>")
+		return fmt.Errorf("usage: mateway weixin <login|enable>")
 	}
 }
 
@@ -2074,6 +2096,7 @@ Usage:
   mateway secret list
   mateway secret delete <id>
   mateway weixin login [--timeout <duration>]
+  mateway weixin enable [account_id]
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dongping/mateway/internal/config"
 	"github.com/mdp/qrterminal/v3"
+	"gopkg.in/yaml.v3"
 )
 
 func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, timeout time.Duration, out io.Writer) (Account, string, error) {
@@ -84,6 +87,9 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 			if err := SaveAccount(accountDir, account); err != nil {
 				return Account{}, qrURL, err
 			}
+			if err := EnableConfig(home, account); err != nil && out != nil {
+				fmt.Fprintf(out, "\n微信凭据已保存，但更新 weixin.yaml 失败：%v\n", err)
+			}
 			if out != nil {
 				fmt.Fprintln(out, "\n微信连接成功。")
 			}
@@ -94,6 +100,100 @@ func Login(ctx context.Context, cfg config.WeixinConfig, home, botType string, t
 		sleepOrDone(ctx, time.Second)
 	}
 	return Account{}, qrURL, fmt.Errorf("weixin login timed out")
+}
+
+func EnableSavedAccount(cfg config.WeixinConfig, home, accountID string) (Account, error) {
+	cfg = cfg.ResolveSecrets()
+	accountDir := strings.TrimSpace(cfg.AccountDir)
+	if accountDir == "" {
+		accountDir = defaultAccountDir(home)
+	}
+	var account Account
+	var err error
+	if strings.TrimSpace(accountID) != "" {
+		account, err = LoadAccount(accountDir, accountID)
+	} else {
+		account, err = LoadLatestAccount(accountDir)
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	if err := EnableConfig(home, account); err != nil {
+		return Account{}, err
+	}
+	return account, nil
+}
+
+func EnableConfig(home string, account Account) error {
+	path := filepath.Join(home, "config", "channels", "weixin.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	doc := documentMapping(&root)
+	if doc == nil {
+		return fmt.Errorf("weixin.yaml must contain a mapping")
+	}
+	weixinNode := mappingValue(doc, "weixin")
+	if weixinNode == nil {
+		weixinNode = &yaml.Node{Kind: yaml.MappingNode}
+		doc.Content = append(doc.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "weixin"}, weixinNode)
+	}
+	setMappingValue(weixinNode, "enabled", "true", "!!bool")
+	setMappingValue(weixinNode, "account_id", account.AccountID, "!!str")
+	setMappingValue(weixinNode, "base_url", account.BaseURL, "!!str")
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+func documentMapping(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return node.Content[0]
+	}
+	if node.Kind == yaml.MappingNode {
+		return node
+	}
+	return nil
+}
+
+func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func setMappingValue(mapping *yaml.Node, key, value, tag string) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1].Kind = yaml.ScalarNode
+			mapping.Content[i+1].Value = value
+			mapping.Content[i+1].Tag = tag
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value, Tag: tag},
+	)
 }
 
 func mapString(values map[string]any, key string) string {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/channel"
 )
@@ -51,6 +52,9 @@ func TestReplyToMessagePreservesContextToken(t *testing.T) {
 	)
 	if reply.ToUserID != "wxid_user" || reply.ContextToken != "ctx" {
 		t.Fatalf("reply = %#v", reply)
+	}
+	if reply.ClientID == "" || reply.MessageType != 2 || reply.MessageState != 2 {
+		t.Fatalf("reply metadata = %#v", reply)
 	}
 	if len(reply.ItemList) != 1 || reply.ItemList[0].TextItem.Text != "pong" {
 		t.Fatalf("items = %#v", reply.ItemList)
@@ -101,6 +105,50 @@ func TestSaveAndLoadAccount(t *testing.T) {
 	}
 	if account.Token != "tok" || account.BaseURL != "https://base" {
 		t.Fatalf("account = %#v", account)
+	}
+}
+
+func TestLoadLatestAccount(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "accounts")
+	if err := SaveAccount(dir, Account{AccountID: "old", Token: "old-token", BaseURL: "https://old"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := SaveAccount(dir, Account{AccountID: "new", Token: "new-token", BaseURL: "https://new"}); err != nil {
+		t.Fatal(err)
+	}
+	account, err := LoadLatestAccount(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.AccountID != "new" {
+		t.Fatalf("account = %#v", account)
+	}
+}
+
+func TestEnableConfigWritesAccountButNotToken(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "config", "channels")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "weixin.yaml")
+	if err := os.WriteFile(path, []byte("weixin:\n  enabled: false\n  token: \"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnableConfig(home, Account{AccountID: "acct", Token: "secret-token", BaseURL: "https://base"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "enabled: true") || !strings.Contains(text, "account_id: acct") || !strings.Contains(text, "base_url: https://base") {
+		t.Fatalf("config = %s", text)
+	}
+	if strings.Contains(text, "secret-token") {
+		t.Fatalf("token leaked into config: %s", text)
 	}
 }
 

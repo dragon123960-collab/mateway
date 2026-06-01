@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -41,6 +42,42 @@ func LoadAccount(dir, accountID string) (Account, error) {
 	}
 	err = json.Unmarshal(data, &account)
 	return account, err
+}
+
+func LoadLatestAccount(dir string) (Account, error) {
+	var account Account
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return account, err
+	}
+	type candidate struct {
+		path string
+		info os.FileInfo
+	}
+	var candidates []candidate
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || strings.Contains(entry.Name(), ".sync") || strings.Contains(entry.Name(), ".context") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, candidate{path: filepath.Join(dir, entry.Name()), info: info})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].info.ModTime().After(candidates[j].info.ModTime())
+	})
+	for _, candidate := range candidates {
+		data, err := os.ReadFile(candidate.path)
+		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(data, &account); err == nil && account.AccountID != "" && account.Token != "" {
+			return account, nil
+		}
+	}
+	return account, os.ErrNotExist
 }
 
 func loadSyncBuf(dir, accountID string) string {
