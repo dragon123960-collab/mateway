@@ -132,6 +132,8 @@ Mateway 目前支持：
 
 - CLI 任务入口：`mateway ask`
 - 飞书 WebSocket gateway
+- 原生微信 iLink Bot channel：`mateway weixin login`、`mateway weixin enable`
+- 从本地 channel 配置文件发现 channel id：`mateway channel list`
 - 真实 runtime 测试：`mateway test`
 - trace 回看：`mateway trace`
 - session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
@@ -143,8 +145,9 @@ Mateway 目前支持：
 - workspace profile 注入
 - 从 `workspace/skills` 和 agent-specific overrides 发现 skills
 - Markdown memory lint/search/index
-- memory proposal create/list/commit/reject
+- memory proposal create/list/show/commit/reject
 - 有价值任务完成后的自动 diary/proposal 生成
+- 可按 channel、间隔和展示数量配置的候选记忆提醒
 - memory proposal 的聊天回复处理：`保存` / `忽略`
 - 通过 `context_hook` 做 memory safe-read 注入
 - session 和 project distill 命令
@@ -222,13 +225,41 @@ vim ~/.mateway/config/config.yaml
 ./build/mateway test --session-key demo:a001 --message "Read README.md and explain the memory system."
 ```
 
-### 启动飞书 Gateway
+### 启动 Gateway
 
 ```bash
 ./build/mateway gateway serve
 ```
 
-`gateway serve` 以前台进程运行。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
+`gateway serve` 会以前台进程启动已启用的内置 channel。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
+
+查看当前可配置的 channel id：
+
+```bash
+./build/mateway channel list
+```
+
+示例：
+
+```text
+ID      ENABLED  CONFIG
+feishu  true     ~/.mateway/config/channels/feishu.yaml
+weixin  true     ~/.mateway/config/channels/weixin.yaml
+```
+
+配置候选记忆提醒等 channel-scoped 行为时，使用 `ID` 列里的名字。
+
+### 接入微信
+
+Mateway 的原生微信 channel 参考 Hermes 的 iLink Bot API 路线，支持扫码登录、保存账号、长轮询接收文本消息和发送文本回复。
+
+```bash
+./build/mateway weixin login
+./build/mateway weixin enable
+./build/mateway gateway restart
+```
+
+登录凭据保存在 `~/.mateway/run/weixin/accounts/`。`weixin enable` 会更新 `~/.mateway/config/channels/weixin.yaml`，但不会把 token 写进配置文件。媒体/CDN 支持暂不纳入当前版本。
 
 ## Memory 命令
 
@@ -254,9 +285,24 @@ Review proposals：
 
 ```bash
 ./build/mateway memory proposal list
+./build/mateway memory proposal show <proposal_id>
 ./build/mateway memory proposal commit <proposal_id>
 ./build/mateway memory proposal reject <proposal_id> --reason "not reusable"
 ```
+
+候选记忆提醒可以在 `~/.mateway/config/config.yaml` 配置：
+
+```yaml
+memory:
+  proposal_nudge:
+    enabled: true
+    interval: 24h
+    channels:
+      - cli
+    max_proposals: 3
+```
+
+提醒由 runtime 生成，但只会出现在配置的 channel id 中。提醒会展示少量候选摘要，并给出 `mateway memory proposal show <proposal_id>` 查看详情，不会把所有待审核候选一次性塞进聊天窗口。
 
 蒸馏 session 或 project：
 
@@ -438,6 +484,8 @@ Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执
 
 原生微信 channel 参考 Hermes 的 iLink Bot API 路线：`mateway weixin login` 扫码并把凭据保存到 `~/.mateway/run/weixin/accounts/`；`gateway serve` 之后通过 `getupdates` 长轮询收消息，并通过 `sendmessage` 发送文本回复。媒体/CDN 支持暂不纳入首版。
 
+使用 `mateway channel list` 可以从 `~/.mateway/config/channels/*.yaml` 查看 canonical channel id。runtime 配置应使用这些 id，例如 `feishu` 或 `weixin`，而不是 `lark`、`wechat` 这类别名。
+
 `gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
 
 ## 当前边界
@@ -459,24 +507,27 @@ Mateway 不会把这些能力伪装成已经完成：
 
 - 小型 AgentCore runtime loop
 - 多 agent profile 和 binding 基础
-- CLI / test / Feishu entrypoints
+- CLI / test / Feishu / Weixin entrypoints
 - Hook pipeline
 - Tool policy 和 confirmation boundaries
 - JSONL traces
 - Skill discovery 和 context injection
 - 本地 secret store 和 skill secret 扫描
 - Markdown memory lint/search/index
-- Memory proposal commit/reject workflow
+- Memory proposal list/show/commit/reject workflow
+- 可配置的候选记忆提醒
 - Self-learning diary/proposal generation
 - Memory safe-read context injection
 - Session/project distill commands
 - Heartbeat `lint-index` 和前台 heartbeat runner
 - Channel-neutral scheduled task create/test/run-due/serve
+- 通过 `mateway channel list` 发现内置 channel
 - 持久化 runtime 记录 secret redaction
 
 ### 下一步
 
-- 多 agent profile 产品化：agent list/report/create/bind、profile lint 和多 profile 测试
+- 更多内置 channel：钉钉、QQ、企业微信、Telegram
+- channel 图片/文件等媒体能力
 - user-provided connectors 的 script bridge specification
 - skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers
