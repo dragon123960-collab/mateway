@@ -560,6 +560,35 @@ func TestScriptSandboxAndWorkspaceReports(t *testing.T) {
 	}
 }
 
+func TestAgentCommandsCreateBindReport(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"agent", "list"}) })
+	if !strings.Contains(out, "main") {
+		t.Fatalf("unexpected agent list:\n%s", out)
+	}
+	if err := run([]string{"agent", "create", "ops", "--name", "Ops Agent"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "workspace", "agents", "ops", "agent.md")); err != nil {
+		t.Fatalf("missing agent files: %v", err)
+	}
+	if err := run([]string{"agent", "bind", "--channel", "feishu", "--peer-id", "chat-ops", "ops"}); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() error { return run([]string{"agent", "report", "ops"}) })
+	if !strings.Contains(out, "agent: ops") || !strings.Contains(out, "peer_id=chat-ops") || !strings.Contains(out, "issues: 0") {
+		t.Fatalf("unexpected agent report:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"agent", "unbind", "--channel", "feishu", "--peer-id", "chat-ops"}) })
+	if !strings.Contains(out, "removed: true") {
+		t.Fatalf("unexpected unbind:\n%s", out)
+	}
+}
+
 func TestSecretCommandsStoreAndListWithoutValue(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

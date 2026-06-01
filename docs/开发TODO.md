@@ -25,7 +25,7 @@ Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / S
 
 ### S2.1 Multi-Agent Profile 产品化
 
-状态：下一阶段优先
+状态：已完成第一轮产品化
 
 目标：
 
@@ -43,14 +43,19 @@ Stage 2：多 Agent Profile 产品化 / Skill Source Adapter / Script Bridge / S
 - `workspace/memory/agents/<agent_id>/`
 - `AgentPool` 按 session/channel binding 选择 profile，并 clone agent 避免 session 状态串线。
 
-待开发：
+已完成：
 
 - `mateway agent list`
 - `mateway agent report <agent_id>`
-- `mateway agent create <agent_id>`，只生成 profile 文件和目录，不自动改复杂路由
+- `mateway agent create <agent_id>`，只生成 profile 文件和目录，不引入复杂路由
 - `mateway agent bind` / `unbind`，编辑 `config.agents.bindings[]`
-- agent profile lint：目录、prompt 文件、skill override、memory root、model fallback 是否齐全
-- 多 agent 真实任务测试：不同 session/channel 选择正确 profile，memory safe-read 不串 agent
+- agent profile lint：目录、prompt 文件、memory root、model fallback 基础检查
+- 多 agent 绑定测试：channel/peer binding 选择正确 profile
+
+待开发：
+
+- 多 agent 真实任务测试：memory safe-read 不串 agent 的更完整验收
+- skill override / tool allow-deny 的更细 lint
 
 验收：
 

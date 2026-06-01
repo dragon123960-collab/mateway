@@ -134,13 +134,13 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	writeCompactTrace(trace, "model_input_compacted", compactStats)
 	messages = append(messages, agentcore.Message{Role: agentcore.RoleUser, Content: userText})
 
-	agent := rt.Pool.AgentForSession(msg.SessionKey)
+	agent := rt.Pool.AgentForMessage(msg)
 	if agent == nil {
 		agent = agentcore.NewAgent(rt.Model, rt.Tools)
 	}
 	agent.Messages = messages
 	agent.MaxIterations = 6
-	profile := rt.Pool.ProfileForSession(msg.SessionKey)
+	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,

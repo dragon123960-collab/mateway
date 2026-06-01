@@ -413,9 +413,18 @@ Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router�
 - `workspace/agents/<agent_id>/skills/`
 - `workspace/memory/agents/<agent_id>/`
 
-这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。下一阶段会把这部分产品化，补齐 agent list/report/create/bind 命令、profile lint 和多 profile 验收测试。
+这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。
 
 边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
+
+Profile 产品化命令：
+
+- `mateway agent list`
+- `mateway agent report <agent_id>`
+- `mateway agent lint <agent_id>`
+- `mateway agent create <agent_id> [--name <name>] [--default]`
+- `mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>`
+- `mateway agent unbind --channel <channel> [--account-id <id>] [--peer-id <id>]`
 
 ## Gateway 边界
 

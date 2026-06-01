@@ -121,6 +121,8 @@ func run(args []string) error {
 		return runMemory(args[1:])
 	case "agent-profile":
 		return runAgentProfile(args[1:])
+	case "agent":
+		return runAgent(args[1:])
 	case "script":
 		return runScript(args[1:])
 	case "sandbox":
@@ -590,6 +592,147 @@ func runSkillUsage(cfg *config.Root, args []string) error {
 	}
 	printLearningReport(report)
 	return nil
+}
+
+func runAgent(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway agent <list|report|lint|create|bind|unbind>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	manager := agentprofile.Manager{Config: cfg}
+	switch args[0] {
+	case "list":
+		agents := manager.List()
+		fmt.Println("agents:", len(agents))
+		for _, agent := range agents {
+			fmt.Printf("- %s name=%s default=%v session_namespace=%s model=%s\n", agent.ID, agent.Name, agent.Default, agent.SessionNamespace, agent.Model.Default)
+		}
+		return nil
+	case "report", "lint":
+		agentID := ""
+		if len(args) > 1 {
+			agentID = args[1]
+		}
+		report, err := manager.Report(agentID)
+		if err != nil {
+			return err
+		}
+		printAgentReport(report)
+		if args[0] == "lint" && hasAgentLintErrors(report.Issues) {
+			return fmt.Errorf("agent lint found errors")
+		}
+		return nil
+	case "create":
+		fs := flag.NewFlagSet("mateway agent create", flag.ContinueOnError)
+		name := fs.String("name", "", "agent display name")
+		setDefault := fs.Bool("default", false, "set as default agent")
+		if err := fs.Parse(reorderAgentCreateFlags(args[1:])); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway agent create <agent_id> [--name <name>] [--default]")
+		}
+		created, err := manager.Create(agentprofile.CreateAgentInput{ID: fs.Arg(0), Name: *name, SetDefault: *setDefault})
+		if err != nil {
+			return err
+		}
+		fmt.Println("agent:", created.ID)
+		fmt.Println("name:", created.Name)
+		fmt.Println("default:", created.Default)
+		return nil
+	case "bind":
+		fs := flag.NewFlagSet("mateway agent bind", flag.ContinueOnError)
+		channelName := fs.String("channel", "", "channel name such as cli or feishu")
+		accountID := fs.String("account-id", "", "optional account id")
+		peerID := fs.String("peer-id", "", "optional peer/thread id")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>")
+		}
+		binding, err := manager.Bind(agentprofile.BindInput{Channel: *channelName, AccountID: *accountID, PeerID: *peerID, AgentID: fs.Arg(0)})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("binding: channel=%s account_id=%s peer_id=%s agent=%s\n", binding.Channel, binding.AccountID, binding.PeerID, binding.AgentID)
+		return nil
+	case "unbind":
+		fs := flag.NewFlagSet("mateway agent unbind", flag.ContinueOnError)
+		channelName := fs.String("channel", "", "channel name such as cli or feishu")
+		accountID := fs.String("account-id", "", "optional account id")
+		peerID := fs.String("peer-id", "", "optional peer/thread id")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		removed, err := manager.Unbind(agentprofile.BindInput{Channel: *channelName, AccountID: *accountID, PeerID: *peerID})
+		if err != nil {
+			return err
+		}
+		fmt.Println("removed:", removed)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway agent <list|report|lint|create|bind|unbind>")
+	}
+}
+
+func reorderAgentCreateFlags(args []string) []string {
+	if len(args) < 3 || strings.HasPrefix(args[0], "-") {
+		return args
+	}
+	var flags []string
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--name" || arg == "-name" {
+			if i+1 < len(args) {
+				flags = append(flags, arg, args[i+1])
+				i++
+				continue
+			}
+		}
+		if arg == "--default" || arg == "-default" {
+			flags = append(flags, arg)
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
+}
+
+func printAgentReport(report agentprofile.AgentReport) {
+	fmt.Println("agent:", report.ID)
+	fmt.Println("name:", report.Name)
+	fmt.Println("default:", report.Default)
+	fmt.Println("session_namespace:", report.SessionNS)
+	fmt.Println("agent_dir:", report.AgentDir)
+	fmt.Println("memory_root:", report.MemoryRoot)
+	fmt.Println("model:", report.ModelDefault)
+	fmt.Println("skills:", report.Skills)
+	fmt.Println("prompt_files:")
+	for _, file := range report.PromptFiles {
+		fmt.Printf("- %s exists=%v bytes=%d\n", file.Path, file.Exists, file.Bytes)
+	}
+	fmt.Println("bindings:")
+	for _, binding := range report.Bindings {
+		fmt.Printf("- channel=%s account_id=%s peer_id=%s agent=%s\n", binding.Channel, binding.AccountID, binding.PeerID, binding.AgentID)
+	}
+	fmt.Println("issues:", len(report.Issues))
+	for _, issue := range report.Issues {
+		fmt.Printf("- %s %s %s\n", issue.Severity, issue.Code, issue.Message)
+	}
+}
+
+func hasAgentLintErrors(issues []agentprofile.Issue) bool {
+	for _, issue := range issues {
+		if issue.Severity == "error" {
+			return true
+		}
+	}
+	return false
 }
 
 func runSchedule(args []string) error {
@@ -1854,6 +1997,12 @@ Usage:
   mateway memory proposal list
   mateway memory proposal reject <proposal_id> [--reason <text>]
   mateway memory proposal commit <proposal_id>
+  mateway agent list
+  mateway agent report [agent_id]
+  mateway agent lint [agent_id]
+  mateway agent create <agent_id> [--name <name>] [--default]
+  mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>
+  mateway agent unbind --channel <channel> [--account-id <id>] [--peer-id <id>]
   mateway agent-profile proposal list
   mateway agent-profile proposal show <proposal_id>
   mateway agent-profile proposal promote <proposal_id>

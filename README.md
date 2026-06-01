@@ -404,6 +404,15 @@ This means different channels or session namespaces can select different agent i
 
 The boundary is deliberate: profiles and bindings are in scope; autonomous multi-agent orchestration is not part of the current release.
 
+Profile productization commands:
+
+- `mateway agent list`
+- `mateway agent report <agent_id>`
+- `mateway agent lint <agent_id>`
+- `mateway agent create <agent_id> [--name <name>] [--default]`
+- `mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>`
+- `mateway agent unbind --channel <channel> [--account-id <id>] [--peer-id <id>]`
+
 ## Gateway Boundary
 
 Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. The current `gateway serve` implementation starts the Feishu WebSocket channel when `channels/feishu.yaml` enables it. Future channels should plug into the same gateway boundary rather than bypassing runtime.
