@@ -109,8 +109,7 @@ func TestInboundDedupeUsesMessageID(t *testing.T) {
 func TestBuiltinChannelSpecsExposeEnabledChannels(t *testing.T) {
 	cfg := Config{Config: &config.Root{}}
 	cfg.Config.Channels.Feishu.Enabled = true
-	cfg.Config.Channels.Bridge.Enabled = true
-	cfg.Config.Channels.OpenClawCompat.Enabled = false
+	cfg.Config.Channels.Weixin.Enabled = true
 	specs := builtinChannelSpecs(cfg)
 	var enabled []string
 	for _, spec := range specs {
@@ -119,7 +118,7 @@ func TestBuiltinChannelSpecsExposeEnabledChannels(t *testing.T) {
 		}
 	}
 	got := strings.Join(enabled, ",")
-	if got != "feishu,bridge" {
+	if got != "feishu,weixin" {
 		t.Fatalf("enabled specs = %q", got)
 	}
 }

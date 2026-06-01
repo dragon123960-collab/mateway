@@ -9,9 +9,8 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
-	"github.com/dongping/mateway/internal/channel/bridge"
 	"github.com/dongping/mateway/internal/channel/feishu"
-	"github.com/dongping/mateway/internal/channel/openclawcompat"
+	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
 )
@@ -41,6 +40,7 @@ func Serve(ctx context.Context, cfg Config) error {
 type channelRuntime struct {
 	Runtime runtime.Runtime
 	Dedupe  *inboundDedupe
+	Home    string
 }
 
 type channelStarter func(context.Context, channelRuntime) error
@@ -52,7 +52,7 @@ type channelSpec struct {
 }
 
 func enabledChannelStarters(ctx context.Context, cfg Config, dedupe *inboundDedupe) []func() error {
-	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe}
+	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe, Home: cfg.Config.App.Home}
 	specs := builtinChannelSpecs(cfg)
 	starters := make([]func() error, 0, len(specs))
 	for _, spec := range specs {
@@ -73,8 +73,7 @@ func builtinChannelSpecs(cfg Config) []channelSpec {
 	}
 	return []channelSpec{
 		feishuChannelSpec(cfg.Config.Channels.Feishu),
-		bridgeChannelSpec(cfg.Config.Channels.Bridge),
-		openClawCompatChannelSpec(cfg.Config.Channels.OpenClawCompat),
+		weixinChannelSpec(cfg.Config.Channels.Weixin),
 	}
 }
 
@@ -95,32 +94,12 @@ func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
 	}
 }
 
-func bridgeChannelSpec(channelCfg config.BridgeConfig) channelSpec {
+func weixinChannelSpec(channelCfg config.WeixinConfig) channelSpec {
 	return channelSpec{
-		Name:    "bridge",
+		Name:    "weixin",
 		Enabled: channelCfg.Enabled,
 		Start: func(ctx context.Context, rt channelRuntime) error {
-			return bridge.Start(ctx, channelCfg, func(eventCtx context.Context, event bridge.Event) (bridge.Reply, error) {
-				msg := event.ToInbound()
-				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
-					return bridge.Reply{}, nil
-				}
-				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
-				if err != nil {
-					return bridge.Reply{}, err
-				}
-				return bridge.OutboundToReply(event, resp.Reply), nil
-			})
-		},
-	}
-}
-
-func openClawCompatChannelSpec(channelCfg config.OpenClawCompatConfig) channelSpec {
-	return channelSpec{
-		Name:    "openclaw_compat",
-		Enabled: channelCfg.Enabled,
-		Start: func(ctx context.Context, rt channelRuntime) error {
-			return openclawcompat.Start(ctx, channelCfg, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
+			return weixin.Start(ctx, channelCfg, rt.Home, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
 				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
 					return channel.OutboundMessage{}, nil
 				}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
 	"github.com/dongping/mateway/internal/memory"
@@ -87,8 +88,7 @@ func run(args []string) error {
 		fmt.Println("workspace:", cfg.App.Workspace)
 		fmt.Println("model:", cfg.Model.Default)
 		fmt.Println("feishu_enabled:", cfg.Channels.Feishu.Enabled)
-		fmt.Println("bridge_enabled:", cfg.Channels.Bridge.Enabled)
-		fmt.Println("openclaw_compat_enabled:", cfg.Channels.OpenClawCompat.Enabled)
+		fmt.Println("weixin_enabled:", cfg.Channels.Weixin.Enabled)
 		return nil
 	case "home":
 		return runHome(args[1:])
@@ -161,9 +161,43 @@ func run(args []string) error {
 		default:
 			return fmt.Errorf("usage: mateway gateway <serve|start|restart|stop|status>")
 		}
+	case "weixin":
+		return runWeixin(args[1:])
 	default:
 		printHelp()
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runWeixin(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway weixin <login>")
+	}
+	switch args[0] {
+	case "login":
+		fs := flag.NewFlagSet("mateway weixin login", flag.ContinueOnError)
+		timeout := fs.Duration("timeout", 2*time.Minute, "QR login timeout")
+		botType := fs.String("bot-type", "", "optional iLink bot type")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		account, qrURL, err := weixin.Login(context.Background(), cfg.Channels.Weixin, cfg.App.Home, *botType, *timeout, os.Stdout)
+		if err != nil {
+			return err
+		}
+		fmt.Println("weixin_account_id:", account.AccountID)
+		fmt.Println("weixin_base_url:", account.BaseURL)
+		if strings.TrimSpace(qrURL) != "" {
+			fmt.Println("qrcode_url:", qrURL)
+		}
+		fmt.Println("saved_to:", filepath.Join(cfg.App.Home, "run", "weixin", "accounts", account.AccountID+".json"))
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway weixin <login>")
 	}
 }
 
@@ -2039,6 +2073,7 @@ Usage:
   mateway secret get <id>
   mateway secret list
   mateway secret delete <id>
+  mateway weixin login [--timeout <duration>]
   mateway doctor
   mateway gateway <serve|start|restart|stop|status>`)
 }

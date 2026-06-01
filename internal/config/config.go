@@ -276,9 +276,8 @@ type AgentBindingConfig struct {
 }
 
 type ChannelsConfig struct {
-	Feishu         FeishuConfig         `yaml:"feishu"`
-	Bridge         BridgeConfig         `yaml:"bridge"`
-	OpenClawCompat OpenClawCompatConfig `yaml:"openclaw_compat"`
+	Feishu FeishuConfig `yaml:"feishu"`
+	Weixin WeixinConfig `yaml:"weixin"`
 }
 
 type FeishuConfig struct {
@@ -309,31 +308,25 @@ type FeishuWebSocketConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
-type BridgeConfig struct {
-	Enabled         bool     `yaml:"enabled"`
-	Addr            string   `yaml:"addr"`
-	BasePath        string   `yaml:"base_path"`
-	Token           string   `yaml:"token"`
-	TokenEnv        string   `yaml:"token_env"`
-	AllowedChannels []string `yaml:"allowed_channels"`
+type WeixinConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	BaseURL              string `yaml:"base_url"`
+	BaseURLEnv           string `yaml:"base_url_env"`
+	AccountID            string `yaml:"account_id"`
+	AccountIDEnv         string `yaml:"account_id_env"`
+	Token                string `yaml:"token"`
+	TokenEnv             string `yaml:"token_env"`
+	AccountDir           string `yaml:"account_dir"`
+	MediaDir             string `yaml:"media_dir"`
+	BotAgent             string `yaml:"bot_agent"`
+	PollTimeoutMS        int    `yaml:"poll_timeout_ms"`
+	RetryInterval        string `yaml:"retry_interval"`
+	MentionRequiredGroup bool   `yaml:"mention_required_in_group"`
 }
 
-func (c BridgeConfig) ResolveSecrets() BridgeConfig {
-	c.Token = firstNonEmpty(c.Token, getenv(c.TokenEnv))
-	return c
-}
-
-type OpenClawCompatConfig struct {
-	Enabled           bool   `yaml:"enabled"`
-	Addr              string `yaml:"addr"`
-	PathPrefix        string `yaml:"path_prefix"`
-	Token             string `yaml:"token"`
-	TokenEnv          string `yaml:"token_env"`
-	BotAgent          string `yaml:"bot_agent"`
-	LongPollTimeoutMS int    `yaml:"longpoll_timeout_ms"`
-}
-
-func (c OpenClawCompatConfig) ResolveSecrets() OpenClawCompatConfig {
+func (c WeixinConfig) ResolveSecrets() WeixinConfig {
+	c.BaseURL = firstNonEmpty(c.BaseURL, getenv(c.BaseURLEnv))
+	c.AccountID = firstNonEmpty(c.AccountID, getenv(c.AccountIDEnv))
 	c.Token = firstNonEmpty(c.Token, getenv(c.TokenEnv))
 	return c
 }
@@ -709,7 +702,7 @@ func shouldSkipConfigFile(entry os.DirEntry, name string) bool {
 
 func (l Loader) loadChannels() (ChannelsConfig, error) {
 	var channels ChannelsConfig
-	for _, name := range []string{"feishu.yaml", "bridge.yaml", "openclaw_compat.yaml"} {
+	for _, name := range []string{"feishu.yaml", "weixin.yaml"} {
 		path := filepath.Join(l.ConfigDir(), "channels", name)
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			continue

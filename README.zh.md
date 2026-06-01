@@ -432,13 +432,11 @@ Profile 产品化命令：
 
 ## Gateway 边界
 
-Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket、bridge 协议和 OpenClaw 兼容适配层。
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket 和原生微信长轮询。
 
-新的稳定 channel 应优先做成内置 channel spec，这样一个 gateway 进程就能统一管理。Bridge 协议保留为很小的原型/重依赖接入口：外部服务向 `POST /channels/{channel}/events` 投递归一化文本事件，可以通过 `GET /channels/{channel}/replies` 拉取回复，也可以用可选 ack 上报发送结果。
+新的稳定 channel 应优先做成内置 channel spec，这样一个 gateway 进程就能统一管理。channel package 负责平台 I/O 和消息归一化，gateway 负责 session key、dedupe、异步 runtime 执行和 trace。
 
-OpenClaw 兼容适配层暴露 `@tencent-weixin/openclaw-weixin` 所需的最小 HTTP JSON 接口：`sendmessage`、`getupdates`、`getconfig` 和 `sendtyping`。v1 只支持文本，并保留 `context_token`；媒体/CDN 上传暂不纳入范围。
-
-第三方 channel adapter 和微信 ClawBot 的具体接入方式见 [Channel Extension Protocol](docs/channel-extension.md)。
+原生微信 channel 参考 Hermes 的 iLink Bot API 路线：`mateway weixin login` 扫码并把凭据保存到 `~/.mateway/run/weixin/accounts/`；`gateway serve` 之后通过 `getupdates` 长轮询收消息，并通过 `sendmessage` 发送文本回复。媒体/CDN 支持暂不纳入首版。
 
 `gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
 

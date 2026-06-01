@@ -435,13 +435,11 @@ Profile productization commands:
 
 ## Gateway Boundary
 
-Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` starts enabled built-in channels from `channels/`, including Feishu WebSocket, the bridge protocol, and the OpenClaw-compatible adapter.
+Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` starts enabled built-in channels from `channels/`, including Feishu WebSocket and native Weixin long-poll.
 
-New stable channels should be added as built-in channel specs so one gateway process can manage them. The bridge protocol stays intentionally small for prototypes and heavy integrations: external services post normalized text events to `POST /channels/{channel}/events`, can poll `GET /channels/{channel}/replies`, and can report optional delivery acks.
+New stable channels should be added as built-in channel specs so one gateway process can manage them. A channel package owns platform I/O and message normalization, while gateway owns session key, dedupe, async runtime execution, and trace events.
 
-The OpenClaw compatibility adapter exposes the minimal HTTP JSON surface used by `@tencent-weixin/openclaw-weixin`: `sendmessage`, `getupdates`, `getconfig`, and `sendtyping`. It supports text only and preserves `context_token`; media/CDN upload is intentionally out of scope for v1.
-
-See [Channel Extension Protocol](docs/channel-extension.md) for third-party channel adapter and WeChat ClawBot setup details.
+The native Weixin channel follows the Hermes-style iLink Bot API path: `mateway weixin login` scans a QR code and saves account credentials under `~/.mateway/run/weixin/accounts/`; `gateway serve` then long-polls `getupdates` and sends text replies through `sendmessage`. Media/CDN support is intentionally out of scope for the first Mateway implementation.
 
 `gateway serve` uses the same config loader as CLI commands, so it reads `~/.mateway/config/mateway.env`. Existing process environment variables still win over values from that file.
 
