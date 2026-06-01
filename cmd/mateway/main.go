@@ -87,6 +87,8 @@ func run(args []string) error {
 		fmt.Println("workspace:", cfg.App.Workspace)
 		fmt.Println("model:", cfg.Model.Default)
 		fmt.Println("feishu_enabled:", cfg.Channels.Feishu.Enabled)
+		fmt.Println("bridge_enabled:", cfg.Channels.Bridge.Enabled)
+		fmt.Println("openclaw_compat_enabled:", cfg.Channels.OpenClawCompat.Enabled)
 		return nil
 	case "home":
 		return runHome(args[1:])

@@ -435,7 +435,11 @@ Profile productization commands:
 
 ## Gateway Boundary
 
-Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. The current `gateway serve` implementation starts the Feishu WebSocket channel when `channels/feishu.yaml` enables it. Future channels should plug into the same gateway boundary rather than bypassing runtime.
+Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` can start built-in Feishu WebSocket, the process-external bridge protocol, and the OpenClaw-compatible adapter when their files under `channels/` enable them.
+
+The bridge protocol is intentionally small: external channel services post normalized text events to `POST /channels/{channel}/events`, can poll `GET /channels/{channel}/replies`, and can report optional delivery acks. This keeps platform-specific login and SDK dependencies outside the Mateway runtime.
+
+The OpenClaw compatibility adapter exposes the minimal HTTP JSON surface used by `@tencent-weixin/openclaw-weixin`: `sendmessage`, `getupdates`, `getconfig`, and `sendtyping`. It supports text only and preserves `context_token`; media/CDN upload is intentionally out of scope for v1.
 
 `gateway serve` uses the same config loader as CLI commands, so it reads `~/.mateway/config/mateway.env`. Existing process environment variables still win over values from that file.
 

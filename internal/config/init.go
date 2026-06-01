@@ -31,6 +31,10 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("channels", "_README.md"), Content: channelsReadmeTemplate},
 		{RelPath: filepath.Join("channels", "feishu.yaml"), Content: feishuYAMLTemplate},
 		{RelPath: filepath.Join("channels", "feishu.sample.yaml"), Content: feishuSampleYAMLTemplate},
+		{RelPath: filepath.Join("channels", "bridge.yaml"), Content: bridgeYAMLTemplate},
+		{RelPath: filepath.Join("channels", "bridge.sample.yaml"), Content: bridgeSampleYAMLTemplate},
+		{RelPath: filepath.Join("channels", "openclaw_compat.yaml"), Content: openClawCompatYAMLTemplate},
+		{RelPath: filepath.Join("channels", "openclaw_compat.sample.yaml"), Content: openClawCompatSampleYAMLTemplate},
 		{RelPath: filepath.Join("..", "workspace", "agents", "main", "agent.md"), Content: mainAgentFiles["agent.md"]},
 		{RelPath: filepath.Join("..", "workspace", "agents", "main", "soul.md"), Content: mainAgentFiles["soul.md"]},
 		{RelPath: filepath.Join("..", "workspace", "agents", "main", "user.md"), Content: mainAgentFiles["user.md"]},
@@ -60,6 +64,12 @@ func EnsureDefaultConfigFiles(home string) error {
 		return err
 	}
 	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "feishu.yaml"), []byte(feishuYAMLTemplate)); err != nil {
+		return err
+	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "bridge.yaml"), []byte(bridgeYAMLTemplate)); err != nil {
+		return err
+	}
+	if err := mergeDefaultYAMLFile(filepath.Join(loader.ConfigDir(), "channels", "openclaw_compat.yaml"), []byte(openClawCompatYAMLTemplate)); err != nil {
 		return err
 	}
 	return nil
@@ -395,7 +405,38 @@ MATEWAY_FEISHU_APP_ID=
 MATEWAY_FEISHU_APP_SECRET=
 MATEWAY_FEISHU_VERIFICATION_TOKEN=
 MATEWAY_FEISHU_ENCRYPT_KEY=
+MATEWAY_BRIDGE_TOKEN=
+MATEWAY_OPENCLAW_COMPAT_TOKEN=
 `
+
+const bridgeYAMLTemplate = `bridge:
+  enabled: false
+  addr: 127.0.0.1:8789
+  base_path: /channels
+  token: ""
+  token_env: MATEWAY_BRIDGE_TOKEN
+  allowed_channels: []
+`
+
+const bridgeSampleYAMLTemplate = `# Copy this file to channels/bridge.yaml.
+# Put real tokens in mateway.env and keep direct token fields empty.
+
+` + bridgeYAMLTemplate
+
+const openClawCompatYAMLTemplate = `openclaw_compat:
+  enabled: false
+  addr: 127.0.0.1:8790
+  path_prefix: /
+  token: ""
+  token_env: MATEWAY_OPENCLAW_COMPAT_TOKEN
+  bot_agent: Mateway/0.1
+  longpoll_timeout_ms: 35000
+`
+
+const openClawCompatSampleYAMLTemplate = `# Copy this file to channels/openclaw_compat.yaml.
+# Put real tokens in mateway.env and keep direct token fields empty.
+
+` + openClawCompatYAMLTemplate
 
 const configReadmeTemplate = `# Mateway Configuration
 
@@ -733,13 +774,13 @@ const memoryAgentIndexTemplate = `# Main Agent Memory
 
 const channelsReadmeTemplate = `# Channel Configs
 
-` + "`feishu.sample.yaml`" + ` is safe to keep as a user-facing template.
+` + "`feishu.sample.yaml`" + `, ` + "`bridge.sample.yaml`" + `, and ` + "`openclaw_compat.sample.yaml`" + ` are safe to keep as user-facing templates.
 
-Copy it to ` + "`feishu.yaml`" + `, then enable Feishu only after app_id/app_secret are configured.
+Copy a sample to its runtime YAML, then enable the channel only after credentials or tokens are configured.
 
 Recommended:
 
 - Keep direct secret fields empty.
 - Put real secrets in ` + "`../mateway.env`" + `.
-- Use ` + "`*_env`" + ` fields in ` + "`feishu.yaml`" + `.
+- Use ` + "`*_env`" + ` fields in channel YAML files.
 `

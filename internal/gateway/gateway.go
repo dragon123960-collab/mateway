@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/channel/bridge"
 	"github.com/dongping/mateway/internal/channel/feishu"
+	"github.com/dongping/mateway/internal/channel/openclawcompat"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
 )
@@ -28,83 +30,172 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer lock.Close()
-	if !cfg.Config.Channels.Feishu.Enabled {
-		return fmt.Errorf("no enabled channel: feishu is disabled")
-	}
-	sender := feishu.NewSender(cfg.Config.Channels.Feishu)
 	dedupe := newInboundDedupe(30 * time.Minute)
-	return feishu.StartWebSocket(ctx, cfg.Config.Channels.Feishu, func(eventCtx context.Context, msg channel.InboundMessage) error {
-		if msg.SessionKey == "" {
-			msg.SessionKey = SessionKey(msg)
-		}
-		if shouldIgnoreInbound(cfg.Config.Channels.Feishu, msg) || dedupe.Seen(msg) {
-			return nil
-		}
-		go func() {
-			start := time.Now()
-			runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
-			cardAction := isCardAction(msg)
-			if !cardAction {
-				react(runCtx, sender, msg.ID, "SMILE")
-			}
-			ackMessageID := ""
-			if !cardAction {
-				id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
-					Channel:  msg.Channel,
-					ThreadID: msg.ThreadID,
-					Text:     "收到，开始处理。需要执行本地检查或安装时，我会在完成后更新这条回复。",
-					Style:    "processing",
-				}, msg.ID+":processing")
-				if ackErr != nil {
-					log.Printf("mateway gateway processing ack error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, ackErr)
+	var starters []func() error
+	if cfg.Config.Channels.Feishu.Enabled {
+		sender := feishu.NewSender(cfg.Config.Channels.Feishu)
+		starters = append(starters, func() error {
+			return feishu.StartWebSocket(ctx, cfg.Config.Channels.Feishu, func(eventCtx context.Context, msg channel.InboundMessage) error {
+				if shouldIgnoreInbound(cfg.Config.Channels.Feishu, msg) || prepareInbound(&msg, dedupe) {
+					return nil
 				}
-				ackMessageID = id
-			}
-			runtimeStart := time.Now()
-			resp, err := cfg.Runtime.Handle(runCtx, msg)
-			runtimeDuration := time.Since(runtimeStart)
-			if err != nil {
-				log.Printf("mateway gateway runtime error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-				if !cardAction {
-					react(runCtx, sender, msg.ID, "CROSS_MARK")
-				}
-				_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
-				return
-			}
-			replyStart := time.Now()
-			if err := sendFinalReply(runCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
-				log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-				_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
-					"type":                "gateway_done",
-					"message_id":          msg.ID,
-					"session_key":         msg.SessionKey,
-					"runtime_duration_ms": runtimeDuration.Milliseconds(),
-					"reply_duration_ms":   time.Since(replyStart).Milliseconds(),
-					"total_duration_ms":   time.Since(start).Milliseconds(),
-					"reply_error":         err.Error(),
-				})
-				if !cardAction {
-					react(runCtx, sender, msg.ID, "CROSS_MARK")
-				}
-				return
-			}
-			replyDuration := time.Since(replyStart)
-			if !cardAction {
-				react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
-			}
-			_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
-				"type":                "gateway_done",
-				"message_id":          msg.ID,
-				"session_key":         msg.SessionKey,
-				"runtime_duration_ms": runtimeDuration.Milliseconds(),
-				"reply_duration_ms":   replyDuration.Milliseconds(),
-				"total_duration_ms":   time.Since(start).Milliseconds(),
-				"reply_style":         resp.Reply.Style,
-				"failed":              resp.Failed,
+				go runFeishuMessage(cfg.Runtime, sender, msg)
+				return nil
 			})
-		}()
+		})
+	}
+	if cfg.Config.Channels.Bridge.Enabled {
+		starters = append(starters, func() error {
+			return bridge.Start(ctx, cfg.Config.Channels.Bridge, func(eventCtx context.Context, event bridge.Event) (bridge.Reply, error) {
+				msg := event.ToInbound()
+				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, dedupe) {
+					return bridge.Reply{}, nil
+				}
+				resp, err := runRuntimeMessage(eventCtx, cfg.Runtime, msg)
+				if err != nil {
+					return bridge.Reply{}, err
+				}
+				return bridge.OutboundToReply(event, resp.Reply), nil
+			})
+		})
+	}
+	if cfg.Config.Channels.OpenClawCompat.Enabled {
+		starters = append(starters, func() error {
+			return openclawcompat.Start(ctx, cfg.Config.Channels.OpenClawCompat, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
+				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, dedupe) {
+					return channel.OutboundMessage{}, nil
+				}
+				resp, err := runRuntimeMessage(eventCtx, cfg.Runtime, msg)
+				return resp.Reply, err
+			})
+		})
+	}
+	if len(starters) == 0 {
+		return fmt.Errorf("no enabled channel")
+	}
+	return runStarters(ctx, starters)
+}
+
+func runStarters(ctx context.Context, starters []func() error) error {
+	errCh := make(chan error, len(starters))
+	for _, starter := range starters {
+		go func(start func() error) {
+			errCh <- start()
+		}(starter)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func prepareInbound(msg *channel.InboundMessage, dedupe *inboundDedupe) bool {
+	if msg.SessionKey == "" {
+		msg.SessionKey = SessionKey(*msg)
+	}
+	return dedupe.Seen(*msg)
+}
+
+func shouldIgnoreGeneric(msg channel.InboundMessage) bool {
+	return strings.TrimSpace(msg.Text) == ""
+}
+
+func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.InboundMessage) (runtime.Response, error) {
+	start := time.Now()
+	runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			cancel()
+		}()
+	}
+	runtimeStart := time.Now()
+	resp, err := rt.Handle(runCtx, msg)
+	runtimeDuration := time.Since(runtimeStart)
+	if err != nil {
+		return resp, err
+	}
+	_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+		"type":                "gateway_done",
+		"message_id":          msg.ID,
+		"session_key":         msg.SessionKey,
+		"runtime_duration_ms": runtimeDuration.Milliseconds(),
+		"reply_duration_ms":   int64(0),
+		"total_duration_ms":   time.Since(start).Milliseconds(),
+		"reply_style":         resp.Reply.Style,
+		"failed":              resp.Failed,
+	})
+	return resp, nil
+}
+
+func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.InboundMessage) {
+	start := time.Now()
+	runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cardAction := isCardAction(msg)
+	if !cardAction {
+		react(runCtx, sender, msg.ID, "SMILE")
+	}
+	ackMessageID := ""
+	if !cardAction {
+		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
+			Channel:  msg.Channel,
+			ThreadID: msg.ThreadID,
+			Text:     "收到，开始处理。需要执行本地检查或安装时，我会在完成后更新这条回复。",
+			Style:    "processing",
+		}, msg.ID+":processing")
+		if ackErr != nil {
+			log.Printf("mateway gateway processing ack error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, ackErr)
+		}
+		ackMessageID = id
+	}
+	runtimeStart := time.Now()
+	resp, err := rt.Handle(runCtx, msg)
+	runtimeDuration := time.Since(runtimeStart)
+	if err != nil {
+		log.Printf("mateway gateway runtime error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+		if !cardAction {
+			react(runCtx, sender, msg.ID, "CROSS_MARK")
+		}
+		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
+		return
+	}
+	replyStart := time.Now()
+	if err := sendFinalReply(runCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
+		log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+		_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+			"type":                "gateway_done",
+			"message_id":          msg.ID,
+			"session_key":         msg.SessionKey,
+			"runtime_duration_ms": runtimeDuration.Milliseconds(),
+			"reply_duration_ms":   time.Since(replyStart).Milliseconds(),
+			"total_duration_ms":   time.Since(start).Milliseconds(),
+			"reply_error":         err.Error(),
+		})
+		if !cardAction {
+			react(runCtx, sender, msg.ID, "CROSS_MARK")
+		}
+		return
+	}
+	replyDuration := time.Since(replyStart)
+	if !cardAction {
+		react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
+	}
+	_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+		"type":                "gateway_done",
+		"message_id":          msg.ID,
+		"session_key":         msg.SessionKey,
+		"runtime_duration_ms": runtimeDuration.Milliseconds(),
+		"reply_duration_ms":   replyDuration.Milliseconds(),
+		"total_duration_ms":   time.Since(start).Milliseconds(),
+		"reply_style":         resp.Reply.Style,
+		"failed":              resp.Failed,
 	})
 }
 

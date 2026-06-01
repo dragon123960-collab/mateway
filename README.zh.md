@@ -432,7 +432,11 @@ Profile 产品化命令：
 
 ## Gateway 边界
 
-Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。当前 `gateway serve` 已实现的是飞书 WebSocket channel，需要在 `channels/feishu.yaml` 启用。后续新增 channel 应接入同一个 gateway 边界，而不是绕过 runtime。
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 可以启动内置飞书 WebSocket、进程外 bridge 协议和 OpenClaw 兼容适配层，前提是 `channels/` 下对应 YAML 已启用。
+
+Bridge 协议刻意保持很小：外部 channel 服务向 `POST /channels/{channel}/events` 投递归一化文本事件，可以通过 `GET /channels/{channel}/replies` 拉取回复，也可以用可选 ack 上报发送结果。这样平台登录、SDK 和依赖都留在 Mateway runtime 外部。
+
+OpenClaw 兼容适配层暴露 `@tencent-weixin/openclaw-weixin` 所需的最小 HTTP JSON 接口：`sendmessage`、`getupdates`、`getconfig` 和 `sendtyping`。v1 只支持文本，并保留 `context_token`；媒体/CDN 上传暂不纳入范围。
 
 `gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
 

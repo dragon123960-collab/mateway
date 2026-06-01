@@ -276,7 +276,9 @@ type AgentBindingConfig struct {
 }
 
 type ChannelsConfig struct {
-	Feishu FeishuConfig `yaml:"feishu"`
+	Feishu         FeishuConfig         `yaml:"feishu"`
+	Bridge         BridgeConfig         `yaml:"bridge"`
+	OpenClawCompat OpenClawCompatConfig `yaml:"openclaw_compat"`
 }
 
 type FeishuConfig struct {
@@ -305,6 +307,35 @@ type FeishuWebhookConfig struct {
 
 type FeishuWebSocketConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+type BridgeConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	Addr            string   `yaml:"addr"`
+	BasePath        string   `yaml:"base_path"`
+	Token           string   `yaml:"token"`
+	TokenEnv        string   `yaml:"token_env"`
+	AllowedChannels []string `yaml:"allowed_channels"`
+}
+
+func (c BridgeConfig) ResolveSecrets() BridgeConfig {
+	c.Token = firstNonEmpty(c.Token, getenv(c.TokenEnv))
+	return c
+}
+
+type OpenClawCompatConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	Addr              string `yaml:"addr"`
+	PathPrefix        string `yaml:"path_prefix"`
+	Token             string `yaml:"token"`
+	TokenEnv          string `yaml:"token_env"`
+	BotAgent          string `yaml:"bot_agent"`
+	LongPollTimeoutMS int    `yaml:"longpoll_timeout_ms"`
+}
+
+func (c OpenClawCompatConfig) ResolveSecrets() OpenClawCompatConfig {
+	c.Token = firstNonEmpty(c.Token, getenv(c.TokenEnv))
+	return c
 }
 
 func (c FeishuConfig) ResolveSecrets() FeishuConfig {
@@ -678,12 +709,14 @@ func shouldSkipConfigFile(entry os.DirEntry, name string) bool {
 
 func (l Loader) loadChannels() (ChannelsConfig, error) {
 	var channels ChannelsConfig
-	path := filepath.Join(l.ConfigDir(), "channels", "feishu.yaml")
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return channels, nil
-	}
-	if err := readYAML(path, &channels); err != nil {
-		return channels, err
+	for _, name := range []string{"feishu.yaml", "bridge.yaml", "openclaw_compat.yaml"} {
+		path := filepath.Join(l.ConfigDir(), "channels", name)
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := readYAML(path, &channels); err != nil {
+			return channels, err
+		}
 	}
 	return channels, nil
 }

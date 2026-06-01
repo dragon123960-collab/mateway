@@ -98,6 +98,10 @@ func TestEnsureDefaultConfigFilesCreatesSamplesAndRealConfig(t *testing.T) {
 		filepath.Join("channels", "_README.md"),
 		filepath.Join("channels", "feishu.yaml"),
 		filepath.Join("channels", "feishu.sample.yaml"),
+		filepath.Join("channels", "bridge.yaml"),
+		filepath.Join("channels", "bridge.sample.yaml"),
+		filepath.Join("channels", "openclaw_compat.yaml"),
+		filepath.Join("channels", "openclaw_compat.sample.yaml"),
 	}
 	for _, rel := range paths {
 		path := filepath.Join(home, "config", rel)
