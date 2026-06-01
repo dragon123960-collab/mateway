@@ -84,6 +84,7 @@ Every run writes a JSONL trace:
 
 - request and channel
 - model turns
+- model request count and token usage when the provider returns usage metadata
 - tool calls and tool results
 - hook events
 - pending confirmations
@@ -92,7 +93,21 @@ Every run writes a JSONL trace:
 
 Persistent traces, session transcripts, and task step summaries redact secret-like fields such as `api_key`, `token`, `password`, `smtp_pass`, `imap_pass`, and bearer tokens. The model still sees live tool output for the current task; persistent logs avoid storing obvious credentials.
 
-### 5. Skills As Editable Behavior, Not Magic Tools
+### 5. Bounded Session Context
+Sessions are runtime state, not an ever-growing raw chat log. Before each model call, Mateway builds context from:
+
+- fresh system/runtime context from `context_hook`
+- the current agent profile Markdown files
+- discovered skill guidance
+- relevant long-term memory snippets when `memory_safe_read` triggers
+- the compacted recent session transcript
+- the current user message
+
+System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, trace ids, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt.
+
+Send `/new`, `/新会话`, or `新会话` to archive the current session and clear the active state under the same `session_key`. This is useful for long Feishu threads where the channel session key stays fixed but the agent should start from a clean context.
+
+### 6. Skills As Editable Behavior, Not Magic Tools
 Mateway discovers local `SKILL.md` files and injects concise guidance into the runtime context. Current default skills include:
 
 - `software-install`
@@ -110,6 +125,7 @@ Mateway currently supports:
 - Feishu WebSocket gateway
 - real runtime tests: `mateway test`
 - trace review: `mateway trace`
+- session inspect/archive commands: `mateway session list`, `mateway session show`, `mateway session archive list/show`
 - task tree and follow-up binding
 - pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
@@ -278,6 +294,7 @@ If a scheduled task needs notification, make notification part of the task itsel
 Use traces to inspect:
 
 - model/tool/runtime latency
+- model request count and input/output/total tokens
 - hook decisions
 - tool calls and acceptance evidence
 - pending confirmations
@@ -291,6 +308,7 @@ Use traces to inspect:
   config/        # config.yaml, env files, model/channel config
   workspace/     # agent profiles, skills, Markdown memory
   sessions/      # transcripts, task trees, pending states
+    archive/     # archived sessions created by /new
   trace/         # JSONL traces
   observe/       # diary, proposals, reflections, audit logs
   indexes/       # rebuildable memory indexes

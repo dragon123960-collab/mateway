@@ -31,6 +31,100 @@ func TestRuntimeAsk(t *testing.T) {
 	}
 }
 
+func TestRuntimeNewArchivesAndClearsSession(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	state := session.State{Key: "feishu:test"}
+	task := state.StartTask("old task")
+	state.Messages = []agentcore.Message{{Role: agentcore.RoleUser, Content: "old"}}
+	state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: "old?"}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "feishu", SessionKey: "feishu:test", Text: "/new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "已开启新会话") {
+		t.Fatalf("expected reset reply, got %#v", resp.Reply)
+	}
+	state, err = rt.Store.Load("feishu:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Messages) != 0 || len(state.Tasks) != 0 || state.Pending != nil || state.ActiveTask != "" {
+		t.Fatalf("expected cleared state, got %#v", state)
+	}
+	archives, err := rt.Store.ListArchives("feishu:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("expected one archive, got %#v", archives)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"session_archived"`) || !contains(string(data), `"type":"session_reset"`) {
+		t.Fatalf("expected reset trace events, got %s", data)
+	}
+}
+
+func TestCompactMessagesForStorageDropsSystemTruncatesToolAndKeepsRecent(t *testing.T) {
+	var messages []agentcore.Message
+	messages = append(messages, agentcore.Message{Role: agentcore.RoleSystem, Content: "system"})
+	for i := 0; i < storedRecentMessagesLimit+5; i++ {
+		messages = append(messages, agentcore.Message{Role: agentcore.RoleUser, Content: "user"})
+	}
+	messages = append(messages, agentcore.Message{Role: agentcore.RoleTool, Content: strings.Repeat("x", storedToolContentLimit+500)})
+
+	out, stats := compactMessagesForStorage(redactMessagesForStorage(messages))
+	if len(out) != storedRecentMessagesLimit {
+		t.Fatalf("expected recent limit, got %d", len(out))
+	}
+	for _, msg := range out {
+		if msg.Role == agentcore.RoleSystem {
+			t.Fatalf("system message persisted: %#v", out)
+		}
+		if msg.Role == agentcore.RoleTool && !contains(msg.Content, "truncated") {
+			t.Fatalf("expected truncated tool content, got %d chars", len(msg.Content))
+		}
+	}
+	if stats.DroppedSystem != 1 || stats.TruncatedTools != 1 || stats.DroppedOld == 0 {
+		t.Fatalf("unexpected stats %#v", stats)
+	}
+}
+
+func TestRuntimeStoresTaskSummaryTraceAndUsage(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(usageModel{}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Summary == "" || state.Tasks[0].TracePath != resp.TracePath {
+		t.Fatalf("expected task summary and trace, got %#v", state.Tasks)
+	}
+	if state.Usage.Requests != 1 || state.Usage.InputTokens != 11 || state.Usage.OutputTokens != 7 || state.Usage.TotalTokens != 18 {
+		t.Fatalf("unexpected usage %#v", state.Usage)
+	}
+	summary, err := SummarizeTrace(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ModelRequests != 1 || summary.TotalTokens != 18 {
+		t.Fatalf("unexpected trace usage %#v", summary)
+	}
+}
+
 func TestRuntimeRecordsTaskTreeForToolExecution(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -1366,6 +1460,8 @@ type errorModel struct {
 	err error
 }
 
+type usageModel struct{}
+
 type panicHookProvider struct{}
 
 func (panicHookProvider) Name() string { return "panic_provider" }
@@ -1418,6 +1514,10 @@ func lastUserContent(messages []agentcore.Message) string {
 
 func (m staticModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
+}
+
+func (usageModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "done", Usage: &agentcore.Usage{Provider: "test", Model: "usage-model", InputTokens: 11, OutputTokens: 7, TotalTokens: 18}}, nil
 }
 
 func (readRememberModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {

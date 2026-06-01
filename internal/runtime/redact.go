@@ -9,6 +9,11 @@ import (
 )
 
 const redactedSecret = "[REDACTED_SECRET]"
+const (
+	storedRecentMessagesLimit = 20
+	storedToolContentLimit    = 2048
+	modelPromptCharBudget     = 120000
+)
 
 var (
 	secretAssignmentPattern = regexp.MustCompile(`(?i)\b([a-z0-9_.-]*(?:secret|token|api[_-]?key|password|passwd|pwd|pass|authorization|auth[_-]?code|smtp[_-]?pass|imap[_-]?pass|pop3[_-]?pass)[a-z0-9_.-]*)(\s*[:=]\s*)(["']?)([^\s"',}#]+)(["']?)`)
@@ -130,4 +135,105 @@ func redactMessagesForStorage(messages []agentcore.Message) []agentcore.Message 
 		out[i] = redactSecrets(msg).(agentcore.Message)
 	}
 	return out
+}
+
+type messageCompactStats struct {
+	BeforeMessages int
+	AfterMessages  int
+	BeforeChars    int
+	AfterChars     int
+	TruncatedTools int
+	DroppedSystem  int
+	DroppedOld     int
+}
+
+func compactMessagesForStorage(messages []agentcore.Message) ([]agentcore.Message, messageCompactStats) {
+	stats := messageCompactStats{BeforeMessages: len(messages), BeforeChars: messageChars(messages)}
+	if len(messages) == 0 {
+		return messages, stats
+	}
+	filtered := make([]agentcore.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role == agentcore.RoleSystem {
+			stats.DroppedSystem++
+			continue
+		}
+		if msg.Role == agentcore.RoleTool {
+			content, truncated := truncateMiddle(msg.Content, storedToolContentLimit)
+			msg.Content = content
+			if truncated {
+				stats.TruncatedTools++
+			}
+		}
+		filtered = append(filtered, msg)
+	}
+	if len(filtered) > storedRecentMessagesLimit {
+		stats.DroppedOld = len(filtered) - storedRecentMessagesLimit
+		filtered = append([]agentcore.Message(nil), filtered[len(filtered)-storedRecentMessagesLimit:]...)
+	}
+	stats.AfterMessages = len(filtered)
+	stats.AfterChars = messageChars(filtered)
+	return filtered, stats
+}
+
+func prepareMessagesForModel(messages []agentcore.Message) ([]agentcore.Message, messageCompactStats, error) {
+	prepared, stats := compactMessagesForStorage(redactMessagesForStorage(messages))
+	if messageChars(prepared) <= modelPromptCharBudget {
+		return prepared, stats, nil
+	}
+	for limit := storedToolContentLimit / 2; limit >= 256; limit /= 2 {
+		prepared = shrinkToolMessages(prepared, limit)
+		if messageChars(prepared) <= modelPromptCharBudget {
+			stats.AfterChars = messageChars(prepared)
+			stats.AfterMessages = len(prepared)
+			return prepared, stats, nil
+		}
+	}
+	for len(prepared) > 4 && messageChars(prepared) > modelPromptCharBudget {
+		prepared = prepared[1:]
+		stats.DroppedOld++
+	}
+	stats.AfterChars = messageChars(prepared)
+	stats.AfterMessages = len(prepared)
+	if stats.AfterChars > modelPromptCharBudget {
+		return prepared, stats, fmt.Errorf("session context is still too large after compaction: %d chars", stats.AfterChars)
+	}
+	return prepared, stats, nil
+}
+
+func shrinkToolMessages(messages []agentcore.Message, limit int) []agentcore.Message {
+	out := append([]agentcore.Message(nil), messages...)
+	for i := range out {
+		if out[i].Role != agentcore.RoleTool {
+			continue
+		}
+		out[i].Content, _ = truncateMiddle(out[i].Content, limit)
+	}
+	return out
+}
+
+func messageChars(messages []agentcore.Message) int {
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Content)
+		for _, call := range msg.ToolCalls {
+			total += len(call.Name) + len(call.ID)
+			for key, value := range call.Args {
+				total += len(key) + len(fmt.Sprint(value))
+			}
+		}
+	}
+	return total
+}
+
+func truncateMiddle(text string, limit int) (string, bool) {
+	if limit <= 0 || len(text) <= limit {
+		return text, false
+	}
+	if limit < 80 {
+		return text[:limit], true
+	}
+	head := limit / 2
+	tail := limit - head
+	return text[:head] + fmt.Sprintf("\n...[truncated %d chars]...\n", len(text)-limit) + text[len(text)-tail:], true
 }

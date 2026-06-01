@@ -82,35 +82,41 @@ func (m AgentModel) Next(ctx context.Context, agentCtx agentcore.Context) (agent
 	if len(systemSections) > 0 {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + strings.Join(systemSections, "\n\n"))
 	}
-	text, err := m.generateWithFallbacks(ctx, buildSystemPrompt(systemPrompt, agentCtx.Tools), messages)
+	result, err := m.generateWithFallbacks(ctx, buildSystemPrompt(systemPrompt, agentCtx.Tools), messages)
 	if err != nil {
 		return agentcore.Message{}, err
 	}
+	text := strings.TrimSpace(result.Text)
 	if call, ok := parseToolCallText(text); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, Content: strings.TrimSpace(text), ToolCalls: []agentcore.ToolCall{call}}, nil
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: text, ToolCalls: []agentcore.ToolCall{call}, Usage: usagePtr(result.Usage)}, nil
 	}
-	return agentcore.Message{Role: agentcore.RoleAssistant, Content: strings.TrimSpace(text)}, nil
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: text, Usage: usagePtr(result.Usage)}, nil
 }
 
-func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, messages []Message) (string, error) {
-	text, err := m.Client.Generate(ctx, system, messages)
+func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
+	result, err := m.Client.Generate(ctx, system, messages)
 	if err == nil {
-		return text, nil
+		return result, nil
 	}
 	errors := []string{m.Client.Config.Name + ": " + err.Error()}
 	for _, client := range m.Fallbacks {
-		text, fallbackErr := client.Generate(ctx, system, messages)
+		result, fallbackErr := client.Generate(ctx, system, messages)
 		if fallbackErr == nil {
-			return text, nil
+			return result, nil
 		}
 		errors = append(errors, client.Config.Name+": "+fallbackErr.Error())
 	}
-	return "", fmt.Errorf("all models failed: %s", strings.Join(errors, " | "))
+	return GenerateResult{}, fmt.Errorf("all models failed: %s", strings.Join(errors, " | "))
 }
 
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+type GenerateResult struct {
+	Text  string
+	Usage agentcore.Usage
 }
 
 func defaultSystemPrompt() string {
@@ -205,25 +211,25 @@ func parseToolCallText(text string) (agentcore.ToolCall, bool) {
 
 var toolCallBlockPattern = regexp.MustCompile(`(?is)\[\s*TOOL_CALL\s*\](.*?)\[\s*/\s*TOOL_CALL\s*\]`)
 
-func (c Client) Generate(ctx context.Context, system string, messages []Message) (string, error) {
+func (c Client) Generate(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
 	switch strings.ToLower(strings.TrimSpace(c.Config.API)) {
 	case "", "anthropic":
 		return c.generateAnthropic(ctx, system, messages)
 	case "openai":
 		return c.generateOpenAI(ctx, system, messages)
 	default:
-		return "", fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
+		return GenerateResult{}, fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
 	}
 }
 
-func (c Client) generateAnthropic(ctx context.Context, system string, messages []Message) (string, error) {
+func (c Client) generateAnthropic(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
 	key := c.Config.ResolvedAPIKey()
 	if key == "" {
-		return "", fmt.Errorf("model api key is empty for %s", c.Config.Name)
+		return GenerateResult{}, fmt.Errorf("model api key is empty for %s", c.Config.Name)
 	}
 	endpoint, err := endpointWithSuffix(c.Config.APIBase, "/v1/messages")
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	body := map[string]any{
 		"model":      c.Config.Model,
@@ -235,11 +241,11 @@ func (c Client) generateAnthropic(ctx context.Context, system string, messages [
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
@@ -248,10 +254,10 @@ func (c Client) generateAnthropic(ctx context.Context, system string, messages [
 	return c.doGenerate(req)
 }
 
-func (c Client) generateOpenAI(ctx context.Context, system string, messages []Message) (string, error) {
+func (c Client) generateOpenAI(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
 	endpoint, err := endpointWithSuffix(c.Config.APIBase, "/responses")
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	body := map[string]any{
 		"model":             c.Config.Model,
@@ -260,11 +266,11 @@ func (c Client) generateOpenAI(ctx context.Context, system string, messages []Me
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	req.Header.Set("content-type", "application/json")
 	if key := strings.TrimSpace(c.Config.ResolvedAPIKey()); key != "" {
@@ -294,39 +300,46 @@ func openAIResponsesInput(system string, messages []Message) []map[string]any {
 	return input
 }
 
-func (c Client) doGenerate(req *http.Request) (string, error) {
+func (c Client) doGenerate(req *http.Request) (GenerateResult, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("model request failed: status=%d body=%s", resp.StatusCode, truncateForError(string(data)))
+		return GenerateResult{}, fmt.Errorf("model request failed: status=%d body=%s", resp.StatusCode, truncateForError(string(data)))
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Config.API)) {
 	case "", "anthropic":
-		text, err := parseAnthropicText(data)
-		return finishGenerate(c.Config, text, err)
+		result, err := parseAnthropicResult(data)
+		return finishGenerate(c.Config, result, err)
 	case "openai":
-		text, err := parseOpenAIText(data)
-		return finishGenerate(c.Config, text, err)
+		result, err := parseOpenAIResult(data)
+		return finishGenerate(c.Config, result, err)
 	default:
-		return "", fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
+		return GenerateResult{}, fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
 	}
 }
 
-func finishGenerate(cfg config.ModelConfig, text string, err error) (string, error) {
+func finishGenerate(cfg config.ModelConfig, result GenerateResult, err error) (GenerateResult, error) {
 	if err != nil {
-		return "", err
+		return GenerateResult{}, err
 	}
+	text := result.Text
 	if cfg.StripReasoning {
 		text = stripReasoning(text)
 	}
 	if strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("model returned empty text")
+		return GenerateResult{}, fmt.Errorf("model returned empty text")
 	}
-	return strings.TrimSpace(text), nil
+	result.Text = strings.TrimSpace(text)
+	result.Usage.Provider = strings.TrimSpace(cfg.API)
+	if result.Usage.Provider == "" {
+		result.Usage.Provider = "anthropic"
+	}
+	result.Usage.Model = firstNonEmptyString(cfg.Model, cfg.Name)
+	return result, nil
 }
 
 func endpointWithSuffix(apiBase, suffix string) (string, error) {
@@ -345,6 +358,11 @@ func endpointWithSuffix(apiBase, suffix string) (string, error) {
 }
 
 func parseAnthropicText(data []byte) (string, error) {
+	result, err := parseAnthropicResult(data)
+	return result.Text, err
+}
+
+func parseAnthropicResult(data []byte) (GenerateResult, error) {
 	var payload struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -354,12 +372,16 @@ func parseAnthropicText(data []byte) (string, error) {
 			Type    string `json:"type"`
 			Message string `json:"message"`
 		} `json:"error"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", fmt.Errorf("parse model response: %w", err)
+		return GenerateResult{}, fmt.Errorf("parse model response: %w", err)
 	}
 	if payload.Error != nil {
-		return "", fmt.Errorf("model error %s: %s", payload.Error.Type, payload.Error.Message)
+		return GenerateResult{}, fmt.Errorf("model error %s: %s", payload.Error.Type, payload.Error.Message)
 	}
 	var parts []string
 	for _, item := range payload.Content {
@@ -367,12 +389,19 @@ func parseAnthropicText(data []byte) (string, error) {
 			parts = append(parts, item.Text)
 		}
 	}
-	return strings.TrimSpace(strings.Join(parts, "\n")), nil
+	usage := agentcore.Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens}
+	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	return GenerateResult{Text: strings.TrimSpace(strings.Join(parts, "\n")), Usage: usage}, nil
 }
 
 func parseOpenAIText(data []byte) (string, error) {
-	if text := parseOpenAIResponsesText(data); strings.TrimSpace(text) != "" {
-		return text, nil
+	result, err := parseOpenAIResult(data)
+	return result.Text, err
+}
+
+func parseOpenAIResult(data []byte) (GenerateResult, error) {
+	if result := parseOpenAIResponsesResult(data); strings.TrimSpace(result.Text) != "" {
+		return result, nil
 	}
 	var payload struct {
 		Choices []struct {
@@ -386,12 +415,17 @@ func parseOpenAIText(data []byte) (string, error) {
 			Message string `json:"message"`
 			Type    string `json:"type"`
 		} `json:"error"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", fmt.Errorf("parse model response: %w", err)
+		return GenerateResult{}, fmt.Errorf("parse model response: %w", err)
 	}
 	if payload.Error != nil {
-		return "", fmt.Errorf("model error %s: %s", payload.Error.Type, payload.Error.Message)
+		return GenerateResult{}, fmt.Errorf("model error %s: %s", payload.Error.Type, payload.Error.Message)
 	}
 	var parts []string
 	for _, choice := range payload.Choices {
@@ -414,10 +448,18 @@ func parseOpenAIText(data []byte) (string, error) {
 			}
 		}
 	}
-	return strings.TrimSpace(strings.Join(parts, "\n")), nil
+	usage := agentcore.Usage{InputTokens: payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens, TotalTokens: payload.Usage.TotalTokens}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	}
+	return GenerateResult{Text: strings.TrimSpace(strings.Join(parts, "\n")), Usage: usage}, nil
 }
 
 func parseOpenAIResponsesText(data []byte) string {
+	return parseOpenAIResponsesResult(data).Text
+}
+
+func parseOpenAIResponsesResult(data []byte) GenerateResult {
 	var payload struct {
 		Output []struct {
 			Type    string `json:"type"`
@@ -427,12 +469,21 @@ func parseOpenAIResponsesText(data []byte) string {
 			} `json:"content"`
 		} `json:"output"`
 		OutputText string `json:"output_text"`
+		Usage      struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return ""
+		return GenerateResult{}
+	}
+	usage := agentcore.Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens, TotalTokens: payload.Usage.TotalTokens}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
 	if strings.TrimSpace(payload.OutputText) != "" {
-		return strings.TrimSpace(payload.OutputText)
+		return GenerateResult{Text: strings.TrimSpace(payload.OutputText), Usage: usage}
 	}
 	var parts []string
 	for _, item := range payload.Output {
@@ -442,7 +493,23 @@ func parseOpenAIResponsesText(data []byte) string {
 			}
 		}
 	}
-	return strings.TrimSpace(strings.Join(parts, "\n"))
+	return GenerateResult{Text: strings.TrimSpace(strings.Join(parts, "\n")), Usage: usage}
+}
+
+func usagePtr(usage agentcore.Usage) *agentcore.Usage {
+	if usage.Provider == "" && usage.Model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		return nil
+	}
+	return &usage
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func stripReasoning(text string) string {

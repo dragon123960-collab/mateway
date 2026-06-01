@@ -123,8 +123,9 @@
     agents/main/                  # 默认 agent profile 的 prompt-facing 文件
     skills/                       # shared skills，可被所有 agent 发现
     memory/                       # Markdown 长期记忆库
-  sessions/                       # runtime session state、task tree、pending 状态
-  trace/                          # 每次任务的 JSONL trace
+  sessions/                       # runtime session state、task tree、pending 状态、usage 累计
+    archive/                      # /new 归档的旧 session state
+  trace/                          # 每次任务的 JSONL trace，含 timing、tool、token usage
   observe/                        # diary、reflection、proposal、audit
   indexes/                        # 可重建索引，如 memory_index.json
   schedules/                      # 定时任务和运行记录
@@ -145,6 +146,9 @@
 ### 根目录
 
 - `~/.mateway/`：Mateway 的本机 HOME。默认由 `MATEWAY_HOME` 或用户家目录推导。这里保存配置、运行状态、trace、workspace、记忆和定时任务数据，不应整体提交到项目仓库。
+- `sessions/<key>.json`：当前活跃 session state。保存 compacted transcript、task tree、pending action 和累计 usage；不保存每轮重新生成的 system context。
+- `sessions/archive/<key>/<timestamp>.json`：`/new` 触发的旧 session 归档。用于回看历史任务、trace path 和旧 pending 状态，不参与新请求上下文注入。
+- `trace/<trace-id>.jsonl`：单次请求的审计轨迹。包含 request、hook、model turn、tool result、reply、timing，以及 provider 返回时的 token usage。
 
 ### `config/`
 

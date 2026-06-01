@@ -104,10 +104,16 @@ func run(args []string) error {
 		fmt.Println("runtime_ms:", summary.RuntimeDurationMS)
 		fmt.Println("reply_ms:", summary.ReplyDurationMS)
 		fmt.Println("total_ms:", summary.TotalDurationMS)
+		fmt.Println("model_requests:", summary.ModelRequests)
+		fmt.Println("input_tokens:", summary.InputTokens)
+		fmt.Println("output_tokens:", summary.OutputTokens)
+		fmt.Println("total_tokens:", summary.TotalTokens)
 		if len(summary.ToolCalls) > 0 {
 			fmt.Println("tools:", strings.Join(summary.ToolCalls, ", "))
 		}
 		return nil
+	case "session":
+		return runSession(args[1:])
 	case "memory":
 		return runMemory(args[1:])
 	case "agent-profile":
@@ -222,6 +228,100 @@ func runSecret(args []string) error {
 		return nil
 	default:
 		return fmt.Errorf("usage: mateway secret <set|get|list|delete>")
+	}
+}
+
+func runSession(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway session <list|show|archive>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	store := session.NewStore(cfg.App.Home)
+	switch args[0] {
+	case "list":
+		keys, err := store.List()
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			state, err := store.Load(key)
+			if err != nil {
+				continue
+			}
+			fmt.Printf("%s messages=%d tasks=%d requests=%d tokens=%d updated=%s\n", key, len(state.Messages), len(state.Tasks), state.Usage.Requests, state.Usage.TotalTokens, state.UpdatedAt.Format(time.RFC3339))
+		}
+		return nil
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway session show <session_key>")
+		}
+		state, err := store.Load(args[1])
+		if err != nil {
+			return err
+		}
+		printSessionState(state, "")
+		return nil
+	case "archive":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: mateway session archive <list|show> <session_key> [archive_id]")
+		}
+		switch args[1] {
+		case "list":
+			ids, err := store.ListArchives(args[2])
+			if err != nil {
+				return err
+			}
+			for _, id := range ids {
+				fmt.Println(id)
+			}
+			return nil
+		case "show":
+			if len(args) != 4 {
+				return fmt.Errorf("usage: mateway session archive show <session_key> <archive_id>")
+			}
+			state, path, err := store.LoadArchive(args[2], args[3])
+			if err != nil {
+				return err
+			}
+			printSessionState(state, path)
+			return nil
+		default:
+			return fmt.Errorf("usage: mateway session archive <list|show> <session_key> [archive_id]")
+		}
+	default:
+		return fmt.Errorf("usage: mateway session <list|show|archive>")
+	}
+}
+
+func printSessionState(state session.State, path string) {
+	if path != "" {
+		fmt.Println("path:", path)
+	}
+	fmt.Println("session:", state.Key)
+	fmt.Println("messages:", len(state.Messages))
+	fmt.Println("tasks:", len(state.Tasks))
+	fmt.Println("active_task:", state.ActiveTask)
+	if state.Pending != nil {
+		fmt.Println("pending:", state.Pending.Kind)
+	}
+	fmt.Printf("usage: requests=%d input_tokens=%d output_tokens=%d total_tokens=%d\n", state.Usage.Requests, state.Usage.InputTokens, state.Usage.OutputTokens, state.Usage.TotalTokens)
+	if !state.UpdatedAt.IsZero() {
+		fmt.Println("updated_at:", state.UpdatedAt.Format(time.RFC3339))
+	}
+	for _, task := range state.Tasks {
+		fmt.Printf("- %s %s %s\n", task.ID, task.Status, task.Goal)
+		if task.Summary != "" {
+			fmt.Println("  summary:", task.Summary)
+		}
+		if task.TracePath != "" {
+			fmt.Println("  trace:", task.TracePath)
+		}
+		for _, step := range task.Steps {
+			fmt.Printf("  - %s %s %s\n", step.Tool, step.Status, step.Summary)
+		}
 	}
 }
 
@@ -1411,6 +1511,10 @@ Usage:
   mateway ask <message>
   mateway test [--case read-readme|project-index|web-search] [--message <task>] [--record=false]
   mateway trace <trace-jsonl-path>
+  mateway session list
+  mateway session show <session_key>
+  mateway session archive list <session_key>
+  mateway session archive show <session_key> <archive_id>
   mateway memory lint [--root <path>]
   mateway memory index rebuild [--root <path>] [--out <path>]
   mateway memory search [--root <path>] [--scope <scope>] [--type <type>] <query>

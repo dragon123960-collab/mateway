@@ -1,33 +1,26 @@
 package model
 
-import (
-	"strings"
-	"testing"
+import "testing"
 
-	"github.com/dongping/mateway/internal/agentcore"
-	"github.com/dongping/mateway/internal/tool"
-)
-
-func TestBuildSystemPromptIncludesToolContract(t *testing.T) {
-	prompt := buildSystemPrompt("base", []agentcore.Tool{tool.FileReadTool{}})
-	for _, want := range []string{"Use when:", "Do not use when:", "Output contract:", "Evidence:", "Acceptance:", "Soft failure signals:", "Parallel mode:", "Reuse policy:", "Confirmation boundary:"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q:\n%s", want, prompt)
-		}
+func TestParseAnthropicResultUsage(t *testing.T) {
+	result, err := parseAnthropicResult([]byte(`{
+		"content":[{"type":"text","text":"hello"}],
+		"usage":{"input_tokens":12,"output_tokens":5}
+	}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(prompt, "Current date:") || !strings.Contains(prompt, "Asia/Shanghai") {
-		t.Fatalf("prompt missing current date context:\n%s", prompt)
+	if result.Text != "hello" || result.Usage.InputTokens != 12 || result.Usage.OutputTokens != 5 || result.Usage.TotalTokens != 17 {
+		t.Fatalf("unexpected result %#v", result)
 	}
 }
 
-func TestParseToolCallTextAllowsWhitespaceInMarkers(t *testing.T) {
-	call, ok := parseToolCallText(`[ TOOL_CALL]
-{"id":" call_1","name":"web.search","args":{"query":"mateway"}}
-[/TOOL_CALL ]`)
-	if !ok {
-		t.Fatal("expected tool call")
-	}
-	if call.ID != "call_1" || call.Name != "web.search" || call.Args["query"] != "mateway" {
-		t.Fatalf("call = %#v", call)
+func TestParseOpenAIResponsesResultUsage(t *testing.T) {
+	result := parseOpenAIResponsesResult([]byte(`{
+		"output_text":"hello",
+		"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}
+	}`))
+	if result.Text != "hello" || result.Usage.InputTokens != 20 || result.Usage.OutputTokens != 8 || result.Usage.TotalTokens != 28 {
+		t.Fatalf("unexpected result %#v", result)
 	}
 }

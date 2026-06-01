@@ -89,6 +89,7 @@ mateway memory proposal reject <proposal_id>
 
 - request 和 channel
 - model turns
+- provider 返回时的模型请求数和 token usage
 - tool calls 和 tool results
 - hook events
 - pending confirmations
@@ -97,7 +98,22 @@ mateway memory proposal reject <proposal_id>
 
 持久化 trace、session transcript 和 task step summary 会脱敏明显的 secret 字段，例如 `api_key`、`token`、`password`、`smtp_pass`、`imap_pass` 和 bearer token。模型在当前任务中仍能看到实时工具输出；持久化日志避免保存明显凭证。
 
-### 5. Skills 是可编辑行为，不是魔法工具
+### 5. 有边界的 Session Context
+
+Session 是运行时状态，不是无限增长的原始聊天记录。每次调用模型前，Mateway 会从这些来源临时组装 context：
+
+- `context_hook` 每轮重新生成的 system/runtime context
+- 当前 agent profile 的 Markdown 文件
+- 已发现 skill 的精简 guidance
+- `memory_safe_read` 命中时的相关长期记忆片段
+- 压缩后的最近 session transcript
+- 当前用户消息
+
+System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、trace id 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。
+
+发送 `/new`、`/新会话` 或 `新会话` 会归档当前 session，并在同一个 `session_key` 下清空 active state。飞书长 thread 仍然保持稳定 session key，但 agent 可以从干净上下文重新开始。
+
+### 6. Skills 是可编辑行为，不是魔法工具
 
 Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime context。当前默认 skills 包括：
 
@@ -116,6 +132,7 @@ Mateway 目前支持：
 - 飞书 WebSocket gateway
 - 真实 runtime 测试：`mateway test`
 - trace 回看：`mateway trace`
+- session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
@@ -290,6 +307,7 @@ Review proposals：
 Trace 可用于检查：
 
 - model/tool/runtime latency
+- 模型请求数和 input/output/total tokens
 - hook decisions
 - tool calls 和 acceptance evidence
 - pending confirmations
@@ -303,6 +321,7 @@ Trace 可用于检查：
   config/        # config.yaml, env files, model/channel config
   workspace/     # agent profiles, skills, Markdown memory
   sessions/      # transcripts, task trees, pending states
+    archive/     # /new 创建的旧 session 归档
   trace/         # JSONL traces
   observe/       # diary, proposals, reflections, audit logs
   indexes/       # rebuildable memory indexes

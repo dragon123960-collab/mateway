@@ -16,6 +16,15 @@ type Message struct {
 	Content    string
 	ToolCalls  []ToolCall
 	ToolCallID string
+	Usage      *Usage `json:"usage,omitempty"`
+}
+
+type Usage struct {
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	InputTokens  int    `json:"input_tokens,omitempty"`
+	OutputTokens int    `json:"output_tokens,omitempty"`
+	TotalTokens  int    `json:"total_tokens,omitempty"`
 }
 
 type ToolCall struct {

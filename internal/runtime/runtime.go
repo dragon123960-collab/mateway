@@ -64,6 +64,9 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
 	}()
+	if isNewSessionCommand(msg.Text) {
+		return rt.resetSession(msg, state, trace, start)
+	}
 	if resp, handled, err := rt.handlePending(ctx, &state, msg, trace); handled || err != nil {
 		if handled && err == nil {
 			resp.TraceID = trace.id
@@ -77,7 +80,7 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		task := state.StartTask(msg.Text)
 		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
 		state.BlockActiveTask("await_user_input")
-		if err := rt.Store.Save(state); err != nil {
+		if err := rt.saveState(&state, trace); err != nil {
 			return Response{}, err
 		}
 		resp := reply(msg, decision.ClarifyPrompt, "clarify")
@@ -102,7 +105,33 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 }
 
 func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, trace *traceRecorder) (Response, error) {
-	messages := append([]agentcore.Message(nil), state.Messages...)
+	messages, compactStats, err := prepareMessagesForModel(state.Messages)
+	if err != nil {
+		_ = trace.write(map[string]any{
+			"type":         "context_budget_exceeded",
+			"before_chars": compactStats.BeforeChars,
+			"after_chars":  compactStats.AfterChars,
+			"error":        err.Error(),
+		})
+		state.BlockActiveTask("failed")
+		if saveErr := rt.saveState(state, trace); saveErr != nil {
+			return Response{}, saveErr
+		}
+		resp := Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     "当前会话上下文仍然过大，已停止这次请求。请发送 `/new` 开启干净会话，旧会话会自动归档。",
+				Style:    "error",
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+			Failed:    true,
+		}
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+		return resp, nil
+	}
+	writeCompactTrace(trace, "model_input_compacted", compactStats)
 	messages = append(messages, agentcore.Message{Role: agentcore.RoleUser, Content: userText})
 
 	agent := rt.Pool.AgentForSession(msg.SessionKey)
@@ -122,7 +151,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	result, err := agent.Continue(ctx)
 	if err != nil {
 		state.BlockActiveTask("failed")
-		if saveErr := rt.Store.Save(*state); saveErr != nil {
+		if saveErr := rt.saveState(state, trace); saveErr != nil {
 			return Response{}, saveErr
 		}
 		text := friendlyRuntimeError(err)
@@ -143,17 +172,20 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 
 	state.Messages = redactMessagesForStorage(result.Messages)
+	usage := usageFromMessages(result.Messages)
+	addUsage(&state.Usage, usage)
+	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	if state.Pending == nil {
 		if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 		} else {
-			state.CompleteActiveTask()
+			state.CompleteActiveTaskWithSummary(summarize(result.FinalText), trace.id, trace.path)
 			taskCompleted = true
 		}
 	}
-	if err := rt.Store.Save(*state); err != nil {
+	if err := rt.saveState(state, trace); err != nil {
 		return Response{}, err
 	}
 	if proposalID := pendingAgentProfileProposalID(task); proposalID != "" {
@@ -163,7 +195,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			ProposalID: proposalID,
 			Question:   "检测到 agent 核心 md 修改草稿。回复“确认”让它生效，回复“忽略”放弃；也可以继续发新任务。",
 		}
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
 	}
@@ -175,7 +207,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Question:   "定时任务已记录为待试运行。回复“执行”现在试运行；试运行成功后我会激活它。也可以稍后手动执行：`mateway schedule test " + scheduleID + "`。",
 		}
 		state.BlockActiveTask("await_schedule_test")
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
 		resp := reply(msg, state.Pending.Question, "schedule_review_pending")
@@ -214,7 +246,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 					ProposalID: learningResult.Proposal.ID,
 					Question:   "回复“保存”写入长期记忆，或回复“忽略”放弃这条候选。",
 				}
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, err
 				}
 			}
@@ -238,6 +270,119 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text})
 	return resp, nil
+}
+
+func (rt Runtime) saveState(state *session.State, trace *traceRecorder) error {
+	if state == nil {
+		return nil
+	}
+	compacted, stats := compactMessagesForStorage(redactMessagesForStorage(state.Messages))
+	state.Messages = compacted
+	writeCompactTrace(trace, "session_compacted", stats)
+	return rt.Store.Save(*state)
+}
+
+func (rt Runtime) resetSession(msg channel.InboundMessage, state session.State, trace *traceRecorder, start time.Time) (Response, error) {
+	archivePath := ""
+	if hasSessionState(state) {
+		path, err := rt.Store.Archive(state)
+		if err != nil {
+			return Response{}, err
+		}
+		archivePath = path
+		_ = trace.write(map[string]any{"type": "session_archived", "path": path, "session_key": state.Key, "messages": len(state.Messages), "tasks": len(state.Tasks)})
+	}
+	reset := session.State{Key: state.Key}
+	if reset.Key == "" {
+		reset.Key = msg.SessionKey
+	}
+	if err := rt.saveState(&reset, trace); err != nil {
+		return Response{}, err
+	}
+	_ = trace.write(map[string]any{"type": "session_reset", "session_key": reset.Key, "archive_path": archivePath})
+	text := "已开启新会话。"
+	if archivePath != "" {
+		text += "\n旧会话已归档：" + archivePath
+	}
+	resp := reply(msg, text, "session_reset")
+	resp.TraceID = trace.id
+	resp.TracePath = trace.path
+	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
+	return resp, nil
+}
+
+func hasSessionState(state session.State) bool {
+	return len(state.Messages) > 0 || len(state.Tasks) > 0 || state.Pending != nil || state.ActiveTask != "" || state.Usage.Requests > 0
+}
+
+func writeCompactTrace(trace *traceRecorder, eventType string, stats messageCompactStats) {
+	if trace == nil {
+		return
+	}
+	if stats.BeforeMessages == 0 && stats.AfterMessages == 0 {
+		return
+	}
+	_ = trace.write(map[string]any{
+		"type":             eventType,
+		"before_messages":  stats.BeforeMessages,
+		"after_messages":   stats.AfterMessages,
+		"before_chars":     stats.BeforeChars,
+		"after_chars":      stats.AfterChars,
+		"truncated_tools":  stats.TruncatedTools,
+		"dropped_system":   stats.DroppedSystem,
+		"dropped_old_msgs": stats.DroppedOld,
+	})
+}
+
+func isNewSessionCommand(text string) bool {
+	switch strings.TrimSpace(strings.ToLower(text)) {
+	case "/new", "/新会话", "新会话":
+		return true
+	default:
+		return false
+	}
+}
+
+func usageFromMessages(messages []agentcore.Message) session.Usage {
+	var usage session.Usage
+	for _, msg := range messages {
+		if msg.Usage == nil {
+			continue
+		}
+		usage.Requests++
+		usage.InputTokens += msg.Usage.InputTokens
+		usage.OutputTokens += msg.Usage.OutputTokens
+		total := msg.Usage.TotalTokens
+		if total == 0 {
+			total = msg.Usage.InputTokens + msg.Usage.OutputTokens
+		}
+		usage.TotalTokens += total
+	}
+	return usage
+}
+
+func addUsage(total *session.Usage, delta session.Usage) {
+	if total == nil {
+		return
+	}
+	total.Requests += delta.Requests
+	total.InputTokens += delta.InputTokens
+	total.OutputTokens += delta.OutputTokens
+	total.TotalTokens += delta.TotalTokens
+	total.Cost += delta.Cost
+}
+
+func writeUsageTrace(trace *traceRecorder, usage session.Usage) {
+	if trace == nil || usage.Requests == 0 {
+		return
+	}
+	_ = trace.write(map[string]any{
+		"type":          "model_usage",
+		"requests":      usage.Requests,
+		"input_tokens":  usage.InputTokens,
+		"output_tokens": usage.OutputTokens,
+		"total_tokens":  usage.TotalTokens,
+	})
 }
 
 func (rt Runtime) home() string {
@@ -389,7 +534,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if isCancel(text) {
 			state.Pending = nil
 			state.BlockActiveTask("cancelled")
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return reply(msg, "已取消。", "cancelled"), true, nil
@@ -423,7 +568,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content},
 		)
 		if !result.IsError {
-			state.CompleteActiveTask()
+			state.CompleteActiveTaskWithSummary(summarize(result.Content), trace.id, trace.path)
 		}
 		if proposalID := strings.TrimSpace(fmt.Sprint(evidence["proposal_id"])); proposalID != "" {
 			state.Pending = &session.PendingAction{
@@ -433,7 +578,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 				Question:   "检测到 agent 核心 md 修改草稿。回复“确认”让它生效，回复“忽略”放弃；也可以继续发新任务。",
 			}
 		}
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		if result.IsError {
@@ -446,14 +591,14 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if shouldBypassMemoryProposalReview(text) {
 				_ = trace.write(map[string]any{"type": "memory_proposal_review_bypassed", "proposal_id": state.Pending.ProposalID, "text": text})
 				state.Pending = nil
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, true, err
 				}
 				return Response{}, false, nil
 			}
 			_ = trace.write(map[string]any{"type": "memory_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
 			state.Pending = nil
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return Response{}, false, nil
@@ -464,26 +609,26 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if action == "commit" {
 			proposal, target, err := store.Commit(proposalID)
 			if err != nil {
-				if saveErr := rt.Store.Save(*state); saveErr != nil {
+				if saveErr := rt.saveState(state, trace); saveErr != nil {
 					return Response{}, true, saveErr
 				}
 				return reply(msg, "保存长期记忆失败："+err.Error(), "error"), true, nil
 			}
 			_ = trace.write(map[string]any{"type": "memory_proposal_review_committed", "proposal_id": proposal.ID, "target": target})
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return reply(msg, "已保存到长期记忆："+target, "completed"), true, nil
 		}
 		proposal, err := store.Reject(proposalID, "user ignored from conversation")
 		if err != nil {
-			if saveErr := rt.Store.Save(*state); saveErr != nil {
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
 				return Response{}, true, saveErr
 			}
 			return reply(msg, "忽略长期记忆候选失败："+err.Error(), "error"), true, nil
 		}
 		_ = trace.write(map[string]any{"type": "memory_proposal_review_rejected", "proposal_id": proposal.ID})
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		return reply(msg, "已忽略这条长期记忆候选。", "completed"), true, nil
@@ -493,7 +638,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if shouldBypassAgentProfileProposalReview(text) {
 				_ = trace.write(map[string]any{"type": "agent_profile_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
 				state.Pending = nil
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, true, err
 				}
 				return Response{}, false, nil
@@ -506,26 +651,26 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if action == "promote" {
 			proposal, backupDir, err := store.Promote(proposalID)
 			if err != nil {
-				if saveErr := rt.Store.Save(*state); saveErr != nil {
+				if saveErr := rt.saveState(state, trace); saveErr != nil {
 					return Response{}, true, saveErr
 				}
 				return reply(msg, "核心 md 草稿生效失败："+err.Error(), "error"), true, nil
 			}
 			_ = trace.write(map[string]any{"type": "agent_profile_proposal_promoted", "proposal_id": proposal.ID, "target": proposal.TargetPath, "backup_dir": backupDir})
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return reply(msg, "已生效 agent 核心 md 草稿："+proposal.TargetPath+"\n备份："+backupDir, "completed"), true, nil
 		}
 		proposal, err := store.Reject(proposalID, "user rejected from conversation")
 		if err != nil {
-			if saveErr := rt.Store.Save(*state); saveErr != nil {
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
 				return Response{}, true, saveErr
 			}
 			return reply(msg, "忽略核心 md 草稿失败："+err.Error(), "error"), true, nil
 		}
 		_ = trace.write(map[string]any{"type": "agent_profile_proposal_rejected", "proposal_id": proposal.ID})
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		return reply(msg, "已忽略这个 agent 核心 md 草稿。", "completed"), true, nil
@@ -535,7 +680,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if shouldBypassScheduleReview(text) {
 				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
 				state.Pending = nil
-				if err := rt.Store.Save(*state); err != nil {
+				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, true, err
 				}
 				return Response{}, false, nil
@@ -548,27 +693,27 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if action == "cancel" {
 			store := schedule.Store{Home: rt.home()}
 			if _, err := store.Pause(scheduleID); err != nil {
-				if saveErr := rt.Store.Save(*state); saveErr != nil {
+				if saveErr := rt.saveState(state, trace); saveErr != nil {
 					return Response{}, true, saveErr
 				}
 				return reply(msg, "取消定时任务失败："+err.Error(), "error"), true, nil
 			}
 			blockTask(state, taskID, "cancelled")
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return reply(msg, "已取消这个待试运行的定时任务。", "cancelled"), true, nil
 		}
 		task, record, err := rt.testAndActivateSchedule(ctx, scheduleID)
 		if err != nil {
-			if saveErr := rt.Store.Save(*state); saveErr != nil {
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
 				return Response{}, true, saveErr
 			}
 			return reply(msg, "试运行失败，定时任务没有激活："+err.Error(), "error"), true, nil
 		}
 		state.ActivateTask(taskID)
-		state.CompleteActiveTask()
-		if err := rt.Store.Save(*state); err != nil {
+		state.CompleteActiveTaskWithSummary("定时任务试运行成功："+task.ID, trace.id, trace.path)
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		_ = trace.write(map[string]any{"type": "schedule_review_tested", "schedule_id": task.ID, "run_id": record.ID, "status": record.Status})
@@ -582,7 +727,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 				state.ActiveTask = ""
 			}
 			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": "standalone task request"})
-			if err := rt.Store.Save(*state); err != nil {
+			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return Response{}, false, nil
@@ -593,7 +738,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			agentcore.Message{Role: agentcore.RoleUser, Content: text},
 		)
 		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text})
-		if err := rt.Store.Save(*state); err != nil {
+		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
 		return Response{}, false, nil

@@ -16,6 +16,7 @@ type State struct {
 	Tasks      []TaskNode          `json:"tasks,omitempty"`
 	ActiveTask string              `json:"active_task,omitempty"`
 	Pending    *PendingAction      `json:"pending,omitempty"`
+	Usage      Usage               `json:"usage,omitempty"`
 	UpdatedAt  time.Time           `json:"updated_at"`
 }
 
@@ -23,8 +24,11 @@ type TaskNode struct {
 	ID        string     `json:"id"`
 	ParentID  string     `json:"parent_id,omitempty"`
 	Goal      string     `json:"goal"`
+	Summary   string     `json:"summary,omitempty"`
 	Status    string     `json:"status"`
 	Steps     []TaskStep `json:"steps,omitempty"`
+	TraceID   string     `json:"trace_id,omitempty"`
+	TracePath string     `json:"trace_path,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 }
@@ -45,6 +49,14 @@ type PendingAction struct {
 	Question   string             `json:"question,omitempty"`
 	ToolCall   agentcore.ToolCall `json:"tool_call,omitempty"`
 	ResumeText string             `json:"resume_text,omitempty"`
+}
+
+type Usage struct {
+	Requests     int     `json:"requests,omitempty"`
+	InputTokens  int     `json:"input_tokens,omitempty"`
+	OutputTokens int     `json:"output_tokens,omitempty"`
+	TotalTokens  int     `json:"total_tokens,omitempty"`
+	Cost         float64 `json:"cost,omitempty"`
 }
 
 type Store struct {
@@ -84,6 +96,85 @@ func (s Store) Save(state State) error {
 		return err
 	}
 	return os.WriteFile(s.path(state.Key), data, 0o644)
+}
+
+func (s Store) Archive(state State) (string, error) {
+	if strings.TrimSpace(state.Key) == "" {
+		state.Key = "default"
+	}
+	dir := filepath.Join(s.dir, "archive", safeName(state.Key))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	state.UpdatedAt = time.Now()
+	name := time.Now().Format("20060102-150405.000000") + ".json"
+	path := filepath.Join(dir, name)
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func (s Store) List() ([]string, error) {
+	entries, err := os.ReadDir(s.dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var state State
+		if json.Unmarshal(data, &state) == nil && strings.TrimSpace(state.Key) != "" {
+			keys = append(keys, state.Key)
+		}
+	}
+	return keys, nil
+}
+
+func (s Store) ListArchives(key string) ([]string, error) {
+	dir := filepath.Join(s.dir, "archive", safeName(key))
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(entry.Name(), ".json"))
+	}
+	return ids, nil
+}
+
+func (s Store) LoadArchive(key, id string) (State, string, error) {
+	id = strings.TrimSuffix(strings.TrimSpace(id), ".json")
+	path := filepath.Join(s.dir, "archive", safeName(key), id+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return State{}, path, err
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return State{}, path, err
+	}
+	if state.Key == "" {
+		state.Key = key
+	}
+	return state, path, nil
 }
 
 func (s *State) EnsureTask(goal string) *TaskNode {
@@ -162,6 +253,19 @@ func (s *State) CompleteActiveTask() {
 	}
 }
 
+func (s *State) CompleteActiveTaskWithSummary(summary, traceID, tracePath string) {
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == s.ActiveTask {
+			s.Tasks[i].Status = "completed"
+			s.Tasks[i].Summary = strings.TrimSpace(summary)
+			s.Tasks[i].TraceID = strings.TrimSpace(traceID)
+			s.Tasks[i].TracePath = strings.TrimSpace(tracePath)
+			s.Tasks[i].UpdatedAt = time.Now()
+			return
+		}
+	}
+}
+
 func (s *State) BlockActiveTask(kind string) {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {
@@ -173,11 +277,15 @@ func (s *State) BlockActiveTask(kind string) {
 }
 
 func (s Store) path(key string) string {
-	name := strings.NewReplacer("/", "_", ":", "_", "\\", "_").Replace(key)
+	name := safeName(key)
 	if name == "" {
 		name = "default"
 	}
 	return filepath.Join(s.dir, name+".json")
+}
+
+func safeName(key string) string {
+	return strings.NewReplacer("/", "_", ":", "_", "\\", "_").Replace(key)
 }
 
 func nextTaskID(n int) string {
