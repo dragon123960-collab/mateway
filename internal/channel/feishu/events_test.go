@@ -37,6 +37,28 @@ func TestNormalizeMessageReceiveCapturesSenderType(t *testing.T) {
 	}
 }
 
+func TestNormalizeMessageReceiveCapturesImagePart(t *testing.T) {
+	messageID := "om_img"
+	chatID := "oc_1"
+	content := `{"image_key":"img_v2_abc"}`
+	messageType := "image"
+	event := &larkim.P2MessageReceiveV1{Event: &larkim.P2MessageReceiveV1Data{
+		Message: &larkim.EventMessage{
+			MessageId:   &messageID,
+			ChatId:      &chatID,
+			Content:     &content,
+			MessageType: &messageType,
+		},
+	}}
+	msg := NormalizeMessageReceive(event)
+	if msg.Metadata["image_key"] != "img_v2_abc" {
+		t.Fatalf("expected image key metadata, got %#v", msg.Metadata)
+	}
+	if len(msg.Parts) != 1 || msg.Parts[0].Type != channel.PartImage || msg.Parts[0].Metadata["image_key"] != "img_v2_abc" {
+		t.Fatalf("unexpected image parts %#v", msg.Parts)
+	}
+}
+
 func TestRenderReplyMessageStripsToolCallEcho(t *testing.T) {
 	msgType, content, err := renderReplyMessage(channel.OutboundMessage{
 		Style: "reply",

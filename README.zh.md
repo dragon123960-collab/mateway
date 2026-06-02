@@ -113,6 +113,8 @@ Session 是运行时状态，不是无限增长的原始聊天记录。每次调
 
 System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、trace id 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。
 
+飞书图片消息会下载到 `~/.mateway/media`；微信 channel 如果收到带 URL 或本地路径的媒体 item，也会归一化到同一套 message part。Session transcript 只保存媒体引用，不内联图片字节。模型详情、启用开关、`context_window` 和 `max_tokens` 放在 `~/.mateway/config/models/*.yaml`；`config.yaml` 只选择默认模型、fallback 和角色。如果当前模型声明了 `modalities: [text, image]`，用户文字和图片会作为同一个 user turn 一起发送给多模态模型；否则 Mateway 会优先使用 `model.roles.vision`，它可以是单个模型，也可以是 `vision: [glm-4.6v-flash, minimax]` 这样的有序列表，然后再尝试其他支持图片的 fallback 模型。音频、视频和文件 part 已在消息结构中预留，后续再接渠道下载和模型发送。
+
 发送 `/new`、`/新会话` 或 `新会话` 会归档当前 session，并在同一个 `session_key` 下清空 active state。飞书长 thread 仍然保持稳定 session key，但 agent 可以从干净上下文重新开始。
 
 ### 6. Skills 是可编辑行为，不是魔法工具
@@ -527,7 +529,7 @@ Mateway 不会把这些能力伪装成已经完成：
 ### 下一步
 
 - 更多内置 channel：钉钉、QQ、企业微信、Telegram
-- channel 图片/文件等媒体能力
+- channel 音频/视频/文件等媒体能力
 - user-provided connectors 的 script bridge specification
 - skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers

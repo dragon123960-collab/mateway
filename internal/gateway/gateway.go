@@ -87,6 +87,13 @@ func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
 				if shouldIgnoreInbound(channelCfg, msg) || prepareInbound(&msg, rt.Dedupe) {
 					return nil
 				}
+				downloaded, err := sender.DownloadMessageImages(eventCtx, msg, rt.Home)
+				if err != nil {
+					log.Printf("mateway gateway feishu media download error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "图片下载失败：" + err.Error(), Style: "error"})
+					return nil
+				}
+				msg = downloaded
 				go runFeishuMessage(rt.Runtime, sender, msg)
 				return nil
 			})
@@ -136,7 +143,7 @@ func prepareInbound(msg *channel.InboundMessage, dedupe *inboundDedupe) bool {
 }
 
 func shouldIgnoreGeneric(msg channel.InboundMessage) bool {
-	return strings.TrimSpace(msg.Text) == ""
+	return !msg.HasContent()
 }
 
 func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.InboundMessage) (runtime.Response, error) {
@@ -264,14 +271,14 @@ func SessionKey(msg channel.InboundMessage) string {
 }
 
 func shouldIgnoreInbound(cfg config.FeishuConfig, msg channel.InboundMessage) bool {
-	if strings.TrimSpace(msg.Text) == "" {
+	if !msg.HasContent() {
 		return true
 	}
 	if !strings.EqualFold(strings.TrimSpace(msg.Channel), "feishu") {
 		return false
 	}
 	messageType := strings.TrimSpace(msg.Metadata["message_type"])
-	if messageType != "" && messageType != "text" && !isCardAction(msg) {
+	if messageType != "" && messageType != "text" && messageType != "image" && !isCardAction(msg) {
 		return true
 	}
 	senderType := strings.ToLower(strings.TrimSpace(msg.Metadata["sender_type"]))

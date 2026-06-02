@@ -1244,6 +1244,63 @@ func TestAgentPoolBuildsModelFallbackChain(t *testing.T) {
 	}
 }
 
+func TestAgentPoolIncludesVisionRoleInFallbackChain(t *testing.T) {
+	t.Setenv("MATEWAY_TEXT_KEY", "text")
+	t.Setenv("MATEWAY_VISION_KEY", "vision")
+	cfg := &config.Root{
+		App:   config.AppConfig{Home: t.TempDir()},
+		Model: config.ModelSelection{Default: "text", Roles: config.ModelRoles{"vision": []string{"vision"}}},
+		Models: []config.ModelConfig{
+			{Name: "text", API: "openai", APIBase: "https://text.example/v1", Model: "text-model", APIKeyEnv: "TEXT_KEY", Enabled: true, Modalities: []string{"text"}},
+			{Name: "vision", API: "openai", APIBase: "https://vision.example/v1", Model: "vision-model", APIKeyEnv: "VISION_KEY", Enabled: true, Modalities: []string{"text", "image"}},
+		},
+		Agents: config.AgentsConfig{
+			Default:  "main",
+			Profiles: []config.AgentProfileConfig{{ID: "main", Model: config.ModelSelection{Default: "text"}}},
+		},
+	}
+	pool := NewAgentPool(cfg)
+	agent := pool.AgentForSession("cli:test")
+	model, ok := agent.Model.(model.AgentModel)
+	if !ok {
+		t.Fatalf("expected AgentModel, got %T", agent.Model)
+	}
+	if len(model.Vision) != 1 || model.Vision[0].Config.Name != "vision" || !model.Vision[0].Config.SupportsModality("image") {
+		t.Fatalf("expected vision role candidate, got %#v", model.Vision)
+	}
+}
+
+func TestAgentPoolVisionRolePreferredOverFallbackForImage(t *testing.T) {
+	t.Setenv("MATEWAY_TEXT_KEY", "text")
+	t.Setenv("MATEWAY_MINIMAX_KEY", "minimax")
+	t.Setenv("MATEWAY_VISION_KEY", "vision")
+	cfg := &config.Root{
+		App:   config.AppConfig{Home: t.TempDir()},
+		Model: config.ModelSelection{Default: "text", Fallbacks: []string{"minimax"}, Roles: config.ModelRoles{"vision": []string{"vision", "minimax"}}},
+		Models: []config.ModelConfig{
+			{Name: "text", API: "openai", APIBase: "https://text.example/v1", Model: "text-model", APIKeyEnv: "TEXT_KEY", Enabled: true, Modalities: []string{"text"}},
+			{Name: "minimax", API: "openai", APIBase: "https://minimax.example/v1", Model: "minimax-model", APIKeyEnv: "MINIMAX_KEY", Enabled: true, Modalities: []string{"text", "image"}},
+			{Name: "vision", API: "openai", APIBase: "https://vision.example/v1", Model: "vision-model", APIKeyEnv: "VISION_KEY", Enabled: true, Modalities: []string{"text", "image"}},
+		},
+		Agents: config.AgentsConfig{
+			Default:  "main",
+			Profiles: []config.AgentProfileConfig{{ID: "main", Model: config.ModelSelection{Default: "text"}}},
+		},
+	}
+	pool := NewAgentPool(cfg)
+	agent := pool.AgentForSession("cli:test")
+	model, ok := agent.Model.(model.AgentModel)
+	if !ok {
+		t.Fatalf("expected AgentModel, got %T", agent.Model)
+	}
+	if len(model.Fallbacks) != 1 || model.Fallbacks[0].Config.Name != "minimax" {
+		t.Fatalf("expected minimax regular fallback, got %#v", model.Fallbacks)
+	}
+	if len(model.Vision) != 2 || model.Vision[0].Config.Name != "vision" || model.Vision[1].Config.Name != "minimax" {
+		t.Fatalf("expected ordered vision candidates, got %#v", model.Vision)
+	}
+}
+
 func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")

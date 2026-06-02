@@ -168,7 +168,10 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 	}
 	names = append(names, profile.Model.Fallbacks...)
 	names = append(names, cfg.Model.Fallbacks...)
+	visionNames := append([]string{}, profile.Model.Roles.Models("vision")...)
+	visionNames = append(visionNames, cfg.Model.Roles.Models("vision")...)
 	var configs []config.ModelConfig
+	var visionConfigs []config.ModelConfig
 	seen := map[string]bool{}
 	for _, name := range names {
 		key := strings.ToLower(strings.TrimSpace(name))
@@ -180,8 +183,17 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 			configs = append(configs, cfg)
 		}
 	}
+	for _, name := range visionNames {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			continue
+		}
+		if cfg, ok := enabledModelByName(cfg, key); ok && strings.TrimSpace(cfg.ResolvedAPIKey()) != "" && cfg.SupportsModality("image") {
+			visionConfigs = append(visionConfigs, cfg)
+		}
+	}
 	if len(configs) > 0 {
-		return model.NewFallbackAgentModel(configs)
+		return model.NewRoutedAgentModel(configs, visionConfigs)
 	}
 	return HeuristicModel{}
 }

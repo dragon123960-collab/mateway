@@ -24,6 +24,10 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: "mateway.env.sample", Content: envSampleTemplate},
 		{RelPath: filepath.Join("models", "minimax.yaml"), Content: minimaxYAMLTemplate},
 		{RelPath: filepath.Join("models", "minimax.sample.yaml"), Content: minimaxSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.7-flash.yaml"), Content: glm47FlashYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.7-flash.sample.yaml"), Content: glm47FlashSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.6v-flash.yaml"), Content: glm46VFlashYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.6v-flash.sample.yaml"), Content: glm46VFlashSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "openai-gpt54-mini.yaml"), Content: openAIGPT54MiniYAMLTemplate},
 		{RelPath: filepath.Join("models", "openai-gpt54-mini.sample.yaml"), Content: openAIGPT54MiniSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "local-mlx.yaml"), Content: localMLXYAMLTemplate},
@@ -176,8 +180,14 @@ const configYAMLTemplate = `app:
   message_catalog_dir: ""
 
 model:
-  default: minimax
-  fallbacks: []
+  default: glm-4.7-flash
+  fallbacks:
+    - minimax
+  roles:
+    vision:
+      - glm-4.6v-flash
+      - minimax
+    strong: minimax
 
 memory:
   enabled: true
@@ -243,9 +253,6 @@ agents:
       name: Main Assistant
       default: true
       session_namespace: main
-      model:
-        default: minimax
-        fallbacks: []
       heartbeat:
         enabled: false
         interval: 30m
@@ -320,10 +327,13 @@ const configSampleYAMLTemplate = `# Copy this file to config.yaml, then adjust m
 const minimaxYAMLTemplate = `name: minimax
 provider: minimax
 api: anthropic
-model: MiniMax-M2.7
+model: MiniMax-M3
 api_base: https://api.minimaxi.com/anthropic
 api_key: ""
 api_key_env: MINIMAX_API_KEY
+modalities: [text, image]
+context_window: 1000000
+max_tokens: 8192
 strip_reasoning: true
 enabled: true
 description: Default remote model for planning, repair, synthesis, and high-reliability tasks.
@@ -334,6 +344,46 @@ const minimaxSampleYAMLTemplate = `# Copy this file to minimax.yaml.
 
 ` + minimaxYAMLTemplate
 
+const glm47FlashYAMLTemplate = `name: glm-4.7-flash
+provider: glm
+api: openai_chat
+model: GLM-4.7-Flash
+api_base: https://open.bigmodel.cn/api/paas/v4
+api_key: ""
+api_key_env: GLM_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 4096
+strip_reasoning: false
+enabled: false
+description: GLM free/flash text model for low-cost reasoning tasks.
+`
+
+const glm47FlashSampleYAMLTemplate = `# Copy this file to glm-4.7-flash.yaml.
+# Put the real key in mateway.env as GLM_API_KEY.
+
+` + glm47FlashYAMLTemplate
+
+const glm46VFlashYAMLTemplate = `name: glm-4.6v-flash
+provider: glm
+api: openai_chat
+model: GLM-4.6V-Flash
+api_base: https://open.bigmodel.cn/api/paas/v4
+api_key: ""
+api_key_env: GLM_API_KEY
+modalities: [text, image]
+context_window: 128000
+max_tokens: 4096
+strip_reasoning: false
+enabled: false
+description: GLM vision-capable flash model for image understanding and multimodal fallback.
+`
+
+const glm46VFlashSampleYAMLTemplate = `# Copy this file to glm-4.6v-flash.yaml.
+# Put the real key in mateway.env as GLM_API_KEY.
+
+` + glm46VFlashYAMLTemplate
+
 const openAIGPT54MiniYAMLTemplate = `name: openai-gpt54-mini
 provider: openai
 api: openai
@@ -341,6 +391,9 @@ model: gpt-5.4-mini
 api_base: https://api.openai.com/v1
 api_key: ""
 api_key_env: OPENAI_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 4096
 strip_reasoning: false
 enabled: false
 description: OpenAI GPT-5.4 mini model for optional planning/repair/synthesis experiments.
@@ -358,6 +411,9 @@ model: Qwen2.5-14B-Instruct-4bit
 api_base: http://127.0.0.1:8080/v1
 api_key: local
 api_key_env: ""
+modalities: [text]
+context_window: 32768
+max_tokens: 4096
 strip_reasoning: false
 enabled: false
 description: "Local mlx_lm.server model on 127.0.0.1:8080. Set enabled: true after the server is running."

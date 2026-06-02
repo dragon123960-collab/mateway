@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadModelsSkipsSampleAndExampleFiles(t *testing.T) {
@@ -44,6 +46,51 @@ enabled: true
 	}
 	if models[0].Name != "minimax" || models[0].Model != "MiniMax-M2.7" {
 		t.Fatalf("unexpected model loaded: %#v", models[0])
+	}
+}
+
+func TestModelConfigSupportsModalityDefaultsToText(t *testing.T) {
+	cfg := ModelConfig{}
+	if !cfg.SupportsModality("text") {
+		t.Fatal("expected missing modalities to support text")
+	}
+	if cfg.SupportsModality("image") {
+		t.Fatal("expected missing modalities not to support image")
+	}
+	cfg.Modalities = []string{"text", "image", "audio"}
+	if !cfg.SupportsModality("image") || !cfg.SupportsModality("audio") {
+		t.Fatalf("expected configured modalities to be supported: %#v", cfg.Modalities)
+	}
+}
+
+func TestModelConfigMaxTokensDefaults(t *testing.T) {
+	if got := (ModelConfig{}).MaxTokensValue(); got != 4096 {
+		t.Fatalf("default max tokens = %d", got)
+	}
+	if got := (ModelConfig{MaxTokens: 8192}).MaxTokensValue(); got != 8192 {
+		t.Fatalf("configured max tokens = %d", got)
+	}
+}
+
+func TestModelRolesAcceptStringAndList(t *testing.T) {
+	var cfg struct {
+		Model ModelSelection `yaml:"model"`
+	}
+	if err := yaml.Unmarshal([]byte(`
+model:
+  roles:
+    vision:
+      - glm-4.6v-flash
+      - minimax
+    strong: minimax
+`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Model.Roles.Models("vision"), ","); got != "glm-4.6v-flash,minimax" {
+		t.Fatalf("vision roles = %q", got)
+	}
+	if got := strings.Join(cfg.Model.Roles.Models("strong"), ","); got != "minimax" {
+		t.Fatalf("strong roles = %q", got)
 	}
 }
 

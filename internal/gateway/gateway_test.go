@@ -62,6 +62,17 @@ func TestShouldIgnoreFeishuNonTextEvents(t *testing.T) {
 	}
 }
 
+func TestShouldIgnoreFeishuImageMessages(t *testing.T) {
+	msg := channel.InboundMessage{
+		Channel:  "feishu",
+		Metadata: map[string]string{"message_type": "image", "chat_type": "p2p"},
+		Parts:    []channel.MessagePart{{Type: channel.PartImage, Metadata: map[string]string{"image_key": "img_1"}}},
+	}
+	if shouldIgnoreInbound(config.FeishuConfig{}, msg) {
+		t.Fatal("expected image message accepted")
+	}
+}
+
 func TestShouldIgnoreFeishuGroupWithoutMentionWhenRequired(t *testing.T) {
 	cfg := config.FeishuConfig{MentionRequiredGroup: true}
 	msg := channel.InboundMessage{Channel: "feishu", Text: "hello", Metadata: map[string]string{"message_type": "text", "chat_type": "group", "is_mentioned": "false"}}

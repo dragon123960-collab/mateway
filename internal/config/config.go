@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -167,22 +168,129 @@ type SearchProviderConfig struct {
 }
 
 type ModelSelection struct {
-	Default   string            `yaml:"default"`
-	Fallbacks []string          `yaml:"fallbacks"`
-	Roles     map[string]string `yaml:"roles"`
+	Default   string     `yaml:"default"`
+	Fallbacks []string   `yaml:"fallbacks"`
+	Roles     ModelRoles `yaml:"roles"`
+}
+
+type ModelRoles map[string][]string
+
+func (r ModelRoles) Models(role string) []string {
+	if len(r) == 0 {
+		return nil
+	}
+	values := r[strings.TrimSpace(role)]
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func (r *ModelRoles) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil || value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
+		*r = nil
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("model roles must be a mapping")
+	}
+	out := ModelRoles{}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key := strings.TrimSpace(value.Content[i].Value)
+		if key == "" {
+			continue
+		}
+		values, err := stringOrStringList(value.Content[i+1])
+		if err != nil {
+			return fmt.Errorf("model role %s: %w", key, err)
+		}
+		out[key] = values
+	}
+	*r = out
+	return nil
+}
+
+func (r ModelRoles) MarshalYAML() (any, error) {
+	out := map[string]any{}
+	for key, values := range r {
+		if len(values) == 1 {
+			out[key] = values[0]
+		} else {
+			out[key] = values
+		}
+	}
+	return out, nil
+}
+
+func (r *ModelRoles) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	out := ModelRoles{}
+	for key, value := range raw {
+		switch v := value.(type) {
+		case string:
+			out[key] = []string{v}
+		case []any:
+			for _, item := range v {
+				text, ok := item.(string)
+				if !ok {
+					return fmt.Errorf("model role %s must contain strings", key)
+				}
+				out[key] = append(out[key], text)
+			}
+		default:
+			return fmt.Errorf("model role %s must be string or string list", key)
+		}
+	}
+	*r = out
+	return nil
+}
+
+func stringOrStringList(node *yaml.Node) ([]string, error) {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if node.Tag == "!!null" || strings.TrimSpace(node.Value) == "" {
+			return nil, nil
+		}
+		return []string{node.Value}, nil
+	case yaml.SequenceNode:
+		values := make([]string, 0, len(node.Content))
+		for _, item := range node.Content {
+			if item.Kind != yaml.ScalarNode {
+				return nil, fmt.Errorf("must contain scalar strings")
+			}
+			values = append(values, item.Value)
+		}
+		return values, nil
+	default:
+		return nil, fmt.Errorf("must be string or string list")
+	}
 }
 
 type ModelConfig struct {
-	Name           string `yaml:"name"`
-	Provider       string `yaml:"provider"`
-	API            string `yaml:"api"`
-	Model          string `yaml:"model"`
-	APIBase        string `yaml:"api_base"`
-	APIKey         string `yaml:"api_key"`
-	APIKeyEnv      string `yaml:"api_key_env"`
-	StripReasoning bool   `yaml:"strip_reasoning"`
-	Enabled        bool   `yaml:"enabled"`
-	Description    string `yaml:"description"`
+	Name           string   `yaml:"name"`
+	Provider       string   `yaml:"provider"`
+	API            string   `yaml:"api"`
+	Model          string   `yaml:"model"`
+	APIBase        string   `yaml:"api_base"`
+	APIKey         string   `yaml:"api_key"`
+	APIKeyEnv      string   `yaml:"api_key_env"`
+	Modalities     []string `yaml:"modalities"`
+	ContextWindow  int      `yaml:"context_window"`
+	MaxTokens      int      `yaml:"max_tokens"`
+	StripReasoning bool     `yaml:"strip_reasoning"`
+	Enabled        bool     `yaml:"enabled"`
+	Description    string   `yaml:"description"`
 }
 
 type MemoryConfig struct {
@@ -368,6 +476,30 @@ func (c ModelConfig) ResolvedAPIKey() string {
 	return firstNonEmpty(c.APIKey, getenvWithMatewayFallback(c.APIKeyEnv))
 }
 
+func (c ModelConfig) SupportsModality(modality string) bool {
+	modality = strings.TrimSpace(strings.ToLower(modality))
+	if modality == "" {
+		return false
+	}
+	modalities := c.Modalities
+	if len(modalities) == 0 {
+		modalities = []string{"text"}
+	}
+	for _, candidate := range modalities {
+		if strings.EqualFold(strings.TrimSpace(candidate), modality) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c ModelConfig) MaxTokensValue() int {
+	if c.MaxTokens > 0 {
+		return c.MaxTokens
+	}
+	return 4096
+}
+
 func DefaultHome() string {
 	if home := strings.TrimSpace(os.Getenv("MATEWAY_HOME")); home != "" {
 		return home
@@ -447,7 +579,7 @@ func (r *Root) applyDefaults() {
 		r.Model.Fallbacks = defaults.Model.Fallbacks
 	}
 	if r.Model.Roles == nil {
-		r.Model.Roles = map[string]string{}
+		r.Model.Roles = ModelRoles{}
 	}
 	if r.Memory.RecentDays <= 0 {
 		r.Memory.RecentDays = defaults.Memory.RecentDays

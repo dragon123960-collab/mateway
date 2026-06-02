@@ -36,6 +36,25 @@ func TestRunExecutesToolCall(t *testing.T) {
 	}
 }
 
+func TestRunExecutesMultipleToolCallsInOneTurn(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.echo", Args: map[string]any{"text": "agent.md"}},
+			{ID: "2", Name: "test.echo", Args: map[string]any{"text": "user.md"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(testEchoTool{})
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry}, []Message{{Role: RoleUser, Content: "read files"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsToolMessage(result.Messages, "agent.md") || !containsToolMessage(result.Messages, "user.md") {
+		t.Fatalf("tool results not appended: %#v", result.Messages)
+	}
+}
+
 func TestRunUnknownToolAppendsErrorResult(t *testing.T) {
 	model := scriptedModel{messages: []Message{
 		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "missing"}}},

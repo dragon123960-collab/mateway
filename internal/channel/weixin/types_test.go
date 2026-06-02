@@ -38,10 +38,48 @@ func TestMessageToInboundText(t *testing.T) {
 	}
 }
 
-func TestMessageToInboundRejectsNonText(t *testing.T) {
-	_, ok := Message{MessageID: 42, ItemList: []Item{{Type: 2}}}.ToInbound("acct")
+func TestMessageToInboundImageOnly(t *testing.T) {
+	msg, ok := Message{
+		MessageID:  42,
+		FromUserID: "wxid_user",
+		ToUserID:   "bot_account",
+		ItemList: []Item{{Type: 2, ImageItem: &MediaItem{
+			URL:      "https://example.test/image.png",
+			MimeType: "image/png",
+			Name:     "image.png",
+			Size:     123,
+		}}},
+	}.ToInbound("acct")
+	if !ok {
+		t.Fatal("expected image message")
+	}
+	if msg.Text != "" || len(msg.Parts) != 1 || msg.Parts[0].Type != channel.PartImage || msg.Parts[0].URI != "https://example.test/image.png" {
+		t.Fatalf("unexpected inbound image: %#v", msg)
+	}
+}
+
+func TestMessageToInboundTextAndImage(t *testing.T) {
+	msg, ok := Message{
+		MessageID:  42,
+		FromUserID: "wxid_user",
+		ToUserID:   "bot_account",
+		ItemList: []Item{
+			{Type: 1, TextItem: &TextItem{Text: "看图"}},
+			{Type: 2, ImageItem: &MediaItem{Path: "/tmp/image.png", MimeType: "image/png"}},
+		},
+	}.ToInbound("acct")
+	if !ok {
+		t.Fatal("expected mixed message")
+	}
+	if msg.Text != "看图" || len(msg.Parts) != 1 || msg.Parts[0].URI != "file:///tmp/image.png" {
+		t.Fatalf("unexpected mixed inbound: %#v", msg)
+	}
+}
+
+func TestMessageToInboundRejectsUnsupportedNonText(t *testing.T) {
+	_, ok := Message{MessageID: 42, ItemList: []Item{{Type: 9}}}.ToInbound("acct")
 	if ok {
-		t.Fatal("expected non-text message rejected")
+		t.Fatal("expected unsupported message rejected")
 	}
 }
 

@@ -3,11 +3,15 @@ package model
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -31,6 +35,7 @@ func NewClient(cfg config.ModelConfig) Client {
 type AgentModel struct {
 	Client       Client
 	Fallbacks    []Client
+	Vision       []Client
 	SystemPrompt string
 }
 
@@ -42,6 +47,10 @@ func NewAgentModel(cfg config.ModelConfig) AgentModel {
 }
 
 func NewFallbackAgentModel(configs []config.ModelConfig) AgentModel {
+	return NewRoutedAgentModel(configs, nil)
+}
+
+func NewRoutedAgentModel(configs []config.ModelConfig, visionConfigs []config.ModelConfig) AgentModel {
 	if len(configs) == 0 {
 		return NewAgentModel(config.ModelConfig{})
 	}
@@ -49,9 +58,14 @@ func NewFallbackAgentModel(configs []config.ModelConfig) AgentModel {
 	for _, cfg := range configs[1:] {
 		clients = append(clients, NewClient(cfg))
 	}
+	visionClients := make([]Client, 0, len(visionConfigs))
+	for _, cfg := range visionConfigs {
+		visionClients = append(visionClients, NewClient(cfg))
+	}
 	return AgentModel{
 		Client:       NewClient(configs[0]),
 		Fallbacks:    clients,
+		Vision:       visionClients,
 		SystemPrompt: defaultSystemPrompt(),
 	}
 }
@@ -75,7 +89,7 @@ func (m AgentModel) Next(ctx context.Context, agentCtx agentcore.Context) (agent
 				messages = append(messages, Message{Role: "assistant", Content: msg.Content})
 			}
 		default:
-			messages = append(messages, Message{Role: "user", Content: msg.Content})
+			messages = append(messages, Message{Role: "user", Content: msg.Content, Parts: msg.Parts})
 		}
 	}
 	systemPrompt := strings.TrimSpace(m.SystemPrompt)
@@ -87,19 +101,30 @@ func (m AgentModel) Next(ctx context.Context, agentCtx agentcore.Context) (agent
 		return agentcore.Message{}, err
 	}
 	text := strings.TrimSpace(result.Text)
-	if call, ok := parseToolCallText(text); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, Content: text, ToolCalls: []agentcore.ToolCall{call}, Usage: usagePtr(result.Usage)}, nil
+	if calls := parseToolCallText(text); len(calls) > 0 {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: text, ToolCalls: calls, Usage: usagePtr(result.Usage)}, nil
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: text, Usage: usagePtr(result.Usage)}, nil
 }
 
 func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
+	var errors []string
+	if messagesRequireImage(messages) && !m.Client.Config.SupportsModality("image") {
+		if result, err := m.generateViaVision(ctx, system, messages); err == nil {
+			return result, nil
+		} else {
+			errors = append(errors, "vision: "+err.Error())
+		}
+	}
 	result, err := m.Client.Generate(ctx, system, messages)
 	if err == nil {
 		return result, nil
 	}
-	errors := []string{m.Client.Config.Name + ": " + err.Error()}
+	errors = append(errors, m.Client.Config.Name+": "+err.Error())
 	for _, client := range m.Fallbacks {
+		if messagesRequireImage(messages) && !client.Config.SupportsModality("image") {
+			continue
+		}
 		result, fallbackErr := client.Generate(ctx, system, messages)
 		if fallbackErr == nil {
 			return result, nil
@@ -109,9 +134,98 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, me
 	return GenerateResult{}, fmt.Errorf("all models failed: %s", strings.Join(errors, " | "))
 }
 
+func (m AgentModel) generateViaVision(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
+	vision, ok := m.firstImageCapableClient()
+	if !ok {
+		return GenerateResult{}, fmt.Errorf("image input requires an image-capable model; configure a fallback or role model with modalities including image")
+	}
+	converted, err := describeImageMessages(ctx, vision, messages)
+	if err != nil {
+		return GenerateResult{}, err
+	}
+	return m.Client.Generate(ctx, system, converted)
+}
+
+func (m AgentModel) firstImageCapableClient() (Client, bool) {
+	if m.Client.Config.SupportsModality("image") {
+		return m.Client, true
+	}
+	for _, client := range m.Vision {
+		if client.Config.SupportsModality("image") {
+			return client, true
+		}
+	}
+	for _, client := range m.Fallbacks {
+		if client.Config.SupportsModality("image") {
+			return client, true
+		}
+	}
+	return Client{}, false
+}
+
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string                  `json:"role"`
+	Content string                  `json:"content"`
+	Parts   []agentcore.MessagePart `json:"parts,omitempty"`
+}
+
+func messagesRequireImage(messages []Message) bool {
+	for _, msg := range messages {
+		for _, part := range msg.Parts {
+			if part.Type == agentcore.PartImage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func describeImageMessages(ctx context.Context, vision Client, messages []Message) ([]Message, error) {
+	converted := make([]Message, 0, len(messages))
+	for _, msg := range messages {
+		if !messageHasImage(msg) {
+			converted = append(converted, msg)
+			continue
+		}
+		prompt := strings.TrimSpace(msg.Content)
+		if prompt == "" {
+			prompt = "Describe the image in detail for a text-only reasoning model. Include visible text, objects, layout, and any uncertainty."
+		} else {
+			prompt = "User text: " + prompt + "\n\nDescribe the attached image in detail for a text-only reasoning model. Include visible text, objects, layout, and any uncertainty relevant to the user text."
+		}
+		visionMsg := Message{Role: "user", Content: prompt, Parts: partsWithoutText(msg.Parts)}
+		result, err := vision.Generate(ctx, "You are a vision model. Return a concise but complete image description for downstream text reasoning.", []Message{visionMsg})
+		if err != nil {
+			return nil, err
+		}
+		text := strings.TrimSpace(msg.Content)
+		if text != "" {
+			text += "\n\n"
+		}
+		text += "Image description:\n" + strings.TrimSpace(result.Text)
+		converted = append(converted, Message{Role: msg.Role, Content: text})
+	}
+	return converted, nil
+}
+
+func messageHasImage(msg Message) bool {
+	for _, part := range msg.Parts {
+		if part.Type == agentcore.PartImage {
+			return true
+		}
+	}
+	return false
+}
+
+func partsWithoutText(parts []agentcore.MessagePart) []agentcore.MessagePart {
+	out := make([]agentcore.MessagePart, 0, len(parts))
+	for _, part := range parts {
+		if part.Type == agentcore.PartText {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
 }
 
 type GenerateResult struct {
@@ -123,13 +237,13 @@ func defaultSystemPrompt() string {
 	return strings.TrimSpace(`You are Mateway, a concise tool-using assistant.
 
 When you can answer directly, answer directly.
-When you need a tool, emit a single tool call block exactly like:
+When you need tools, emit one or more tool call blocks exactly like:
 
 [TOOL_CALL]
 {"id":"call_1","name":"tool.name","args":{"key":"value"}}
 [/TOOL_CALL]
 
-Use tools sparingly. Do not expose raw tool planning unless calling a tool.`)
+Use tools sparingly. Do not expose raw tool planning unless calling tools.`)
 }
 
 func buildSystemPrompt(base string, tools []agentcore.Tool) string {
@@ -181,42 +295,54 @@ func writeContractLine(b *strings.Builder, label, value string) {
 	b.WriteString("\n")
 }
 
-func parseToolCallText(text string) (agentcore.ToolCall, bool) {
-	parts := toolCallBlockPattern.FindStringSubmatchIndex(text)
-	if len(parts) < 4 {
-		return agentcore.ToolCall{}, false
+func parseToolCallText(text string) []agentcore.ToolCall {
+	matches := toolCallBlockPattern.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
 	}
-	raw := strings.TrimSpace(text[parts[2]:parts[3]])
-	var payload struct {
-		ID   string         `json:"id"`
-		Name string         `json:"name"`
-		Args map[string]any `json:"args"`
+	calls := make([]agentcore.ToolCall, 0, len(matches))
+	for i, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		raw := strings.TrimSpace(match[1])
+		var payload struct {
+			ID   string         `json:"id"`
+			Name string         `json:"name"`
+			Args map[string]any `json:"args"`
+		}
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			continue
+		}
+		payload.ID = strings.TrimSpace(payload.ID)
+		payload.Name = strings.TrimSpace(payload.Name)
+		if payload.Name == "" {
+			continue
+		}
+		if payload.ID == "" {
+			payload.ID = fmt.Sprintf("call_%d", i+1)
+		}
+		if payload.Args == nil {
+			payload.Args = map[string]any{}
+		}
+		calls = append(calls, agentcore.ToolCall{ID: payload.ID, Name: payload.Name, Args: payload.Args})
 	}
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		return agentcore.ToolCall{}, false
-	}
-	payload.ID = strings.TrimSpace(payload.ID)
-	payload.Name = strings.TrimSpace(payload.Name)
-	if payload.Name == "" {
-		return agentcore.ToolCall{}, false
-	}
-	if payload.ID == "" {
-		payload.ID = "call_1"
-	}
-	if payload.Args == nil {
-		payload.Args = map[string]any{}
-	}
-	return agentcore.ToolCall{ID: payload.ID, Name: payload.Name, Args: payload.Args}, true
+	return calls
 }
 
 var toolCallBlockPattern = regexp.MustCompile(`(?is)\[\s*TOOL_CALL\s*\](.*?)\[\s*/\s*TOOL_CALL\s*\]`)
 
 func (c Client) Generate(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
+	if messagesRequireImage(messages) && !c.Config.SupportsModality("image") {
+		return GenerateResult{}, fmt.Errorf("model %s does not support image input", c.Config.Name)
+	}
 	switch strings.ToLower(strings.TrimSpace(c.Config.API)) {
 	case "", "anthropic":
 		return c.generateAnthropic(ctx, system, messages)
 	case "openai":
 		return c.generateOpenAI(ctx, system, messages)
+	case "openai_chat":
+		return c.generateOpenAIChat(ctx, system, messages)
 	default:
 		return GenerateResult{}, fmt.Errorf("unsupported model api %q for %s", c.Config.API, c.Config.Name)
 	}
@@ -233,8 +359,8 @@ func (c Client) generateAnthropic(ctx context.Context, system string, messages [
 	}
 	body := map[string]any{
 		"model":      c.Config.Model,
-		"max_tokens": 4096,
-		"messages":   messages,
+		"max_tokens": c.Config.MaxTokensValue(),
+		"messages":   anthropicMessages(messages),
 	}
 	if strings.TrimSpace(system) != "" {
 		body["system"] = system
@@ -262,7 +388,32 @@ func (c Client) generateOpenAI(ctx context.Context, system string, messages []Me
 	body := map[string]any{
 		"model":             c.Config.Model,
 		"input":             openAIResponsesInput(system, messages),
-		"max_output_tokens": 4096,
+		"max_output_tokens": c.Config.MaxTokensValue(),
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return GenerateResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return GenerateResult{}, err
+	}
+	req.Header.Set("content-type", "application/json")
+	if key := strings.TrimSpace(c.Config.ResolvedAPIKey()); key != "" {
+		req.Header.Set("authorization", "Bearer "+key)
+	}
+	return c.doGenerate(req)
+}
+
+func (c Client) generateOpenAIChat(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
+	endpoint, err := endpointWithSuffix(c.Config.APIBase, "/chat/completions")
+	if err != nil {
+		return GenerateResult{}, err
+	}
+	body := map[string]any{
+		"model":      c.Config.Model,
+		"messages":   openAIChatMessages(system, messages),
+		"max_tokens": c.Config.MaxTokensValue(),
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -294,10 +445,186 @@ func openAIResponsesInput(system string, messages []Message) []map[string]any {
 		}
 		input = append(input, map[string]any{
 			"role":    role,
-			"content": msg.Content,
+			"content": openAIContent(msg),
 		})
 	}
 	return input
+}
+
+func openAIChatMessages(system string, messages []Message) []map[string]any {
+	out := make([]map[string]any, 0, len(messages)+1)
+	if strings.TrimSpace(system) != "" {
+		out = append(out, map[string]any{"role": "system", "content": system})
+	}
+	for _, msg := range messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			role = "user"
+		}
+		out = append(out, map[string]any{
+			"role":    role,
+			"content": openAIChatContent(msg),
+		})
+	}
+	return out
+}
+
+func openAIChatContent(msg Message) any {
+	content := openAIContent(msg)
+	blocks, ok := content.([]map[string]any)
+	if !ok {
+		return content
+	}
+	out := make([]map[string]any, 0, len(blocks))
+	for _, block := range blocks {
+		switch block["type"] {
+		case "input_text":
+			out = append(out, map[string]any{"type": "text", "text": block["text"]})
+		case "input_image":
+			out = append(out, map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": block["image_url"]},
+			})
+		}
+	}
+	if len(out) == 0 {
+		return msg.Content
+	}
+	return out
+}
+
+func anthropicMessages(messages []Message) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			role = "user"
+		}
+		out = append(out, map[string]any{
+			"role":    role,
+			"content": anthropicContent(msg),
+		})
+	}
+	return out
+}
+
+func anthropicContent(msg Message) any {
+	if len(msg.Parts) == 0 {
+		return msg.Content
+	}
+	content := make([]map[string]any, 0, len(msg.Parts)+1)
+	if strings.TrimSpace(msg.Content) != "" && !partsContainText(msg.Parts) {
+		content = append(content, map[string]any{"type": "text", "text": msg.Content})
+	}
+	for _, part := range msg.Parts {
+		switch part.Type {
+		case agentcore.PartText:
+			if strings.TrimSpace(part.Text) != "" {
+				content = append(content, map[string]any{"type": "text", "text": part.Text})
+			}
+		case agentcore.PartImage:
+			if block, err := anthropicImageBlock(part); err == nil {
+				content = append(content, block)
+			}
+		}
+	}
+	if len(content) == 0 {
+		return msg.Content
+	}
+	return content
+}
+
+func openAIContent(msg Message) any {
+	if len(msg.Parts) == 0 {
+		return msg.Content
+	}
+	content := make([]map[string]any, 0, len(msg.Parts)+1)
+	if strings.TrimSpace(msg.Content) != "" && !partsContainText(msg.Parts) {
+		content = append(content, map[string]any{"type": "input_text", "text": msg.Content})
+	}
+	for _, part := range msg.Parts {
+		switch part.Type {
+		case agentcore.PartText:
+			if strings.TrimSpace(part.Text) != "" {
+				content = append(content, map[string]any{"type": "input_text", "text": part.Text})
+			}
+		case agentcore.PartImage:
+			if url := imageURL(part); strings.TrimSpace(url) != "" {
+				content = append(content, map[string]any{"type": "input_image", "image_url": url})
+			}
+		}
+	}
+	if len(content) == 0 {
+		return msg.Content
+	}
+	return content
+}
+
+func partsContainText(parts []agentcore.MessagePart) bool {
+	for _, part := range parts {
+		if part.Type == agentcore.PartText && strings.TrimSpace(part.Text) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicImageBlock(part agentcore.MessagePart) (map[string]any, error) {
+	data, mimeType, err := imageData(part)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"type": "image",
+		"source": map[string]any{
+			"type":       "base64",
+			"media_type": mimeType,
+			"data":       data,
+		},
+	}, nil
+}
+
+func imageURL(part agentcore.MessagePart) string {
+	uri := strings.TrimSpace(part.URI)
+	if strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://") || strings.HasPrefix(uri, "data:") {
+		return uri
+	}
+	data, mimeType, err := imageData(part)
+	if err != nil {
+		return ""
+	}
+	return "data:" + mimeType + ";base64," + data
+}
+
+func imageData(part agentcore.MessagePart) (string, string, error) {
+	uri := strings.TrimSpace(part.URI)
+	if strings.HasPrefix(uri, "data:") {
+		prefix, data, ok := strings.Cut(uri, ",")
+		if !ok {
+			return "", "", fmt.Errorf("invalid data uri")
+		}
+		mimeType := strings.TrimPrefix(strings.TrimSuffix(prefix, ";base64"), "data:")
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		return data, mimeType, nil
+	}
+	path := strings.TrimPrefix(uri, "file://")
+	if path == "" {
+		return "", "", fmt.Errorf("image uri is empty")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	mimeType := strings.TrimSpace(part.MimeType)
+	if mimeType == "" {
+		mimeType = mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	}
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	return base64.StdEncoding.EncodeToString(data), mimeType, nil
 }
 
 func (c Client) doGenerate(req *http.Request) (GenerateResult, error) {
@@ -314,7 +641,7 @@ func (c Client) doGenerate(req *http.Request) (GenerateResult, error) {
 	case "", "anthropic":
 		result, err := parseAnthropicResult(data)
 		return finishGenerate(c.Config, result, err)
-	case "openai":
+	case "openai", "openai_chat":
 		result, err := parseOpenAIResult(data)
 		return finishGenerate(c.Config, result, err)
 	default:

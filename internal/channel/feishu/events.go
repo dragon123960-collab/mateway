@@ -71,6 +71,17 @@ func NormalizeMessageReceive(event *larkim.P2MessageReceiveV1) channel.InboundMe
 	msg.Text = extractText(value(message.Content))
 	msg.Metadata["chat_type"] = value(message.ChatType)
 	msg.Metadata["message_type"] = value(message.MessageType)
+	if imageKey := extractImageKey(value(message.Content)); imageKey != "" {
+		msg.Metadata["image_key"] = imageKey
+		msg.Parts = append(msg.Parts, channel.MessagePart{
+			Type: channel.PartImage,
+			Name: imageKey,
+			Metadata: map[string]string{
+				"channel":   "feishu",
+				"image_key": imageKey,
+			},
+		})
+	}
 	if event.Event.Sender != nil {
 		msg.Metadata["sender_type"] = value(event.Event.Sender.SenderType)
 	}
@@ -121,6 +132,17 @@ func extractText(content string) string {
 		return strings.TrimSpace(payload.Text)
 	}
 	return content
+}
+
+func extractImageKey(content string) string {
+	content = strings.TrimSpace(content)
+	var payload struct {
+		ImageKey string `json:"image_key"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err == nil && payload.ImageKey != "" {
+		return strings.TrimSpace(payload.ImageKey)
+	}
+	return ""
 }
 
 func value(ptr *string) string {

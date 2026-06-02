@@ -1552,13 +1552,9 @@ func memoryDistillModel(cfg *config.Root) memory.DistillModel {
 		return nil
 	}
 	names := []string{}
-	if role := strings.TrimSpace(cfg.Model.Roles["memory_distill"]); role != "" {
-		names = append(names, role)
-	}
+	names = append(names, cfg.Model.Roles.Models("memory_distill")...)
 	if profile := defaultAgentProfile(cfg); profile != nil {
-		if role := strings.TrimSpace(profile.Model.Roles["memory_distill"]); role != "" {
-			names = append(names, role)
-		}
+		names = append(names, profile.Model.Roles.Models("memory_distill")...)
 		if strings.TrimSpace(profile.Model.Default) != "" {
 			names = append(names, profile.Model.Default)
 		}

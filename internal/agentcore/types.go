@@ -14,9 +14,31 @@ const (
 type Message struct {
 	Role       Role
 	Content    string
+	Parts      []MessagePart `json:"parts,omitempty"`
 	ToolCalls  []ToolCall
 	ToolCallID string
 	Usage      *Usage `json:"usage,omitempty"`
+}
+
+type PartType string
+
+const (
+	PartText  PartType = "text"
+	PartImage PartType = "image"
+	PartAudio PartType = "audio"
+	PartVideo PartType = "video"
+	PartFile  PartType = "file"
+)
+
+type MessagePart struct {
+	Type     PartType          `json:"type"`
+	Text     string            `json:"text,omitempty"`
+	URI      string            `json:"uri,omitempty"`
+	MimeType string            `json:"mime_type,omitempty"`
+	Name     string            `json:"name,omitempty"`
+	Size     int64             `json:"size,omitempty"`
+	SHA256   string            `json:"sha256,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type Usage struct {

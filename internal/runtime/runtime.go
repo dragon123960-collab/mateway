@@ -134,7 +134,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		return resp, nil
 	}
 	writeCompactTrace(trace, "model_input_compacted", compactStats)
-	messages = append(messages, agentcore.Message{Role: agentcore.RoleUser, Content: userText})
+	messages = append(messages, userAgentMessage(userText, msg.Parts))
 
 	agent := rt.Pool.AgentForMessage(msg)
 	if agent == nil {
@@ -370,6 +370,36 @@ func writeCompactTrace(trace *traceRecorder, eventType string, stats messageComp
 		"dropped_system":   stats.DroppedSystem,
 		"dropped_old_msgs": stats.DroppedOld,
 	})
+}
+
+func userAgentMessage(text string, parts []channel.MessagePart) agentcore.Message {
+	msg := agentcore.Message{Role: agentcore.RoleUser, Content: strings.TrimSpace(text)}
+	msg.Parts = channelPartsToAgentParts(text, parts)
+	return msg
+}
+
+func channelPartsToAgentParts(text string, parts []channel.MessagePart) []agentcore.MessagePart {
+	out := make([]agentcore.MessagePart, 0, len(parts)+1)
+	if strings.TrimSpace(text) != "" {
+		out = append(out, agentcore.MessagePart{Type: agentcore.PartText, Text: strings.TrimSpace(text)})
+	}
+	for _, part := range parts {
+		converted := agentcore.MessagePart{
+			Type:     agentcore.PartType(part.Type),
+			Text:     part.Text,
+			URI:      part.URI,
+			MimeType: part.MimeType,
+			Name:     part.Name,
+			Size:     part.Size,
+			SHA256:   part.SHA256,
+			Metadata: part.Metadata,
+		}
+		if converted.Type == "" {
+			converted.Type = agentcore.PartFile
+		}
+		out = append(out, converted)
+	}
+	return out
 }
 
 func isNewSessionCommand(text string) bool {

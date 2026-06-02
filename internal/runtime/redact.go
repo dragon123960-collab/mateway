@@ -44,6 +44,9 @@ func redactSecrets(value any) any {
 		return out
 	case agentcore.Message:
 		v.Content = redactSecretString(v.Content)
+		for i := range v.Parts {
+			v.Parts[i] = redactMessagePart(v.Parts[i])
+		}
 		for i := range v.ToolCalls {
 			v.ToolCalls[i] = redactToolCall(v.ToolCalls[i])
 		}
@@ -55,6 +58,22 @@ func redactSecrets(value any) any {
 	default:
 		return v
 	}
+}
+
+func redactMessagePart(part agentcore.MessagePart) agentcore.MessagePart {
+	part.Text = redactSecretString(part.Text)
+	if len(part.Metadata) > 0 {
+		metadata := make(map[string]string, len(part.Metadata))
+		for key, value := range part.Metadata {
+			if isSecretKey(key) {
+				metadata[key] = redactedSecret
+				continue
+			}
+			metadata[key] = redactSecretString(value)
+		}
+		part.Metadata = metadata
+	}
+	return part
 }
 
 func redactToolCall(call agentcore.ToolCall) agentcore.ToolCall {
@@ -216,6 +235,9 @@ func messageChars(messages []agentcore.Message) int {
 	total := 0
 	for _, msg := range messages {
 		total += len(msg.Content)
+		for _, part := range msg.Parts {
+			total += len(part.Text) + len(part.URI) + len(part.MimeType) + len(part.Name)
+		}
 		for _, call := range msg.ToolCalls {
 			total += len(call.Name) + len(call.ID)
 			for key, value := range call.Args {

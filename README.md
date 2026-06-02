@@ -105,6 +105,8 @@ Sessions are runtime state, not an ever-growing raw chat log. Before each model 
 
 System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, trace ids, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt.
 
+Feishu image messages are downloaded under `~/.mateway/media`, and Weixin media items are normalized into the same message part schema when the channel provides a URL or local path. Transcripts store media references, not inline image bytes. Model details, enable switches, `context_window`, and `max_tokens` live in `~/.mateway/config/models/*.yaml`; `config.yaml` only selects defaults, fallbacks, and roles. If the selected model declares `modalities: [text, image]`, the user text and image parts are sent together in the same user turn. Otherwise Mateway can use `model.roles.vision` as a single model or ordered list such as `vision: [glm-4.6v-flash, minimax]` before falling back to other image-capable models. Audio, video, and file parts are reserved in the message schema for future channel support.
+
 Send `/new`, `/新会话`, or `新会话` to archive the current session and clear the active state under the same `session_key`. This is useful for long Feishu threads where the channel session key stays fixed but the agent should start from a clean context.
 
 ### 6. Skills As Editable Behavior, Not Magic Tools
@@ -529,7 +531,7 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 ### Next
 
 - more built-in channels such as DingTalk, QQ, WeCom, and Telegram
-- richer media handling for channels that support images/files
+- richer audio/video/file handling for channels that support media
 - script bridge specification for user-provided connectors
 - skill source adapters and promote workflow
 - safer terminal sandbox wrappers

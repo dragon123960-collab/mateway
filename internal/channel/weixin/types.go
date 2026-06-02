@@ -46,12 +46,30 @@ type Message struct {
 }
 
 type Item struct {
-	Type     int       `json:"type"`
-	TextItem *TextItem `json:"text_item,omitempty"`
+	Type      int        `json:"type"`
+	TextItem  *TextItem  `json:"text_item,omitempty"`
+	ImageItem *MediaItem `json:"image_item,omitempty"`
+	FileItem  *MediaItem `json:"file_item,omitempty"`
+	AudioItem *MediaItem `json:"audio_item,omitempty"`
+	VideoItem *MediaItem `json:"video_item,omitempty"`
 }
 
 type TextItem struct {
 	Text string `json:"text"`
+}
+
+type MediaItem struct {
+	URL         string `json:"url,omitempty"`
+	DownloadURL string `json:"download_url,omitempty"`
+	ThumbURL    string `json:"thumb_url,omitempty"`
+	Path        string `json:"path,omitempty"`
+	FileID      string `json:"file_id,omitempty"`
+	MediaID     string `json:"media_id,omitempty"`
+	FileKey     string `json:"file_key,omitempty"`
+	ImageKey    string `json:"image_key,omitempty"`
+	Name        string `json:"name,omitempty"`
+	MimeType    string `json:"mime_type,omitempty"`
+	Size        int64  `json:"size,omitempty"`
 }
 
 type LoginStartResponse struct {
@@ -74,8 +92,9 @@ type Account struct {
 }
 
 func (m Message) ToInbound(accountID string) (channel.InboundMessage, bool) {
-	text, ok := textFromItems(m.ItemList)
-	if !ok {
+	text := textFromItems(m.ItemList)
+	parts := partsFromItems(m.ItemList)
+	if strings.TrimSpace(text) == "" && len(parts) == 0 {
 		return channel.InboundMessage{}, false
 	}
 	id := messageID(m)
@@ -86,6 +105,7 @@ func (m Message) ToInbound(accountID string) (channel.InboundMessage, bool) {
 		ThreadID: peerID,
 		UserID:   firstNonEmpty(m.FromUserID, peerID),
 		Text:     text,
+		Parts:    parts,
 		Metadata: map[string]string{
 			"account_id":    firstNonEmpty(accountID, m.ToUserID),
 			"peer_id":       peerID,
@@ -115,13 +135,68 @@ func ReplyToMessage(original channel.InboundMessage, reply channel.OutboundMessa
 	}
 }
 
-func textFromItems(items []Item) (string, bool) {
+func textFromItems(items []Item) string {
+	var parts []string
 	for _, item := range items {
 		if item.Type == 1 && item.TextItem != nil && strings.TrimSpace(item.TextItem.Text) != "" {
-			return strings.TrimSpace(item.TextItem.Text), true
+			parts = append(parts, strings.TrimSpace(item.TextItem.Text))
 		}
 	}
-	return "", false
+	return strings.Join(parts, "\n")
+}
+
+func partsFromItems(items []Item) []channel.MessagePart {
+	var parts []channel.MessagePart
+	for _, item := range items {
+		if item.Type == 1 {
+			continue
+		}
+		if part, ok := mediaPartFromItem(item); ok {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+func mediaPartFromItem(item Item) (channel.MessagePart, bool) {
+	switch {
+	case item.ImageItem != nil:
+		return mediaPart(channel.PartImage, item.ImageItem), true
+	case item.AudioItem != nil:
+		return mediaPart(channel.PartAudio, item.AudioItem), true
+	case item.VideoItem != nil:
+		return mediaPart(channel.PartVideo, item.VideoItem), true
+	case item.FileItem != nil:
+		return mediaPart(channel.PartFile, item.FileItem), true
+	default:
+		return channel.MessagePart{}, false
+	}
+}
+
+func mediaPart(kind channel.PartType, media *MediaItem) channel.MessagePart {
+	uri := firstNonEmpty(media.URL, media.DownloadURL, media.ThumbURL)
+	if uri == "" && strings.TrimSpace(media.Path) != "" {
+		uri = "file://" + strings.TrimSpace(media.Path)
+	}
+	metadata := map[string]string{
+		"file_id":   media.FileID,
+		"media_id":  media.MediaID,
+		"file_key":  media.FileKey,
+		"image_key": media.ImageKey,
+	}
+	for key, value := range metadata {
+		if strings.TrimSpace(value) == "" {
+			delete(metadata, key)
+		}
+	}
+	return channel.MessagePart{
+		Type:     kind,
+		URI:      uri,
+		MimeType: media.MimeType,
+		Name:     media.Name,
+		Size:     media.Size,
+		Metadata: metadata,
+	}
 }
 
 func messageID(m Message) string {
