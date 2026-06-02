@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/secret"
 )
 
 func TestResolveAllowedPathDefaultsRelativeToHome(t *testing.T) {
@@ -94,6 +96,42 @@ func TestFileWriteRejectsSkillPlaintextSecret(t *testing.T) {
 	})
 	if !result.IsError || !strings.Contains(result.Content, "refusing to write secret-like content") {
 		t.Fatalf("expected secret write rejection, got %#v", result)
+	}
+}
+
+func TestSecretSetToolStoresValueWithoutReturningIt(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	result := SecretSetTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "secret.set",
+		Args: map[string]any{"id": "mail.auth_code", "value": "QBptnPtt6Hnp3awb"},
+	})
+	if result.IsError || result.Evidence["stored"] != true {
+		t.Fatalf("expected stored secret result, got %#v", result)
+	}
+	if strings.Contains(result.Content, "QBptnPtt6Hnp3awb") || strings.Contains(fmt.Sprint(result.Evidence), "QBptnPtt6Hnp3awb") {
+		t.Fatalf("secret value leaked in result: %#v", result)
+	}
+	entry, ok, err := secret.Store{Home: home}.Get("mail.auth_code")
+	if err != nil || !ok || entry.Value != "QBptnPtt6Hnp3awb" {
+		t.Fatalf("secret not stored: entry=%#v ok=%v err=%v", entry, ok, err)
+	}
+}
+
+func TestSecretSetToolRejectsRedactedPlaceholder(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	result := SecretSetTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "secret.set",
+		Args: map[string]any{"id": "mail.auth_code", "value": "[REDACTED_SECRET]"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "redacted placeholder") {
+		t.Fatalf("expected placeholder rejection, got %#v", result)
+	}
+	if _, ok, err := (secret.Store{Home: home}).Get("mail.auth_code"); err != nil || ok {
+		t.Fatalf("placeholder should not be stored: ok=%v err=%v", ok, err)
 	}
 }
 

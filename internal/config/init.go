@@ -765,8 +765,11 @@ Preferred layout:
 
 - Never put plaintext secrets, passwords, tokens, authorization codes, or API keys in SKILL.md.
 - Never hard-code plaintext secrets in scripts/.
-- Store real secret values with mateway secret set <secret_id> or the secret.set tool when available.
+- If the user has provided a concrete secret value in the current task, store it immediately with the secret.set tool. Do not ask the user to run mateway secret manually.
+- Use mateway secret set <secret_id> only as a CLI fallback outside the agent loop; it is not the preferred answer to the user.
+- If the value visible to tools is [REDACTED_SECRET] or any placeholder, do not store it; ask the user to provide the real value again.
 - If the user has not provided a concrete secret value, write only required-secret references and report the missing secret ids.
+- After secret.set succeeds, scripts receive secrets only through environment variables injected by script.run from mateway.required_secret headers.
 - Script headers may declare required secrets:
 
 ` + "```text" + `
