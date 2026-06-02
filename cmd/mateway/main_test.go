@@ -551,6 +551,41 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 	}
 }
 
+func TestSkillCleanupCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "skills", "software-install", "SKILL.md")
+	old := time.Now().AddDate(0, 0, -120)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"skill", "cleanup", "report"}) })
+	if !strings.Contains(out, "skill_cleanup:") || !strings.Contains(out, "hidden:") || !strings.Contains(out, "software-install") {
+		t.Fatalf("unexpected cleanup report:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"skill", "cleanup", "list", "--state", "hidden"}) })
+	if !strings.Contains(out, "software-install") || !strings.Contains(out, "id=shared-software-install") {
+		t.Fatalf("unexpected cleanup list:\n%s", out)
+	}
+	id := ""
+	for _, part := range strings.Fields(out) {
+		if strings.HasPrefix(part, "id=") {
+			id = strings.TrimPrefix(part, "id=")
+			break
+		}
+	}
+	if id == "" {
+		t.Fatalf("missing id in cleanup list:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return run([]string{"skill", "cleanup", "restore", id}) })
+	if !strings.Contains(out, "state: active") || !strings.Contains(out, "reason: restored") {
+		t.Fatalf("unexpected restore output:\n%s", out)
+	}
+}
+
 func TestScriptSandboxAndWorkspaceReports(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

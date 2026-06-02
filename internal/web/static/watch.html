@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mateway Office Watch</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/watch.css" />
+  </head>
+  <body class="watch-body">
+    <aside class="watch-sidebar">
+      <div class="brand">Office Watch</div>
+      <button class="primary" id="refresh-watch">刷新 Sessions</button>
+      <div id="watch-sessions" class="session-list"></div>
+    </aside>
+    <main class="watch-stage">
+      <header class="watch-top">
+        <div>
+          <h1 id="watch-title">Mateway Runtime</h1>
+          <p id="watch-subtitle">实时观察任务从发布到完成的执行过程</p>
+        </div>
+        <a href="/">返回 Console</a>
+      </header>
+      <section class="office-floor">
+        <div class="pixel-wall">
+          <div class="clock">TRACE</div>
+          <div class="board" id="watch-board">idle</div>
+        </div>
+        <div class="desk">
+          <div class="monitor" id="watch-monitor">等待任务</div>
+          <div class="agent-avatar idle" id="agent-avatar"><span></span></div>
+          <div class="keyboard"></div>
+        </div>
+        <div class="shelf">
+          <div></div><div></div><div></div>
+        </div>
+      </section>
+      <section class="watch-metrics" id="watch-metrics"></section>
+    </main>
+    <aside class="watch-inspector">
+      <h2>Timeline</h2>
+      <div id="watch-timeline" class="timeline"></div>
+    </aside>
+    <script src="/static/watch.js"></script>
+  </body>
+</html>

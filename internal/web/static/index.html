@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mateway Console</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">Mateway</div>
+      <button data-view="chat" class="nav active">对话</button>
+      <button data-view="skills" class="nav">技能</button>
+      <button data-view="schedules" class="nav">定时任务</button>
+      <button data-view="config" class="nav">配置</button>
+      <button data-view="usage" class="nav">记忆</button>
+      <a class="nav link-nav" href="/watch" target="_blank">Office Watch</a>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">对话</h1>
+          <p id="view-subtitle">本地 Web Console</p>
+        </div>
+        <button id="refresh">刷新</button>
+      </header>
+      <section id="content" class="content"></section>
+    </main>
+    <aside class="inspector">
+      <h2>状态</h2>
+      <div id="status" class="status"></div>
+    </aside>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

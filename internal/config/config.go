@@ -24,6 +24,7 @@ type Root struct {
 	Skills    SkillsConfig    `yaml:"skills"`
 	Scripts   ScriptsConfig   `yaml:"scripts"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
+	Web       WebConfig       `yaml:"web"`
 	Agents    AgentsConfig    `yaml:"agents"`
 	Models    []ModelConfig   `yaml:"-"`
 	Channels  ChannelsConfig  `yaml:"-"`
@@ -59,10 +60,26 @@ func DefaultRoot() Root {
 			RequireUserConfirm: true,
 			AskTiming:          "next_interaction",
 		}},
+		Skills: SkillsConfig{Cleanup: SkillCleanupConfig{
+			Enabled:         boolPtr(true),
+			ColdAfterDays:   30,
+			HiddenAfterDays: 90,
+			MaxUsageCount:   1,
+			RestoreMode:     "permanent",
+			Protected:       []string{},
+		}},
 		Scheduler: SchedulerConfig{
 			Enabled:  false,
 			Timezone: "Asia/Shanghai",
 			Interval: "30s",
+		},
+		Web: WebConfig{
+			Enabled:            boolPtr(true),
+			Bind:               "127.0.0.1:8765",
+			OpenBrowser:        false,
+			AllowConfigWrite:   true,
+			RealtimeEnabled:    true,
+			OfficeWatchEnabled: true,
 		},
 		Security: SecurityConfig{
 			EnforceWorkspacePaths:       true,
@@ -340,6 +357,23 @@ type SkillCrystallizationConfig struct {
 
 type SkillsConfig struct {
 	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
+	Cleanup  SkillCleanupConfig   `yaml:"cleanup"`
+}
+
+type SkillCleanupConfig struct {
+	Enabled         *bool    `yaml:"enabled"`
+	ColdAfterDays   int      `yaml:"cold_after_days"`
+	HiddenAfterDays int      `yaml:"hidden_after_days"`
+	MaxUsageCount   int      `yaml:"max_usage_count"`
+	Protected       []string `yaml:"protected"`
+	RestoreMode     string   `yaml:"restore_mode"`
+}
+
+func (c SkillCleanupConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 type ScriptsConfig struct {
@@ -360,6 +394,23 @@ type SchedulerConfig struct {
 	Timezone string `yaml:"timezone"`
 	StateDir string `yaml:"state_dir"`
 	Interval string `yaml:"interval"`
+}
+
+type WebConfig struct {
+	Enabled            *bool  `yaml:"enabled"`
+	Bind               string `yaml:"bind"`
+	OpenBrowser        bool   `yaml:"open_browser"`
+	AllowConfigWrite   bool   `yaml:"allow_config_write"`
+	RealtimeEnabled    bool   `yaml:"realtime_enabled"`
+	OfficeWatchEnabled bool   `yaml:"office_watch_enabled"`
+	OfficeWatchAssets  string `yaml:"office_watch_assets"`
+}
+
+func (c WebConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 type AgentsConfig struct {
@@ -574,6 +625,9 @@ func (r *Root) NormalizeForUse() {
 
 func (r *Root) applyDefaults() {
 	defaults := DefaultRoot()
+	if r.Skills.Cleanup.Enabled == nil {
+		r.Skills.Cleanup.Enabled = defaults.Skills.Cleanup.Enabled
+	}
 	if strings.TrimSpace(r.App.Name) == "" {
 		r.App.Name = defaults.App.Name
 	}
@@ -625,6 +679,12 @@ func (r *Root) applyDefaults() {
 	}
 	if strings.TrimSpace(r.Scheduler.Interval) == "" {
 		r.Scheduler.Interval = defaults.Scheduler.Interval
+	}
+	if strings.TrimSpace(r.Web.Bind) == "" {
+		r.Web.Bind = defaults.Web.Bind
+	}
+	if r.Web.Enabled == nil {
+		r.Web.Enabled = defaults.Web.Enabled
 	}
 	if r.Security.AccessiblePaths == nil {
 		r.Security.AccessiblePaths = []string{}
@@ -683,6 +743,22 @@ func mergeSearchProviderDefaults(dst *SearchProviderConfig, defaults SearchProvi
 }
 
 func (r *Root) normalizeSkills() {
+	defaults := DefaultRoot()
+	if r.Skills.Cleanup.ColdAfterDays <= 0 {
+		r.Skills.Cleanup.ColdAfterDays = defaults.Skills.Cleanup.ColdAfterDays
+	}
+	if r.Skills.Cleanup.HiddenAfterDays <= 0 {
+		r.Skills.Cleanup.HiddenAfterDays = defaults.Skills.Cleanup.HiddenAfterDays
+	}
+	if r.Skills.Cleanup.MaxUsageCount <= 0 {
+		r.Skills.Cleanup.MaxUsageCount = defaults.Skills.Cleanup.MaxUsageCount
+	}
+	if r.Skills.Cleanup.Protected == nil {
+		r.Skills.Cleanup.Protected = []string{}
+	}
+	if strings.TrimSpace(r.Skills.Cleanup.RestoreMode) == "" {
+		r.Skills.Cleanup.RestoreMode = defaults.Skills.Cleanup.RestoreMode
+	}
 	if len(r.Skills.Catalogs) > 0 {
 		return
 	}

@@ -4,6 +4,7 @@
 
 当前文档：
 
+- [Web Console 本地控制台与 Office Watch](./web-console.md)
 - [Channel 配置与内置接入](./channels.md)
 - [微信接入指南](./weixin.md)
 - [候选记忆提醒](./memory-proposal-nudge.md)

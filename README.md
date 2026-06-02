@@ -9,7 +9,7 @@
 
 It is not a heavy workflow platform and not a toy chatbot demo. Mateway is a small Go runtime built around one compact AgentCore loop, with multi-agent profile and binding foundations for different work identities, channels, skills, and memory scopes.
 
-> **In a nutshell: Mateway = Small AgentCore + Multi-Agent Profiles + Hook Runtime + Tool Boundaries + Git-like Memory + Self-learning Proposals + Trace Ledger.**
+> **In a nutshell: Mateway = Small AgentCore + Multi-Agent Profiles + Hook Runtime + Tool Boundaries + Git-like Memory + Self-learning Proposals + Trace Ledger + Live Office Watch.**
 
 ```text
 receive -> followup_hook -> context_hook -> model/tool loop
@@ -93,7 +93,13 @@ Every run writes a JSONL trace:
 
 Persistent traces, session transcripts, and task step summaries redact secret-like fields such as `api_key`, `token`, `password`, `smtp_pass`, `imap_pass`, and bearer tokens. The model still sees live tool output for the current task; persistent logs avoid storing obvious credentials.
 
-### 5. Bounded Session Context
+### 5. Live Runtime Visualization
+
+`gateway serve` can run the local Web Console and Office Watch alongside CLI, Feishu, Weixin, schedules, and future channels. Runtime trace events are published through an in-process WebSocket event bus, so tasks posted from Feishu can be watched live in the browser when they run in the same gateway process.
+
+Office Watch shows task publication, context assembly, model turns, tool execution, usage deltas, replies, blocked states, and completion. It also supports historical replay from JSONL traces. Context numbers marked `est` are character-based estimates; token usage is shown as real only when the model provider returns usage metadata.
+
+### 6. Bounded Session Context
 Sessions are runtime state, not an ever-growing raw chat log. Before each model call, Mateway builds context from:
 
 - fresh system/runtime context from `context_hook`
@@ -109,14 +115,14 @@ Feishu image messages are downloaded under `~/.mateway/media`, and Weixin media 
 
 Send `/new`, `/新会话`, or `新会话` to archive the current session and clear the active state under the same `session_key`. This is useful for long Feishu threads where the channel session key stays fixed but the agent should start from a clean context.
 
-### 6. Skills As Editable Behavior, Not Magic Tools
+### 7. Skills As Editable Behavior, Not Magic Tools
 Mateway discovers local `SKILL.md` files and injects concise guidance into the runtime context. Current default skills include:
 
 - `software-install`
 - `fresh-search`
 - `source-evaluation`
 
-### 7. Internationalization Boundary
+### 8. Internationalization Boundary
 
 Mateway keeps internal machine interfaces in English: config keys, trace keys, audit events, pending kinds, JSONL evidence, tool names, and machine-readable CLI output are not localized. Human-facing runtime prompts use a small message catalog.
 
@@ -237,7 +243,28 @@ Custom task:
 ./build/mateway gateway serve
 ```
 
-`gateway serve` runs enabled built-in channels in the foreground. Use launchd, systemd, or another service manager if you want it hosted as a background service.
+`gateway serve` runs enabled built-in channels and the local Web Console in the foreground. Use launchd, systemd, or another service manager if you want it hosted as a background service.
+
+The Web Console is enabled by default at:
+
+```text
+http://127.0.0.1:8765
+```
+
+It provides a local workbench for chat, skills, schedules, sessions, channels, agents, config, and usage. Configure it from `web` in `config.yaml`:
+
+```yaml
+web:
+  enabled: true
+  bind: 127.0.0.1:8765
+  open_browser: false
+  allow_config_write: true
+  realtime_enabled: true
+  office_watch_enabled: true
+  office_watch_assets: ""
+```
+
+The console also exposes an optional Office Watch page at `http://127.0.0.1:8765/watch`. It uses local WebSocket events to show the live path from task publication through context assembly, model turns, tool execution, usage deltas, replies, and completion. Office Watch uses Mateway-owned placeholder pixel styling; it does not vendor Star-Office-UI assets. Context numbers marked `est` are character-based estimates unless the model provider returns real token usage.
 
 List channel ids from local channel config files:
 
@@ -444,14 +471,31 @@ required_secrets:
 Current behavior:
 
 - Runtime discovers local skills and injects short guidance into context.
+- Low-use skills can cool down automatically: active skills inject full guidance, cold skills inject only a one-line card, and hidden skills are omitted from context until restored.
 - Default initialized shared skills cover fresh search, source evaluation, connector gaps, and software installation workflow.
 - Agents can inspect existing skills, install local/raw skills, and review skill patch proposals before promotion.
+
+Skill cleanup is configured under `skills.cleanup`:
+
+```yaml
+skills:
+  cleanup:
+    enabled: true
+    cold_after_days: 30
+    hidden_after_days: 90
+    max_usage_count: 1
+    protected: []
+    restore_mode: permanent
+```
+
+Cold skills still appear as tiny recall cards using `name`, `description`, `aliases`, and `when_to_use`. Hidden skills are not deleted; inspect them with `mateway skill cleanup list --state hidden` and restore one with `mateway skill cleanup restore <id>`.
 
 Available:
 
 - `mateway skill catalog report`
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
+- `mateway skill cleanup report|list|restore`
 - `mateway skill proposal list|show|promote|reject`
 - `mateway skill usage report`
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
@@ -487,7 +531,7 @@ Profile productization commands:
 
 ## Gateway Boundary
 
-Gateway is the channel aggregation layer: session key, dedupe, async runtime execution, and reply dispatch. `gateway serve` starts enabled built-in channels from `channels/`, including Feishu WebSocket and native Weixin long-poll.
+Gateway is the channel aggregation layer and local control-plane host: session key, dedupe, async runtime execution, reply dispatch, and the Web Console. `gateway serve` starts enabled built-in channels from `channels/`, including Feishu WebSocket and native Weixin long-poll, plus the local Web Console when `web.enabled` is true.
 
 New stable channels should be added as built-in channel specs so one gateway process can manage them. A channel package owns platform I/O and message normalization, while gateway owns session key, dedupe, async runtime execution, and trace events.
 
@@ -504,10 +548,9 @@ Mateway intentionally does not claim these are finished:
 - no multi-agent supervisor or DAG router
 - no OS-level sandbox wrapper yet
 - no general mail/SSH/GitHub connector framework yet
-- no visual workspace UI yet
 - no external skill marketplace installer yet
 
-The current usable release is focused on: a stable small-core runtime, multi-agent profile foundations, hook pipeline, real tools with risk boundaries, Feishu/CLI entrypoints, traceability, and white-box memory.
+The current usable release is focused on: a stable small-core runtime, multi-agent profile foundations, hook pipeline, real tools with risk boundaries, Feishu/CLI/Web entrypoints, traceability, white-box memory, and live runtime observability.
 
 ## Roadmap
 
@@ -531,6 +574,8 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 - Channel-neutral scheduled task create/test/run-due/serve
 - Built-in channel discovery with `mateway channel list`
 - Secret redaction for persistent runtime records
+- Web Console for chat, skills, schedules, sessions, config, memory, and channel switches
+- Office Watch live runtime timeline over WebSocket, with trace replay
 
 ### Next
 
@@ -539,7 +584,7 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 - script bridge specification for user-provided connectors
 - skill source adapters and promote workflow
 - safer terminal sandbox wrappers
-- read-only trace/task/memory workspace UI
+- richer trace/task/memory workspace UI
 - connector packages for mail, SSH, GitHub, and publishing
 
 ## Design Principles

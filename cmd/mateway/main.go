@@ -562,7 +562,7 @@ func runWorkspace(args []string) error {
 
 func runSkill(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway skill <list|search|install|catalog|proposal|usage>")
+		return fmt.Errorf("usage: mateway skill <list|search|install|catalog|proposal|usage|cleanup>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -645,8 +645,10 @@ func runSkill(args []string) error {
 		return runSkillProposal(cfg, args[1:])
 	case "usage":
 		return runSkillUsage(cfg, args[1:])
+	case "cleanup":
+		return runSkillCleanup(cfg, args[1:])
 	default:
-		return fmt.Errorf("usage: mateway skill <list|search|install|catalog|proposal|usage>")
+		return fmt.Errorf("usage: mateway skill <list|search|install|catalog|proposal|usage|cleanup>")
 	}
 }
 
@@ -750,6 +752,85 @@ func runSkillUsage(cfg *config.Root, args []string) error {
 	}
 	printLearningReport(report)
 	return nil
+}
+
+func runSkillCleanup(cfg *config.Root, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway skill cleanup <report|list|restore>")
+	}
+	input := skill.CleanupInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace, Config: cfg.Skills.Cleanup}
+	switch args[0] {
+	case "report":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: mateway skill cleanup report")
+		}
+		report, err := skill.BuildCleanupReport(input)
+		if err != nil {
+			return err
+		}
+		fmt.Println("skill_cleanup:")
+		fmt.Println("active:", report.Active)
+		fmt.Println("cold:", report.Cold)
+		fmt.Println("hidden:", report.Hidden)
+		for _, item := range report.Items {
+			if item.State != skill.StateCold && item.State != skill.StateHidden {
+				continue
+			}
+			printSkillCleanupItem(item)
+		}
+		return nil
+	case "list":
+		fs := flag.NewFlagSet("mateway skill cleanup list", flag.ContinueOnError)
+		state := fs.String("state", "all", "filter state: cold, hidden, active, protected, all")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("usage: mateway skill cleanup list [--state cold|hidden|active|protected|all]")
+		}
+		report, err := skill.BuildCleanupReport(input)
+		if err != nil {
+			return err
+		}
+		filter := strings.ToLower(strings.TrimSpace(*state))
+		if filter == "" {
+			filter = "all"
+		}
+		fmt.Println("skill_cleanup_items:", len(report.Items))
+		for _, item := range report.Items {
+			if filter != "all" && item.State != filter {
+				continue
+			}
+			printSkillCleanupItem(item)
+		}
+		return nil
+	case "restore":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: mateway skill cleanup restore <skill_id>")
+		}
+		item, err := skill.Restore(input, args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println("skill:", item.Name)
+		fmt.Println("id:", item.ID)
+		fmt.Println("state:", item.State)
+		fmt.Println("reason:", item.Reason)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway skill cleanup <report|list|restore>")
+	}
+}
+
+func printSkillCleanupItem(item skill.CleanupItem) {
+	fmt.Printf("- %s id=%s scope=%s state=%s usage_count=%d", item.Name, item.ID, item.Scope, item.State, item.UsageCount)
+	if item.LastUsedAt != "" {
+		fmt.Printf(" last_used=%s", item.LastUsedAt)
+	}
+	if item.Reason != "" {
+		fmt.Printf(" reason=%q", item.Reason)
+	}
+	fmt.Printf(" path=%s\n", item.Path)
 }
 
 func runAgent(args []string) error {

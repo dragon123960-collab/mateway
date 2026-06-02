@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/config"
 )
@@ -87,6 +88,76 @@ func TestInstallRejectsPlaintextSecret(t *testing.T) {
 	}
 }
 
+func TestCleanupReportClassifiesColdHiddenAndProtected(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	old := time.Now().AddDate(0, 0, -120)
+	cold := time.Now().AddDate(0, 0, -40)
+	writeSkill(t, filepath.Join(workspace, "skills", "old-mail", "SKILL.md"), "old-mail", "Mail.", "", "")
+	writeSkill(t, filepath.Join(workspace, "skills", "cold-review", "SKILL.md"), "cold-review", "Review.", "", "")
+	writeSkill(t, filepath.Join(workspace, "skills", "fresh-search", "SKILL.md"), "fresh-search", "Search.", "", "")
+	setSkillMTime(t, filepath.Join(workspace, "skills", "old-mail", "SKILL.md"), old)
+	setSkillMTime(t, filepath.Join(workspace, "skills", "cold-review", "SKILL.md"), cold)
+
+	report, err := BuildCleanupReport(CleanupInput{
+		Home:      home,
+		Workspace: workspace,
+		Config: config.SkillCleanupConfig{
+			Enabled:         testBoolPtr(true),
+			ColdAfterDays:   30,
+			HiddenAfterDays: 90,
+			MaxUsageCount:   1,
+			Protected:       []string{"fresh-search"},
+			RestoreMode:     "permanent",
+		},
+		Now: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]string{}
+	for _, item := range report.Items {
+		states[item.Name] = item.State
+	}
+	if states["old-mail"] != StateHidden || states["cold-review"] != StateCold || states["fresh-search"] != StateProtected {
+		t.Fatalf("unexpected states: %#v", states)
+	}
+	if report.Hidden != 1 || report.Cold != 1 || report.Active != 1 {
+		t.Fatalf("unexpected counts: %#v", report)
+	}
+}
+
+func TestCleanupRestoreMakesSkillActive(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	path := filepath.Join(workspace, "skills", "old-mail", "SKILL.md")
+	writeSkill(t, path, "old-mail", "Mail.", "", "")
+	setSkillMTime(t, path, time.Now().AddDate(0, 0, -120))
+	input := CleanupInput{
+		Home:      home,
+		Workspace: workspace,
+		Config:    config.SkillCleanupConfig{Enabled: testBoolPtr(true), ColdAfterDays: 30, HiddenAfterDays: 90, MaxUsageCount: 1},
+		Now:       time.Now(),
+	}
+	id := SkillID("shared", "old-mail")
+	item, err := Restore(input, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.State != StateActive || item.Reason != "restored" {
+		t.Fatalf("unexpected restored item: %#v", item)
+	}
+	report, err := BuildCleanupReport(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range report.Items {
+		if item.Name == "old-mail" && item.State != StateActive {
+			t.Fatalf("expected restored skill active, got %#v", item)
+		}
+	}
+}
+
 func writeSkill(t *testing.T, path, name, description, stage, priority string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -96,4 +167,15 @@ func writeSkill(t *testing.T, path, name, description, stage, priority string) {
 	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func setSkillMTime(t *testing.T, path string, at time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testBoolPtr(value bool) *bool {
+	return &value
 }
