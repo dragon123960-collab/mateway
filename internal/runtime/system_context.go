@@ -45,8 +45,6 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString("- Agent profile core prompt files are agent.md, soul.md, user.md, tools.md, and memory.md, but only use this core-file shortcut when the user explicitly asks for core documents.\n")
-	b.WriteString("- If the user asks for all documents under a directory, use the directory listing and include every document file, including nested README/SKILL/Markdown files; do not narrow the task to core prompt files.\n")
 	b.WriteString("\nTask freshness policy:\n")
 	b.WriteString("- First decide whether the task needs real-time or external information.\n")
 	b.WriteString("- Use web.search or web.fetch for weather, news, prices, schedules, software versions, laws, APIs, or anything likely to have changed.\n")
