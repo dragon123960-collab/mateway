@@ -1072,6 +1072,13 @@ func TestRuntimeHandlesDanglingToolCallFinalText(t *testing.T) {
 	if contains(resp.Reply.Text, "TOOL_CALL") || !contains(resp.Reply.Text, "工具调用格式无效") {
 		t.Fatalf("reply did not recover from dangling tool call: %q", resp.Reply.Text)
 	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"task_warning"`) || !contains(string(data), "tool_call_format_issue") {
+		t.Fatalf("trace missing malformed warning:\n%s", data)
+	}
 
 	cfg = &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt = New(cfg)

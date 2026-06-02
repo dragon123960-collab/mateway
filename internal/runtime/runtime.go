@@ -203,6 +203,9 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	if state.Pending == nil {
+		if warning := finalTextWarning(result.FinalText); warning != "" {
+			_ = trace.write(map[string]any{"type": "task_warning", "task_id": task.ID, "warning": warning, "text": result.FinalText})
+		}
 		if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
@@ -533,6 +536,18 @@ func selectedModelConfig(cfg *config.Root, profile config.AgentProfileConfig) co
 		}
 	}
 	return config.ModelConfig{}
+}
+
+func finalTextWarning(text string) string {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	switch {
+	case strings.Contains(lower, "malformed") || strings.Contains(text, "工具调用格式") || strings.Contains(text, "工具调用格式无效"):
+		return "tool_call_format_issue"
+	case strings.Contains(lower, "tool budget reached") || strings.Contains(text, "最大工具循环次数"):
+		return "tool_budget_reached"
+	default:
+		return ""
+	}
 }
 
 func (rt Runtime) home() string {

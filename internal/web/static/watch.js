@@ -70,10 +70,15 @@ function renderWatch() {
   }).join("") || `<div class="meta">等待实时事件</div>`;
   const usage = latestPayload("usage_delta") || {};
   const context = latestPayload("context_built") || {};
+  const counts = eventCounts();
   document.getElementById("watch-metrics").innerHTML = [
-    ["Input", usage.input_tokens || 0],
-    ["Output", usage.output_tokens || 0],
-    ["Total", usage.total_tokens || 0],
+    ["Stage", label(latest?.type || "idle")],
+    ["Events", watch.events.length],
+    ["Model Turns", counts.model],
+    ["Tool Runs", counts.tool],
+    ["Input Tokens", usage.input_tokens || 0],
+    ["Output Tokens", usage.output_tokens || 0],
+    ["Total Tokens", usage.total_tokens || 0],
     ["Context", `${context.estimated_context || context.estimated_tokens || 0} est`],
   ].map(([k, v]) => `<div class="card"><span class="meta">${esc(k)}</span><strong>${esc(v)}</strong></div>`).join("");
 }
@@ -83,6 +88,15 @@ function latestPayload(type) {
     if (watch.events[i]?.type === type) return watch.events[i].payload || {};
   }
   return null;
+}
+
+function eventCounts() {
+  return watch.events.reduce((acc, event) => {
+    const type = event?.type || "";
+    if (type === "model_started" || type === "model_finished") acc.model++;
+    if (type === "tool_started" || type === "tool_finished") acc.tool++;
+    return acc;
+  }, { model: 0, tool: 0 });
 }
 
 function eventType(traceType) {
@@ -99,6 +113,7 @@ function eventType(traceType) {
     model_usage: "usage_delta",
     reply: "reply",
     task_completed: "task_completed",
+    task_warning: "task_warning",
     task_blocked: "task_blocked",
     runtime_done: "runtime_done",
     model_error: "error",
@@ -120,6 +135,7 @@ function label(type) {
     usage_delta: "Usage",
     reply: "Reply",
     task_completed: "Completed",
+    task_warning: "Warning",
     task_blocked: "Waiting",
     runtime_done: "Runtime Done",
     error: "Error",
@@ -128,7 +144,7 @@ function label(type) {
 
 function detail(event) {
   const p = event?.payload || {};
-  return p.text || p.summary || p.status || p.error || p.hook || p.tool_call?.Name || p.tool_call?.name || p.trace_id || "";
+  return p.warning || p.text || p.summary || p.status || p.error || p.hook || p.tool_call?.Name || p.tool_call?.name || p.trace_id || "";
 }
 
 function monitorText(event) {
@@ -155,7 +171,7 @@ function agentStatus(type) {
   if (type === "tool_started" || type === "tool_finished") return "tooling";
   if (type === "task_blocked") return "waiting";
   if (type === "task_completed" || type === "runtime_done" || type === "reply") return "done";
-  if (type === "error") return "error";
+  if (type === "error" || type === "task_warning") return "error";
   return "idle";
 }
 

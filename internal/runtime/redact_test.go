@@ -25,6 +25,21 @@ func TestRedactSecretString(t *testing.T) {
 	}
 }
 
+func TestRedactionKeepsUsageTokenCounters(t *testing.T) {
+	payload := redactPayload(map[string]any{
+		"input_tokens":  12,
+		"output_tokens": 5,
+		"total_tokens":  17,
+		"api_token":     "secret-token-value",
+	})
+	if payload["input_tokens"] != 12 || payload["output_tokens"] != 5 || payload["total_tokens"] != 17 {
+		t.Fatalf("usage counters were redacted: %#v", payload)
+	}
+	if payload["api_token"] != redactedSecret {
+		t.Fatalf("secret token was not redacted: %#v", payload)
+	}
+}
+
 func TestRuntimeTraceRedactsToolResultSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}

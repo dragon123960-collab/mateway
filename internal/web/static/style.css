@@ -376,6 +376,10 @@ textarea {
   border-left-color: var(--bad);
 }
 
+.event-row.task_warning {
+  border-left-color: var(--warn);
+}
+
 .inspector {
   min-width: 0;
   height: 100vh;

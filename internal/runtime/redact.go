@@ -121,12 +121,24 @@ func redactSecretString(text string) string {
 func isSecretKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	normalized = strings.ReplaceAll(normalized, "-", "_")
+	if isTelemetryKey(normalized) {
+		return false
+	}
 	for _, marker := range []string{"secret", "token", "api_key", "apikey", "password", "passwd", "pwd", "smtp_pass", "imap_pass", "pop3_pass", "authorization", "auth_code"} {
 		if strings.Contains(normalized, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+func isTelemetryKey(key string) bool {
+	switch key {
+	case "input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens", "max_tokens", "max_output_tokens":
+		return true
+	default:
+		return false
+	}
 }
 
 func redactPayload(payload map[string]any) map[string]any {

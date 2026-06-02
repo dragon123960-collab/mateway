@@ -185,9 +185,14 @@ function updateLivePane() {
 function renderLiveStats() {
   const usage = latestPayload("usage_delta") || {};
   const context = latestPayload("context_built") || {};
+  const counts = liveEventCounts();
+  const latest = state.events[state.events.length - 1] || {};
   return `<div class="live-stats">
+    <div><span>Stage</span><strong>${h(eventLabel(latest.type || "idle"))}</strong></div>
+    <div><span>Events</span><strong>${h(state.events.length)}</strong></div>
+    <div><span>Model</span><strong>${h(counts.model)}</strong></div>
+    <div><span>Tools</span><strong>${h(counts.tool)}</strong></div>
     <div><span>Input</span><strong>${h(usage.input_tokens || 0)}</strong></div>
-    <div><span>Output</span><strong>${h(usage.output_tokens || 0)}</strong></div>
     <div><span>Total</span><strong>${h(usage.total_tokens || 0)}</strong></div>
     <div><span>Context</span><strong>${h(context.estimated_context || context.estimated_tokens || 0)} est</strong></div>
   </div>`;
@@ -200,12 +205,22 @@ function latestPayload(type) {
   return null;
 }
 
+function liveEventCounts() {
+  return state.events.reduce((acc, event) => {
+    const type = event?.type || "";
+    if (type === "model_started" || type === "model_finished") acc.model++;
+    if (type === "tool_started" || type === "tool_finished") acc.tool++;
+    return acc;
+  }, { model: 0, tool: 0 });
+}
+
 function eventRow(event) {
   event = normalizeEvent(event);
   const payload = event.payload || {};
   const label = eventLabel(event.type);
   const detail = payload.tool_call?.Name || payload.tool_call?.name || payload.hook || payload.text || payload.summary || payload.status || payload.error || "";
-  return `<div class="event-row ${h(event.type)}"><span>${h(label)}</span><strong>${h(detail)}</strong></div>`;
+  const finalDetail = payload.warning || detail;
+  return `<div class="event-row ${h(event.type)}"><span>${h(label)}</span><strong>${h(finalDetail)}</strong></div>`;
 }
 
 function normalizeEvent(event) {
@@ -226,6 +241,7 @@ function eventLabel(type) {
     tool_finished: "tool done",
     usage_delta: "usage",
     reply: "reply",
+    task_warning: "warning",
     task_completed: "done",
     task_blocked: "waiting",
     runtime_done: "finished",
