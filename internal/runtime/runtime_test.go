@@ -1175,6 +1175,50 @@ func TestRuntimeHandlesDanglingToolCallFinalText(t *testing.T) {
 	}
 }
 
+func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "接下来写三个脚本,然后跑连通性测试。"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建邮件 skill"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "接下来写三个脚本,然后跑连通性测试。" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 {
+		t.Fatalf("expected one task, got %#v", state.Tasks)
+	}
+	if state.Tasks[0].Status != "await_execution" {
+		t.Fatalf("expected await_execution, got %q", state.Tasks[0].Status)
+	}
+	if state.Tasks[0].Summary != "" {
+		t.Fatalf("expected no completed summary, got %q", state.Tasks[0].Summary)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"status":"await_execution"`) || !contains(string(data), "unfinished_execution_plan") {
+		t.Fatalf("trace missing await_execution block:\n%s", data)
+	}
+}
+
+func TestPendingAgentProfileProposalIDIgnoresNilEvidence(t *testing.T) {
+	task := &session.TaskNode{Steps: []session.TaskStep{{
+		Tool:     "file.write",
+		Status:   "accepted",
+		Evidence: map[string]any{"proposal_id": nil},
+	}}}
+	if id := pendingAgentProfileProposalID(task); id != "" {
+		t.Fatalf("expected no proposal id, got %q", id)
+	}
+}
+
 func TestRuntimeDangerousTerminalCommandRequiresConfirmationEvenWhenRiskyAllowed(t *testing.T) {
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: t.TempDir()},

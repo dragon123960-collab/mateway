@@ -216,6 +216,9 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_user_input", "question": result.FinalText})
+		} else if looksLikeUnfinishedExecutionPlan(result.FinalText) {
+			state.BlockActiveTask("await_execution")
+			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_execution", "reason": "unfinished_execution_plan", "text": result.FinalText})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(result.FinalText), trace.id, trace.path)
 			taskCompleted = true
@@ -556,6 +559,38 @@ func finalTextWarning(text string) string {
 	}
 }
 
+func looksLikeUnfinishedExecutionPlan(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	planCues := []string{
+		"接下来", "然后", "再跑", "再执行", "准备", "我会", "我将", "下一步",
+		"next", "then", "i will", "i'll", "going to",
+	}
+	hasPlanCue := false
+	for _, cue := range planCues {
+		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+			hasPlanCue = true
+			break
+		}
+	}
+	if !hasPlanCue {
+		return false
+	}
+	actionCues := []string{
+		"写", "建", "创建", "修改", "跑", "测试", "验证", "执行", "脚本", "文件",
+		"write", "create", "modify", "run", "test", "verify", "script", "file",
+	}
+	for _, cue := range actionCues {
+		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+			return true
+		}
+	}
+	return false
+}
+
 func (rt Runtime) home() string {
 	home := config.DefaultHome()
 	if rt.Config != nil && strings.TrimSpace(rt.Config.App.Home) != "" {
@@ -607,11 +642,16 @@ func pendingAgentProfileProposalID(task *session.TaskNode) string {
 		if task.Steps[i].Tool != "file.write" || task.Steps[i].Status != "accepted" {
 			continue
 		}
-		if id := strings.TrimSpace(fmt.Sprint(task.Steps[i].Evidence["proposal_id"])); id != "" {
+		if id := strings.TrimSpace(fmt.Sprint(task.Steps[i].Evidence["proposal_id"])); validProposalID(id) {
 			return id
 		}
 	}
 	return ""
+}
+
+func validProposalID(id string) bool {
+	id = strings.TrimSpace(id)
+	return id != "" && id != "<nil>" && !strings.EqualFold(id, "nil") && !strings.EqualFold(id, "null")
 }
 
 func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIndex int, toolCallID string) string {
