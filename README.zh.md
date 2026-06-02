@@ -148,6 +148,7 @@ Mateway 目前支持：
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
+- Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
 - 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
 - 本地 secret store：`mateway secret set/get/list/delete`
 - trace 中可见 hook events
@@ -380,6 +381,12 @@ memory:
 ```
 
 如果定时任务需要通知某人，请把通知写进任务本身，通过已有 tool、本地脚本、connector 或 skill 完成。没有可用投递渠道时，agent 应说明缺口，并询问是否需要创建相关脚本或 skill。
+
+## 模型工具调用
+
+Mateway 现在优先使用大模型原生 tool/function calling，不再把手写工具 JSON 当作主路径。Anthropic-compatible 模型，例如 MiniMax M3，会使用 Anthropic `tools` / `tool_use`；OpenAI Chat-compatible 模型，例如 GLM Flash，会使用 Chat Completions `tools` / `tool_calls`。旧的 `[TOOL_CALL]` 文本协议只保留为兜底：当某个模型 API 不支持原生工具调用，或原生请求失败时才使用。
+
+所有入口共用同一个 runtime loop，所以 CLI、飞书、微信、Web Console 和定时任务，只要配置的模型支持原生工具调用，都会走同一条原生工具路径。OpenAI Responses 风格的 `api: openai` 目前保持保守处理，在对应 provider 或代理的原生 Responses tools 验证完成前继续使用 fallback 路径。
 
 ## Trace 命令
 

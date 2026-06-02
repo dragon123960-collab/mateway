@@ -25,6 +25,51 @@ func TestParseAnthropicResultUsage(t *testing.T) {
 	}
 }
 
+func TestParseAnthropicResultToolUse(t *testing.T) {
+	result, err := parseAnthropicResult([]byte(`{
+		"content":[
+			{"type":"text","text":"reading"},
+			{"type":"tool_use","id":"toolu_1","name":"file_read","input":{"path":"README.md"}}
+		],
+		"usage":{"input_tokens":12,"output_tokens":5}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "reading" || len(result.ToolCalls) != 1 {
+		t.Fatalf("unexpected result %#v", result)
+	}
+	if result.ToolCalls[0].ID != "toolu_1" || result.ToolCalls[0].Name != "file.read" || result.ToolCalls[0].Args["path"] != "README.md" {
+		t.Fatalf("unexpected tool call %#v", result.ToolCalls[0])
+	}
+}
+
+func TestParseOpenAIChatResultToolCalls(t *testing.T) {
+	result, err := parseOpenAIResult([]byte(`{
+		"choices":[{
+			"message":{
+				"role":"assistant",
+				"content":null,
+				"tool_calls":[{
+					"id":"call_1",
+					"type":"function",
+					"function":{"name":"terminal_run","arguments":"{\"command\":\"go test ./...\"}"}
+				}]
+			}
+		}],
+		"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("expected tool call, got %#v", result)
+	}
+	if result.ToolCalls[0].Name != "terminal.run" || result.ToolCalls[0].Args["command"] != "go test ./..." {
+		t.Fatalf("unexpected tool call %#v", result.ToolCalls[0])
+	}
+}
+
 func TestParseOpenAIResponsesResultUsage(t *testing.T) {
 	result := parseOpenAIResponsesResult([]byte(`{
 		"output_text":"hello",
@@ -32,6 +77,53 @@ func TestParseOpenAIResponsesResultUsage(t *testing.T) {
 	}`))
 	if result.Text != "hello" || result.Usage.InputTokens != 20 || result.Usage.OutputTokens != 8 || result.Usage.TotalTokens != 28 {
 		t.Fatalf("unexpected result %#v", result)
+	}
+}
+
+func TestNativeSystemPromptDoesNotIncludeTextToolProtocol(t *testing.T) {
+	prompt := buildNativeSystemPrompt("base", []agentcore.Tool{fakeTool{name: "file.read", required: []string{"path"}}})
+	if contains(prompt, "[TOOL_CALL]") {
+		t.Fatalf("native prompt should not contain text protocol: %s", prompt)
+	}
+	if !contains(prompt, "native name: file_read") {
+		t.Fatalf("expected native alias in prompt: %s", prompt)
+	}
+}
+
+func TestTextSystemPromptKeepsFallbackToolProtocol(t *testing.T) {
+	prompt := buildTextSystemPrompt("base", []agentcore.Tool{fakeTool{name: "file.read", required: []string{"path"}}})
+	if !contains(prompt, "[TOOL_CALL]") || !contains(prompt, "file.read exactly") {
+		t.Fatalf("expected fallback protocol in prompt: %s", prompt)
+	}
+}
+
+func TestAnthropicMessagesIncludeNativeToolBlocks(t *testing.T) {
+	messages := anthropicMessages([]Message{
+		{Role: "assistant", ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": "README.md"}}}},
+		{Role: "tool", ToolCallID: "call_1", Content: "ok"},
+	})
+	data, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !contains(text, `"type":"tool_use"`) || !contains(text, `"name":"file_read"`) || !contains(text, `"type":"tool_result"`) {
+		t.Fatalf("unexpected anthropic messages %s", text)
+	}
+}
+
+func TestOpenAIChatMessagesIncludeNativeToolCalls(t *testing.T) {
+	messages := openAIChatMessages("", []Message{
+		{Role: "assistant", ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": "README.md"}}}},
+		{Role: "tool", ToolCallID: "call_1", Content: "ok"},
+	})
+	data, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !contains(text, `"tool_calls"`) || !contains(text, `"name":"file_read"`) || !contains(text, `"role":"tool"`) {
+		t.Fatalf("unexpected openai chat messages %s", text)
 	}
 }
 
@@ -160,4 +252,17 @@ func TestAnthropicContentIncludesTextAndImage(t *testing.T) {
 
 func contains(text, sub string) bool {
 	return strings.Contains(text, sub)
+}
+
+type fakeTool struct {
+	name     string
+	required []string
+}
+
+func (t fakeTool) Name() string             { return t.name }
+func (t fakeTool) Description() string      { return "fake tool" }
+func (t fakeTool) Schema() agentcore.Schema { return agentcore.Schema{Required: t.required} }
+func (t fakeTool) Risk() agentcore.Risk     { return agentcore.RiskSafeRead }
+func (t fakeTool) Run(context.Context, agentcore.ToolCall) agentcore.ToolResult {
+	return agentcore.ToolResult{}
 }

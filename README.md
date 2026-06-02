@@ -157,6 +157,7 @@ Mateway currently supports:
 - task tree and follow-up binding
 - pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
+- native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
 - parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
 - local secret store: `mateway secret set/get/list/delete`
 - hook events in trace
@@ -383,6 +384,12 @@ Run due tasks once or keep a foreground runner alive:
 ```
 
 If a scheduled task needs notification, make notification part of the task itself through an available tool, local script, connector, or skill. If no delivery channel exists, the agent should explain the gap and ask whether to create the relevant script or skill.
+
+## Model Tool Calling
+
+Mateway prefers native model tool/function calling instead of asking the model to hand-write tool-call JSON. Anthropic-compatible models such as MiniMax M3 use Anthropic `tools` / `tool_use`; OpenAI Chat-compatible models such as GLM Flash use Chat Completions `tools` / `tool_calls`. The older `[TOOL_CALL]` text protocol remains only as a fallback for model APIs that do not support native tool calling or fail a native request.
+
+All entrypoints share the same runtime loop, so CLI, Feishu, Weixin, Web Console, and scheduled tasks use the same native-tool path whenever their configured model supports it. OpenAI Responses-style `api: openai` is currently treated conservatively and uses the fallback path unless native Responses tools are added and verified for the configured provider or proxy.
 
 ## Trace Commands
 
