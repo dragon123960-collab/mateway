@@ -165,7 +165,8 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		UserText: userText,
 		Profile:  profile,
 	}, trace)
-	agent.Hooks = rt.hooksForState(state, task.ID, trace, steering)
+	var progress progressCollector
+	agent.Hooks = rt.hooksForState(state, task.ID, trace, steering, &progress)
 	contextChars := messageChars(messages) + messageChars(steering)
 	_ = trace.write(map[string]any{
 		"type":                "context_built",
@@ -212,6 +213,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		if warning := finalResultWarning(result); warning != "" {
 			_ = trace.write(map[string]any{"type": "task_warning", "task_id": task.ID, "warning": warning, "text": result.FinalText})
 			state.BlockActiveTask("failed")
+			progress.Add("任务未完成：" + progressReasonLabel(warning) + "。")
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": result.FinalText})
 		} else if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
@@ -298,6 +300,15 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
 	var followUps []channel.OutboundMessage
+	if progressText := progress.Render(); progressText != "" {
+		followUps = append(followUps, channel.OutboundMessage{
+			Channel:  msg.Channel,
+			ThreadID: msg.ThreadID,
+			Text:     progressText,
+			Style:    "progress",
+			Locale:   runtimeLocale(rt.Config, msg),
+		})
+	}
 	if learningResult != nil && learningResult.Proposal != nil {
 		followUps = append(followUps, channel.OutboundMessage{
 			Channel:  msg.Channel,
@@ -759,7 +770,63 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 	return out
 }
 
-func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+type progressCollector struct {
+	notes []string
+}
+
+func (p *progressCollector) Add(note string) {
+	if p == nil {
+		return
+	}
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return
+	}
+	for _, existing := range p.notes {
+		if existing == note {
+			return
+		}
+	}
+	p.notes = append(p.notes, note)
+}
+
+func (p *progressCollector) Render() string {
+	if p == nil || len(p.notes) == 0 {
+		return ""
+	}
+	limit := len(p.notes)
+	if limit > 3 {
+		limit = 3
+	}
+	var b strings.Builder
+	b.WriteString("过程提示：")
+	for i := 0; i < limit; i++ {
+		b.WriteString("\n- ")
+		b.WriteString(p.notes[i])
+	}
+	if remaining := len(p.notes) - limit; remaining > 0 {
+		b.WriteString("\n- 还有 ")
+		b.WriteString(fmt.Sprint(remaining))
+		b.WriteString(" 条过程记录，详见 trace。")
+	}
+	return b.String()
+}
+
+func progressReasonLabel(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "tool_budget_reached":
+		return "工具预算已到上限"
+	case "tool_call_format_issue":
+		return "工具调用格式无效"
+	default:
+		if strings.TrimSpace(reason) == "" {
+			return "执行失败"
+		}
+		return reason
+	}
+}
+
+func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message, progress *progressCollector) agentcore.Hooks {
 	steeringSent := false
 	var followUps []agentcore.Message
 	return agentcore.Hooks{
@@ -773,6 +840,9 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 		},
 		ShouldStopAfterTurn: func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
 			if len(turn.Message.ToolCalls) == 0 && looksLikeUnfinishedExecutionPlan(turn.Message.Content) {
+				if progress != nil {
+					progress.Add("检测到模型只给了后续计划，已要求它继续执行。")
+				}
 				followUps = append(followUps, agentcore.Message{
 					Role:    agentcore.RoleUser,
 					Content: "Completion check failed: your previous message described future work but did not complete it. Continue the task now. Execute the required tools, or ask the user only if required information is missing. Do not present a plan as the final answer.",
@@ -815,6 +885,9 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
+				if progress != nil && observe.TaskStep.Status == "failed" {
+					progress.Add("工具 `" + input.ToolCall.Name + "` 失败：" + summarize(observe.TaskStep.Summary))
+				}
 			}
 			return agentcore.AfterToolCallResult{}, nil
 		},

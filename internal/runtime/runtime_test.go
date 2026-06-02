@@ -1263,6 +1263,25 @@ func TestRuntimeDoesNotSynthesizeScriptAfterToolBudget(t *testing.T) {
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
 		t.Fatalf("expected failed task, got %#v", state.Tasks)
 	}
+	if len(resp.FollowUps) != 1 || !contains(resp.FollowUps[0].Text, "工具预算已到上限") {
+		t.Fatalf("expected budget progress follow-up, got %#v", resp.FollowUps)
+	}
+}
+
+func TestRuntimeProgressFollowUpMentionsToolFailure(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "secret.set", Args: map[string]any{"id": "mail.auth", "value": "[REDACTED_SECRET]"}}}},
+		{Role: agentcore.RoleAssistant, Content: "授权码不可用，请重新提供真实授权码。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "保存授权码"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.FollowUps) != 1 || !contains(resp.FollowUps[0].Text, "工具 `secret.set` 失败") {
+		t.Fatalf("expected tool failure progress follow-up, got %#v", resp.FollowUps)
+	}
 }
 
 func TestPendingAgentProfileProposalIDIgnoresNilEvidence(t *testing.T) {
