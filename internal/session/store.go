@@ -222,7 +222,7 @@ func (s *State) ActivateTask(taskID string) *TaskNode {
 
 func IsOpenTaskStatus(status string) bool {
 	switch strings.TrimSpace(status) {
-	case "", "running", "await_confirm", "await_user_input", "await_execution":
+	case "", "running", "await_confirm", "await_user_input":
 		return true
 	default:
 		return false

@@ -2,7 +2,6 @@ package tool
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +9,6 @@ import (
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/secret"
 )
 
 func TestResolveAllowedPathDefaultsRelativeToHome(t *testing.T) {
@@ -96,67 +94,6 @@ func TestFileWriteRejectsSkillPlaintextSecret(t *testing.T) {
 	})
 	if !result.IsError || !strings.Contains(result.Content, "refusing to write secret-like content") {
 		t.Fatalf("expected secret write rejection, got %#v", result)
-	}
-}
-
-func TestSecretSetToolStoresValueWithoutReturningIt(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}}
-	result := SecretSetTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "secret.set",
-		Args: map[string]any{"id": "mail.pop_password", "value": "supersecret123"},
-	})
-	if result.IsError || result.Evidence["stored"] != true {
-		t.Fatalf("expected stored secret result, got %#v", result)
-	}
-	if strings.Contains(result.Content, "supersecret123") || strings.Contains(fmt.Sprint(result.Evidence), "supersecret123") {
-		t.Fatalf("secret value leaked in result: %#v", result)
-	}
-	entry, ok, err := secret.Store{Home: home}.Get("mail.pop_password")
-	if err != nil || !ok || entry.Value != "supersecret123" {
-		t.Fatalf("secret not stored: entry=%#v ok=%v err=%v", entry, ok, err)
-	}
-}
-
-func TestSecretSetToolRejectsRedactedPlaceholder(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}}
-	result := SecretSetTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "secret.set",
-		Args: map[string]any{"id": "mail.auth_code", "value": "[REDACTED_SECRET]"},
-	})
-	if !result.IsError || !strings.Contains(result.Content, "redacted placeholder") {
-		t.Fatalf("expected placeholder rejection, got %#v", result)
-	}
-	store := secret.Store{Home: home}
-	if _, ok, err := store.Get("mail.auth_code"); err != nil || ok {
-		t.Fatalf("placeholder should not be stored: ok=%v err=%v", ok, err)
-	}
-}
-
-func TestScriptRunToolAcceptsItemArgsObject(t *testing.T) {
-	home := t.TempDir()
-	scriptPath := filepath.Join(home, "scripts", "mail")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n# mateway.name: email.receive\necho count=$1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}}
-	cfg.NormalizeForUse()
-	result := ScriptRunTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "script.run",
-		Args: map[string]any{"name": "email.receive", "args": map[string]any{"item": "1"}},
-	})
-	if result.IsError || !strings.Contains(result.Content, "count=1") {
-		t.Fatalf("expected script arg to be passed, got %#v", result)
-	}
-	if got := fmt.Sprint(result.Evidence["args"]); got != "[1]" {
-		t.Fatalf("args evidence = %s", got)
 	}
 }
 

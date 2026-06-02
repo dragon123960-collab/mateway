@@ -139,5 +139,4 @@ type Result struct {
 	Messages   []Message
 	FinalText  string
 	Iterations int
-	StopReason string
 }

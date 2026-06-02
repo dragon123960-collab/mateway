@@ -7,11 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
-
-var storeMu sync.Mutex
 
 type Store struct {
 	Home string
@@ -25,8 +22,6 @@ type Entry struct {
 }
 
 func (s Store) Set(id, value string) error {
-	storeMu.Lock()
-	defer storeMu.Unlock()
 	id = normalizeID(id)
 	if id == "" {
 		return fmt.Errorf("secret id is required")
@@ -73,8 +68,6 @@ func (s Store) List() ([]Entry, error) {
 }
 
 func (s Store) Delete(id string) (bool, error) {
-	storeMu.Lock()
-	defer storeMu.Unlock()
 	data, err := s.load()
 	if err != nil {
 		return false, err
@@ -127,24 +120,7 @@ func (s Store) save(data map[string]Entry) error {
 		return err
 	}
 	out = append(out, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".secrets-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(out); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
+	return os.WriteFile(path, out, 0o600)
 }
 
 func normalizeID(id string) string {

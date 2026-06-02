@@ -115,21 +115,14 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 			return finish(ctx, cfg.Hooks, result)
 		}
 		if iteration == maxIterations {
-			result := Result{
-				Messages:   transcript,
-				FinalText:  "工具预算已到上限，任务未完成。已有工具结果已保留在 trace 中；请补充信息后重试或继续当前任务。",
-				Iterations: iteration,
-				StopReason: "tool_budget_reached",
-			}
-			return finish(ctx, cfg.Hooks, result)
+			return synthesizeAfterToolBudget(ctx, cfg, transcript, iteration)
 		}
 	}
 
 	result := Result{
 		Messages:   transcript,
-		FinalText:  "工具预算已到上限，任务未完成。已有工具结果已保留在 trace 中；请补充信息后重试或继续当前任务。",
+		FinalText:  "达到最大工具循环次数，已停止。",
 		Iterations: maxIterations,
-		StopReason: "tool_budget_reached",
 	}
 	return finish(ctx, cfg.Hooks, result)
 }

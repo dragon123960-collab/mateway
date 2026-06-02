@@ -180,7 +180,7 @@ func TestRunMaxIterations(t *testing.T) {
 	if result.Iterations != 2 {
 		t.Fatalf("Iterations = %d", result.Iterations)
 	}
-	if !strings.Contains(result.FinalText, "工具预算已到上限") || result.StopReason != "tool_budget_reached" {
+	if !strings.Contains(result.FinalText, "最大工具循环次数") {
 		t.Fatalf("FinalText = %q", result.FinalText)
 	}
 }
@@ -193,14 +193,11 @@ func TestRunSynthesizesAfterToolBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.FinalText != "工具预算已到上限，任务未完成。已有工具结果已保留在 trace 中；请补充信息后重试或继续当前任务。" {
+	if result.FinalText != "summary from existing evidence" {
 		t.Fatalf("FinalText = %q", result.FinalText)
 	}
-	if result.StopReason != "tool_budget_reached" {
-		t.Fatalf("StopReason = %q", result.StopReason)
-	}
-	if containsUserMessage(result.Messages, "Tool budget reached") {
-		t.Fatalf("budget synthesis instruction should not be appended: %#v", result.Messages)
+	if !containsUserMessage(result.Messages, "Tool budget reached") {
+		t.Fatalf("synthesis instruction not appended: %#v", result.Messages)
 	}
 }
 
@@ -256,43 +253,6 @@ func TestRunBeforeToolCallCanBlock(t *testing.T) {
 	}
 	if !containsToolMessage(result.Messages, "needs confirmation") {
 		t.Fatalf("blocked tool result not appended: %#v", result.Messages)
-	}
-}
-
-func TestRunCanContinueAfterRejectedFinalText(t *testing.T) {
-	model := scriptedModel{messages: []Message{
-		{Role: RoleAssistant, Content: "next I will write the script"},
-		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.echo", Args: map[string]any{"text": "script written"}}}},
-		{Role: RoleAssistant, Content: "completed with evidence"},
-	}}
-	registry := NewToolRegistry()
-	registry.Register(testEchoTool{})
-	var followUps []Message
-	result, err := Run(context.Background(), Config{
-		Model: &model,
-		Tools: registry,
-		Hooks: Hooks{
-			ShouldStopAfterTurn: func(_ context.Context, turn TurnContext) (bool, error) {
-				if turn.Message.Content == "next I will write the script" {
-					followUps = append(followUps, Message{Role: RoleUser, Content: "finish now"})
-				}
-				return false, nil
-			},
-			GetFollowUpMessages: func(context.Context) ([]Message, error) {
-				out := followUps
-				followUps = nil
-				return out, nil
-			},
-		},
-	}, []Message{{Role: RoleUser, Content: "create script"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.FinalText != "completed with evidence" {
-		t.Fatalf("FinalText = %q", result.FinalText)
-	}
-	if !containsUserMessage(result.Messages, "finish now") || !containsToolMessage(result.Messages, "script written") {
-		t.Fatalf("expected correction and tool evidence, got %#v", result.Messages)
 	}
 }
 

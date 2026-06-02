@@ -151,13 +151,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxIterations = 6
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	profile := rt.Pool.ProfileForMessage(msg)
-	contextSkills := contextSkillsForTask(rt.Config, profile.ID, userText, 8)
-	_ = trace.write(map[string]any{
-		"type":    "skills_selected",
-		"task_id": task.ID,
-		"label":   "context_skills",
-		"skills":  traceSkills(contextSkills),
-	})
+	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	steering := rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
@@ -165,8 +159,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		UserText: userText,
 		Profile:  profile,
 	}, trace)
-	var progress progressCollector
-	agent.Hooks = rt.hooksForState(state, task.ID, trace, steering, &progress)
+	agent.Hooks = rt.hooksForState(state, task.ID, trace, steering)
 	contextChars := messageChars(messages) + messageChars(steering)
 	_ = trace.write(map[string]any{
 		"type":                "context_built",
@@ -210,18 +203,10 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	if state.Pending == nil {
-		if warning := finalResultWarning(result); warning != "" {
-			_ = trace.write(map[string]any{"type": "task_warning", "task_id": task.ID, "warning": warning, "text": result.FinalText})
-			state.BlockActiveTask("failed")
-			progress.Add("任务未完成：" + progressReasonLabel(warning) + "。")
-			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": result.FinalText})
-		} else if looksLikeInputRequest(result.FinalText) {
+		if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_user_input", "question": result.FinalText})
-		} else if looksLikeUnfinishedExecutionPlan(result.FinalText) {
-			state.BlockActiveTask("await_execution")
-			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_execution", "reason": "unfinished_execution_plan", "text": result.FinalText})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(result.FinalText), trace.id, trace.path)
 			taskCompleted = true
@@ -274,7 +259,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			FinalText:  result.FinalText,
 			TraceID:    trace.id,
 			TracePath:  trace.path,
-			Skills:     memorySkills(contextSkills),
+			Skills:     memorySkills(discoveredSkills),
 			UserText:   userText,
 		}, trace)
 		learningResult = observe.LearningResult
@@ -300,15 +285,6 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
 	var followUps []channel.OutboundMessage
-	if progressText := progress.Render(); progressText != "" {
-		followUps = append(followUps, channel.OutboundMessage{
-			Channel:  msg.Channel,
-			ThreadID: msg.ThreadID,
-			Text:     progressText,
-			Style:    "progress",
-			Locale:   runtimeLocale(rt.Config, msg),
-		})
-	}
 	if learningResult != nil && learningResult.Proposal != nil {
 		followUps = append(followUps, channel.OutboundMessage{
 			Channel:  msg.Channel,
@@ -559,57 +535,6 @@ func selectedModelConfig(cfg *config.Root, profile config.AgentProfileConfig) co
 	return config.ModelConfig{}
 }
 
-func finalTextWarning(text string) string {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	switch {
-	case strings.Contains(lower, "malformed") || strings.Contains(text, "工具调用格式") || strings.Contains(text, "工具调用格式无效"):
-		return "tool_call_format_issue"
-	case strings.Contains(lower, "tool budget reached") || strings.Contains(text, "最大工具循环次数"):
-		return "tool_budget_reached"
-	default:
-		return ""
-	}
-}
-
-func finalResultWarning(result agentcore.Result) string {
-	if strings.TrimSpace(result.StopReason) != "" {
-		return strings.TrimSpace(result.StopReason)
-	}
-	return finalTextWarning(result.FinalText)
-}
-
-func looksLikeUnfinishedExecutionPlan(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return false
-	}
-	lower := strings.ToLower(trimmed)
-	planCues := []string{
-		"接下来", "然后", "再跑", "再执行", "准备", "我会", "我将", "下一步",
-		"next", "then", "i will", "i'll", "going to",
-	}
-	hasPlanCue := false
-	for _, cue := range planCues {
-		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
-			hasPlanCue = true
-			break
-		}
-	}
-	if !hasPlanCue {
-		return false
-	}
-	actionCues := []string{
-		"写", "建", "创建", "修改", "跑", "测试", "验证", "执行", "脚本", "文件",
-		"write", "create", "modify", "run", "test", "verify", "script", "file",
-	}
-	for _, cue := range actionCues {
-		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
-			return true
-		}
-	}
-	return false
-}
-
 func (rt Runtime) home() string {
 	home := config.DefaultHome()
 	if rt.Config != nil && strings.TrimSpace(rt.Config.App.Home) != "" {
@@ -661,16 +586,11 @@ func pendingAgentProfileProposalID(task *session.TaskNode) string {
 		if task.Steps[i].Tool != "file.write" || task.Steps[i].Status != "accepted" {
 			continue
 		}
-		if id := strings.TrimSpace(fmt.Sprint(task.Steps[i].Evidence["proposal_id"])); validProposalID(id) {
+		if id := strings.TrimSpace(fmt.Sprint(task.Steps[i].Evidence["proposal_id"])); id != "" {
 			return id
 		}
 	}
 	return ""
-}
-
-func validProposalID(id string) bool {
-	id = strings.TrimSpace(id)
-	return id != "" && id != "<nil>" && !strings.EqualFold(id, "nil") && !strings.EqualFold(id, "null")
 }
 
 func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIndex int, toolCallID string) string {
@@ -770,65 +690,8 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 	return out
 }
 
-type progressCollector struct {
-	notes []string
-}
-
-func (p *progressCollector) Add(note string) {
-	if p == nil {
-		return
-	}
-	note = strings.TrimSpace(note)
-	if note == "" {
-		return
-	}
-	for _, existing := range p.notes {
-		if existing == note {
-			return
-		}
-	}
-	p.notes = append(p.notes, note)
-}
-
-func (p *progressCollector) Render() string {
-	if p == nil || len(p.notes) == 0 {
-		return ""
-	}
-	limit := len(p.notes)
-	if limit > 3 {
-		limit = 3
-	}
-	var b strings.Builder
-	b.WriteString("过程提示：")
-	for i := 0; i < limit; i++ {
-		b.WriteString("\n- ")
-		b.WriteString(p.notes[i])
-	}
-	if remaining := len(p.notes) - limit; remaining > 0 {
-		b.WriteString("\n- 还有 ")
-		b.WriteString(fmt.Sprint(remaining))
-		b.WriteString(" 条过程记录，详见 trace。")
-	}
-	return b.String()
-}
-
-func progressReasonLabel(reason string) string {
-	switch strings.TrimSpace(reason) {
-	case "tool_budget_reached":
-		return "工具预算已到上限"
-	case "tool_call_format_issue":
-		return "工具调用格式无效"
-	default:
-		if strings.TrimSpace(reason) == "" {
-			return "执行失败"
-		}
-		return reason
-	}
-}
-
-func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message, progress *progressCollector) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
-	var followUps []agentcore.Message
 	return agentcore.Hooks{
 		Emit: trace.emit,
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
@@ -837,28 +700,6 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			}
 			steeringSent = true
 			return append([]agentcore.Message(nil), steering...), nil
-		},
-		ShouldStopAfterTurn: func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
-			if len(turn.Message.ToolCalls) == 0 && looksLikeUnfinishedExecutionPlan(turn.Message.Content) {
-				if progress != nil {
-					progress.Add("检测到模型只给了后续计划，已要求它继续执行。")
-				}
-				followUps = append(followUps, agentcore.Message{
-					Role:    agentcore.RoleUser,
-					Content: "Completion check failed: your previous message described future work but did not complete it. Continue the task now. Execute the required tools, or ask the user only if required information is missing. Do not present a plan as the final answer.",
-				})
-				_ = trace.write(map[string]any{"type": "completion_check_failed", "task_id": taskID, "reason": "unfinished_execution_plan", "text": turn.Message.Content})
-				return false, nil
-			}
-			return false, nil
-		},
-		GetFollowUpMessages: func(context.Context) ([]agentcore.Message, error) {
-			if len(followUps) == 0 {
-				return nil, nil
-			}
-			out := followUps
-			followUps = nil
-			return out, nil
 		},
 		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
 			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)
@@ -885,9 +726,6 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
-				if progress != nil && observe.TaskStep.Status == "failed" {
-					progress.Add("工具 `" + input.ToolCall.Name + "` 失败：" + summarize(observe.TaskStep.Summary))
-				}
 			}
 			return agentcore.AfterToolCallResult{}, nil
 		},

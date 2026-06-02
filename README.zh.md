@@ -104,7 +104,7 @@ mateway memory proposal reject <proposal_id>
 
 `gateway serve` 可以在同一个进程里同时运行本地 Web Console、Office Watch、飞书、微信、定时任务和未来 channel。Runtime 写 trace 的同时会通过进程内 WebSocket event bus 发布事件，所以从飞书发布的任务，只要由同一个 gateway 进程执行，也可以在浏览器里实时看到进度。
 
-Office Watch 现在重点展示 runtime explainability：agent 是在休息、思考、选择工具、执行工具、等待、完成还是出错；本轮上下文注入了哪些 skills；模型选择了哪些工具；每个工具的参数、耗时、结果摘要和 evidence；以及 context/model/usage 事件。它也支持从 JSONL trace 做历史回放。标记为 `est` 的 context 数字是基于字符数的估算；只有模型 provider 返回的 usage 才是真实 token。
+Office Watch 会展示任务发布、上下文组装、模型轮次、工具执行、usage 增量、回复、等待状态和完成状态，也支持从 JSONL trace 做历史回放。标记为 `est` 的 context 数字是基于字符数的估算；只有模型 provider 返回的 usage 才是真实 token。
 
 ### 6. 有边界的 Session Context
 
@@ -131,7 +131,6 @@ Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime
 - `fresh-search`
 - `source-evaluation`
 - `connector-gap`
-- `skillcreate`
 
 Skills 是行为指导，本身不是可执行能力。如果任务需要真实动作，Agent 仍必须调用真实工具或脚本，并给出证据。
 
@@ -263,7 +262,7 @@ web:
   office_watch_assets: ""
 ```
 
-控制台还提供可选的 Office Watch 页面：`http://127.0.0.1:8765/watch`。它通过本地 WebSocket 事件展示 agent 状态、按任务筛选后注入的 context skills、工具参数、工具结果、evidence、上下文组装、模型轮次、usage 增量、回复和完成状态。Office Watch 使用 Mateway 自制占位像素样式，不打包 Star-Office-UI 的非商用素材。标记为 `est` 的上下文数字是基于字符数的估算；模型 provider 返回的 usage 才是真实 token。
+控制台还提供可选的 Office Watch 页面：`http://127.0.0.1:8765/watch`。它通过本地 WebSocket 事件展示任务从发布、上下文组装、模型轮次、工具执行、usage 增量、回复到完成的动态过程。Office Watch 使用 Mateway 自制占位像素样式，不打包 Star-Office-UI 的非商用素材。标记为 `est` 的上下文数字是基于字符数的估算；模型 provider 返回的 usage 才是真实 token。
 
 查看当前可配置的 channel id：
 
@@ -477,7 +476,7 @@ required_secrets:
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
 - 低频 skills 可以自动冷却：active skills 注入完整 guidance，cold skills 只注入一行召回卡片，hidden skills 不进入 context，直到手动恢复。
-- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps、software installation workflow 和 Mateway skill creation rules。
+- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps 和 software installation workflow。
 - Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
 
 Skill cleanup 通过 `skills.cleanup` 配置：
@@ -506,7 +505,7 @@ Cold skills 仍会用 `name`、`description`、`aliases` 和 `when_to_use` 生�
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
 - heartbeat 生成 skill patch proposal 的审核工作流
 
-Script Bridge 保持小而硬：`workspace/agents/<agent_id>/skills/<skill>/scripts/`、`workspace/skills/<skill>/scripts/`、`workspace/scripts/`、`~/.mateway/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。同名脚本冲突时，agent-specific skill scripts 优先于 shared skill scripts，shared skill scripts 优先于 global scripts。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
+Script Bridge 保持小而硬：`~/.mateway/scripts/`、`workspace/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
 
 ## 多 Agent Profiles
 

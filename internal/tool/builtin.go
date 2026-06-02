@@ -37,7 +37,6 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
 	registry.Register(ScriptRunTool{Config: root})
-	registry.Register(SecretSetTool{Config: root})
 	registry.Register(ScheduleCreateTool{Config: root})
 	registry.Register(ScheduleListTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
@@ -178,7 +177,6 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 
 type TerminalRunTool struct{ Config *config.Root }
 type ScriptRunTool struct{ Config *config.Root }
-type SecretSetTool struct{ Config *config.Root }
 type ScheduleCreateTool struct{ Config *config.Root }
 type ScheduleListTool struct{ Config *config.Root }
 
@@ -365,13 +363,6 @@ func terminalWorkdir(cfg *config.Root) (string, error) {
 	return ResolveAllowedPath(raw, cfg)
 }
 
-func configHome(cfg *config.Root) string {
-	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
-		return strings.TrimSpace(cfg.App.Home)
-	}
-	return config.DefaultHome()
-}
-
 func (ScriptRunTool) Name() string        { return "script.run" }
 func (ScriptRunTool) Description() string { return "run a discovered local Mateway script" }
 func (ScriptRunTool) Schema() agentcore.Schema {
@@ -379,8 +370,8 @@ func (ScriptRunTool) Schema() agentcore.Schema {
 }
 func (ScriptRunTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Use when a reusable local script exists for a connector-like task such as mail, publishing, or server operations. Pass only the script id in name, and pass script parameters in args; for example {\"name\":\"email.receive\",\"args\":[\"1\"]}.",
-		WhenNotToUse:         "Do not use terminal.run to call mateway script run for a discovered script. Do not put arguments into name, such as email.receive 1; use args instead. If no matching script exists, explain the connector gap instead of fabricating execution.",
+		WhenToUse:            "Use when a reusable local script exists for a connector-like task such as mail, publishing, or server operations.",
+		WhenNotToUse:         "Do not use if no matching script exists; explain the connector gap instead of fabricating execution.",
 		OutputContract:       "Return script output, exit code, duration, and script path evidence.",
 		Evidence:             "Return script name, path, args, exit_code, and duration_ms.",
 		Acceptance:           "Accepted when the script exits successfully and returns useful output.",
@@ -401,7 +392,7 @@ func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentco
 	if result.Script.Name != "" {
 		evidence["script"] = result.Script.Name
 		evidence["path"] = result.Script.Path
-		evidence["args"] = result.Command[1:]
+		evidence["args"] = args
 		evidence["exit_code"] = result.ExitCode
 		evidence["duration_ms"] = result.Duration.Milliseconds()
 	}
@@ -413,57 +404,6 @@ func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentco
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: content, IsError: true, Evidence: evidence}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result.Output, Evidence: evidence}
-}
-
-func (SecretSetTool) Name() string        { return "secret.set" }
-func (SecretSetTool) Description() string { return "store or update a Mateway secret value by id" }
-func (SecretSetTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"id", "value"}}
-}
-func (SecretSetTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when creating or configuring a skill/script and the user has explicitly provided a credential, token, password, authorization code, host, username, or other secret/config value that should be persisted in the Mateway secret store.",
-		WhenNotToUse:         "Do not invent secret values. Do not use for normal notes, memories, or values that should be visible in SKILL.md. If the user has not provided the value, ask for it or report the missing secret id.",
-		OutputContract:       "Return only the secret id and stored=true; never return the secret value.",
-		Evidence:             "Return secret id, store path, and stored=true without the value.",
-		Acceptance:           "Accepted when the secret store write succeeds and evidence contains stored=true.",
-		SoftFailureSignals:   []string{"secret id is required", "secret value is required", "permission denied"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
-	}
-}
-func (SecretSetTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t SecretSetTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	id := strings.TrimSpace(toolArgString(call.Args, "id"))
-	value := fmt.Sprint(call.Args["value"])
-	if isRedactedSecretPlaceholder(value) {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: "secret value is a redacted placeholder; ask the user to provide the real value again", IsError: true, Evidence: map[string]any{"id": id, "placeholder": true}}
-	}
-	store := secret.Store{Home: configHome(t.Config)}
-	if err := store.Set(id, value); err != nil {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"id": id}}
-	}
-	path := filepath.Join(configHome(t.Config), "secrets", "secrets.json")
-	return agentcore.ToolResult{
-		ToolCallID: call.ID,
-		Content:    "secret stored: " + id,
-		Evidence: map[string]any{
-			"id":     id,
-			"path":   path,
-			"stored": true,
-		},
-	}
-}
-
-func isRedactedSecretPlaceholder(value string) bool {
-	lower := strings.ToLower(strings.TrimSpace(value))
-	switch lower {
-	case "[redacted_secret]", "redacted_secret", "[redacted]", "redacted", "***", "******":
-		return true
-	default:
-		return false
-	}
 }
 
 type WebFetchTool struct{}
@@ -997,25 +937,6 @@ func stringSliceArg(value any) []string {
 		var out []string
 		for _, item := range v {
 			if text := strings.TrimSpace(fmt.Sprint(item)); text != "" && text != "<nil>" {
-				out = append(out, text)
-			}
-		}
-		return out
-	case map[string]any:
-		if item, ok := v["item"]; ok {
-			text := strings.TrimSpace(fmt.Sprint(item))
-			if text != "" && text != "<nil>" {
-				return []string{text}
-			}
-		}
-		keys := make([]string, 0, len(v))
-		for key := range v {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		var out []string
-		for _, key := range keys {
-			if text := strings.TrimSpace(fmt.Sprint(v[key])); text != "" && text != "<nil>" {
 				out = append(out, text)
 			}
 		}

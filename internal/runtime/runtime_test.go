@@ -157,89 +157,6 @@ func TestRuntimeRecordsTaskTreeForToolExecution(t *testing.T) {
 	}
 }
 
-func TestRuntimeTraceIncludesStructuredToolPayload(t *testing.T) {
-	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	file := filepath.Join(t.TempDir(), "hello.txt")
-	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/read " + file})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
-	for _, want := range []string{`"type":"tool_execution_start"`, `"type":"tool_execution_end"`, `"tool":`, `"name":"file.read"`, `"args":`, `"summary":`, `"evidence":`} {
-		if !contains(text, want) {
-			t.Fatalf("expected structured tool trace %q in:\n%s", want, text)
-		}
-	}
-}
-
-func TestRuntimeTraceIncludesSelectedSkills(t *testing.T) {
-	home := t.TempDir()
-	workspace := filepath.Join(home, "workspace")
-	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "fresh-search", "SKILL.md"), "---\nname: fresh-search\ndescription: Prefer fresh official sources.\nstage: planning\npriority: 8\n---\n# Fresh Search\nUse official sources.")
-	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "done"}, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
-	for _, want := range []string{`"type":"skills_selected"`, `"name":"fresh-search"`, `"scope":"shared"`, `"state":"active"`} {
-		if !contains(text, want) {
-			t.Fatalf("expected selected skill trace %q in:\n%s", want, text)
-		}
-	}
-}
-
-func TestRuntimeInjectsOnlyTaskRelevantContextSkills(t *testing.T) {
-	home := t.TempDir()
-	workspace := filepath.Join(home, "workspace")
-	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "email", "SKILL.md"), "---\nname: email\ndescription: Use when checking or sending mail.\naliases: mail, 邮件\nwhen_to_use: 查邮件, 收邮件, 发邮件\nstage: execution\npriority: 75\n---\n# Email\nUse script.run email.receive.")
-	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "fresh-search", "SKILL.md"), "---\nname: fresh-search\ndescription: Prefer fresh official sources.\nstage: planning\npriority: 8\n---\n# Fresh Search\nUse official sources.")
-	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "software-install", "SKILL.md"), "---\nname: software-install\ndescription: Install developer tools.\nstage: execution\npriority: 5\n---\n# Software Install\nInstall tools.")
-	model := &captureRuntimeContextModel{}
-	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "帮我查邮件"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !contains(model.systemMessages, "email") || !contains(model.systemMessages, "email.receive") {
-		t.Fatalf("expected email skill in context:\n%s", model.systemMessages)
-	}
-	for _, unexpected := range []string{"fresh-search", "software-install"} {
-		if contains(model.systemMessages, unexpected) {
-			t.Fatalf("unexpected skill %q in context:\n%s", unexpected, model.systemMessages)
-		}
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
-	if !contains(text, `"type":"skills_selected"`) || !contains(text, `"name":"email"`) {
-		t.Fatalf("expected email context skill trace:\n%s", text)
-	}
-	for _, unexpected := range []string{`"name":"fresh-search"`, `"name":"software-install"`} {
-		if contains(text, unexpected) {
-			t.Fatalf("unexpected skill trace %s in:\n%s", unexpected, text)
-		}
-	}
-}
-
 func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
@@ -1155,13 +1072,6 @@ func TestRuntimeHandlesDanglingToolCallFinalText(t *testing.T) {
 	if contains(resp.Reply.Text, "TOOL_CALL") || !contains(resp.Reply.Text, "工具调用格式无效") {
 		t.Fatalf("reply did not recover from dangling tool call: %q", resp.Reply.Text)
 	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !contains(string(data), `"type":"task_warning"`) || !contains(string(data), "tool_call_format_issue") {
-		t.Fatalf("trace missing malformed warning:\n%s", data)
-	}
 
 	cfg = &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt = New(cfg)
@@ -1172,126 +1082,6 @@ func TestRuntimeHandlesDanglingToolCallFinalText(t *testing.T) {
 	}
 	if !contains(resp.Reply.Text, "工具调用格式无效") {
 		t.Fatalf("expected diagnostic fallback, got %q", resp.Reply.Text)
-	}
-}
-
-func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
-	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "接下来写三个脚本,然后跑连通性测试。"}, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建邮件 skill"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Reply.Text != "工具预算已到上限，任务未完成。已有工具结果已保留在 trace 中；请补充信息后重试或继续当前任务。" {
-		t.Fatalf("reply = %q", resp.Reply.Text)
-	}
-	state, err := rt.Store.Load("cli:test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Tasks) != 1 {
-		t.Fatalf("expected one task, got %#v", state.Tasks)
-	}
-	if state.Tasks[0].Status != "failed" {
-		t.Fatalf("expected failed, got %q", state.Tasks[0].Status)
-	}
-	if state.Tasks[0].Summary != "" {
-		t.Fatalf("expected no completed summary, got %q", state.Tasks[0].Summary)
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !contains(string(data), `"type":"completion_check_failed"`) || !contains(string(data), `"reason":"tool_budget_reached"`) || !contains(string(data), `"status":"failed"`) {
-		t.Fatalf("trace missing failed completion check:\n%s", data)
-	}
-}
-
-func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
-	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, Content: "接下来写三个脚本,然后跑连通性测试。"},
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "email/scripts/list.py", "content": "ok"}}}},
-		{Role: agentcore.RoleAssistant, Content: "脚本已写入并验证。"},
-	}}, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建邮件 skill"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Reply.Text != "脚本已写入并验证。" {
-		t.Fatalf("reply = %q", resp.Reply.Text)
-	}
-	state, err := rt.Store.Load("cli:test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
-		t.Fatalf("expected completed task, got %#v", state.Tasks)
-	}
-	if len(state.Tasks[0].Steps) != 1 || state.Tasks[0].Steps[0].Tool != "file.write" {
-		t.Fatalf("expected file.write evidence, got %#v", state.Tasks[0].Steps)
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !contains(string(data), `"type":"completion_check_failed"`) {
-		t.Fatalf("trace missing completion check:\n%s", data)
-	}
-}
-
-func TestRuntimeDoesNotSynthesizeScriptAfterToolBudget(t *testing.T) {
-	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(repeatRuntimeToolModel{}, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "写邮件脚本"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if contains(resp.Reply.Text, "```python") || contains(resp.Reply.Text, "保存为") {
-		t.Fatalf("budget reply should not synthesize scripts: %q", resp.Reply.Text)
-	}
-	if !contains(resp.Reply.Text, "工具预算已到上限") {
-		t.Fatalf("expected budget diagnostic, got %q", resp.Reply.Text)
-	}
-	state, err := rt.Store.Load("cli:test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
-		t.Fatalf("expected failed task, got %#v", state.Tasks)
-	}
-	if len(resp.FollowUps) != 1 || !contains(resp.FollowUps[0].Text, "工具预算已到上限") {
-		t.Fatalf("expected budget progress follow-up, got %#v", resp.FollowUps)
-	}
-}
-
-func TestRuntimeProgressFollowUpMentionsToolFailure(t *testing.T) {
-	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "secret.set", Args: map[string]any{"id": "mail.auth", "value": "[REDACTED_SECRET]"}}}},
-		{Role: agentcore.RoleAssistant, Content: "授权码不可用，请重新提供真实授权码。"},
-	}}, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "保存授权码"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(resp.FollowUps) != 1 || !contains(resp.FollowUps[0].Text, "工具 `secret.set` 失败") {
-		t.Fatalf("expected tool failure progress follow-up, got %#v", resp.FollowUps)
-	}
-}
-
-func TestPendingAgentProfileProposalIDIgnoresNilEvidence(t *testing.T) {
-	task := &session.TaskNode{Steps: []session.TaskStep{{
-		Tool:     "file.write",
-		Status:   "accepted",
-		Evidence: map[string]any{"proposal_id": nil},
-	}}}
-	if id := pendingAgentProfileProposalID(task); id != "" {
-		t.Fatalf("expected no proposal id, got %q", id)
 	}
 }
 
@@ -1559,18 +1349,9 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 		Search:   config.SearchConfig{ProviderOrder: []string{"searxng"}},
 	}
 	text := buildRuntimeSystemContext(cfg, config.AgentProfileConfig{ID: "main"})
-	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng"} {
+	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
 		if !contains(text, want) {
 			t.Fatalf("context missing %q:\n%s", want, text)
-		}
-	}
-	if contains(text, "Discovered skills:") {
-		t.Fatalf("base runtime context should not inject unfiltered skills:\n%s", text)
-	}
-	messageText := buildRuntimeSystemContextForMessage(cfg, config.AgentProfileConfig{ID: "main"}, channel.InboundMessage{Channel: "cli", SessionKey: "cli:test"}, "需要 fresh search 当前资料")
-	for _, want := range []string{"Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
-		if !contains(messageText, want) {
-			t.Fatalf("message context missing %q:\n%s", want, messageText)
 		}
 	}
 }
@@ -1841,66 +1622,6 @@ func TestDiscoverSkillsPrefersAgentSpecificSkill(t *testing.T) {
 	}
 }
 
-func TestDiscoverSkillsKeepsRedactedCardForSensitiveSkill(t *testing.T) {
-	home := t.TempDir()
-	workspace := filepath.Join(home, "workspace")
-	skillPath := filepath.Join(workspace, "skills", "email", "SKILL.md")
-	writeRuntimeSkill(t, skillPath, `---
-name: email
-description: Use when the user asks to check, read, receive, send, or manage emails.
-stage: execution
-priority: 75
-config:
-  imap_host: imap.163.com
-  imap_user: user@example.com
-  imap_pass: supersecret123
----
-
-# email skill
-
-Use this skill with the configured IMAP password supersecret123.
-`)
-	skills := discoverSkills(&config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}, 10)
-	if len(skills) != 1 || skills[0].Name != "email" || !skills[0].Redacted {
-		t.Fatalf("expected redacted email skill card, got %#v", skills)
-	}
-	prompt := skillsPrompt(skills)
-	if !contains(prompt, "- email") || !contains(prompt, "guidance redacted") {
-		t.Fatalf("expected redacted card in prompt:\n%s", prompt)
-	}
-	if contains(prompt, "supersecret123") || contains(prompt, "imap.163.com") || contains(prompt, "user@example.com") {
-		t.Fatalf("prompt leaked sensitive skill content:\n%s", prompt)
-	}
-}
-
-func TestDiscoverSkillsAllowsRequiredSecretReferences(t *testing.T) {
-	home := t.TempDir()
-	workspace := filepath.Join(home, "workspace")
-	skillPath := filepath.Join(workspace, "skills", "email", "SKILL.md")
-	writeRuntimeSkill(t, skillPath, `---
-name: email
-description: Use when the user asks to check, read, receive, send, or manage emails.
-stage: execution
-priority: 75
-required_secrets:
-  - id: mail.pop_password
-    env: POP_PASSWORD
----
-
-# email skill
-
-Run `+"`script.run`"+` with name `+"`email.receive`"+` to check recent emails.
-`)
-	skills := discoverSkills(&config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}, 10)
-	if len(skills) != 1 || skills[0].Name != "email" || skills[0].Redacted {
-		t.Fatalf("expected full email skill with secret references, got %#v", skills)
-	}
-	prompt := skillsPrompt(skills)
-	if !contains(prompt, "email.receive") || contains(prompt, "guidance redacted") {
-		t.Fatalf("expected full email guidance:\n%s", prompt)
-	}
-}
-
 func TestDiscoverSkillsAppliesCleanupStates(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
@@ -1957,13 +1678,6 @@ func runtimeBoolPtr(value bool) *bool {
 type staticModel struct {
 	text string
 }
-
-type scriptedRuntimeModel struct {
-	messages []agentcore.Message
-	index    int
-}
-
-type repeatRuntimeToolModel struct{}
 
 type readRememberModel struct{}
 
@@ -2042,20 +1756,6 @@ func lastUserContent(messages []agentcore.Message) string {
 
 func (m staticModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
-}
-
-func (m *scriptedRuntimeModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
-	msg := m.messages[m.index]
-	m.index++
-	return msg, nil
-}
-
-func (repeatRuntimeToolModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
-	return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
-		ID:   "call_1",
-		Name: "terminal.run",
-		Args: map[string]any{"command": "printf ok"},
-	}}}, nil
 }
 
 func (usageModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
