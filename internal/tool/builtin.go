@@ -437,6 +437,9 @@ func (SecretSetTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutatio
 func (t SecretSetTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	id := strings.TrimSpace(toolArgString(call.Args, "id"))
 	value := fmt.Sprint(call.Args["value"])
+	if isRedactedSecretPlaceholder(value) {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "secret value is a redacted placeholder; ask the user to provide the real value again", IsError: true, Evidence: map[string]any{"id": id, "placeholder": true}}
+	}
 	store := secret.Store{Home: configHome(t.Config)}
 	if err := store.Set(id, value); err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"id": id}}
@@ -450,6 +453,16 @@ func (t SecretSetTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 			"path":   path,
 			"stored": true,
 		},
+	}
+}
+
+func isRedactedSecretPlaceholder(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	switch lower {
+	case "[redacted_secret]", "redacted_secret", "[redacted]", "redacted", "***", "******":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -211,8 +211,9 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	if state.Pending == nil {
 		if warning := finalTextWarning(result.FinalText); warning != "" {
 			_ = trace.write(map[string]any{"type": "task_warning", "task_id": task.ID, "warning": warning, "text": result.FinalText})
-		}
-		if looksLikeInputRequest(result.FinalText) {
+			state.BlockActiveTask("failed")
+			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": result.FinalText})
+		} else if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_user_input", "question": result.FinalText})
@@ -753,6 +754,7 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 
 func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
+	var followUps []agentcore.Message
 	return agentcore.Hooks{
 		Emit: trace.emit,
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
@@ -761,6 +763,25 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			}
 			steeringSent = true
 			return append([]agentcore.Message(nil), steering...), nil
+		},
+		ShouldStopAfterTurn: func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
+			if len(turn.Message.ToolCalls) == 0 && looksLikeUnfinishedExecutionPlan(turn.Message.Content) {
+				followUps = append(followUps, agentcore.Message{
+					Role:    agentcore.RoleUser,
+					Content: "Completion check failed: your previous message described future work but did not complete it. Continue the task now. Execute the required tools, or ask the user only if required information is missing. Do not present a plan as the final answer.",
+				})
+				_ = trace.write(map[string]any{"type": "completion_check_failed", "task_id": taskID, "reason": "unfinished_execution_plan", "text": turn.Message.Content})
+				return false, nil
+			}
+			return false, nil
+		},
+		GetFollowUpMessages: func(context.Context) ([]agentcore.Message, error) {
+			if len(followUps) == 0 {
+				return nil, nil
+			}
+			out := followUps
+			followUps = nil
+			return out, nil
 		},
 		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
 			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)

@@ -256,6 +256,43 @@ func TestRunBeforeToolCallCanBlock(t *testing.T) {
 	}
 }
 
+func TestRunCanContinueAfterRejectedFinalText(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, Content: "next I will write the script"},
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.echo", Args: map[string]any{"text": "script written"}}}},
+		{Role: RoleAssistant, Content: "completed with evidence"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(testEchoTool{})
+	var followUps []Message
+	result, err := Run(context.Background(), Config{
+		Model: &model,
+		Tools: registry,
+		Hooks: Hooks{
+			ShouldStopAfterTurn: func(_ context.Context, turn TurnContext) (bool, error) {
+				if turn.Message.Content == "next I will write the script" {
+					followUps = append(followUps, Message{Role: RoleUser, Content: "finish now"})
+				}
+				return false, nil
+			},
+			GetFollowUpMessages: func(context.Context) ([]Message, error) {
+				out := followUps
+				followUps = nil
+				return out, nil
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "create script"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText != "completed with evidence" {
+		t.Fatalf("FinalText = %q", result.FinalText)
+	}
+	if !containsUserMessage(result.Messages, "finish now") || !containsToolMessage(result.Messages, "script written") {
+		t.Fatalf("expected correction and tool evidence, got %#v", result.Messages)
+	}
+}
+
 func TestRunAfterToolCallCanRewriteResult(t *testing.T) {
 	model := scriptedModel{messages: []Message{
 		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.echo", Args: map[string]any{"text": "ok"}}}},

@@ -119,6 +119,23 @@ func TestSecretSetToolStoresValueWithoutReturningIt(t *testing.T) {
 	}
 }
 
+func TestSecretSetToolRejectsRedactedPlaceholder(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	result := SecretSetTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "secret.set",
+		Args: map[string]any{"id": "mail.auth_code", "value": "[REDACTED_SECRET]"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "redacted placeholder") {
+		t.Fatalf("expected placeholder rejection, got %#v", result)
+	}
+	store := secret.Store{Home: home}
+	if _, ok, err := store.Get("mail.auth_code"); err != nil || ok {
+		t.Fatalf("placeholder should not be stored: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestScriptRunToolAcceptsItemArgsObject(t *testing.T) {
 	home := t.TempDir()
 	scriptPath := filepath.Join(home, "scripts", "mail")

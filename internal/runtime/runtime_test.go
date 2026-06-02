@@ -1183,7 +1183,7 @@ func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Text != "接下来写三个脚本,然后跑连通性测试。" {
+	if resp.Reply.Text != "达到最大工具循环次数，已停止。" {
 		t.Fatalf("reply = %q", resp.Reply.Text)
 	}
 	state, err := rt.Store.Load("cli:test")
@@ -1193,8 +1193,8 @@ func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
 	if len(state.Tasks) != 1 {
 		t.Fatalf("expected one task, got %#v", state.Tasks)
 	}
-	if state.Tasks[0].Status != "await_execution" {
-		t.Fatalf("expected await_execution, got %q", state.Tasks[0].Status)
+	if state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed, got %q", state.Tasks[0].Status)
 	}
 	if state.Tasks[0].Summary != "" {
 		t.Fatalf("expected no completed summary, got %q", state.Tasks[0].Summary)
@@ -1203,8 +1203,42 @@ func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), `"status":"await_execution"`) || !contains(string(data), "unfinished_execution_plan") {
-		t.Fatalf("trace missing await_execution block:\n%s", data)
+	if !contains(string(data), `"type":"completion_check_failed"`) || !contains(string(data), `"status":"failed"`) {
+		t.Fatalf("trace missing failed completion check:\n%s", data)
+	}
+}
+
+func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "接下来写三个脚本,然后跑连通性测试。"},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "email/scripts/list.py", "content": "ok"}}}},
+		{Role: agentcore.RoleAssistant, Content: "脚本已写入并验证。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建邮件 skill"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "脚本已写入并验证。" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+	if len(state.Tasks[0].Steps) != 1 || state.Tasks[0].Steps[0].Tool != "file.write" {
+		t.Fatalf("expected file.write evidence, got %#v", state.Tasks[0].Steps)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"completion_check_failed"`) {
+		t.Fatalf("trace missing completion check:\n%s", data)
 	}
 }
 
@@ -1882,6 +1916,11 @@ type staticModel struct {
 	text string
 }
 
+type scriptedRuntimeModel struct {
+	messages []agentcore.Message
+	index    int
+}
+
 type readRememberModel struct{}
 
 type readRememberThenCaptureModel struct {
@@ -1959,6 +1998,12 @@ func lastUserContent(messages []agentcore.Message) string {
 
 func (m staticModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
+}
+
+func (m *scriptedRuntimeModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
+	msg := m.messages[m.index]
+	m.index++
+	return msg, nil
 }
 
 func (usageModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
