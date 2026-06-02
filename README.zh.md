@@ -104,7 +104,7 @@ mateway memory proposal reject <proposal_id>
 
 `gateway serve` 可以在同一个进程里同时运行本地 Web Console、Office Watch、飞书、微信、定时任务和未来 channel。Runtime 写 trace 的同时会通过进程内 WebSocket event bus 发布事件，所以从飞书发布的任务，只要由同一个 gateway 进程执行，也可以在浏览器里实时看到进度。
 
-Office Watch 会展示任务发布、上下文组装、模型轮次、工具执行、usage 增量、回复、等待状态和完成状态，也支持从 JSONL trace 做历史回放。标记为 `est` 的 context 数字是基于字符数的估算；只有模型 provider 返回的 usage 才是真实 token。
+Office Watch 现在重点展示 runtime explainability：agent 是在休息、思考、选择工具、执行工具、等待、完成还是出错；本轮上下文注入了哪些 skills；模型选择了哪些工具；每个工具的参数、耗时、结果摘要和 evidence；以及 context/model/usage 事件。它也支持从 JSONL trace 做历史回放。标记为 `est` 的 context 数字是基于字符数的估算；只有模型 provider 返回的 usage 才是真实 token。
 
 ### 6. 有边界的 Session Context
 
@@ -262,7 +262,7 @@ web:
   office_watch_assets: ""
 ```
 
-控制台还提供可选的 Office Watch 页面：`http://127.0.0.1:8765/watch`。它通过本地 WebSocket 事件展示任务从发布、上下文组装、模型轮次、工具执行、usage 增量、回复到完成的动态过程。Office Watch 使用 Mateway 自制占位像素样式，不打包 Star-Office-UI 的非商用素材。标记为 `est` 的上下文数字是基于字符数的估算；模型 provider 返回的 usage 才是真实 token。
+控制台还提供可选的 Office Watch 页面：`http://127.0.0.1:8765/watch`。它通过本地 WebSocket 事件展示 agent 状态、选中的 skills、工具参数、工具结果、evidence、上下文组装、模型轮次、usage 增量、回复和完成状态。Office Watch 使用 Mateway 自制占位像素样式，不打包 Star-Office-UI 的非商用素材。标记为 `est` 的上下文数字是基于字符数的估算；模型 provider 返回的 usage 才是真实 token。
 
 查看当前可配置的 channel id：
 

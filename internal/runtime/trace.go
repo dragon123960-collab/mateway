@@ -45,6 +45,9 @@ func (r *traceRecorder) emit(ctx context.Context, event agentcore.Event) error {
 		"tool_call":   event.ToolCall,
 		"tool_result": event.ToolResult,
 	}
+	if event.Type == agentcore.EventToolExecutionStart || event.Type == agentcore.EventToolExecutionEnd {
+		payload["tool"] = toolTracePayload(event.ToolCall, event.ToolResult, event.Duration)
+	}
 	if event.Type == agentcore.EventMessageStart && event.Message.Usage != nil {
 		payload["usage"] = event.Message.Usage
 		payload["model"] = event.Message.Usage.Model
@@ -136,6 +139,8 @@ func realtimeEventType(traceType string) string {
 		return "tool_finished"
 	case "model_usage":
 		return "usage_delta"
+	case "skills_selected":
+		return "skills_selected"
 	case "reply", "follow_up_reply":
 		return "reply"
 	case "runtime_done":
@@ -147,6 +152,47 @@ func realtimeEventType(traceType string) string {
 	default:
 		return traceType
 	}
+}
+
+func toolTracePayload(call agentcore.ToolCall, result agentcore.ToolResult, duration time.Duration) map[string]any {
+	payload := map[string]any{
+		"id":   call.ID,
+		"name": call.Name,
+		"args": redactSecrets(call.Args),
+	}
+	if result.ToolCallID != "" {
+		payload["result_id"] = result.ToolCallID
+		payload["status"] = "accepted"
+		if result.IsError {
+			payload["status"] = "error"
+		}
+		payload["summary"] = summarize(result.Content)
+		payload["content"] = redactedSummary(result.Content)
+		payload["evidence"] = redactSecrets(result.Evidence)
+	}
+	if duration > 0 {
+		payload["duration_ms"] = duration.Milliseconds()
+	}
+	return payload
+}
+
+func traceSkills(skills []discoveredSkill) []map[string]any {
+	out := make([]map[string]any, 0, len(skills))
+	for _, item := range skills {
+		out = append(out, map[string]any{
+			"name":        item.Name,
+			"description": item.Description,
+			"scope":       skillScope(item.Path),
+			"state":       defaultText(item.State, "active"),
+			"stage":       item.Stage,
+			"priority":    item.Priority,
+			"aliases":     item.Aliases,
+			"when_to_use": item.WhenToUse,
+			"path":        item.Path,
+			"redacted":    item.Redacted,
+		})
+	}
+	return out
 }
 
 func stringValue(value any) string {

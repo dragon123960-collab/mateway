@@ -97,7 +97,7 @@ Persistent traces, session transcripts, and task step summaries redact secret-li
 
 `gateway serve` can run the local Web Console and Office Watch alongside CLI, Feishu, Weixin, schedules, and future channels. Runtime trace events are published through an in-process WebSocket event bus, so tasks posted from Feishu can be watched live in the browser when they run in the same gateway process.
 
-Office Watch shows task publication, context assembly, model turns, tool execution, usage deltas, replies, blocked states, and completion. It also supports historical replay from JSONL traces. Context numbers marked `est` are character-based estimates; token usage is shown as real only when the model provider returns usage metadata.
+Office Watch focuses on runtime explainability: it shows whether the agent is resting, thinking, choosing tools, working, waiting, done, or in an error state; which skills were injected into the current context; which tools were selected; each tool's arguments, duration, result summary, and evidence; plus model/context/usage events. It also supports historical replay from JSONL traces. Context numbers marked `est` are character-based estimates; token usage is shown as real only when the model provider returns usage metadata.
 
 ### 6. Bounded Session Context
 Sessions are runtime state, not an ever-growing raw chat log. Before each model call, Mateway builds context from:
@@ -265,7 +265,7 @@ web:
   office_watch_assets: ""
 ```
 
-The console also exposes an optional Office Watch page at `http://127.0.0.1:8765/watch`. It uses local WebSocket events to show the live path from task publication through context assembly, model turns, tool execution, usage deltas, replies, and completion. Office Watch uses Mateway-owned placeholder pixel styling; it does not vendor Star-Office-UI assets. Context numbers marked `est` are character-based estimates unless the model provider returns real token usage.
+The console also exposes an optional Office Watch page at `http://127.0.0.1:8765/watch`. It uses local WebSocket events to show agent state, selected skills, tool arguments, tool results, evidence, context assembly, model turns, usage deltas, replies, and completion. Office Watch uses Mateway-owned placeholder pixel styling; it does not vendor Star-Office-UI assets. Context numbers marked `est` are character-based estimates unless the model provider returns real token usage.
 
 List channel ids from local channel config files:
 

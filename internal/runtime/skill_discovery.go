@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/skill"
 )
@@ -20,6 +21,7 @@ type discoveredSkill struct {
 	WhenToUse   []string
 	State       string
 	Path        string
+	Redacted    bool
 }
 
 func skillScope(path string) string {
@@ -121,8 +123,8 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 			continue
 		}
 		path := filepath.Join(root, entry.Name(), "SKILL.md")
-		text := readPromptContextFile(path, 4096)
-		if text == "" {
+		text, redacted := readSkillContextFile(path, 4096)
+		if text == "" && !redacted {
 			continue
 		}
 		skill := parseSkillHeader(text)
@@ -130,9 +132,68 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 			skill.Name = entry.Name()
 		}
 		skill.Path = path
+		skill.Redacted = redacted
 		out = append(out, skill)
 	}
 	return out
+}
+
+func readSkillContextFile(path string, limit int64) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() <= 0 {
+		return "", false
+	}
+	if limit <= 0 {
+		limit = 2048
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	fullText := strings.TrimSpace(string(data))
+	if fullText == "" {
+		return "", false
+	}
+	if info.Size() <= limit && !looksSensitivePromptContext(path, fullText) && !agentprofile.UnsafePromptContext(fullText) {
+		return fullText, false
+	}
+	header := skillHeaderOnly(fullText)
+	if header == "" {
+		return "", false
+	}
+	return header, true
+}
+
+func skillHeaderOnly(text string) string {
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return ""
+	}
+	allowed := map[string]bool{
+		"name":        true,
+		"description": true,
+		"stage":       true,
+		"priority":    true,
+		"aliases":     true,
+		"when_to_use": true,
+	}
+	var out []string
+	out = append(out, "---")
+	for i := 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "---" {
+			out = append(out, "---")
+			return strings.Join(out, "\n")
+		}
+		key, _, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		if allowed[strings.ToLower(strings.TrimSpace(key))] {
+			out = append(out, lines[i])
+		}
+	}
+	return ""
 }
 
 func parseSkillHeader(text string) discoveredSkill {
@@ -221,16 +282,21 @@ func skillsPrompt(skills []discoveredSkill) string {
 			b.WriteString(": ")
 			b.WriteString(skill.Description)
 		}
+		if skill.Redacted {
+			b.WriteString(" (guidance redacted: SKILL.md contains sensitive-looking fields; inspect required secrets or scripts before execution)")
+		}
 		b.WriteString("\n")
-		if guidance := skillGuidance(skill.Path, 1200); guidance != "" {
-			b.WriteString("  Guidance:\n")
-			for _, line := range strings.Split(guidance, "\n") {
-				if strings.TrimSpace(line) == "" {
-					continue
+		if !skill.Redacted {
+			if guidance := skillGuidance(skill.Path, 1200); guidance != "" {
+				b.WriteString("  Guidance:\n")
+				for _, line := range strings.Split(guidance, "\n") {
+					if strings.TrimSpace(line) == "" {
+						continue
+					}
+					b.WriteString("  ")
+					b.WriteString(line)
+					b.WriteString("\n")
 				}
-				b.WriteString("  ")
-				b.WriteString(line)
-				b.WriteString("\n")
 			}
 		}
 	}

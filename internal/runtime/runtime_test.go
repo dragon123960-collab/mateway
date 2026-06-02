@@ -157,6 +157,52 @@ func TestRuntimeRecordsTaskTreeForToolExecution(t *testing.T) {
 	}
 }
 
+func TestRuntimeTraceIncludesStructuredToolPayload(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	file := filepath.Join(t.TempDir(), "hello.txt")
+	if err := os.WriteFile(file, []byte("hello file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/read " + file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{`"type":"tool_execution_start"`, `"type":"tool_execution_end"`, `"tool":`, `"name":"file.read"`, `"args":`, `"summary":`, `"evidence":`} {
+		if !contains(text, want) {
+			t.Fatalf("expected structured tool trace %q in:\n%s", want, text)
+		}
+	}
+}
+
+func TestRuntimeTraceIncludesSelectedSkills(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "fresh-search", "SKILL.md"), "---\nname: fresh-search\ndescription: Prefer fresh official sources.\nstage: planning\npriority: 8\n---\n# Fresh Search\nUse official sources.")
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "done"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{`"type":"skills_selected"`, `"name":"fresh-search"`, `"scope":"shared"`, `"state":"active"`} {
+		if !contains(text, want) {
+			t.Fatalf("expected selected skill trace %q in:\n%s", want, text)
+		}
+	}
+}
+
 func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
@@ -1626,6 +1672,38 @@ func TestDiscoverSkillsPrefersAgentSpecificSkill(t *testing.T) {
 	skills := discoverSkills(&config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}, 10)
 	if len(skills) != 1 || skills[0].Description != "Agent research." {
 		t.Fatalf("expected agent-specific skill to win, got %#v", skills)
+	}
+}
+
+func TestDiscoverSkillsKeepsRedactedCardForSensitiveSkill(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	skillPath := filepath.Join(workspace, "skills", "email", "SKILL.md")
+	writeRuntimeSkill(t, skillPath, `---
+name: email
+description: Use when the user asks to check, read, receive, send, or manage emails.
+stage: execution
+priority: 75
+config:
+  imap_host: imap.163.com
+  imap_user: user@example.com
+  imap_pass: supersecret123
+---
+
+# email skill
+
+Use this skill with the configured IMAP password supersecret123.
+`)
+	skills := discoverSkills(&config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}, 10)
+	if len(skills) != 1 || skills[0].Name != "email" || !skills[0].Redacted {
+		t.Fatalf("expected redacted email skill card, got %#v", skills)
+	}
+	prompt := skillsPrompt(skills)
+	if !contains(prompt, "- email") || !contains(prompt, "guidance redacted") {
+		t.Fatalf("expected redacted card in prompt:\n%s", prompt)
+	}
+	if contains(prompt, "supersecret123") || contains(prompt, "imap.163.com") || contains(prompt, "user@example.com") {
+		t.Fatalf("prompt leaked sensitive skill content:\n%s", prompt)
 	}
 }
 

@@ -152,6 +152,11 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
+	_ = trace.write(map[string]any{
+		"type":    "skills_selected",
+		"task_id": task.ID,
+		"skills":  traceSkills(discoveredSkills),
+	})
 	steering := rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
