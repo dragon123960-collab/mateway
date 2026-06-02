@@ -66,6 +66,7 @@ func TestInitSupportsHomeFlag(t *testing.T) {
 		filepath.Join("config", "config.yaml"),
 		filepath.Join("workspace", "skills", "software-install", "SKILL.md"),
 		filepath.Join("workspace", "skills", "connector-gap", "SKILL.md"),
+		filepath.Join("workspace", "skills", "skillcreate", "SKILL.md"),
 	} {
 		if _, err := os.Stat(filepath.Join(home, rel)); err != nil {
 			t.Fatalf("expected %s under init home: %v", rel, err)

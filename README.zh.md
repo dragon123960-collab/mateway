@@ -131,6 +131,7 @@ Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime
 - `fresh-search`
 - `source-evaluation`
 - `connector-gap`
+- `skillcreate`
 
 Skills 是行为指导，本身不是可执行能力。如果任务需要真实动作，Agent 仍必须调用真实工具或脚本，并给出证据。
 
@@ -435,6 +436,7 @@ Workspace：
     fresh-search/
     source-evaluation/
     connector-gap/
+    skillcreate/
   memory/
     user/
       long/
@@ -476,7 +478,7 @@ required_secrets:
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
 - 低频 skills 可以自动冷却：active skills 注入完整 guidance，cold skills 只注入一行召回卡片，hidden skills 不进入 context，直到手动恢复。
-- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps 和 software installation workflow。
+- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps、software installation workflow 和 Mateway skill creation rules。
 - Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
 
 Skill cleanup 通过 `skills.cleanup` 配置：
@@ -505,7 +507,7 @@ Cold skills 仍会用 `name`、`description`、`aliases` 和 `when_to_use` 生�
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
 - heartbeat 生成 skill patch proposal 的审核工作流
 
-Script Bridge 保持小而硬：`~/.mateway/scripts/`、`workspace/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
+Script Bridge 保持小而硬：`workspace/agents/<agent_id>/skills/<skill>/scripts/`、`workspace/skills/<skill>/scripts/`、`workspace/scripts/`、`~/.mateway/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。同名脚本冲突时，agent-specific skill scripts 优先于 shared skill scripts，shared skill scripts 优先于 global scripts。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
 
 ## 多 Agent Profiles
 

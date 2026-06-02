@@ -47,6 +47,7 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("..", "workspace", "skills", "fresh-search", "SKILL.md"), Content: skillFreshSearchTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "source-evaluation", "SKILL.md"), Content: skillSourceEvaluationTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "connector-gap", "SKILL.md"), Content: skillConnectorGapTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "skillcreate", "SKILL.md"), Content: skillCreateTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "README.md"), Content: memoryReadmeTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "schema.md"), Content: memorySchemaTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "index.md"), Content: memoryIndexTemplate},
@@ -737,6 +738,81 @@ Workflow:
    If the runtime is missing, choose an available runtime or stop with setup instructions.
 5. If real credentials, server hostnames, recipients, or platform choices are missing, ask only for those concrete fields.
 6. Never claim that email was sent, a server was checked, or content was published unless a tool/script/action actually did it.
+`
+
+const skillCreateTemplate = `---
+name: skillcreate
+description: Use when creating or updating a Mateway skill, especially when scripts, connectors, credentials, or secrets are involved.
+stage: planning
+priority: 90
+aliases: skill create, create skill, skill creation
+when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to a skill, handling skill secrets
+---
+
+# skillcreate
+
+Use this skill before creating or updating any Mateway skill.
+
+## Directory rules
+
+Mateway skills live under:
+
+` + "```text" + `
+workspace/agents/<agent_id>/skills/<skill_name>/
+workspace/skills/<skill_name>/
+` + "```" + `
+
+Preferred layout:
+
+` + "```text" + `
+<skill_name>/
+  SKILL.md
+  scripts/
+  references/
+  assets/
+` + "```" + `
+
+- Put skill-specific executable scripts in <skill_name>/scripts/.
+- Use workspace/scripts/, ~/.mateway/scripts/, or configured scripts.dirs only for reusable cross-skill scripts.
+- If script names collide, agent-specific skill scripts win over shared skill scripts, which win over global scripts.
+- Keep SKILL.md concise: trigger description, workflow, script names, required inputs, safety boundaries, and verification steps.
+
+## Secret rules
+
+- Never put plaintext secrets, passwords, tokens, authorization codes, or API keys in SKILL.md.
+- Never hard-code plaintext secrets in scripts/.
+- Store real secret values with mateway secret set <secret_id> or the secret.set tool when available.
+- If the user has not provided a concrete secret value, write only required-secret references and report the missing secret ids.
+- Script headers may declare required secrets:
+
+` + "```text" + `
+# mateway.required_secret: id=<secret_id> env=<ENV_NAME>
+` + "```" + `
+
+## Script rules
+
+Each executable skill script should include headers:
+
+` + "```text" + `
+# mateway.name: <skill_name>.<action>
+# mateway.description: <short purpose>
+# mateway.risk: safe_read | guarded_mutation
+# mateway.required_secret: id=<secret_id> env=<ENV_NAME>
+` + "```" + `
+
+- Use namespaced script names such as email.receive or email.send.
+- Read credentials from environment variables injected by script.run.
+- Validate missing required environment variables before connecting to external services.
+- Print concise machine-readable or clearly structured output.
+- Do not claim external actions succeeded unless the script exits successfully and prints evidence.
+
+## Creation workflow
+
+1. Create or update SKILL.md.
+2. Add skill-local scripts under scripts/ when deterministic execution is needed.
+3. Add mateway.required_secret headers for each required credential.
+4. Run mateway script list to confirm scripts are discovered.
+5. Run a safe test path or confirm the missing-secret failure path is clear.
 `
 
 const memoryReadmeTemplate = `# Mateway Memory Wiki

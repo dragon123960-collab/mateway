@@ -139,6 +139,13 @@ func scriptDirs(cfg *config.Root) []string {
 	var dirs []string
 	home := home(cfg)
 	workspace := workspace(cfg)
+	agentID := defaultAgentID(cfg)
+	if workspace != "" && agentID != "" {
+		dirs = append(dirs, skillScriptDirs(filepath.Join(workspace, "agents", agentID, "skills"))...)
+	}
+	if workspace != "" {
+		dirs = append(dirs, skillScriptDirs(filepath.Join(workspace, "skills"))...)
+	}
 	dirs = append(dirs, filepath.Join(home, "scripts"))
 	if workspace != "" {
 		dirs = append(dirs, filepath.Join(workspace, "scripts"))
@@ -161,6 +168,22 @@ func scriptDirs(cfg *config.Root) []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+func skillScriptDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(root, entry.Name(), "scripts"))
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 func parseScript(path string) (Script, error) {
@@ -230,6 +253,13 @@ func workspace(cfg *config.Root) string {
 		return strings.TrimSpace(cfg.App.Workspace)
 	}
 	return filepath.Join(home(cfg), "workspace")
+}
+
+func defaultAgentID(cfg *config.Root) string {
+	if cfg != nil && strings.TrimSpace(cfg.Agents.Default) != "" {
+		return strings.TrimSpace(cfg.Agents.Default)
+	}
+	return "main"
 }
 
 func expandHome(path string) string {
