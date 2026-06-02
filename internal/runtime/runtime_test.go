@@ -1048,6 +1048,19 @@ func TestRuntimeSanitizesToolCallBlocks(t *testing.T) {
 	}
 }
 
+func TestRuntimeSanitizesNamedToolCallTag(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "我来先列出目录。\n<tool_call>project.index\n{\"path\":\"/tmp\"}"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(resp.Reply.Text, "tool_call") || contains(resp.Reply.Text, "project.index") {
+		t.Fatalf("unsanitized reply = %q", resp.Reply.Text)
+	}
+}
+
 func TestRuntimeHandlesDanglingToolCallFinalText(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)

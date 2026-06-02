@@ -297,9 +297,6 @@ func writeContractLine(b *strings.Builder, label, value string) {
 
 func parseToolCallText(text string) []agentcore.ToolCall {
 	matches := toolCallBlockPattern.FindAllStringSubmatch(text, -1)
-	if len(matches) == 0 {
-		return nil
-	}
 	var calls []agentcore.ToolCall
 	for _, match := range matches {
 		if len(match) < 2 {
@@ -307,6 +304,9 @@ func parseToolCallText(text string) []agentcore.ToolCall {
 		}
 		raw := strings.TrimSpace(match[1])
 		calls = append(calls, parseToolCallPayloads(raw, len(calls)+1)...)
+	}
+	if len(calls) == 0 {
+		calls = append(calls, parseNamedToolCallTags(text, len(calls)+1)...)
 	}
 	return calls
 }
@@ -340,6 +340,35 @@ func parseToolCallPayloads(raw string, startIndex int) []agentcore.ToolCall {
 }
 
 var toolCallBlockPattern = regexp.MustCompile(`(?is)\[\s*TOOL_CALL\s*\](.*?)\[\s*/\s*TOOL_CALL\s*\]`)
+var namedToolCallTagPattern = regexp.MustCompile(`(?is)<\s*tool_call\s*>\s*([A-Za-z0-9_.-]+)\s*`)
+
+func parseNamedToolCallTags(text string, startIndex int) []agentcore.ToolCall {
+	matches := namedToolCallTagPattern.FindAllStringSubmatchIndex(text, -1)
+	var calls []agentcore.ToolCall
+	for _, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+		name := strings.TrimSpace(text[match[2]:match[3]])
+		if name == "" {
+			continue
+		}
+		var args map[string]any
+		decoder := json.NewDecoder(strings.NewReader(text[match[1]:]))
+		if err := decoder.Decode(&args); err != nil {
+			continue
+		}
+		if args == nil {
+			args = map[string]any{}
+		}
+		calls = append(calls, agentcore.ToolCall{
+			ID:   fmt.Sprintf("call_%d", startIndex+len(calls)),
+			Name: name,
+			Args: args,
+		})
+	}
+	return calls
+}
 
 func (c Client) Generate(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
 	if messagesRequireImage(messages) && !c.Config.SupportsModality("image") {

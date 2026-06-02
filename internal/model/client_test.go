@@ -121,6 +121,19 @@ func TestParseToolCallTextReturnsMultipleObjectsInOneBlock(t *testing.T) {
 	}
 }
 
+func TestParseToolCallTextReturnsNamedToolCallTag(t *testing.T) {
+	text := `我来先列出目录。
+<tool_call>project.index
+{"path": "/Users/dongping/.mateway/workspace/agents/main"}`
+	calls := parseToolCallText(text)
+	if len(calls) != 1 {
+		t.Fatalf("expected one tool call, got %#v", calls)
+	}
+	if calls[0].ID != "call_1" || calls[0].Name != "project.index" || calls[0].Args["path"] != "/Users/dongping/.mateway/workspace/agents/main" {
+		t.Fatalf("unexpected call %#v", calls[0])
+	}
+}
+
 func TestAnthropicContentIncludesTextAndImage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "image.png")
