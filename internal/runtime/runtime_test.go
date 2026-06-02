@@ -1114,7 +1114,7 @@ func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), `"type":"completion_check_failed"`) {
+	if !contains(string(data), `"type":"completion_contract_failed"`) {
 		t.Fatalf("trace missing completion check:\n%s", data)
 	}
 }
@@ -1162,35 +1162,25 @@ func TestLooksLikeUnfinishedExecutionPlan(t *testing.T) {
 	}
 }
 
-func TestFinalVerifierRequiresEvidenceForExecutionTasks(t *testing.T) {
-	input := FinalVerificationInput{
-		UserText:  "create an email skill",
-		FinalText: "The email skill has been designed.",
-		Task:      session.TaskNode{},
+func TestCompletionContractRequiresMutationEvidenceForExecutionTasks(t *testing.T) {
+	contract := buildCompletionContract("create an email skill")
+	if len(contract.RequiredTools) != 1 || contract.RequiredTools[0] != "mutation" {
+		t.Fatalf("contract = %#v", contract)
 	}
-	result := heuristicFinalVerification(input)
-	if result.Action != FinalVerificationContinue {
-		t.Fatalf("expected continue, got %#v", result)
+	task := session.TaskNode{CompletionContract: contract}
+	result := checkCompletionContract(task)
+	if result.Satisfied {
+		t.Fatalf("expected missing evidence, got %#v", result)
 	}
-	input.Task.Steps = []session.TaskStep{{Tool: "project.index", Status: "accepted"}}
-	result = heuristicFinalVerification(input)
-	if result.Action != FinalVerificationContinue {
-		t.Fatalf("expected continue with read-only evidence, got %#v", result)
+	task.Steps = []session.TaskStep{{Tool: "project.index", Status: "accepted"}}
+	result = checkCompletionContract(task)
+	if result.Satisfied {
+		t.Fatalf("expected read-only evidence to be insufficient, got %#v", result)
 	}
-	input.Task.Steps = []session.TaskStep{{Tool: "file.write", Status: "accepted"}}
-	result = heuristicFinalVerification(input)
-	if result.Action != FinalVerificationAllow {
-		t.Fatalf("expected allow with evidence, got %#v", result)
-	}
-}
-
-func TestParseFinalVerificationJSON(t *testing.T) {
-	result, err := parseFinalVerificationJSON("```json\n{\"action\":\"ask_user\",\"reason\":\"missing recipient\",\"follow_up\":\"Ask for recipient\",\"missing_inputs\":[\"recipient\"]}\n```")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Action != FinalVerificationAskUser || result.FollowUp != "Ask for recipient" || len(result.MissingInputs) != 1 {
-		t.Fatalf("parsed result = %#v", result)
+	task.Steps = []session.TaskStep{{Tool: "file.write", Status: "accepted"}}
+	result = checkCompletionContract(task)
+	if !result.Satisfied {
+		t.Fatalf("expected mutation evidence to satisfy contract, got %#v", result)
 	}
 }
 

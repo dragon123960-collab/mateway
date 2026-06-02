@@ -21,16 +21,23 @@ type State struct {
 }
 
 type TaskNode struct {
-	ID        string     `json:"id"`
-	ParentID  string     `json:"parent_id,omitempty"`
-	Goal      string     `json:"goal"`
-	Summary   string     `json:"summary,omitempty"`
-	Status    string     `json:"status"`
-	Steps     []TaskStep `json:"steps,omitempty"`
-	TraceID   string     `json:"trace_id,omitempty"`
-	TracePath string     `json:"trace_path,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID                 string             `json:"id"`
+	ParentID           string             `json:"parent_id,omitempty"`
+	Goal               string             `json:"goal"`
+	Summary            string             `json:"summary,omitempty"`
+	Status             string             `json:"status"`
+	CompletionContract CompletionContract `json:"completion_contract,omitempty"`
+	Steps              []TaskStep         `json:"steps,omitempty"`
+	TraceID            string             `json:"trace_id,omitempty"`
+	TracePath          string             `json:"trace_path,omitempty"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+}
+
+type CompletionContract struct {
+	RequiredTools     []string `json:"required_tools,omitempty"`
+	RequiresLLMReview bool     `json:"requires_llm_review,omitempty"`
+	SuccessCondition  string   `json:"success_condition,omitempty"`
 }
 
 type TaskStep struct {

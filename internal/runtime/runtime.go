@@ -39,7 +39,6 @@ func New(cfg *config.Root) Runtime {
 	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, ruleFollowupHookProvider{})
-	hooks.Providers = append(hooks.Providers, modelFinalVerifierHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultResponseHookProvider{})
@@ -108,6 +107,16 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 }
 
 func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, trace *traceRecorder) (Response, error) {
+	if task != nil && task.CompletionContract.SuccessCondition == "" && len(task.CompletionContract.RequiredTools) == 0 && !task.CompletionContract.RequiresLLMReview {
+		task.CompletionContract = buildCompletionContract(userText)
+		_ = trace.write(map[string]any{
+			"type":                "completion_contract",
+			"task_id":             task.ID,
+			"required_tools":      task.CompletionContract.RequiredTools,
+			"requires_llm_review": task.CompletionContract.RequiresLLMReview,
+			"success_condition":   task.CompletionContract.SuccessCondition,
+		})
+	}
 	messages, compactStats, err := prepareMessagesForModel(state.Messages)
 	if err != nil {
 		_ = trace.write(map[string]any{
@@ -147,7 +156,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	agent.Hooks = rt.hooksForState(state, task.ID, userText, agent.Model, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
@@ -640,14 +649,7 @@ func activeTaskSnapshot(state *session.State, taskID string) session.TaskNode {
 	return session.TaskNode{}
 }
 
-func defaultVerificationFollowUp(action FinalVerificationAction) string {
-	if action == FinalVerificationAskUser {
-		return "Ask the user for the concrete missing inputs only. Do not ask broad planning questions."
-	}
-	return "Continue now by calling tools and produce concrete evidence for the requested task. Do not present a plan as the final answer."
-}
-
-func (rt Runtime) hooksForState(state *session.State, taskID string, userText string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
 	var followUps []agentcore.Message
 	return agentcore.Hooks{
@@ -663,27 +665,15 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, userText st
 			if len(turn.Message.ToolCalls) != 0 {
 				return false, nil
 			}
-			verification := rt.Hooks.verifyFinal(context.Background(), FinalVerificationInput{
-				UserText:  userText,
-				FinalText: turn.Message.Content,
-				Messages:  turn.Messages,
-				Task:      activeTaskSnapshot(state, taskID),
-				Model:     model,
-			}, trace)
-			switch verification.Action {
-			case FinalVerificationContinue, FinalVerificationAskUser:
-				message := strings.TrimSpace(verification.FollowUp)
-				if message == "" {
-					message = defaultVerificationFollowUp(verification.Action)
-				}
-				followUps = append(followUps, agentcore.Message{Role: agentcore.RoleUser, Content: message})
+			task := activeTaskSnapshot(state, taskID)
+			check := checkCompletionContract(task)
+			if !check.Satisfied {
+				followUps = append(followUps, agentcore.Message{Role: agentcore.RoleUser, Content: check.FollowUp})
 				_ = trace.write(map[string]any{
-					"type":           "completion_check_failed",
-					"task_id":        taskID,
-					"reason":         verification.Reason,
-					"action":         verification.Action,
-					"missing_inputs": verification.MissingInputs,
-					"text":           turn.Message.Content,
+					"type":    "completion_contract_failed",
+					"task_id": taskID,
+					"reason":  check.Reason,
+					"text":    turn.Message.Content,
 				})
 			}
 			return false, nil
