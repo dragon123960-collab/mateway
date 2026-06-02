@@ -39,6 +39,7 @@ func New(cfg *config.Root) Runtime {
 	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, ruleFollowupHookProvider{})
+	hooks.Providers = append(hooks.Providers, modelFinalVerifierHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultResponseHookProvider{})
@@ -146,7 +147,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+	agent.Hooks = rt.hooksForState(state, task.ID, userText, agent.Model, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
@@ -624,7 +625,26 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 	return out
 }
 
-func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+func activeTaskSnapshot(state *session.State, taskID string) session.TaskNode {
+	if state == nil {
+		return session.TaskNode{}
+	}
+	for _, task := range state.Tasks {
+		if task.ID == taskID {
+			return task
+		}
+	}
+	return session.TaskNode{}
+}
+
+func defaultVerificationFollowUp(action FinalVerificationAction) string {
+	if action == FinalVerificationAskUser {
+		return "Ask the user for the concrete missing inputs only. Do not ask broad planning questions."
+	}
+	return "Continue now by calling tools and produce concrete evidence for the requested task. Do not present a plan as the final answer."
+}
+
+func (rt Runtime) hooksForState(state *session.State, taskID string, userText string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
 	var followUps []agentcore.Message
 	return agentcore.Hooks{
@@ -637,12 +657,31 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			return append([]agentcore.Message(nil), steering...), nil
 		},
 		ShouldStopAfterTurn: func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
-			if len(turn.Message.ToolCalls) == 0 && looksLikeUnfinishedExecutionPlan(turn.Message.Content) {
-				followUps = append(followUps, agentcore.Message{
-					Role:    agentcore.RoleUser,
-					Content: "Completion check failed: your previous answer described future work but did not execute it. Continue now by calling tools, or ask only if required information is missing. Do not present a plan as the final answer.",
+			if len(turn.Message.ToolCalls) != 0 {
+				return false, nil
+			}
+			verification := rt.Hooks.verifyFinal(context.Background(), FinalVerificationInput{
+				UserText:  userText,
+				FinalText: turn.Message.Content,
+				Messages:  turn.Messages,
+				Task:      activeTaskSnapshot(state, taskID),
+				Model:     model,
+			}, trace)
+			switch verification.Action {
+			case FinalVerificationContinue, FinalVerificationAskUser:
+				message := strings.TrimSpace(verification.FollowUp)
+				if message == "" {
+					message = defaultVerificationFollowUp(verification.Action)
+				}
+				followUps = append(followUps, agentcore.Message{Role: agentcore.RoleUser, Content: message})
+				_ = trace.write(map[string]any{
+					"type":           "completion_check_failed",
+					"task_id":        taskID,
+					"reason":         verification.Reason,
+					"action":         verification.Action,
+					"missing_inputs": verification.MissingInputs,
+					"text":           turn.Message.Content,
 				})
-				_ = trace.write(map[string]any{"type": "completion_check_failed", "task_id": taskID, "reason": "unfinished_execution_plan", "text": turn.Message.Content})
 			}
 			return false, nil
 		},

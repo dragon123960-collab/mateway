@@ -1135,6 +1135,33 @@ func TestLooksLikeUnfinishedExecutionPlan(t *testing.T) {
 	}
 }
 
+func TestFinalVerifierRequiresEvidenceForExecutionTasks(t *testing.T) {
+	input := FinalVerificationInput{
+		UserText:  "创建邮件 skill",
+		FinalText: "邮件 skill 已经设计好了。",
+		Task:      session.TaskNode{},
+	}
+	result := heuristicFinalVerification(input)
+	if result.Action != FinalVerificationContinue {
+		t.Fatalf("expected continue, got %#v", result)
+	}
+	input.Task.Steps = []session.TaskStep{{Tool: "file.write", Status: "accepted"}}
+	result = heuristicFinalVerification(input)
+	if result.Action != FinalVerificationAllow {
+		t.Fatalf("expected allow with evidence, got %#v", result)
+	}
+}
+
+func TestParseFinalVerificationJSON(t *testing.T) {
+	result, err := parseFinalVerificationJSON("```json\n{\"action\":\"ask_user\",\"reason\":\"missing recipient\",\"follow_up\":\"Ask for recipient\",\"missing_inputs\":[\"recipient\"]}\n```")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != FinalVerificationAskUser || result.FollowUp != "Ask for recipient" || len(result.MissingInputs) != 1 {
+		t.Fatalf("parsed result = %#v", result)
+	}
+}
+
 func TestRuntimeDangerousTerminalCommandRequiresConfirmationEvenWhenRiskyAllowed(t *testing.T) {
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: t.TempDir()},

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -12,11 +13,15 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
 
-const defaultHookTimeout = 2 * time.Second
+const (
+	defaultHookTimeout              = 2 * time.Second
+	defaultFinalVerificationTimeout = 30 * time.Second
+)
 
 type ContextHookInput struct {
 	Message  channel.InboundMessage
@@ -77,6 +82,35 @@ type ToolPolicyHookResult struct {
 type ToolPolicyHookProvider interface {
 	HookProvider
 	ToolPolicyHook(context.Context, ToolPolicyHookInput) (ToolPolicyHookResult, error)
+}
+
+type FinalVerificationAction string
+
+const (
+	FinalVerificationAllow      FinalVerificationAction = "allow"
+	FinalVerificationContinue   FinalVerificationAction = "continue"
+	FinalVerificationAskUser    FinalVerificationAction = "ask_user"
+	FinalVerificationStopReport FinalVerificationAction = "stop_report"
+)
+
+type FinalVerificationInput struct {
+	UserText  string
+	FinalText string
+	Messages  []agentcore.Message
+	Task      session.TaskNode
+	Model     agentcore.Model
+}
+
+type FinalVerificationResult struct {
+	Action        FinalVerificationAction
+	Reason        string
+	FollowUp      string
+	MissingInputs []string
+}
+
+type FinalVerificationHookProvider interface {
+	HookProvider
+	FinalVerificationHook(context.Context, FinalVerificationInput) (FinalVerificationResult, error)
 }
 
 type ObserveHookInput struct {
@@ -217,6 +251,43 @@ func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput,
 		}
 	}
 	return ToolPolicyHookResult{}
+}
+
+func (h RuntimeHooks) verifyFinal(ctx context.Context, input FinalVerificationInput, trace *traceRecorder) FinalVerificationResult {
+	timeout := h.Timeout
+	if timeout < defaultFinalVerificationTimeout {
+		timeout = defaultFinalVerificationTimeout
+	}
+	for _, provider := range h.Providers {
+		verifyProvider, ok := provider.(FinalVerificationHookProvider)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(provider.Name())
+		if name == "" {
+			name = "unknown"
+		}
+		result, err := runFinalVerificationHookProvider(ctx, verifyProvider, input, timeout)
+		if err != nil {
+			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "final_verification_hook", "provider": name, "error": err.Error()})
+			continue
+		}
+		if result.Action == "" {
+			result.Action = FinalVerificationAllow
+		}
+		_ = trace.write(map[string]any{
+			"type":           "hook_event",
+			"hook":           "final_verification_hook",
+			"provider":       name,
+			"action":         result.Action,
+			"reason":         result.Reason,
+			"missing_inputs": result.MissingInputs,
+		})
+		if result.Action != FinalVerificationAllow {
+			return result
+		}
+	}
+	return FinalVerificationResult{Action: FinalVerificationAllow}
 }
 
 func (h RuntimeHooks) observe(ctx context.Context, input ObserveHookInput, trace *traceRecorder) ObserveHookResult {
@@ -377,6 +448,39 @@ func runToolPolicyHookProvider(ctx context.Context, provider ToolPolicyHookProvi
 			return ToolPolicyHookResult{}, err
 		}
 		return ToolPolicyHookResult{}, context.DeadlineExceeded
+	}
+}
+
+func runFinalVerificationHookProvider(ctx context.Context, provider FinalVerificationHookProvider, input FinalVerificationInput, timeout time.Duration) (result FinalVerificationResult, err error) {
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan struct {
+		result FinalVerificationResult
+		err    error
+	}, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- struct {
+					result FinalVerificationResult
+					err    error
+				}{err: fmt.Errorf("panic: %v", recovered)}
+			}
+		}()
+		result, err := provider.FinalVerificationHook(child, input)
+		done <- struct {
+			result FinalVerificationResult
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case output := <-done:
+		return output.result, output.err
+	case <-child.Done():
+		if err := child.Err(); err != nil {
+			return FinalVerificationResult{}, err
+		}
+		return FinalVerificationResult{}, context.DeadlineExceeded
 	}
 }
 
@@ -594,6 +698,148 @@ func hasMemoryLintErrors(issues []memory.Issue) bool {
 		}
 	}
 	return false
+}
+
+type modelFinalVerifierHookProvider struct{}
+
+func (modelFinalVerifierHookProvider) Name() string { return "model_final_verifier" }
+
+func (modelFinalVerifierHookProvider) FinalVerificationHook(ctx context.Context, input FinalVerificationInput) (FinalVerificationResult, error) {
+	if looksLikeInputRequest(input.FinalText) {
+		return FinalVerificationResult{Action: FinalVerificationAllow}, nil
+	}
+	if !needsFinalVerification(input.UserText, input.FinalText) {
+		return FinalVerificationResult{Action: FinalVerificationAllow}, nil
+	}
+	if _, ok := input.Model.(model.AgentModel); input.Model == nil || !ok {
+		return heuristicFinalVerification(input), nil
+	}
+	prompt := finalVerifierPrompt(input)
+	msg, err := input.Model.Next(ctx, agentcore.Context{
+		SystemPrompt: "You are a strict task completion verifier. Return only JSON.",
+		Messages: []agentcore.Message{
+			{Role: agentcore.RoleUser, Content: prompt},
+		},
+		Tools: nil,
+	})
+	if err != nil {
+		return FinalVerificationResult{}, err
+	}
+	result, err := parseFinalVerificationJSON(msg.Content)
+	if err != nil {
+		return heuristicFinalVerification(input), nil
+	}
+	if result.Action == "" {
+		result.Action = FinalVerificationAllow
+	}
+	return result, nil
+}
+
+func needsFinalVerification(userText, finalText string) bool {
+	if looksLikeUnfinishedExecutionPlan(finalText) {
+		return true
+	}
+	text := strings.ToLower(strings.TrimSpace(userText + "\n" + finalText))
+	for _, cue := range []string{
+		"create", "write", "modify", "edit", "fix", "test", "verify", "install", "send", "publish", "deploy", "script", "skill",
+		"创建", "新建", "写", "修改", "修复", "测试", "验证", "安装", "发送", "发布", "部署", "脚本", "技能",
+	} {
+		if strings.Contains(text, cue) {
+			return true
+		}
+	}
+	return false
+}
+
+func heuristicFinalVerification(input FinalVerificationInput) FinalVerificationResult {
+	if looksLikeUnfinishedExecutionPlan(input.FinalText) {
+		return FinalVerificationResult{
+			Action:   FinalVerificationContinue,
+			Reason:   "final answer describes future work without execution",
+			FollowUp: "Continue now. Execute the required tools, or ask only if required information is missing. Do not present a plan as the final answer.",
+		}
+	}
+	if needsFinalVerification(input.UserText, input.FinalText) && taskHasNoAcceptedToolEvidence(input.Task) {
+		return FinalVerificationResult{
+			Action:   FinalVerificationContinue,
+			Reason:   "task appears to require execution evidence but no accepted tool evidence is present",
+			FollowUp: "Continue now and produce concrete tool evidence for the requested task. If required information is missing, ask the user for only those fields.",
+		}
+	}
+	return FinalVerificationResult{Action: FinalVerificationAllow}
+}
+
+func taskHasNoAcceptedToolEvidence(task session.TaskNode) bool {
+	for _, step := range task.Steps {
+		if step.Status == "accepted" && strings.TrimSpace(step.Tool) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func finalVerifierPrompt(input FinalVerificationInput) string {
+	var b strings.Builder
+	b.WriteString("Decide whether the assistant's final answer satisfies the user's task.\n")
+	b.WriteString("Return JSON only with fields: action, reason, follow_up, missing_inputs.\n")
+	b.WriteString("Allowed action values: allow, continue, ask_user, stop_report.\n")
+	b.WriteString("Use continue when more tool execution is needed. Use ask_user only when concrete missing inputs block progress.\n\n")
+	b.WriteString("User task:\n")
+	b.WriteString(strings.TrimSpace(input.UserText))
+	b.WriteString("\n\nAssistant final answer:\n")
+	b.WriteString(strings.TrimSpace(input.FinalText))
+	b.WriteString("\n\nAccepted tool evidence:\n")
+	evidence := acceptedToolEvidence(input.Task)
+	if len(evidence) == 0 {
+		b.WriteString("(none)")
+	} else {
+		b.WriteString(strings.Join(evidence, "\n"))
+	}
+	return b.String()
+}
+
+func acceptedToolEvidence(task session.TaskNode) []string {
+	var out []string
+	for _, step := range task.Steps {
+		if step.Status != "accepted" {
+			continue
+		}
+		line := "- " + strings.TrimSpace(step.Tool)
+		if summary := strings.TrimSpace(fmt.Sprint(step.Evidence["summary"])); summary != "" && summary != "<nil>" {
+			line += ": " + summarize(summary)
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func parseFinalVerificationJSON(text string) (FinalVerificationResult, error) {
+	raw := strings.TrimSpace(text)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	var payload struct {
+		Action        string   `json:"action"`
+		Reason        string   `json:"reason"`
+		FollowUp      string   `json:"follow_up"`
+		MissingInputs []string `json:"missing_inputs"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return FinalVerificationResult{}, err
+	}
+	action := FinalVerificationAction(strings.TrimSpace(payload.Action))
+	switch action {
+	case FinalVerificationAllow, FinalVerificationContinue, FinalVerificationAskUser, FinalVerificationStopReport:
+	default:
+		action = FinalVerificationAllow
+	}
+	return FinalVerificationResult{
+		Action:        action,
+		Reason:        strings.TrimSpace(payload.Reason),
+		FollowUp:      strings.TrimSpace(payload.FollowUp),
+		MissingInputs: payload.MissingInputs,
+	}, nil
 }
 
 type ruleFollowupHookProvider struct{}
