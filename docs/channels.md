@@ -1,8 +1,6 @@
 # Channel 配置与内置接入
 
-Mateway 当前采用内置 channel 模式：`gateway serve` 是唯一常驻入口，负责启动已启用的 channel、统一 session key、dedupe、异步运行 runtime 和发送回复。`gateway serve` 也会在 `web.enabled` 为 true 时启动本地 [Web Console](./web-console.md)；Web Console 是 control plane，不算外部消息 channel。
-
-同一个 `gateway serve` 进程内，Feishu、Weixin、Web 和 schedule 触发的 runtime 都会写 JSONL trace，并把新 trace event 发布到 WebSocket event bus。打开 Office Watch 后，选择对应 `session_key` 就能实时观察任务进度；服务重启后的历史查看走 trace replay。
+Mateway 当前采用内置 channel 模式：`gateway serve` 是唯一常驻入口，负责启动已启用的 channel、统一 session key、dedupe、异步运行 runtime 和发送回复。
 
 ## 查看 Channel ID
 
@@ -42,7 +40,6 @@ channel 配置位于：
 
 - channel package 只负责平台 I/O 和消息归一化。
 - gateway 负责 session key、dedupe、异步 runtime 执行和 channel serving。
-- observe/Web 只订阅 runtime trace event，不参与 channel I/O。
 - runtime 负责 setup -> AgentCore loop -> finalize。
 - tool/connector 能解决的问题，不上升到 runtime 复杂机制。
 

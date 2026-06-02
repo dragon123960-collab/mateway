@@ -62,7 +62,6 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	if err != nil {
 		return Response{}, err
 	}
-	trace.setSessionKey(msg.SessionKey)
 	_ = trace.write(map[string]any{"type": "request", "session_key": msg.SessionKey, "channel": msg.Channel, "text": msg.Text})
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
@@ -81,8 +80,6 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text}, trace)
 	if decision.Kind == followupClarify {
 		task := state.StartTask(msg.Text)
-		trace.setTaskID(task.ID)
-		_ = trace.write(map[string]any{"type": "task_created", "task_id": task.ID, "goal": task.Goal})
 		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
 		state.BlockActiveTask("await_user_input")
 		if err := rt.saveState(&state, trace); err != nil {
@@ -110,9 +107,6 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 }
 
 func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, trace *traceRecorder) (Response, error) {
-	trace.setSessionKey(msg.SessionKey)
-	trace.setTaskID(task.ID)
-	_ = trace.write(map[string]any{"type": "task_created", "task_id": task.ID, "goal": task.Goal, "status": task.Status})
 	messages, compactStats, err := prepareMessagesForModel(state.Messages)
 	if err != nil {
 		_ = trace.write(map[string]any{
@@ -152,27 +146,13 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	steering := rt.Hooks.contextMessages(ctx, ContextHookInput{
+	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
 		UserText: userText,
 		Profile:  profile,
-	}, trace)
-	agent.Hooks = rt.hooksForState(state, task.ID, trace, steering)
-	contextChars := messageChars(messages) + messageChars(steering)
-	_ = trace.write(map[string]any{
-		"type":                "context_built",
-		"task_id":             task.ID,
-		"messages":            len(messages),
-		"steering_messages":   len(steering),
-		"context_estimated":   true,
-		"context_chars":       contextChars,
-		"context_window":      modelContextWindow(rt.Config, profile),
-		"max_output":          modelMaxTokens(rt.Config, profile),
-		"estimated_context":   estimateTokensFromChars(contextChars),
-		"remaining_estimated": estimatedRemainingContext(rt.Config, profile, contextChars),
-	})
+	}, trace))
 	result, err := agent.Continue(ctx)
 	if err != nil {
 		state.BlockActiveTask("failed")
@@ -206,11 +186,9 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
-			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_user_input", "question": result.FinalText})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(result.FinalText), trace.id, trace.path)
 			taskCompleted = true
-			_ = trace.write(map[string]any{"type": "task_completed", "task_id": task.ID, "summary": summarize(result.FinalText)})
 		}
 	}
 	if err := rt.saveState(state, trace); err != nil {
@@ -235,7 +213,6 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
 		}
 		state.BlockActiveTask("await_schedule_test")
-		_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "await_schedule_test", "schedule_id": scheduleID})
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
@@ -490,49 +467,6 @@ func writeUsageTrace(trace *traceRecorder, usage session.Usage) {
 		"output_tokens": usage.OutputTokens,
 		"total_tokens":  usage.TotalTokens,
 	})
-}
-
-func estimateTokensFromChars(chars int) int {
-	if chars <= 0 {
-		return 0
-	}
-	return (chars + 3) / 4
-}
-
-func estimatedRemainingContext(cfg *config.Root, profile config.AgentProfileConfig, chars int) int {
-	window := modelContextWindow(cfg, profile)
-	if window <= 0 {
-		return 0
-	}
-	remaining := window - estimateTokensFromChars(chars) - modelMaxTokens(cfg, profile)
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
-}
-
-func modelContextWindow(cfg *config.Root, profile config.AgentProfileConfig) int {
-	return selectedModelConfig(cfg, profile).ContextWindow
-}
-
-func modelMaxTokens(cfg *config.Root, profile config.AgentProfileConfig) int {
-	return selectedModelConfig(cfg, profile).MaxTokens
-}
-
-func selectedModelConfig(cfg *config.Root, profile config.AgentProfileConfig) config.ModelConfig {
-	if cfg == nil {
-		return config.ModelConfig{}
-	}
-	name := strings.TrimSpace(profile.Model.Default)
-	if name == "" {
-		name = strings.TrimSpace(cfg.Model.Default)
-	}
-	for _, model := range cfg.Models {
-		if strings.EqualFold(strings.TrimSpace(model.Name), name) {
-			return model
-		}
-	}
-	return config.ModelConfig{}
 }
 
 func (rt Runtime) home() string {

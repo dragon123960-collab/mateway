@@ -9,7 +9,7 @@
 
 它不是重型工作流平台，也不是只能演示的聊天机器人。Mateway 是一个围绕小型 AgentCore 主循环构建的 Go 运行时，同时已经预留多 agent profile 和 binding 基础，用于不同工作身份、渠道、skills 和记忆作用域。
 
-> **一句话：Mateway = 小型 AgentCore + 多 Agent Profile + Hook Runtime + 工具边界 + 类 Git 记忆 + 自学习 Proposal + Trace Ledger + 实时 Office Watch。**
+> **一句话：Mateway = 小型 AgentCore + 多 Agent Profile + Hook Runtime + 工具边界 + 类 Git 记忆 + 自学习 Proposal + Trace Ledger。**
 
 ```text
 receive -> followup_hook -> context_hook -> model/tool loop
@@ -100,13 +100,7 @@ mateway memory proposal reject <proposal_id>
 
 持久化 trace、session transcript 和 task step summary 会脱敏明显的 secret 字段，例如 `api_key`、`token`、`password`、`smtp_pass`、`imap_pass` 和 bearer token。模型在当前任务中仍能看到实时工具输出；持久化日志避免保存明显凭证。
 
-### 5. 实时 Runtime 可视化
-
-`gateway serve` 可以在同一个进程里同时运行本地 Web Console、Office Watch、飞书、微信、定时任务和未来 channel。Runtime 写 trace 的同时会通过进程内 WebSocket event bus 发布事件，所以从飞书发布的任务，只要由同一个 gateway 进程执行，也可以在浏览器里实时看到进度。
-
-Office Watch 会展示任务发布、上下文组装、模型轮次、工具执行、usage 增量、回复、等待状态和完成状态，也支持从 JSONL trace 做历史回放。标记为 `est` 的 context 数字是基于字符数的估算；只有模型 provider 返回的 usage 才是真实 token。
-
-### 6. 有边界的 Session Context
+### 5. 有边界的 Session Context
 
 Session 是运行时状态，不是无限增长的原始聊天记录。每次调用模型前，Mateway 会从这些来源临时组装 context：
 
@@ -123,7 +117,7 @@ System context 每轮重新生成，不会写回 session transcript。持久化 
 
 发送 `/new`、`/新会话` 或 `新会话` 会归档当前 session，并在同一个 `session_key` 下清空 active state。飞书长 thread 仍然保持稳定 session key，但 agent 可以从干净上下文重新开始。
 
-### 7. Skills 是可编辑行为，不是魔法工具
+### 6. Skills 是可编辑行为，不是魔法工具
 
 Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime context。当前默认 skills 包括：
 
@@ -242,28 +236,7 @@ vim ~/.mateway/config/config.yaml
 ./build/mateway gateway serve
 ```
 
-`gateway serve` 会以前台进程启动已启用的内置 channel 和本地 Web Console。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
-
-Web Console 默认启用，地址为：
-
-```text
-http://127.0.0.1:8765
-```
-
-它提供一个本地工作台，用于对话、skills、定时任务、sessions、channels、agents、配置和 usage 查看。可以在 `config.yaml` 的 `web` 块里配置：
-
-```yaml
-web:
-  enabled: true
-  bind: 127.0.0.1:8765
-  open_browser: false
-  allow_config_write: true
-  realtime_enabled: true
-  office_watch_enabled: true
-  office_watch_assets: ""
-```
-
-控制台还提供可选的 Office Watch 页面：`http://127.0.0.1:8765/watch`。它通过本地 WebSocket 事件展示任务从发布、上下文组装、模型轮次、工具执行、usage 增量、回复到完成的动态过程。Office Watch 使用 Mateway 自制占位像素样式，不打包 Star-Office-UI 的非商用素材。标记为 `est` 的上下文数字是基于字符数的估算；模型 provider 返回的 usage 才是真实 token。
+`gateway serve` 会以前台进程启动已启用的内置 channel。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
 
 查看当前可配置的 channel id：
 
@@ -387,7 +360,7 @@ memory:
 
 Mateway 现在优先使用大模型原生 tool/function calling，不再把手写工具 JSON 当作主路径。Anthropic-compatible 模型，例如 MiniMax M3，会使用 Anthropic `tools` / `tool_use`；OpenAI Chat-compatible 模型，例如 GLM Flash，会使用 Chat Completions `tools` / `tool_calls`。旧的 `[TOOL_CALL]` 文本协议只保留为兜底：当某个模型 API 不支持原生工具调用，或原生请求失败时才使用。
 
-所有入口共用同一个 runtime loop，所以 CLI、飞书、微信、Web Console 和定时任务，只要配置的模型支持原生工具调用，都会走同一条原生工具路径。OpenAI Responses 风格的 `api: openai` 目前保持保守处理，在对应 provider 或代理的原生 Responses tools 验证完成前继续使用 fallback 路径。
+所有 runtime 入口共用同一个 AgentCore loop，所以 CLI、飞书、微信和定时任务，只要配置的模型支持原生工具调用，都会走同一条原生工具路径。OpenAI Responses 风格的 `api: openai` 目前保持保守处理，在对应 provider 或代理的原生 Responses tools 验证完成前继续使用 fallback 路径。
 
 ## Trace 命令
 
@@ -477,31 +450,14 @@ required_secrets:
 当前行为：
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
-- 低频 skills 可以自动冷却：active skills 注入完整 guidance，cold skills 只注入一行召回卡片，hidden skills 不进入 context，直到手动恢复。
 - 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps、software installation workflow 和 Mateway skill creation rules。
 - Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
-
-Skill cleanup 通过 `skills.cleanup` 配置：
-
-```yaml
-skills:
-  cleanup:
-    enabled: true
-    cold_after_days: 30
-    hidden_after_days: 90
-    max_usage_count: 1
-    protected: []
-    restore_mode: permanent
-```
-
-Cold skills 仍会用 `name`、`description`、`aliases` 和 `when_to_use` 生成极短召回卡片。Hidden skills 不会被删除；可以用 `mateway skill cleanup list --state hidden` 查看，并用 `mateway skill cleanup restore <id>` 恢复。
 
 已可用：
 
 - `mateway skill catalog report`
 - `mateway skill search <query>`
 - `mateway skill install <name-or-url>`
-- `mateway skill cleanup report|list|restore`
 - `mateway skill proposal list|show|promote|reject`
 - `mateway skill usage report`
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
@@ -537,7 +493,7 @@ Profile 产品化命令：
 
 ## Gateway 边界
 
-Gateway 是 channel 汇聚层和本地控制台宿主：负责 session key、dedupe、异步 runtime 执行、reply 分发和 Web Console。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket、原生微信长轮询，以及 `web.enabled` 为 true 时的本地 Web Console。
+Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket 和原生微信长轮询。
 
 新的稳定 channel 应优先做成内置 channel spec，这样一个 gateway 进程就能统一管理。channel package 负责平台 I/O 和消息归一化，gateway 负责 session key、dedupe、异步 runtime 执行和 trace。
 
@@ -554,9 +510,10 @@ Mateway 不会把这些能力伪装成已经完成：
 - 还没有 multi-agent supervisor 或 DAG router
 - 还没有 OS-level sandbox wrapper
 - 还没有通用 mail/SSH/GitHub connector framework
+- 还没有可视化 workspace UI
 - 还没有外部 skill marketplace installer
 
-当前可用版本聚焦于：稳定小核心 runtime、多 agent profile 基础、hook pipeline、带风险边界的真实工具、飞书/CLI/Web 入口、traceability、white-box memory 和实时运行可观察性。
+当前可用版本聚焦于：稳定小核心 runtime、多 agent profile 基础、hook pipeline、带风险边界的真实工具、飞书/CLI 入口、traceability 和 white-box memory。
 
 
 ## Roadmap
@@ -581,8 +538,6 @@ Mateway 不会把这些能力伪装成已经完成：
 - Channel-neutral scheduled task create/test/run-due/serve
 - 通过 `mateway channel list` 发现内置 channel
 - 持久化 runtime 记录 secret redaction
-- Web Console：对话、skills、定时任务、sessions、配置、记忆和 channel 开关
-- Office Watch：基于 WebSocket 的实时执行 timeline，并支持 trace 回放
 
 ### 下一步
 
@@ -591,7 +546,7 @@ Mateway 不会把这些能力伪装成已经完成：
 - user-provided connectors 的 script bridge specification
 - skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers
-- 更完整的 trace/task/memory workspace UI
+- 只读 trace/task/memory workspace UI
 - mail、SSH、GitHub 和 publishing connector packages
 
 ## 设计原则

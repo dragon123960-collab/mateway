@@ -144,22 +144,7 @@ func TestBuiltinChannelSpecsExposeEnabledChannels(t *testing.T) {
 		}
 	}
 	got := strings.Join(enabled, ",")
-	if got != "feishu,weixin,web" {
+	if got != "feishu,weixin" {
 		t.Fatalf("enabled specs = %q", got)
-	}
-}
-
-func TestBuiltinSpecsAllowWebOnlyGateway(t *testing.T) {
-	enabled := true
-	cfg := Config{Config: &config.Root{Web: config.WebConfig{Enabled: &enabled, Bind: "127.0.0.1:0"}}}
-	specs := builtinChannelSpecs(cfg)
-	var got []string
-	for _, spec := range specs {
-		if spec.Enabled {
-			got = append(got, spec.Name)
-		}
-	}
-	if strings.Join(got, ",") != "web" {
-		t.Fatalf("enabled specs = %#v", got)
 	}
 }

@@ -13,7 +13,6 @@ import (
 	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
-	"github.com/dongping/mateway/internal/web"
 )
 
 type Config struct {
@@ -75,17 +74,6 @@ func builtinChannelSpecs(cfg Config) []channelSpec {
 	return []channelSpec{
 		feishuChannelSpec(cfg.Config.Channels.Feishu),
 		weixinChannelSpec(cfg.Config.Channels.Weixin),
-		webConsoleSpec(cfg),
-	}
-}
-
-func webConsoleSpec(cfg Config) channelSpec {
-	return channelSpec{
-		Name:    "web",
-		Enabled: cfg.Config.Web.EnabledValue(),
-		Start: func(ctx context.Context, rt channelRuntime) error {
-			return web.Serve(ctx, cfg.Config, rt.Runtime)
-		},
 	}
 }
 

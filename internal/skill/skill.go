@@ -19,8 +19,6 @@ type Skill struct {
 	Description string
 	Stage       string
 	Priority    string
-	Aliases     []string
-	WhenToUse   []string
 	Path        string
 	Scope       string
 }
@@ -199,33 +197,12 @@ func ParseHeader(text string) Skill {
 			skill.Stage = value
 		case "priority":
 			skill.Priority = value
-		case "aliases":
-			skill.Aliases = splitHeaderList(value)
-		case "when_to_use":
-			skill.WhenToUse = splitHeaderList(value)
 		}
 		if !inFrontMatter && i > 20 {
 			break
 		}
 	}
 	return skill
-}
-
-func splitHeaderList(value string) []string {
-	value = strings.TrimSpace(value)
-	value = strings.Trim(value, "[]")
-	if value == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	var out []string
-	for _, part := range parts {
-		part = strings.Trim(strings.TrimSpace(part), `"'`)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
 }
 
 func listRoot(root, scope string) ([]Skill, error) {

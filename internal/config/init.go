@@ -221,13 +221,6 @@ learning:
     ask_timing: next_interaction
 
 skills:
-  cleanup:
-    enabled: true
-    cold_after_days: 30
-    hidden_after_days: 90
-    max_usage_count: 1
-    protected: []
-    restore_mode: permanent
   catalogs:
     - name: skills.sh
       enabled: true
@@ -256,15 +249,6 @@ scheduler:
   timezone: Asia/Shanghai
   state_dir: ""
   interval: 30s
-
-web:
-  enabled: true
-  bind: 127.0.0.1:8765
-  open_browser: false
-  allow_config_write: true
-  realtime_enabled: true
-  office_watch_enabled: true
-  office_watch_assets: ""
 
 agents:
   default: main

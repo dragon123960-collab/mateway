@@ -1622,59 +1622,6 @@ func TestDiscoverSkillsPrefersAgentSpecificSkill(t *testing.T) {
 	}
 }
 
-func TestDiscoverSkillsAppliesCleanupStates(t *testing.T) {
-	home := t.TempDir()
-	workspace := filepath.Join(home, "workspace")
-	oldPath := filepath.Join(workspace, "skills", "old-mail", "SKILL.md")
-	coldPath := filepath.Join(workspace, "skills", "cold-mail", "SKILL.md")
-	activePath := filepath.Join(workspace, "skills", "active-search", "SKILL.md")
-	writeRuntimeSkill(t, oldPath, "---\nname: old-mail\ndescription: Old mail.\n---\n# Old Mail\nHidden guidance")
-	writeRuntimeSkill(t, coldPath, "---\nname: cold-mail\ndescription: Cold mail.\naliases: mail, 邮件\nwhen_to_use: notify someone\n---\n# Cold Mail\nCold guidance should not appear")
-	writeRuntimeSkill(t, activePath, "---\nname: active-search\ndescription: Active search.\n---\n# Active Search\nActive guidance")
-	old := time.Now().AddDate(0, 0, -120)
-	cold := time.Now().AddDate(0, 0, -40)
-	if err := os.Chtimes(oldPath, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(coldPath, cold, cold); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Root{
-		App: config.AppConfig{Home: home, Workspace: workspace},
-		Skills: config.SkillsConfig{Cleanup: config.SkillCleanupConfig{
-			Enabled:         runtimeBoolPtr(true),
-			ColdAfterDays:   30,
-			HiddenAfterDays: 90,
-			MaxUsageCount:   1,
-		}},
-	}
-	skills := discoverSkills(cfg, 10)
-	prompt := skillsPrompt(skills)
-	if contains(prompt, "- old-mail") || contains(prompt, "Hidden guidance") {
-		t.Fatalf("hidden skill should not be injected:\n%s", prompt)
-	}
-	if !contains(prompt, "cold-mail (state=cold)") || !contains(prompt, "aliases=mail, 邮件") || contains(prompt, "Cold guidance should not appear") {
-		t.Fatalf("cold skill should inject only a card:\n%s", prompt)
-	}
-	if !contains(prompt, "active-search") || !contains(prompt, "Active guidance") {
-		t.Fatalf("active skill should inject guidance:\n%s", prompt)
-	}
-}
-
-func writeRuntimeSkill(t *testing.T, path, text string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func runtimeBoolPtr(value bool) *bool {
-	return &value
-}
-
 type staticModel struct {
 	text string
 }

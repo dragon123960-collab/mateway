@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/skill"
 )
 
 type discoveredSkill struct {
@@ -16,9 +15,6 @@ type discoveredSkill struct {
 	Description string
 	Stage       string
 	Priority    string
-	Aliases     []string
-	WhenToUse   []string
-	State       string
 	Path        string
 }
 
@@ -51,19 +47,14 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 	roots := skillRoots(workspace, agentID)
 	var out []discoveredSkill
 	seen := map[string]bool{}
-	states := cleanupStates(cfg, workspace)
 	for _, root := range roots {
-		for _, item := range discoverSkillsInRoot(root) {
-			key := strings.ToLower(item.Name)
+		for _, skill := range discoverSkillsInRoot(root) {
+			key := strings.ToLower(skill.Name)
 			if seen[key] {
 				continue
 			}
-			item.State = states[filepath.ToSlash(item.Path)]
-			if item.State == skill.StateHidden {
-				continue
-			}
 			seen[key] = true
-			out = append(out, item)
+			out = append(out, skill)
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -76,25 +67,6 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 	})
 	if len(out) > limit {
 		out = out[:limit]
-	}
-	return out
-}
-
-func cleanupStates(cfg *config.Root, workspace string) map[string]string {
-	if cfg == nil || !cfg.Skills.Cleanup.EnabledValue() {
-		return nil
-	}
-	report, err := skill.BuildCleanupReport(skill.CleanupInput{
-		Home:      cfg.App.Home,
-		Workspace: workspace,
-		Config:    cfg.Skills.Cleanup,
-	})
-	if err != nil {
-		return nil
-	}
-	out := map[string]string{}
-	for _, item := range report.Items {
-		out[filepath.ToSlash(item.Path)] = item.State
 	}
 	return out
 }
@@ -164,10 +136,6 @@ func parseSkillHeader(text string) discoveredSkill {
 			skill.Stage = value
 		case "priority":
 			skill.Priority = value
-		case "aliases":
-			skill.Aliases = splitSkillHeaderList(value)
-		case "when_to_use":
-			skill.WhenToUse = splitSkillHeaderList(value)
 		}
 		if !inFrontMatter && i > 20 {
 			break
@@ -188,23 +156,6 @@ func skillsPrompt(skills []discoveredSkill) string {
 	for _, skill := range skills {
 		b.WriteString("- ")
 		b.WriteString(skill.Name)
-		if skill.State == "cold" {
-			b.WriteString(" (state=cold)")
-			if skill.Description != "" {
-				b.WriteString(": ")
-				b.WriteString(skill.Description)
-			}
-			if len(skill.WhenToUse) > 0 {
-				b.WriteString(" when_to_use=")
-				b.WriteString(strings.Join(skill.WhenToUse, "; "))
-			}
-			if len(skill.Aliases) > 0 {
-				b.WriteString(" aliases=")
-				b.WriteString(strings.Join(skill.Aliases, ", "))
-			}
-			b.WriteString("\n")
-			continue
-		}
 		if skill.Stage != "" || skill.Priority != "" {
 			b.WriteString(" (")
 			var parts []string
@@ -235,23 +186,6 @@ func skillsPrompt(skills []discoveredSkill) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
-}
-
-func splitSkillHeaderList(value string) []string {
-	value = strings.TrimSpace(value)
-	value = strings.Trim(value, "[]")
-	if value == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	var out []string
-	for _, part := range parts {
-		part = strings.Trim(strings.TrimSpace(part), `"'`)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
 }
 
 func skillPriority(skill discoveredSkill) int {
