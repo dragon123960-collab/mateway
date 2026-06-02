@@ -184,7 +184,10 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	if state.Pending == nil {
-		if looksLikeInputRequest(result.FinalText) {
+		if warning := finalTextWarning(result.FinalText); warning != "" {
+			state.BlockActiveTask("failed")
+			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": result.FinalText})
+		} else if looksLikeInputRequest(result.FinalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: result.FinalText}
 			state.BlockActiveTask("await_user_input")
 		} else {
@@ -1179,6 +1182,18 @@ func summarize(text string) string {
 	return text[:160] + fmt.Sprintf("... (%d chars)", len(text))
 }
 
+func finalTextWarning(text string) string {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	switch {
+	case strings.Contains(lower, "tool budget reached") || strings.Contains(lower, "max tool iterations") || strings.Contains(text, "最大工具循环次数"):
+		return "tool_budget_reached"
+	case strings.Contains(lower, "malformed") || strings.Contains(text, "工具调用格式无效"):
+		return "tool_call_format_issue"
+	default:
+		return ""
+	}
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1245,7 +1260,16 @@ func looksLikeInputRequest(text string) bool {
 	if strings.Contains(trimmed, "需要你") || strings.Contains(trimmed, "请提供") || strings.Contains(trimmed, "请补充") {
 		return true
 	}
-	return strings.HasSuffix(trimmed, "？") && (strings.Contains(trimmed, "哪个") || strings.Contains(trimmed, "什么") || strings.Contains(trimmed, "是否"))
+	if strings.HasSuffix(trimmed, "？") && (strings.Contains(trimmed, "哪个") || strings.Contains(trimmed, "什么") || strings.Contains(trimmed, "是否")) {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	return strings.Contains(lower, "please provide") ||
+		strings.Contains(lower, "please clarify") ||
+		strings.Contains(lower, "need you to provide") ||
+		strings.Contains(lower, "missing input") ||
+		strings.Contains(lower, "which ") ||
+		strings.Contains(lower, "what ")
 }
 
 func looksLikeUnfinishedExecutionPlan(text string) bool {
@@ -1255,16 +1279,14 @@ func looksLikeUnfinishedExecutionPlan(text string) bool {
 	}
 	lower := strings.ToLower(trimmed)
 	planCues := []string{
-		"接下来", "下一步", "然后", "之后", "准备", "我会", "我将", "让我", "去",
 		"next", "then", "i will", "i'll", "going to", "let me",
 	}
 	actionCues := []string{
-		"写", "建", "创建", "修改", "跑", "测试", "验证", "执行", "查", "搜索", "获取", "拿", "脚本", "文件", "工具",
 		"write", "create", "modify", "run", "test", "verify", "execute", "search", "fetch", "script", "file", "tool",
 	}
 	hasPlanCue := false
 	for _, cue := range planCues {
-		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+		if strings.Contains(lower, cue) {
 			hasPlanCue = true
 			break
 		}
@@ -1273,7 +1295,7 @@ func looksLikeUnfinishedExecutionPlan(text string) bool {
 		return false
 	}
 	for _, cue := range actionCues {
-		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+		if strings.Contains(lower, cue) {
 			return true
 		}
 	}

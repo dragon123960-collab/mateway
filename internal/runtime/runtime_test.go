@@ -1089,15 +1089,15 @@ func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, Content: "接下来写三个脚本，然后跑连通性测试。"},
+		{Role: agentcore.RoleAssistant, Content: "Next I will write three scripts and run connectivity tests."},
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "email/scripts/list.py", "content": "ok"}}}},
-		{Role: agentcore.RoleAssistant, Content: "脚本已写入并验证。"},
+		{Role: agentcore.RoleAssistant, Content: "Scripts were written and verified."},
 	}}, rt.Tools)
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建邮件 skill"})
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "create an email skill"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Text != "脚本已写入并验证。" {
+	if resp.Reply.Text != "Scripts were written and verified." {
 		t.Fatalf("reply = %q", resp.Reply.Text)
 	}
 	state, err := rt.Store.Load("cli:test")
@@ -1119,31 +1119,63 @@ func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
 	}
 }
 
+func TestRuntimeDoesNotCompleteExecutionTaskWithReadOnlyEvidence(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": "."}}}},
+		{Role: agentcore.RoleAssistant, Content: "Start writing files now."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "file.write", Args: map[string]any{"path": "email/SKILL.md", "content": "# email"}}}},
+		{Role: agentcore.RoleAssistant, Content: "Created the email skill file."},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "create an email skill"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "Created the email skill file." {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+	if len(state.Tasks[0].Steps) != 2 || state.Tasks[0].Steps[1].Tool != "file.write" {
+		t.Fatalf("expected read-only probe followed by file.write, got %#v", state.Tasks[0].Steps)
+	}
+}
+
 func TestLooksLikeUnfinishedExecutionPlan(t *testing.T) {
 	cases := []string{
-		"接下来写三个脚本，然后跑连通性测试。",
-		"去知乎那篇 163/126/QQ 配置汇总页拿一手数据。",
 		"Next I will create the script and run tests.",
+		"Let me fetch the config and write the file.",
 	}
 	for _, text := range cases {
 		if !looksLikeUnfinishedExecutionPlan(text) {
 			t.Fatalf("expected unfinished execution plan: %q", text)
 		}
 	}
-	if looksLikeUnfinishedExecutionPlan("脚本已写入并验证。") {
+	if looksLikeUnfinishedExecutionPlan("Scripts were written and verified.") {
 		t.Fatalf("completed evidence should not look unfinished")
 	}
 }
 
 func TestFinalVerifierRequiresEvidenceForExecutionTasks(t *testing.T) {
 	input := FinalVerificationInput{
-		UserText:  "创建邮件 skill",
-		FinalText: "邮件 skill 已经设计好了。",
+		UserText:  "create an email skill",
+		FinalText: "The email skill has been designed.",
 		Task:      session.TaskNode{},
 	}
 	result := heuristicFinalVerification(input)
 	if result.Action != FinalVerificationContinue {
 		t.Fatalf("expected continue, got %#v", result)
+	}
+	input.Task.Steps = []session.TaskStep{{Tool: "project.index", Status: "accepted"}}
+	result = heuristicFinalVerification(input)
+	if result.Action != FinalVerificationContinue {
+		t.Fatalf("expected continue with read-only evidence, got %#v", result)
 	}
 	input.Task.Steps = []session.TaskStep{{Tool: "file.write", Status: "accepted"}}
 	result = heuristicFinalVerification(input)

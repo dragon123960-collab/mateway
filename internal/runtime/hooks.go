@@ -708,10 +708,10 @@ func (modelFinalVerifierHookProvider) FinalVerificationHook(ctx context.Context,
 	if looksLikeInputRequest(input.FinalText) {
 		return FinalVerificationResult{Action: FinalVerificationAllow}, nil
 	}
-	if !needsFinalVerification(input.UserText, input.FinalText) {
-		return FinalVerificationResult{Action: FinalVerificationAllow}, nil
-	}
 	if _, ok := input.Model.(model.AgentModel); input.Model == nil || !ok {
+		if !needsHeuristicFinalVerification(input.UserText, input.FinalText) {
+			return FinalVerificationResult{Action: FinalVerificationAllow}, nil
+		}
 		return heuristicFinalVerification(input), nil
 	}
 	prompt := finalVerifierPrompt(input)
@@ -739,16 +739,39 @@ func needsFinalVerification(userText, finalText string) bool {
 	if looksLikeUnfinishedExecutionPlan(finalText) {
 		return true
 	}
-	text := strings.ToLower(strings.TrimSpace(userText + "\n" + finalText))
-	for _, cue := range []string{
-		"create", "write", "modify", "edit", "fix", "test", "verify", "install", "send", "publish", "deploy", "script", "skill",
-		"创建", "新建", "写", "修改", "修复", "测试", "验证", "安装", "发送", "发布", "部署", "脚本", "技能",
-	} {
-		if strings.Contains(text, cue) {
+	return hasExecutionIntentCue(userText) || hasExecutionIntentCue(finalText)
+}
+
+func hasExecutionIntentCue(text string) bool {
+	cues := map[string]bool{
+		"create": true, "write": true, "modify": true, "edit": true, "fix": true,
+		"test": true, "tests": true, "verify": true, "install": true, "send": true,
+		"publish": true, "deploy": true, "script": true, "scripts": true, "skill": true,
+		"skills": true,
+	}
+	for _, field := range strings.Fields(strings.ToLower(text)) {
+		if strings.Contains(field, "/") || strings.Contains(field, "\\") {
+			continue
+		}
+		field = strings.Trim(field, ".,:;!?()[]{}\"'`*_")
+		if cues[field] {
 			return true
 		}
 	}
 	return false
+}
+
+func needsHeuristicFinalVerification(userText, finalText string) bool {
+	text := strings.TrimSpace(userText)
+	if strings.HasPrefix(text, "/") {
+		switch {
+		case strings.HasPrefix(text, "/write "), strings.HasPrefix(text, "/run "), strings.HasPrefix(text, "/schedule "):
+			return true
+		default:
+			return looksLikeUnfinishedExecutionPlan(finalText)
+		}
+	}
+	return needsFinalVerification(userText, finalText)
 }
 
 func heuristicFinalVerification(input FinalVerificationInput) FinalVerificationResult {
@@ -759,23 +782,33 @@ func heuristicFinalVerification(input FinalVerificationInput) FinalVerificationR
 			FollowUp: "Continue now. Execute the required tools, or ask only if required information is missing. Do not present a plan as the final answer.",
 		}
 	}
-	if needsFinalVerification(input.UserText, input.FinalText) && taskHasNoAcceptedToolEvidence(input.Task) {
+	if needsHeuristicFinalVerification(input.UserText, input.FinalText) && taskHasNoAcceptedMutationEvidence(input.Task) {
 		return FinalVerificationResult{
 			Action:   FinalVerificationContinue,
-			Reason:   "task appears to require execution evidence but no accepted tool evidence is present",
+			Reason:   "task appears to require execution evidence but no accepted mutation evidence is present",
 			FollowUp: "Continue now and produce concrete tool evidence for the requested task. If required information is missing, ask the user for only those fields.",
 		}
 	}
 	return FinalVerificationResult{Action: FinalVerificationAllow}
 }
 
-func taskHasNoAcceptedToolEvidence(task session.TaskNode) bool {
+func taskHasNoAcceptedMutationEvidence(task session.TaskNode) bool {
 	for _, step := range task.Steps {
-		if step.Status == "accepted" && strings.TrimSpace(step.Tool) != "" {
+		if step.Status == "accepted" && isMutationEvidenceTool(step.Tool) {
 			return false
 		}
 	}
 	return true
+}
+
+func isMutationEvidenceTool(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "file.write", "script.run", "terminal.run", "secret.set", "schedule.create":
+		return true
+	default:
+		return false
+	}
 }
 
 func finalVerifierPrompt(input FinalVerificationInput) string {
@@ -784,6 +817,7 @@ func finalVerifierPrompt(input FinalVerificationInput) string {
 	b.WriteString("Return JSON only with fields: action, reason, follow_up, missing_inputs.\n")
 	b.WriteString("Allowed action values: allow, continue, ask_user, stop_report.\n")
 	b.WriteString("Use continue when more tool execution is needed. Use ask_user only when concrete missing inputs block progress.\n\n")
+	b.WriteString("For tasks that ask to create, write, modify, test, send, publish, deploy, script, or skill, require concrete mutation or verification evidence such as file.write, script.run, terminal.run, secret.set, or schedule.create. Do not accept project.index, file.read, or web.search alone as completion evidence.\n\n")
 	b.WriteString("User task:\n")
 	b.WriteString(strings.TrimSpace(input.UserText))
 	b.WriteString("\n\nAssistant final answer:\n")
