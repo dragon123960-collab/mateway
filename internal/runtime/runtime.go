@@ -626,6 +626,7 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 
 func (rt Runtime) hooksForState(state *session.State, taskID string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
+	var followUps []agentcore.Message
 	return agentcore.Hooks{
 		Emit: trace.emit,
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
@@ -634,6 +635,24 @@ func (rt Runtime) hooksForState(state *session.State, taskID string, trace *trac
 			}
 			steeringSent = true
 			return append([]agentcore.Message(nil), steering...), nil
+		},
+		ShouldStopAfterTurn: func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
+			if len(turn.Message.ToolCalls) == 0 && looksLikeUnfinishedExecutionPlan(turn.Message.Content) {
+				followUps = append(followUps, agentcore.Message{
+					Role:    agentcore.RoleUser,
+					Content: "Completion check failed: your previous answer described future work but did not execute it. Continue now by calling tools, or ask only if required information is missing. Do not present a plan as the final answer.",
+				})
+				_ = trace.write(map[string]any{"type": "completion_check_failed", "task_id": taskID, "reason": "unfinished_execution_plan", "text": turn.Message.Content})
+			}
+			return false, nil
+		},
+		GetFollowUpMessages: func(context.Context) ([]agentcore.Message, error) {
+			if len(followUps) == 0 {
+				return nil, nil
+			}
+			out := followUps
+			followUps = nil
+			return out, nil
 		},
 		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
 			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)
@@ -1188,6 +1207,38 @@ func looksLikeInputRequest(text string) bool {
 		return true
 	}
 	return strings.HasSuffix(trimmed, "？") && (strings.Contains(trimmed, "哪个") || strings.Contains(trimmed, "什么") || strings.Contains(trimmed, "是否"))
+}
+
+func looksLikeUnfinishedExecutionPlan(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	planCues := []string{
+		"接下来", "下一步", "然后", "之后", "准备", "我会", "我将", "让我", "去",
+		"next", "then", "i will", "i'll", "going to", "let me",
+	}
+	actionCues := []string{
+		"写", "建", "创建", "修改", "跑", "测试", "验证", "执行", "查", "搜索", "获取", "拿", "脚本", "文件", "工具",
+		"write", "create", "modify", "run", "test", "verify", "execute", "search", "fetch", "script", "file", "tool",
+	}
+	hasPlanCue := false
+	for _, cue := range planCues {
+		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+			hasPlanCue = true
+			break
+		}
+	}
+	if !hasPlanCue {
+		return false
+	}
+	for _, cue := range actionCues {
+		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func friendlyRuntimeError(err error) string {

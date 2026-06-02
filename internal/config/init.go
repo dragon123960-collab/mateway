@@ -727,7 +727,7 @@ Workflow:
 const skillCreateTemplate = `---
 name: skillcreate
 description: Use when creating or updating a Mateway skill, especially when scripts, connectors, credentials, or secrets are involved.
-stage: planning
+stage: execution
 priority: 90
 aliases: skill create, create skill, skill creation
 when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to a skill, handling skill secrets
@@ -736,6 +736,8 @@ when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to
 # skillcreate
 
 Use this skill before creating or updating any Mateway skill.
+
+Default behavior: when the user asks to create a skill or script and the required inputs are present, create or update the files immediately, then verify discovery or execution. Do not stop after a plan or ask permission to write requested skill files unless required information is missing or a guarded tool requests confirmation.
 
 ## Directory rules
 
@@ -795,11 +797,16 @@ Each executable skill script should include headers:
 
 ## Creation workflow
 
-1. Create or update SKILL.md.
-2. Add skill-local scripts under scripts/ when deterministic execution is needed.
-3. Add mateway.required_secret headers for each required credential.
-4. Run mateway script list to confirm scripts are discovered.
-5. Run a safe test path or confirm the missing-secret failure path is clear.
+1. Determine the smallest useful skill surface from the user's request.
+2. Store any concrete secrets provided in the current task with secret.set.
+3. Create or update SKILL.md.
+4. Add skill-local scripts under scripts/ when deterministic execution is needed.
+5. Add mateway.required_secret headers for each required credential.
+6. Run mateway script list to confirm scripts are discovered.
+7. Run a safe test path, or confirm the missing-secret failure path is clear.
+8. Final answer with created files, commands, and verification evidence.
+
+If provider settings are stable and commonly known, encode them directly in the script with comments or references when helpful. Use web search only when the task needs current or uncertain facts; do not spend the whole turn searching before writing a small, testable script.
 `
 
 const memoryReadmeTemplate = `# Mateway Memory Wiki
