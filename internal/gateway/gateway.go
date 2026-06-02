@@ -106,12 +106,12 @@ func weixinChannelSpec(channelCfg config.WeixinConfig) channelSpec {
 		Name:    "weixin",
 		Enabled: channelCfg.Enabled,
 		Start: func(ctx context.Context, rt channelRuntime) error {
-			return weixin.Start(ctx, channelCfg, rt.Home, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
+			return weixin.Start(ctx, channelCfg, rt.Home, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundBatch, error) {
 				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
-					return channel.OutboundMessage{}, nil
+					return channel.OutboundBatch{}, nil
 				}
 				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
-				return resp.Reply, err
+				return channel.OutboundBatch{Reply: resp.Reply, FollowUps: resp.FollowUps}, err
 			})
 		},
 	}
@@ -170,6 +170,7 @@ func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.Inbo
 		"reply_duration_ms":   int64(0),
 		"total_duration_ms":   time.Since(start).Milliseconds(),
 		"reply_style":         resp.Reply.Style,
+		"follow_up_count":     len(resp.FollowUps),
 		"failed":              resp.Failed,
 	})
 	return resp, nil
@@ -184,11 +185,11 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		react(runCtx, sender, msg.ID, "SMILE")
 	}
 	ackMessageID := ""
-	if !cardAction {
+	if shouldSendProcessingAck(msg) {
 		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
-			Text:     "收到，开始处理。需要执行本地检查或安装时，我会在完成后更新这条回复。",
+			Text:     "收到，开始处理。",
 			Style:    "processing",
 		}, msg.ID+":processing")
 		if ackErr != nil {
@@ -224,6 +225,14 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		}
 		return
 	}
+	for _, followUp := range resp.FollowUps {
+		if strings.TrimSpace(followUp.Text) == "" {
+			continue
+		}
+		if err := sender.Reply(runCtx, msg, followUp); err != nil {
+			log.Printf("mateway gateway follow-up reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+		}
+	}
 	replyDuration := time.Since(replyStart)
 	if !cardAction {
 		react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
@@ -238,6 +247,17 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		"reply_style":         resp.Reply.Style,
 		"failed":              resp.Failed,
 	})
+}
+
+func shouldSendProcessingAck(msg channel.InboundMessage) bool {
+	if isCardAction(msg) {
+		return false
+	}
+	return !isSlashCommand(msg.Text)
+}
+
+func isSlashCommand(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "/")
 }
 
 func sendFinalReply(ctx context.Context, sender *feishu.Sender, msg channel.InboundMessage, ackMessageID string, reply channel.OutboundMessage) error {

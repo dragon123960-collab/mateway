@@ -300,19 +300,28 @@ func parseToolCallText(text string) []agentcore.ToolCall {
 	if len(matches) == 0 {
 		return nil
 	}
-	calls := make([]agentcore.ToolCall, 0, len(matches))
-	for i, match := range matches {
+	var calls []agentcore.ToolCall
+	for _, match := range matches {
 		if len(match) < 2 {
 			continue
 		}
 		raw := strings.TrimSpace(match[1])
+		calls = append(calls, parseToolCallPayloads(raw, len(calls)+1)...)
+	}
+	return calls
+}
+
+func parseToolCallPayloads(raw string, startIndex int) []agentcore.ToolCall {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	var calls []agentcore.ToolCall
+	for {
 		var payload struct {
 			ID   string         `json:"id"`
 			Name string         `json:"name"`
 			Args map[string]any `json:"args"`
 		}
-		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-			continue
+		if err := decoder.Decode(&payload); err != nil {
+			break
 		}
 		payload.ID = strings.TrimSpace(payload.ID)
 		payload.Name = strings.TrimSpace(payload.Name)
@@ -320,7 +329,7 @@ func parseToolCallText(text string) []agentcore.ToolCall {
 			continue
 		}
 		if payload.ID == "" {
-			payload.ID = fmt.Sprintf("call_%d", i+1)
+			payload.ID = fmt.Sprintf("call_%d", startIndex+len(calls))
 		}
 		if payload.Args == nil {
 			payload.Args = map[string]any{}

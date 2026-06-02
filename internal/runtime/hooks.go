@@ -681,9 +681,6 @@ func (defaultResponseHookProvider) ResponseHook(_ context.Context, input Respons
 	if text == "" {
 		text = fallbackFinalReply(input.RawText)
 	}
-	if input.LearningResult != nil && input.LearningResult.Proposal != nil {
-		text = appendMemoryReviewBlock(text, *input.LearningResult.Proposal)
-	}
 	return ResponseHookResult{Text: text}, nil
 }
 

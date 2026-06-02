@@ -189,6 +189,9 @@ model:
       - minimax
     strong: minimax
 
+execution:
+  max_parallel_tools: 4
+
 memory:
   enabled: true
   root: ""

@@ -28,6 +28,7 @@ type Runtime struct {
 
 type Response struct {
 	Reply     channel.OutboundMessage
+	FollowUps []channel.OutboundMessage
 	TraceID   string
 	TracePath string
 	Failed    bool
@@ -65,7 +66,7 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
 	}()
-	if isNewSessionCommand(msg.Text) {
+	if IsNewSessionCommand(msg.Text) {
 		return rt.resetSession(msg, state, trace, start)
 	}
 	if resp, handled, err := rt.handlePending(ctx, &state, msg, trace); handled || err != nil {
@@ -142,6 +143,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	agent.Messages = messages
 	agent.MaxIterations = 6
+	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	agent.Hooks = rt.hooksForState(state, task.ID, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
@@ -259,6 +261,16 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: result.FinalText, LearningResult: learningResult}, trace)
+	var followUps []channel.OutboundMessage
+	if learningResult != nil && learningResult.Proposal != nil {
+		followUps = append(followUps, channel.OutboundMessage{
+			Channel:  msg.Channel,
+			ThreadID: msg.ThreadID,
+			Text:     renderMemoryProposalReview(*learningResult.Proposal),
+			Style:    "memory_proposal_review",
+			Locale:   runtimeLocale(rt.Config, msg),
+		})
+	}
 	if learningResult == nil || learningResult.Proposal == nil {
 		if nudge, err := memory.PendingProposalNudge(rt.home(), state.Key, time.Now(), rt.memoryProposalNudgeOptions(msg)); err == nil && nudge != "" {
 			text = strings.TrimSpace(text) + "\n\n" + nudge
@@ -272,10 +284,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Text:     text,
 			Locale:   runtimeLocale(rt.Config, msg),
 		},
+		FollowUps: followUps,
 		TraceID:   trace.id,
 		TracePath: trace.path,
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text})
+	for _, followUp := range followUps {
+		_ = trace.write(map[string]any{"type": "follow_up_reply", "text": followUp.Text, "style": followUp.Style})
+	}
 	return resp, nil
 }
 
@@ -402,7 +418,7 @@ func channelPartsToAgentParts(text string, parts []channel.MessagePart) []agentc
 	return out
 }
 
-func isNewSessionCommand(text string) bool {
+func IsNewSessionCommand(text string) bool {
 	switch strings.TrimSpace(strings.ToLower(text)) {
 	case "/new", "/新会话", "新会话":
 		return true
@@ -459,6 +475,13 @@ func (rt Runtime) home() string {
 		home = rt.Config.App.Home
 	}
 	return home
+}
+
+func maxParallelTools(cfg *config.Root) int {
+	if cfg == nil || cfg.Execution.MaxParallelTools <= 0 {
+		return 4
+	}
+	return cfg.Execution.MaxParallelTools
 }
 
 func proposalID(proposal *memory.Proposal) string {
@@ -522,25 +545,60 @@ func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIn
 	return ""
 }
 
-func appendMemoryReviewBlock(text string, proposal memory.Proposal) string {
+func renderMemoryProposalReview(proposal memory.Proposal) string {
 	var b strings.Builder
-	b.WriteString(strings.TrimSpace(text))
-	b.WriteString("\n\n我发现一条可能值得保存的长期记忆。\n")
-	b.WriteString("这只是候选，还没有写入长期记忆。你可以选择保存，或忽略这次建议。\n\n")
-	b.WriteString("建议保存：")
-	b.WriteString(proposal.Type)
-	b.WriteString(" - ")
-	b.WriteString(proposal.Title)
+	b.WriteString("我发现一条长期记忆候选，尚未写入长期记忆。\n\n")
+	b.WriteString(proposal.ID)
+	b.WriteString(" ")
+	b.WriteString(strings.TrimSpace(proposal.Title))
+	b.WriteString("\n类型：")
+	b.WriteString(defaultText(proposal.Type, "experience"))
+	b.WriteString(" / ")
+	b.WriteString(defaultText(proposal.Scope, "agent"))
+	if strings.TrimSpace(proposal.Confidence) != "" {
+		b.WriteString("，置信度：")
+		b.WriteString(strings.TrimSpace(proposal.Confidence))
+	}
+	if summary := proposalSummary(proposal); summary != "" {
+		b.WriteString("\n摘要：")
+		b.WriteString(summary)
+	}
 	if len(proposal.Sources) > 0 {
 		b.WriteString("\n来源：")
 		b.WriteString(summarize(strings.Join(proposal.Sources, ", ")))
 	}
-	b.WriteString("\n\n保存到长期记忆：\n`mateway memory proposal commit ")
+	b.WriteString("\n\n查看详情：`mateway memory proposal show ")
 	b.WriteString(proposal.ID)
-	b.WriteString("`\n\n忽略这条候选：\n`mateway memory proposal reject ")
+	b.WriteString("`")
+	b.WriteString("\n保存：`mateway memory proposal commit ")
 	b.WriteString(proposal.ID)
-	b.WriteString("`\n\n判断口径：如果这是以后会反复用到的项目经验、偏好、流程或工具用法，就保存；如果只是一次性测试或临时结果，就忽略。")
+	b.WriteString("`")
+	b.WriteString("\n忽略：`mateway memory proposal reject ")
+	b.WriteString(proposal.ID)
+	b.WriteString("`")
+	b.WriteString("\n\n也可以直接回复 `保存` 或 `忽略`。")
 	return b.String()
+}
+
+func defaultText(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func proposalSummary(proposal memory.Proposal) string {
+	body := strings.TrimSpace(proposal.Body)
+	body = strings.TrimPrefix(body, "# "+strings.TrimSpace(proposal.Title))
+	body = strings.TrimSpace(body)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
+		if line != "" && !strings.HasPrefix(line, "#") {
+			return summarize(line)
+		}
+	}
+	return ""
 }
 
 func fallbackFinalReply(raw string) string {

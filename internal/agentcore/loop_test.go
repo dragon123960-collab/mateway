@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunReturnsAssistantAnswerWithoutTools(t *testing.T) {
@@ -52,6 +53,105 @@ func TestRunExecutesMultipleToolCallsInOneTurn(t *testing.T) {
 	}
 	if !containsToolMessage(result.Messages, "agent.md") || !containsToolMessage(result.Messages, "user.md") {
 		t.Fatalf("tool results not appended: %#v", result.Messages)
+	}
+}
+
+func TestRunExecutesSafeReadToolCallsInParallel(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.slow_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 80 * time.Millisecond})
+	start := time.Now()
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxParallelTools: 4}, []Message{{Role: RoleUser, Content: "read files"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed >= 150*time.Millisecond {
+		t.Fatalf("expected parallel execution, elapsed %s", elapsed)
+	}
+	if got := toolMessages(result.Messages); strings.Join(got, ",") != "first,second" {
+		t.Fatalf("tool result order = %#v", got)
+	}
+}
+
+func TestRunSerializesMixedParallelModes(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.unsafe_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 60 * time.Millisecond})
+	registry.Register(unsafeEchoTool{Delay: 60 * time.Millisecond})
+	start := time.Now()
+	_, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxParallelTools: 4}, []Message{{Role: RoleUser, Content: "mixed tools"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 110*time.Millisecond {
+		t.Fatalf("expected serial execution for mixed tools, elapsed %s", elapsed)
+	}
+}
+
+func TestRunMaxParallelToolsOneSerializesSafeReads(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.slow_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 60 * time.Millisecond})
+	start := time.Now()
+	_, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxParallelTools: 1}, []Message{{Role: RoleUser, Content: "read files"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 110*time.Millisecond {
+		t.Fatalf("expected serial execution when MaxParallelTools=1, elapsed %s", elapsed)
+	}
+}
+
+func TestRunParallelBatchBlocksBeforeExecutingTools(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.counting_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.counting_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	tool := &countingEchoTool{}
+	registry.Register(tool)
+	result, err := Run(context.Background(), Config{
+		Model:            &model,
+		Tools:            registry,
+		MaxParallelTools: 4,
+		Hooks: Hooks{
+			BeforeToolCall: func(_ context.Context, ctx BeforeToolCallContext) (BeforeToolCallResult, error) {
+				if ctx.ToolCall.ID == "2" {
+					return BeforeToolCallResult{Block: true, Reason: "needs confirmation"}, nil
+				}
+				return BeforeToolCallResult{}, nil
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "read files"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tool.Count != 0 {
+		t.Fatalf("expected no tools to run after blocked parallel preflight, ran %d", tool.Count)
+	}
+	if !containsToolMessage(result.Messages, "needs confirmation") {
+		t.Fatalf("blocked result not appended: %#v", result.Messages)
 	}
 }
 
@@ -279,6 +379,66 @@ func (testEchoTool) Run(_ context.Context, call ToolCall) ToolResult {
 	return ToolResult{ToolCallID: call.ID, Content: call.Args["text"].(string)}
 }
 
+type slowEchoTool struct {
+	Delay time.Duration
+}
+
+func (slowEchoTool) Name() string        { return "test.slow_echo" }
+func (slowEchoTool) Description() string { return "test slow echo" }
+func (slowEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (slowEchoTool) Risk() Risk          { return RiskSafeRead }
+func (slowEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (t slowEchoTool) Run(ctx context.Context, call ToolCall) ToolResult {
+	timer := time.NewTimer(t.Delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ToolResult{ToolCallID: call.ID, Content: ctx.Err().Error(), IsError: true}
+	case <-timer.C:
+		return ToolResult{ToolCallID: call.ID, Content: call.Args["text"].(string)}
+	}
+}
+
+type unsafeEchoTool struct {
+	Delay time.Duration
+}
+
+func (unsafeEchoTool) Name() string        { return "test.unsafe_echo" }
+func (unsafeEchoTool) Description() string { return "test unsafe echo" }
+func (unsafeEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (unsafeEchoTool) Risk() Risk          { return RiskGuardedMutation }
+func (unsafeEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "forbid"}
+}
+func (t unsafeEchoTool) Run(ctx context.Context, call ToolCall) ToolResult {
+	timer := time.NewTimer(t.Delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ToolResult{ToolCallID: call.ID, Content: ctx.Err().Error(), IsError: true}
+	case <-timer.C:
+		return ToolResult{ToolCallID: call.ID, Content: call.Args["text"].(string)}
+	}
+}
+
+type countingEchoTool struct {
+	Count int
+}
+
+func (*countingEchoTool) Name() string        { return "test.counting_echo" }
+func (*countingEchoTool) Description() string { return "test counting echo" }
+func (*countingEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (*countingEchoTool) Risk() Risk          { return RiskSafeRead }
+func (*countingEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (t *countingEchoTool) Run(_ context.Context, call ToolCall) ToolResult {
+	t.Count++
+	return ToolResult{ToolCallID: call.ID, Content: call.Args["text"].(string)}
+}
+
 func containsToolMessage(messages []Message, content string) bool {
 	for _, msg := range messages {
 		if msg.Role == RoleTool && strings.Contains(msg.Content, content) {
@@ -286,6 +446,16 @@ func containsToolMessage(messages []Message, content string) bool {
 		}
 	}
 	return false
+}
+
+func toolMessages(messages []Message) []string {
+	var out []string
+	for _, msg := range messages {
+		if msg.Role == RoleTool {
+			out = append(out, msg.Content)
+		}
+	}
+	return out
 }
 
 func containsUserMessage(messages []Message, content string) bool {

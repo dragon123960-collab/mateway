@@ -6,19 +6,21 @@ import (
 )
 
 type Agent struct {
-	SystemPrompt  string
-	Messages      []Message
-	Model         Model
-	Tools         *ToolRegistry
-	Hooks         Hooks
-	MaxIterations int
+	SystemPrompt     string
+	Messages         []Message
+	Model            Model
+	Tools            *ToolRegistry
+	Hooks            Hooks
+	MaxIterations    int
+	MaxParallelTools int
 }
 
 func NewAgent(model Model, tools *ToolRegistry) *Agent {
 	return &Agent{
-		Model:         model,
-		Tools:         tools,
-		MaxIterations: 8,
+		Model:            model,
+		Tools:            tools,
+		MaxIterations:    8,
+		MaxParallelTools: 4,
 	}
 }
 
@@ -28,11 +30,12 @@ func (a *Agent) Prompt(ctx context.Context, messages ...Message) (Result, error)
 	}
 	a.Messages = append(a.Messages, messages...)
 	result, err := Run(ctx, Config{
-		SystemPrompt:  a.SystemPrompt,
-		Model:         a.Model,
-		Tools:         a.Tools,
-		MaxIterations: a.MaxIterations,
-		Hooks:         a.Hooks,
+		SystemPrompt:     a.SystemPrompt,
+		Model:            a.Model,
+		Tools:            a.Tools,
+		MaxIterations:    a.MaxIterations,
+		MaxParallelTools: a.MaxParallelTools,
+		Hooks:            a.Hooks,
 	}, a.Messages)
 	if err != nil {
 		return Result{}, err
@@ -43,11 +46,12 @@ func (a *Agent) Prompt(ctx context.Context, messages ...Message) (Result, error)
 
 func (a *Agent) Continue(ctx context.Context) (Result, error) {
 	result, err := Run(ctx, Config{
-		SystemPrompt:  a.SystemPrompt,
-		Model:         a.Model,
-		Tools:         a.Tools,
-		MaxIterations: a.MaxIterations,
-		Hooks:         a.Hooks,
+		SystemPrompt:     a.SystemPrompt,
+		Model:            a.Model,
+		Tools:            a.Tools,
+		MaxIterations:    a.MaxIterations,
+		MaxParallelTools: a.MaxParallelTools,
+		Hooks:            a.Hooks,
 	}, a.Messages)
 	if err != nil {
 		return Result{}, err

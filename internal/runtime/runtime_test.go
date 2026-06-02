@@ -531,8 +531,14 @@ func TestRuntimeSelfLearningSurfacesProposalForExplicitMemoryCue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "可能值得保存的长期记忆") || !contains(resp.Reply.Text, "保存到长期记忆") || !contains(resp.Reply.Text, "忽略这条候选") {
-		t.Fatalf("expected proposal review block, got %q", resp.Reply.Text)
+	if contains(resp.Reply.Text, "长期记忆候选") || contains(resp.Reply.Text, "保存到长期记忆") {
+		t.Fatalf("proposal review should not be appended to main reply, got %q", resp.Reply.Text)
+	}
+	if len(resp.FollowUps) != 1 {
+		t.Fatalf("expected one proposal follow-up, got %#v", resp.FollowUps)
+	}
+	if !contains(resp.FollowUps[0].Text, "长期记忆候选") || !contains(resp.FollowUps[0].Text, "mateway memory proposal show") || !contains(resp.FollowUps[0].Text, "保存") || !contains(resp.FollowUps[0].Text, "忽略") {
+		t.Fatalf("expected proposal review follow-up, got %q", resp.FollowUps[0].Text)
 	}
 	entries, err := os.ReadDir(filepath.Join(home, "observe", "proposals"))
 	if err != nil {

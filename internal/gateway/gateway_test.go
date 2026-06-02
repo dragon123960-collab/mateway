@@ -103,6 +103,21 @@ func TestReactionForReply(t *testing.T) {
 	}
 }
 
+func TestShouldSendProcessingAckSkipsNewSessionCommand(t *testing.T) {
+	if shouldSendProcessingAck(channel.InboundMessage{Text: "/new"}) {
+		t.Fatal("expected /new to skip processing ack")
+	}
+	if shouldSendProcessingAck(channel.InboundMessage{Text: "/read README.md"}) {
+		t.Fatal("expected slash command to skip processing ack")
+	}
+	if !shouldSendProcessingAck(channel.InboundMessage{Text: "hello"}) {
+		t.Fatal("expected normal message to send processing ack")
+	}
+	if shouldSendProcessingAck(channel.InboundMessage{Text: "hello", Metadata: map[string]string{"message_type": "interactive", "card_action": "confirm"}}) {
+		t.Fatal("expected card action to skip processing ack")
+	}
+}
+
 func TestInboundDedupeUsesMessageID(t *testing.T) {
 	dedupe := newInboundDedupe(time.Minute)
 	msg := channel.InboundMessage{ID: "om_1", Channel: "feishu"}

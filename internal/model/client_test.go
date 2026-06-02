@@ -104,6 +104,23 @@ func TestParseToolCallTextReturnsMultipleCalls(t *testing.T) {
 	}
 }
 
+func TestParseToolCallTextReturnsMultipleObjectsInOneBlock(t *testing.T) {
+	text := `[TOOL_CALL]
+{"id":"call_1","name":"file.read","args":{"path":"agent.md"}}
+{"id":"call_2","name":"file.read","args":{"path":"user.md"}}
+{"id":"call_3","name":"file.read","args":{"path":"tools.md"}}
+[/TOOL_CALL]`
+	calls := parseToolCallText(text)
+	if len(calls) != 3 {
+		t.Fatalf("expected three tool calls, got %#v", calls)
+	}
+	for i, want := range []string{"agent.md", "user.md", "tools.md"} {
+		if calls[i].Name != "file.read" || calls[i].Args["path"] != want {
+			t.Fatalf("call %d = %#v", i, calls[i])
+		}
+	}
+}
+
 func TestAnthropicContentIncludesTextAndImage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "image.png")

@@ -148,11 +148,12 @@ func cloneAgent(agent *agentcore.Agent) *agentcore.Agent {
 		return nil
 	}
 	return &agentcore.Agent{
-		SystemPrompt:  agent.SystemPrompt,
-		Model:         agent.Model,
-		Tools:         agent.Tools,
-		Hooks:         agent.Hooks,
-		MaxIterations: agent.MaxIterations,
+		SystemPrompt:     agent.SystemPrompt,
+		Model:            agent.Model,
+		Tools:            agent.Tools,
+		Hooks:            agent.Hooks,
+		MaxIterations:    agent.MaxIterations,
+		MaxParallelTools: agent.MaxParallelTools,
 	}
 }
 

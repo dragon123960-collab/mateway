@@ -142,6 +142,7 @@ Mateway 目前支持：
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
+- 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
 - 本地 secret store：`mateway secret set/get/list/delete`
 - trace 中可见 hook events
 - workspace profile 注入
@@ -295,6 +296,9 @@ Review proposals：
 候选记忆提醒可以在 `~/.mateway/config/config.yaml` 配置：
 
 ```yaml
+execution:
+  max_parallel_tools: 4
+
 memory:
   proposal_nudge:
     enabled: true

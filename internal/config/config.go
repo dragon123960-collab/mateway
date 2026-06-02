@@ -18,6 +18,7 @@ type Root struct {
 	Security  SecurityConfig  `yaml:"security"`
 	Search    SearchConfig    `yaml:"search"`
 	Model     ModelSelection  `yaml:"model"`
+	Execution ExecutionConfig `yaml:"execution"`
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
 	Skills    SkillsConfig    `yaml:"skills"`
@@ -34,6 +35,9 @@ func DefaultRoot() Root {
 		Model: ModelSelection{
 			Default:   "minimax",
 			Fallbacks: []string{},
+		},
+		Execution: ExecutionConfig{
+			MaxParallelTools: 4,
 		},
 		Memory: MemoryConfig{
 			Enabled:           true,
@@ -291,6 +295,10 @@ type ModelConfig struct {
 	StripReasoning bool     `yaml:"strip_reasoning"`
 	Enabled        bool     `yaml:"enabled"`
 	Description    string   `yaml:"description"`
+}
+
+type ExecutionConfig struct {
+	MaxParallelTools int `yaml:"max_parallel_tools"`
 }
 
 type MemoryConfig struct {
@@ -580,6 +588,9 @@ func (r *Root) applyDefaults() {
 	}
 	if r.Model.Roles == nil {
 		r.Model.Roles = ModelRoles{}
+	}
+	if r.Execution.MaxParallelTools <= 0 {
+		r.Execution.MaxParallelTools = defaults.Execution.MaxParallelTools
 	}
 	if r.Memory.RecentDays <= 0 {
 		r.Memory.RecentDays = defaults.Memory.RecentDays

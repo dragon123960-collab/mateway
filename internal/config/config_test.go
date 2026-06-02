@@ -72,6 +72,19 @@ func TestModelConfigMaxTokensDefaults(t *testing.T) {
 	}
 }
 
+func TestExecutionConfigDefaults(t *testing.T) {
+	root := Root{}
+	root.NormalizeForUse()
+	if root.Execution.MaxParallelTools != 4 {
+		t.Fatalf("default max parallel tools = %d", root.Execution.MaxParallelTools)
+	}
+	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
+	root.NormalizeForUse()
+	if root.Execution.MaxParallelTools != 1 {
+		t.Fatalf("configured max parallel tools = %d", root.Execution.MaxParallelTools)
+	}
+}
+
 func TestModelRolesAcceptStringAndList(t *testing.T) {
 	var cfg struct {
 		Model ModelSelection `yaml:"model"`

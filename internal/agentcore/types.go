@@ -127,11 +127,12 @@ type Context struct {
 }
 
 type Config struct {
-	SystemPrompt  string
-	Model         Model
-	Tools         *ToolRegistry
-	MaxIterations int
-	Hooks         Hooks
+	SystemPrompt     string
+	Model            Model
+	Tools            *ToolRegistry
+	MaxIterations    int
+	MaxParallelTools int
+	Hooks            Hooks
 }
 
 type Result struct {

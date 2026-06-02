@@ -151,6 +151,7 @@ Mateway currently supports:
 - task tree and follow-up binding
 - pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
+- parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
 - local secret store: `mateway secret set/get/list/delete`
 - hook events in trace
 - workspace profile injection
@@ -298,6 +299,9 @@ Review proposals:
 Memory proposal nudges are configurable in `~/.mateway/config/config.yaml`:
 
 ```yaml
+execution:
+  max_parallel_tools: 4
+
 memory:
   proposal_nudge:
     enabled: true
