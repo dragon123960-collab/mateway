@@ -88,6 +88,9 @@ function agentState() {
     };
   }
   const type = latest?.type || "idle";
+  if (type === "task_created" || type === "skills_selected" || type === "runtime_started") {
+    return { key: "thinking", label: "Preparing", board: label(type), monitor: monitorText(latest), event: latest };
+  }
   if (type === "model_started" || type === "context_built") {
     return { key: "thinking", label: "Thinking", board: label(type), monitor: monitorText(latest), event: latest };
   }
@@ -117,7 +120,7 @@ function stateDetailHTML(state, latest) {
 
 function skillsHTML() {
   const skills = latestSkills();
-  if (!skills.length) return `<div class="empty">本轮还没有 skill 选择事件</div>`;
+  if (!skills.length) return `<div class="empty">本轮没有注入 context skill</div>`;
   return skills.map(s => `
     <div class="skill-card ${esc(s.state || "active")}">
       <div>
@@ -273,7 +276,7 @@ function label(type) {
     connected: "Connected",
     runtime_started: "Task Published",
     task_created: "Task Created",
-    skills_selected: "Skills Selected",
+    skills_selected: "Context Skills",
     hook_event: "Hook",
     context_built: "Context Built",
     model_started: "Model Started",
@@ -292,7 +295,7 @@ function label(type) {
 
 function detail(event) {
   const p = event?.payload || {};
-  if (event?.type === "skills_selected") return `${(p.skills || []).length} skill(s)`;
+  if (event?.type === "skills_selected") return `${(p.skills || []).length} context skill(s)`;
   if (event?.type === "tool_started" || event?.type === "tool_finished") return toolName(event);
   if (event?.type === "model_finished") {
     const calls = p.message?.ToolCalls || p.message?.tool_calls || [];

@@ -121,6 +121,8 @@ Mateway discovers local `SKILL.md` files and injects concise guidance into the r
 - `software-install`
 - `fresh-search`
 - `source-evaluation`
+- `connector-gap`
+- `skillcreate`
 
 ### 8. Internationalization Boundary
 
@@ -265,7 +267,7 @@ web:
   office_watch_assets: ""
 ```
 
-The console also exposes an optional Office Watch page at `http://127.0.0.1:8765/watch`. It uses local WebSocket events to show agent state, selected skills, tool arguments, tool results, evidence, context assembly, model turns, usage deltas, replies, and completion. Office Watch uses Mateway-owned placeholder pixel styling; it does not vendor Star-Office-UI assets. Context numbers marked `est` are character-based estimates unless the model provider returns real token usage.
+The console also exposes an optional Office Watch page at `http://127.0.0.1:8765/watch`. It uses local WebSocket events to show agent state, task-filtered context skills, tool arguments, tool results, evidence, context assembly, model turns, usage deltas, replies, and completion. Office Watch uses Mateway-owned placeholder pixel styling; it does not vendor Star-Office-UI assets. Context numbers marked `est` are character-based estimates unless the model provider returns real token usage.
 
 List channel ids from local channel config files:
 
@@ -479,7 +481,7 @@ Current behavior:
 
 - Runtime discovers local skills and injects short guidance into context.
 - Low-use skills can cool down automatically: active skills inject full guidance, cold skills inject only a one-line card, and hidden skills are omitted from context until restored.
-- Default initialized shared skills cover fresh search, source evaluation, connector gaps, and software installation workflow.
+- Default initialized shared skills cover fresh search, source evaluation, connector gaps, software installation workflow, and Mateway skill creation rules.
 - Agents can inspect existing skills, install local/raw skills, and review skill patch proposals before promotion.
 
 Skill cleanup is configured under `skills.cleanup`:
@@ -508,7 +510,7 @@ Available:
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
 - heartbeat-generated skill patch proposal workflow
 
-Script Bridge is intentionally small: executable scripts under `~/.mateway/scripts/`, `workspace/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
+Script Bridge is intentionally small: executable scripts under `workspace/agents/<agent_id>/skills/<skill>/scripts/`, `workspace/skills/<skill>/scripts/`, `workspace/scripts/`, `~/.mateway/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Agent-specific skill scripts win over shared skill scripts, which win over global scripts when names collide. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
 
 ## Multi-Agent Profiles
 

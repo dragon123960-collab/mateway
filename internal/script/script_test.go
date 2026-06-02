@@ -60,3 +60,99 @@ func TestRunScriptMissingSecretFails(t *testing.T) {
 		t.Fatalf("expected missing secret error, got %v", err)
 	}
 }
+
+func TestRunScriptRecoversArgsFromNameWhenExactNameMissing(t *testing.T) {
+	home := t.TempDir()
+	scriptPath := filepath.Join(home, "scripts", "mail")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	text := "#!/bin/sh\n# mateway.name: email.receive\necho first=$1 second=$2\n"
+	if err := os.WriteFile(scriptPath, []byte(text), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}}
+	cfg.NormalizeForUse()
+	result, err := Run(context.Background(), cfg, RunInput{Name: "email.receive 1", Args: []string{"extra"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Output, "first=1 second=extra") {
+		t.Fatalf("unexpected output: %#v", result)
+	}
+	if got := strings.Join(result.Command[1:], " "); got != "1 extra" {
+		t.Fatalf("command args = %q", got)
+	}
+}
+
+func TestSkillLocalScriptWinsOverGlobalScript(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	globalPath := filepath.Join(home, "scripts", "mail")
+	skillPath := filepath.Join(workspace, "skills", "email", "scripts", "mail")
+	for _, path := range []string{globalPath, skillPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(globalPath, []byte("#!/bin/sh\n# mateway.name: mail\necho global\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skillPath, []byte("#!/bin/sh\n# mateway.name: mail\n# mateway.description: skill-local mail\necho skill-local\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}
+	cfg.NormalizeForUse()
+	scripts, err := List(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scripts) != 1 || scripts[0].Path != skillPath || scripts[0].Description != "skill-local mail" {
+		t.Fatalf("expected skill-local script to win, got %#v", scripts)
+	}
+	result, err := Run(context.Background(), cfg, RunInput{Name: "mail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Output, "skill-local") {
+		t.Fatalf("unexpected output: %#v", result)
+	}
+}
+
+func TestAgentSkillScriptWinsOverSharedAndGlobalScript(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	globalPath := filepath.Join(home, "scripts", "mail")
+	sharedPath := filepath.Join(workspace, "skills", "email", "scripts", "mail")
+	agentPath := filepath.Join(workspace, "agents", "main", "skills", "email", "scripts", "mail")
+	for _, path := range []string{globalPath, sharedPath, agentPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(globalPath, []byte("#!/bin/sh\n# mateway.name: mail\necho global\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedPath, []byte("#!/bin/sh\n# mateway.name: mail\necho shared\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agentPath, []byte("#!/bin/sh\n# mateway.name: mail\n# mateway.description: agent mail\necho agent\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}
+	cfg.NormalizeForUse()
+	scripts, err := List(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scripts) != 1 || scripts[0].Path != agentPath || scripts[0].Description != "agent mail" {
+		t.Fatalf("expected agent skill script to win, got %#v", scripts)
+	}
+	result, err := Run(context.Background(), cfg, RunInput{Name: "mail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Output, "agent") {
+		t.Fatalf("unexpected output: %#v", result)
+	}
+}

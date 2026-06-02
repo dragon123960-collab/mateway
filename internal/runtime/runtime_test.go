@@ -203,6 +203,43 @@ func TestRuntimeTraceIncludesSelectedSkills(t *testing.T) {
 	}
 }
 
+func TestRuntimeInjectsOnlyTaskRelevantContextSkills(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "email", "SKILL.md"), "---\nname: email\ndescription: Use when checking or sending mail.\naliases: mail, 邮件\nwhen_to_use: 查邮件, 收邮件, 发邮件\nstage: execution\npriority: 75\n---\n# Email\nUse script.run email.receive.")
+	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "fresh-search", "SKILL.md"), "---\nname: fresh-search\ndescription: Prefer fresh official sources.\nstage: planning\npriority: 8\n---\n# Fresh Search\nUse official sources.")
+	writeRuntimeSkill(t, filepath.Join(workspace, "skills", "software-install", "SKILL.md"), "---\nname: software-install\ndescription: Install developer tools.\nstage: execution\npriority: 5\n---\n# Software Install\nInstall tools.")
+	model := &captureRuntimeContextModel{}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "帮我查邮件"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(model.systemMessages, "email") || !contains(model.systemMessages, "email.receive") {
+		t.Fatalf("expected email skill in context:\n%s", model.systemMessages)
+	}
+	for _, unexpected := range []string{"fresh-search", "software-install"} {
+		if contains(model.systemMessages, unexpected) {
+			t.Fatalf("unexpected skill %q in context:\n%s", unexpected, model.systemMessages)
+		}
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !contains(text, `"type":"skills_selected"`) || !contains(text, `"name":"email"`) {
+		t.Fatalf("expected email context skill trace:\n%s", text)
+	}
+	for _, unexpected := range []string{`"name":"fresh-search"`, `"name":"software-install"`} {
+		if contains(text, unexpected) {
+			t.Fatalf("unexpected skill trace %s in:\n%s", unexpected, text)
+		}
+	}
+}
+
 func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
@@ -1402,9 +1439,18 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 		Search:   config.SearchConfig{ProviderOrder: []string{"searxng"}},
 	}
 	text := buildRuntimeSystemContext(cfg, config.AgentProfileConfig{ID: "main"})
-	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
+	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng"} {
 		if !contains(text, want) {
 			t.Fatalf("context missing %q:\n%s", want, text)
+		}
+	}
+	if contains(text, "Discovered skills:") {
+		t.Fatalf("base runtime context should not inject unfiltered skills:\n%s", text)
+	}
+	messageText := buildRuntimeSystemContextForMessage(cfg, config.AgentProfileConfig{ID: "main"}, channel.InboundMessage{Channel: "cli", SessionKey: "cli:test"}, "需要 fresh search 当前资料")
+	for _, want := range []string{"Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
+		if !contains(messageText, want) {
+			t.Fatalf("message context missing %q:\n%s", want, messageText)
 		}
 	}
 }
@@ -1704,6 +1750,34 @@ Use this skill with the configured IMAP password supersecret123.
 	}
 	if contains(prompt, "supersecret123") || contains(prompt, "imap.163.com") || contains(prompt, "user@example.com") {
 		t.Fatalf("prompt leaked sensitive skill content:\n%s", prompt)
+	}
+}
+
+func TestDiscoverSkillsAllowsRequiredSecretReferences(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	skillPath := filepath.Join(workspace, "skills", "email", "SKILL.md")
+	writeRuntimeSkill(t, skillPath, `---
+name: email
+description: Use when the user asks to check, read, receive, send, or manage emails.
+stage: execution
+priority: 75
+required_secrets:
+  - id: mail.pop_password
+    env: POP_PASSWORD
+---
+
+# email skill
+
+Run `+"`script.run`"+` with name `+"`email.receive`"+` to check recent emails.
+`)
+	skills := discoverSkills(&config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}, 10)
+	if len(skills) != 1 || skills[0].Name != "email" || skills[0].Redacted {
+		t.Fatalf("expected full email skill with secret references, got %#v", skills)
+	}
+	prompt := skillsPrompt(skills)
+	if !contains(prompt, "email.receive") || contains(prompt, "guidance redacted") {
+		t.Fatalf("expected full email guidance:\n%s", prompt)
 	}
 }
 

@@ -82,6 +82,108 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 	return out
 }
 
+func contextSkillsForTask(cfg *config.Root, agentID, userText string, limit int) []discoveredSkill {
+	if limit <= 0 {
+		limit = 8
+	}
+	candidates := discoverSkillsForAgent(cfg, agentID, 24)
+	if len(candidates) == 0 {
+		return nil
+	}
+	queryTokens := skillQueryTokens(userText)
+	queryText := strings.ToLower(userText)
+	var matched []discoveredSkill
+	for _, item := range candidates {
+		if skillMatchesTask(item, queryText, queryTokens) {
+			matched = append(matched, item)
+		}
+	}
+	if len(matched) == 0 {
+		matched = fallbackContextSkills(candidates, minInt(limit, 3))
+	}
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched
+}
+
+func fallbackContextSkills(skills []discoveredSkill, limit int) []discoveredSkill {
+	var out []discoveredSkill
+	for _, item := range skills {
+		if item.State == skill.StateCold {
+			continue
+		}
+		if strings.TrimSpace(item.Stage) == "planning" || skillPriority(item) >= 80 {
+			out = append(out, item)
+		}
+		if len(out) >= limit {
+			return out
+		}
+	}
+	for _, item := range skills {
+		if item.State == skill.StateCold {
+			continue
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func skillMatchesTask(item discoveredSkill, queryText string, queryTokens map[string]bool) bool {
+	if len(queryTokens) == 0 {
+		return false
+	}
+	for _, token := range skillMatchTokens(item) {
+		if queryTokens[token] {
+			return true
+		}
+		if len([]rune(token)) >= 2 && strings.Contains(queryText, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func skillMatchTokens(item discoveredSkill) []string {
+	values := []string{item.Name, item.Description, item.Stage, filepath.Base(filepath.Dir(item.Path))}
+	values = append(values, item.Aliases...)
+	values = append(values, item.WhenToUse...)
+	return skillTokens(strings.Join(values, " "))
+}
+
+func skillQueryTokens(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, token := range skillTokens(text) {
+		out[token] = true
+	}
+	return out
+}
+
+func skillTokens(text string) []string {
+	text = strings.ToLower(text)
+	var tokens []string
+	var b strings.Builder
+	flush := func() {
+		token := strings.TrimSpace(b.String())
+		b.Reset()
+		if len(token) >= 2 {
+			tokens = append(tokens, token)
+		}
+	}
+	for _, r := range text {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r > 127 {
+			b.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return tokens
+}
+
 func cleanupStates(cfg *config.Root, workspace string) map[string]string {
 	if cfg == nil || !cfg.Skills.Cleanup.EnabledValue() {
 		return nil
@@ -99,6 +201,13 @@ func cleanupStates(cfg *config.Root, workspace string) map[string]string {
 		out[filepath.ToSlash(item.Path)] = item.State
 	}
 	return out
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func skillRoots(workspace, agentID string) []string {

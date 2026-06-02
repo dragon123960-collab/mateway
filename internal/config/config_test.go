@@ -215,7 +215,7 @@ func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {
 	if err := EnsureDefaultConfigFiles(home); err != nil {
 		t.Fatalf("ensure default config files: %v", err)
 	}
-	for _, name := range []string{"software-install", "fresh-search", "source-evaluation", "connector-gap"} {
+	for _, name := range []string{"software-install", "fresh-search", "source-evaluation", "connector-gap", "skillcreate"} {
 		path := filepath.Join(home, "workspace", "skills", name, "SKILL.md")
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected default skill %s to exist: %v", path, err)

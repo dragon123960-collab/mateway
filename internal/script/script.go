@@ -87,13 +87,7 @@ func Run(ctx context.Context, cfg *config.Root, input RunInput) (RunResult, erro
 	if err != nil {
 		return RunResult{}, err
 	}
-	var selected Script
-	for _, script := range scripts {
-		if script.Name == name {
-			selected = script
-			break
-		}
-	}
+	selected, args := selectScript(scripts, name, input.Args)
 	if selected.Name == "" {
 		return RunResult{}, fmt.Errorf("script %q not found", name)
 	}
@@ -103,7 +97,7 @@ func Run(ctx context.Context, cfg *config.Root, input RunInput) (RunResult, erro
 	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(timeoutCtx, selected.Path, input.Args...)
+	cmd := exec.CommandContext(timeoutCtx, selected.Path, args...)
 	cmd.Env = os.Environ()
 	store := secret.Store{Home: home(cfg)}
 	for _, ref := range selected.RequiredSecrets {
@@ -124,7 +118,7 @@ func Run(ctx context.Context, cfg *config.Root, input RunInput) (RunResult, erro
 	output, err := cmd.CombinedOutput()
 	result := RunResult{
 		Script:   selected,
-		Command:  append([]string{selected.Path}, input.Args...),
+		Command:  append([]string{selected.Path}, args...),
 		ExitCode: cmd.ProcessState.ExitCode(),
 		Output:   strings.TrimSpace(string(output)),
 		Duration: time.Since(start),
@@ -135,14 +129,39 @@ func Run(ctx context.Context, cfg *config.Root, input RunInput) (RunResult, erro
 	return result, nil
 }
 
+func selectScript(scripts []Script, name string, args []string) (Script, []string) {
+	for _, script := range scripts {
+		if script.Name == name {
+			return script, append([]string(nil), args...)
+		}
+	}
+	parts := strings.Fields(name)
+	if len(parts) <= 1 {
+		return Script{}, nil
+	}
+	for split := len(parts) - 1; split >= 1; split-- {
+		candidate := strings.Join(parts[:split], " ")
+		for _, script := range scripts {
+			if script.Name == candidate {
+				recoveredArgs := append([]string{}, parts[split:]...)
+				recoveredArgs = append(recoveredArgs, args...)
+				return script, recoveredArgs
+			}
+		}
+	}
+	return Script{}, nil
+}
+
 func scriptDirs(cfg *config.Root) []string {
 	var dirs []string
 	home := home(cfg)
 	workspace := workspace(cfg)
-	dirs = append(dirs, filepath.Join(home, "scripts"))
 	if workspace != "" {
+		dirs = append(dirs, skillScriptDirs(filepath.Join(workspace, "agents"))...)
+		dirs = append(dirs, skillScriptDirs(filepath.Join(workspace, "skills"))...)
 		dirs = append(dirs, filepath.Join(workspace, "scripts"))
 	}
+	dirs = append(dirs, filepath.Join(home, "scripts"))
 	if cfg != nil {
 		for _, dir := range cfg.Scripts.Dirs {
 			if strings.TrimSpace(dir) != "" {
@@ -161,6 +180,30 @@ func scriptDirs(cfg *config.Root) []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+func skillScriptDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if filepath.Base(root) == "agents" {
+			dirs = append(dirs, skillScriptDirs(filepath.Join(path, "skills"))...)
+			continue
+		}
+		scriptDir := filepath.Join(path, "scripts")
+		if info, err := os.Stat(scriptDir); err == nil && info.IsDir() {
+			dirs = append(dirs, scriptDir)
+		}
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 func parseScript(path string) (Script, error) {

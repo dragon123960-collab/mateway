@@ -98,6 +98,28 @@ func TestRuntimeTaskStepSummaryRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestRuntimeTraceRedactsSecretSetValue(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(secretSetModel{}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "store mail secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "supersecret123") {
+		t.Fatalf("secret.set trace leaked value:\n%s", text)
+	}
+	if !strings.Contains(text, redactedSecret) || !strings.Contains(text, `"Name":"secret.set"`) {
+		t.Fatalf("expected redacted secret.set trace:\n%s", text)
+	}
+}
+
 func TestFileReadTraceRedactsSkillSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
@@ -161,3 +183,18 @@ func (secretToolModel) Next(_ context.Context, ctx agentcore.Context) (agentcore
 }
 
 var _ agentcore.Tool = secretTool{}
+
+type secretSetModel struct{}
+
+func (secretSetModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	for i := len(ctx.Messages) - 1; i >= 0; i-- {
+		if ctx.Messages[i].Role == agentcore.RoleTool {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "stored"}, nil
+		}
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+		ID:   "call_secret_set",
+		Name: "secret.set",
+		Args: map[string]any{"id": "mail.pop_password", "value": "supersecret123"},
+	}}}, nil
+}

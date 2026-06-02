@@ -11,6 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/secret"
 )
 
 func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConfig) string {
@@ -61,20 +62,20 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 		b.WriteString("\nWorkspace profile context:\n")
 		b.WriteString(workspace)
 	}
-	if skills := skillsPrompt(discoverSkillsForAgent(cfg, profile.ID, 12)); skills != "" {
-		b.WriteString("\n\n")
-		b.WriteString(skills)
-	}
 	return strings.TrimSpace(b.String())
 }
 
-func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentProfileConfig, msg channel.InboundMessage) string {
+func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentProfileConfig, msg channel.InboundMessage, userText string) string {
 	contextText := buildRuntimeSystemContext(cfg, profile)
 	if strings.TrimSpace(msg.Channel) == "" && strings.TrimSpace(msg.ThreadID) == "" && strings.TrimSpace(msg.SessionKey) == "" {
 		return contextText
 	}
 	var b strings.Builder
 	b.WriteString(contextText)
+	if skills := skillsPrompt(contextSkillsForTask(cfg, profile.ID, userText, 8)); skills != "" {
+		b.WriteString("\n\n")
+		b.WriteString(skills)
+	}
 	b.WriteString("\n\nCurrent channel context:\n")
 	writeContextLine(&b, "- channel: ", msg.Channel)
 	writeContextLine(&b, "- thread_id: ", msg.ThreadID)
@@ -144,9 +145,11 @@ func readPromptContextFile(path string, limit int64) string {
 }
 
 func looksSensitivePromptContext(path, text string) bool {
-	lower := strings.ToLower(path + "\n" + text)
-	return strings.Contains(lower, "api_key") ||
-		strings.Contains(lower, "app_secret") ||
-		strings.Contains(lower, "token") ||
-		strings.Contains(lower, "password")
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		switch strings.ToLower(strings.TrimSpace(part)) {
+		case ".env", "secret", "secrets", "token", "tokens", "password", "passwords":
+			return true
+		}
+	}
+	return len(secret.ScanText(text)) > 0
 }

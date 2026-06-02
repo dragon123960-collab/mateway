@@ -82,6 +82,10 @@ func redactToolCall(call agentcore.ToolCall) agentcore.ToolCall {
 	}
 	args := make(map[string]any, len(call.Args))
 	for key, value := range call.Args {
+		if call.Name == "secret.set" && strings.EqualFold(strings.TrimSpace(key), "value") {
+			args[key] = redactedSecret
+			continue
+		}
 		if isSecretKey(key) {
 			args[key] = redactedSecret
 			continue
