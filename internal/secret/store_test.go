@@ -3,6 +3,8 @@ package secret
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -46,5 +48,30 @@ func TestStoreWritesPrivateFile(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v", info.Mode().Perm())
+	}
+}
+
+func TestStoreConcurrentSetKeepsAllEntries(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Home: home}
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := "secret." + strconv.Itoa(i)
+			if err := store.Set(id, "value-"+strconv.Itoa(i)); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 12 {
+		t.Fatalf("entries = %d want 12: %#v", len(entries), entries)
 	}
 }
