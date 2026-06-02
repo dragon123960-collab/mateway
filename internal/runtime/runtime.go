@@ -209,7 +209,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	if state.Pending == nil {
-		if warning := finalTextWarning(result.FinalText); warning != "" {
+		if warning := finalResultWarning(result); warning != "" {
 			_ = trace.write(map[string]any{"type": "task_warning", "task_id": task.ID, "warning": warning, "text": result.FinalText})
 			state.BlockActiveTask("failed")
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": result.FinalText})
@@ -558,6 +558,13 @@ func finalTextWarning(text string) string {
 	default:
 		return ""
 	}
+}
+
+func finalResultWarning(result agentcore.Result) string {
+	if strings.TrimSpace(result.StopReason) != "" {
+		return strings.TrimSpace(result.StopReason)
+	}
+	return finalTextWarning(result.FinalText)
 }
 
 func looksLikeUnfinishedExecutionPlan(text string) bool {

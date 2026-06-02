@@ -180,7 +180,7 @@ func TestRunMaxIterations(t *testing.T) {
 	if result.Iterations != 2 {
 		t.Fatalf("Iterations = %d", result.Iterations)
 	}
-	if !strings.Contains(result.FinalText, "最大工具循环次数") {
+	if !strings.Contains(result.FinalText, "工具预算已到上限") || result.StopReason != "tool_budget_reached" {
 		t.Fatalf("FinalText = %q", result.FinalText)
 	}
 }
@@ -193,11 +193,14 @@ func TestRunSynthesizesAfterToolBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.FinalText != "summary from existing evidence" {
+	if result.FinalText != "工具预算已到上限，任务未完成。已有工具结果已保留在 trace 中；请补充信息后重试或继续当前任务。" {
 		t.Fatalf("FinalText = %q", result.FinalText)
 	}
-	if !containsUserMessage(result.Messages, "Tool budget reached") {
-		t.Fatalf("synthesis instruction not appended: %#v", result.Messages)
+	if result.StopReason != "tool_budget_reached" {
+		t.Fatalf("StopReason = %q", result.StopReason)
+	}
+	if containsUserMessage(result.Messages, "Tool budget reached") {
+		t.Fatalf("budget synthesis instruction should not be appended: %#v", result.Messages)
 	}
 }
 

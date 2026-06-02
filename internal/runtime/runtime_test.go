@@ -1183,7 +1183,7 @@ func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Text != "达到最大工具循环次数，已停止。" {
+	if resp.Reply.Text != "工具预算已到上限，任务未完成。已有工具结果已保留在 trace 中；请补充信息后重试或继续当前任务。" {
 		t.Fatalf("reply = %q", resp.Reply.Text)
 	}
 	state, err := rt.Store.Load("cli:test")
@@ -1203,7 +1203,7 @@ func TestRuntimeBlocksUnfinishedExecutionPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), `"type":"completion_check_failed"`) || !contains(string(data), `"status":"failed"`) {
+	if !contains(string(data), `"type":"completion_check_failed"`) || !contains(string(data), `"reason":"tool_budget_reached"`) || !contains(string(data), `"status":"failed"`) {
 		t.Fatalf("trace missing failed completion check:\n%s", data)
 	}
 }
@@ -1239,6 +1239,29 @@ func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
 	}
 	if !contains(string(data), `"type":"completion_check_failed"`) {
 		t.Fatalf("trace missing completion check:\n%s", data)
+	}
+}
+
+func TestRuntimeDoesNotSynthesizeScriptAfterToolBudget(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(repeatRuntimeToolModel{}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "写邮件脚本"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(resp.Reply.Text, "```python") || contains(resp.Reply.Text, "保存为") {
+		t.Fatalf("budget reply should not synthesize scripts: %q", resp.Reply.Text)
+	}
+	if !contains(resp.Reply.Text, "工具预算已到上限") {
+		t.Fatalf("expected budget diagnostic, got %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed task, got %#v", state.Tasks)
 	}
 }
 
@@ -1921,6 +1944,8 @@ type scriptedRuntimeModel struct {
 	index    int
 }
 
+type repeatRuntimeToolModel struct{}
+
 type readRememberModel struct{}
 
 type readRememberThenCaptureModel struct {
@@ -2004,6 +2029,14 @@ func (m *scriptedRuntimeModel) Next(context.Context, agentcore.Context) (agentco
 	msg := m.messages[m.index]
 	m.index++
 	return msg, nil
+}
+
+func (repeatRuntimeToolModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
+	return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+		ID:   "call_1",
+		Name: "terminal.run",
+		Args: map[string]any{"command": "printf ok"},
+	}}}, nil
 }
 
 func (usageModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
