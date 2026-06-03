@@ -12,16 +12,14 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 	if cfg.Model == nil {
 		return Result{}, fmt.Errorf("agentcore model is required")
 	}
-	maxIterations := cfg.MaxIterations
-	if maxIterations <= 0 {
-		maxIterations = 8
-	}
-
 	transcript := append([]Message(nil), messages...)
 	if err := emit(ctx, cfg.Hooks, Event{Type: EventAgentStart}); err != nil {
 		return Result{}, err
 	}
-	for iteration := 1; iteration <= maxIterations; iteration++ {
+	iteration := 0
+	malformedAttempts := 0
+	for {
+		iteration++
 		if err := emit(ctx, cfg.Hooks, Event{Type: EventTurnStart, Iteration: iteration}); err != nil {
 			return Result{}, err
 		}
@@ -53,7 +51,8 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 		}
 
 		if len(assistant.ToolCalls) == 0 {
-			if looksLikeMalformedToolCall(assistant.Content) && iteration < maxIterations {
+			if looksLikeMalformedToolCall(assistant.Content) && malformedAttempts < 2 {
+				malformedAttempts++
 				transcript = append(transcript, Message{
 					Role:    RoleUser,
 					Content: "Your previous tool call block was malformed and was not executed. Either emit one valid [TOOL_CALL] JSON block, or stop using tools and answer from the evidence already available.",
@@ -66,6 +65,7 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 			if looksLikeMalformedToolCall(assistant.Content) {
 				return synthesizeMalformedToolCall(ctx, cfg, transcript, iteration)
 			}
+			malformedAttempts = 0
 			turn := TurnContext{Message: assistant, Messages: transcript, Iteration: iteration}
 			stop, err := shouldStopAfterTurn(ctx, cfg.Hooks, turn)
 			if err != nil {
@@ -90,6 +90,7 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 		if cfg.Tools == nil {
 			return Result{}, fmt.Errorf("assistant requested tools but no registry is configured")
 		}
+		malformedAttempts = 0
 		toolResults, terminate, err := executeToolCalls(ctx, cfg, assistant, iteration)
 		if err != nil {
 			return Result{}, err
@@ -114,56 +115,7 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 			result := Result{Messages: transcript, FinalText: finalTextForStoppedTurn(assistant, toolResults), Iterations: iteration}
 			return finish(ctx, cfg.Hooks, result)
 		}
-		if iteration == maxIterations {
-			return synthesizeAfterToolBudget(ctx, cfg, transcript, iteration)
-		}
 	}
-
-	result := Result{
-		Messages:   transcript,
-		FinalText:  "达到最大工具循环次数，已停止。",
-		Iterations: maxIterations,
-	}
-	return finish(ctx, cfg.Hooks, result)
-}
-
-func synthesizeAfterToolBudget(ctx context.Context, cfg Config, transcript []Message, iteration int) (Result, error) {
-	transcript = append(transcript, Message{
-		Role:    RoleUser,
-		Content: "Tool budget reached. Do not call more tools. Synthesize the final answer from the existing tool results, and clearly state any remaining uncertainty.",
-	})
-	modelStart := time.Now()
-	assistant, err := cfg.Model.Next(ctx, Context{
-		SystemPrompt: cfg.SystemPrompt,
-		Messages:     transcript,
-		Tools:        nil,
-	})
-	modelDuration := time.Since(modelStart)
-	if err != nil {
-		return Result{}, err
-	}
-	if assistant.Role == "" {
-		assistant.Role = RoleAssistant
-	}
-	if len(assistant.ToolCalls) > 0 {
-		assistant.ToolCalls = nil
-		if strings.TrimSpace(assistant.Content) == "" {
-			assistant.Content = "达到最大工具循环次数，已停止。"
-		}
-	}
-	if err := emit(ctx, cfg.Hooks, Event{Type: EventMessageStart, Message: assistant, Iteration: iteration + 1, Duration: modelDuration}); err != nil {
-		return Result{}, err
-	}
-	transcript = append(transcript, assistant)
-	if err := emit(ctx, cfg.Hooks, Event{Type: EventMessageEnd, Message: assistant, Iteration: iteration + 1}); err != nil {
-		return Result{}, err
-	}
-	result := Result{
-		Messages:   transcript,
-		FinalText:  strings.TrimSpace(assistant.Content),
-		Iterations: iteration,
-	}
-	return finish(ctx, cfg.Hooks, result)
 }
 
 func synthesizeMalformedToolCall(ctx context.Context, cfg Config, transcript []Message, iteration int) (Result, error) {

@@ -110,11 +110,6 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 			},
 		}
 	}
-	if isSkillMarkdownPath(path) {
-		if err := secret.RejectIfSecretLike(content, path); err != nil {
-			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
-		}
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
@@ -122,11 +117,6 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: "wrote " + path, Evidence: map[string]any{"path": path, "bytes": len(content)}}
-}
-
-func isSkillMarkdownPath(path string) bool {
-	clean := filepath.Clean(path)
-	return strings.EqualFold(filepath.Base(clean), "SKILL.md")
 }
 
 func (ProjectIndexTool) Name() string        { return "project.index" }
@@ -203,6 +193,9 @@ func (TerminalRunTool) ToolContract() agentcore.ToolContract {
 func (TerminalRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	command := fmt.Sprint(call.Args["command"])
+	if err := rejectCommandContainingKnownSecret(command, t.Config); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"blocked": true}}
+	}
 	timeout := terminalTimeout(t.Config)
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -231,6 +224,27 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		evidence["sandbox"] = t.Config.Security.TerminalSandbox.Mode
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: evidence}
+}
+
+func rejectCommandContainingKnownSecret(command string, cfg *config.Root) error {
+	store := secret.Store{Home: configHome(cfg)}
+	entries, err := store.List()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		full, ok, err := store.Get(entry.ID)
+		if err != nil {
+			return err
+		}
+		if !ok || strings.TrimSpace(full.Value) == "" {
+			continue
+		}
+		if len(full.Value) >= 8 && strings.Contains(command, full.Value) {
+			return fmt.Errorf("refusing to run terminal command containing secret value %s; use secret.set and script.run required_secret injection instead", entry.ID)
+		}
+	}
+	return nil
 }
 
 func (SecretSetTool) Name() string { return "secret.set" }
@@ -422,13 +436,26 @@ func terminalWorkdir(cfg *config.Root) (string, error) {
 func (ScriptRunTool) Name() string        { return "script.run" }
 func (ScriptRunTool) Description() string { return "run a discovered local Mateway script" }
 func (ScriptRunTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"name"}}
+	return agentcore.Schema{
+		Required: []string{"name"},
+		Properties: map[string]any{
+			"name": map[string]any{
+				"type":        "string",
+				"description": "Discovered script name, for example email.receive.",
+			},
+			"args": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Command-line argv array passed to the script, for example [\"--limit\",\"10\"]. Do not JSON-encode this value.",
+			},
+		},
+	}
 }
 func (ScriptRunTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
 		WhenToUse:            "Use when a reusable local script exists for a connector-like task such as mail, publishing, or server operations.",
 		WhenNotToUse:         "Do not use if no matching script exists; explain the connector gap instead of fabricating execution.",
-		OutputContract:       "Return script output, exit code, duration, and script path evidence.",
+		OutputContract:       "Return script output, exit code, duration, and script path evidence. Pass script arguments with args as a string array, not as JSON text.",
 		Evidence:             "Return script name, path, args, exit_code, and duration_ms.",
 		Acceptance:           "Accepted when the script exits successfully and returns useful output.",
 		SoftFailureSignals:   []string{"script not found", "missing required secret", "non-zero exit", "timeout"},

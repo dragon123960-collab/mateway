@@ -28,6 +28,8 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("models", "glm-4.7-flash.sample.yaml"), Content: glm47FlashSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "glm-4.6v-flash.yaml"), Content: glm46VFlashYAMLTemplate},
 		{RelPath: filepath.Join("models", "glm-4.6v-flash.sample.yaml"), Content: glm46VFlashSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "agnes-2-flash.yaml"), Content: agnes2FlashYAMLTemplate},
+		{RelPath: filepath.Join("models", "agnes-2-flash.sample.yaml"), Content: agnes2FlashSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "openai-gpt54-mini.yaml"), Content: openAIGPT54MiniYAMLTemplate},
 		{RelPath: filepath.Join("models", "openai-gpt54-mini.sample.yaml"), Content: openAIGPT54MiniSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "local-mlx.yaml"), Content: localMLXYAMLTemplate},
@@ -189,6 +191,8 @@ model:
       - glm-4.6v-flash
       - minimax
     strong: minimax
+    followup: glm-4.7-flash
+    review: glm-4.7-flash
 
 execution:
   max_parallel_tools: 4
@@ -387,6 +391,26 @@ const glm46VFlashSampleYAMLTemplate = `# Copy this file to glm-4.6v-flash.yaml.
 # Put the real key in mateway.env as GLM_API_KEY.
 
 ` + glm46VFlashYAMLTemplate
+
+const agnes2FlashYAMLTemplate = `name: agnes-2-flash
+provider: agnes
+api: openai_chat
+model: agnes-2.0-flash
+api_base: https://apihub.agnes-ai.com/v1
+api_key: ""
+api_key_env: AGNES_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 8192
+strip_reasoning: false
+enabled: true
+description: agnes-2.0-flash OpenAI-compatible fast agent model for tool workflows, coding, reasoning, and multi-turn production tasks.
+`
+
+const agnes2FlashSampleYAMLTemplate = `# Copy this file to agnes-2-flash.yaml.
+# If the provider requires a key, put it in mateway.env as AGNES_API_KEY.
+
+` + agnes2FlashYAMLTemplate
 
 const openAIGPT54MiniYAMLTemplate = `name: openai-gpt54-mini
 provider: openai
@@ -737,7 +761,7 @@ when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to
 
 Use this skill before creating or updating any Mateway skill.
 
-Default behavior: when the user asks to create a skill or script and the required inputs are present, create or update the files immediately, then verify discovery or execution. Do not stop after a plan or ask permission to write requested skill files unless required information is missing or a guarded tool requests confirmation.
+Default behavior: create or update the requested skill files, make scripts executable, then verify discovery and at least one safe execution path. Do not stop after a plan unless required information is missing or a guarded tool requests confirmation.
 
 ## Directory rules
 
@@ -772,11 +796,24 @@ Preferred layout:
 - If the value visible to tools is [REDACTED_SECRET] or any placeholder, do not store it; ask the user to provide the real value again.
 - If the user has not provided a concrete secret value, write only required-secret references and report the missing secret ids.
 - After secret.set succeeds, scripts receive secrets only through environment variables injected by script.run from mateway.required_secret headers.
-- Script headers may declare required secrets:
+- Script headers declare required secrets in the first 30 lines. The format must include both ` + "`id=`" + ` and ` + "`env=`" + ` exactly:
 
 ` + "```text" + `
 # mateway.required_secret: id=<secret_id> env=<ENV_NAME>
 ` + "```" + `
+
+- Inside scripts, read only the environment variable:
+
+` + "```python" + `
+password = os.environ.get("ENV_NAME")
+if not password:
+    sys.exit("missing required env ENV_NAME")
+` + "```" + `
+
+- Direct local execution may pass env manually; Mateway execution must use script.run, which injects env from secret store.
+- Do not use terminal.run for credentialed endpoint tests. Credentialed tests must go through script.run so required_secret injection is the only credential path.
+- Skill creation can complete without a working credential. Missing or rejected credentials only block the optional credentialed endpoint test, not the structure/install verification.
+- Final answers must never repeat concrete secret values. Refer only to secret ids and env names.
 
 ## Script rules
 
@@ -790,10 +827,32 @@ Each executable skill script should include headers:
 ` + "```" + `
 
 - Use namespaced script names such as email.receive or email.send.
+- Put scripts under the skill-local scripts directory and run ` + "`chmod +x <script_path>`" + ` after writing each script.
 - Read credentials from environment variables injected by script.run.
 - Validate missing required environment variables before connecting to external services.
+- Use CLI argv arguments. For Mateway calls, script.run args is an argument array, not JSON:
+
+` + "```text" + `
+script.run name=email.receive args=["--limit","10"]
+` + "```" + `
+
+- Scripts should tolerate a leading ` + "`--`" + ` in argv before script-specific flags so manual CLI checks like ` + "`mateway script run name -- --help`" + ` do not become false failures.
 - Print concise machine-readable or clearly structured output.
 - Do not claim external actions succeeded unless the script exits successfully and prints evidence.
+
+## Verification policy
+
+Separate verification into two layers:
+
+1. Structure verification, required for skill creation:
+   - chmod +x every script.
+   - syntax or --help check works without credentials.
+   - mateway script list discovers the expected script names.
+   - script.run can execute a no-secret path such as --help.
+2. Credentialed endpoint verification, optional:
+   - Run only when the real secret is present.
+   - Use script.run, never terminal.run.
+   - If the provider rejects login or the secret is missing, report that credentialed verification is blocked while the skill structure remains installed.
 
 ## Creation workflow
 
@@ -802,9 +861,12 @@ Each executable skill script should include headers:
 3. Create or update SKILL.md.
 4. Add skill-local scripts under scripts/ when deterministic execution is needed.
 5. Add mateway.required_secret headers for each required credential.
-6. Run mateway script list to confirm scripts are discovered.
-7. Run a safe test path, or confirm the missing-secret failure path is clear.
-8. Final answer with created files, commands, and verification evidence.
+6. Run chmod +x for every script.
+7. Run python/go/node/shell syntax or --help checks.
+8. Run mateway script list to confirm scripts are discovered.
+9. Run script.run with a no-secret safe path such as --help.
+10. If credentials are present, optionally run credentialed endpoint verification through script.run.
+11. Final answer with created files, commands, structure verification evidence, and credentialed verification status, without repeating secret values.
 
 If provider settings are stable and commonly known, encode them directly in the script with comments or references when helpful. Use web search only when the task needs current or uncertain facts; do not spend the whole turn searching before writing a small, testable script.
 `

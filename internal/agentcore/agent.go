@@ -11,7 +11,6 @@ type Agent struct {
 	Model            Model
 	Tools            *ToolRegistry
 	Hooks            Hooks
-	MaxIterations    int
 	MaxParallelTools int
 }
 
@@ -19,7 +18,6 @@ func NewAgent(model Model, tools *ToolRegistry) *Agent {
 	return &Agent{
 		Model:            model,
 		Tools:            tools,
-		MaxIterations:    8,
 		MaxParallelTools: 4,
 	}
 }
@@ -33,7 +31,6 @@ func (a *Agent) Prompt(ctx context.Context, messages ...Message) (Result, error)
 		SystemPrompt:     a.SystemPrompt,
 		Model:            a.Model,
 		Tools:            a.Tools,
-		MaxIterations:    a.MaxIterations,
 		MaxParallelTools: a.MaxParallelTools,
 		Hooks:            a.Hooks,
 	}, a.Messages)
@@ -49,7 +46,6 @@ func (a *Agent) Continue(ctx context.Context) (Result, error) {
 		SystemPrompt:     a.SystemPrompt,
 		Model:            a.Model,
 		Tools:            a.Tools,
-		MaxIterations:    a.MaxIterations,
 		MaxParallelTools: a.MaxParallelTools,
 		Hooks:            a.Hooks,
 	}, a.Messages)

@@ -8,6 +8,8 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/session"
 )
 
 func TestSessionKeyUsesChannelNamespace(t *testing.T) {
@@ -89,6 +91,7 @@ func TestReactionForReply(t *testing.T) {
 	cases := map[string]string{
 		"approval_pending": "EYES",
 		"input_required":   "EYES",
+		"partial":          "EYES",
 		"clarify":          "EYES",
 		"error":            "CROSS_MARK",
 		"cancelled":        "CROSS_MARK",
@@ -104,17 +107,34 @@ func TestReactionForReply(t *testing.T) {
 }
 
 func TestShouldSendProcessingAckSkipsNewSessionCommand(t *testing.T) {
-	if shouldSendProcessingAck(channel.InboundMessage{Text: "/new"}) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "/new"}) {
 		t.Fatal("expected /new to skip processing ack")
 	}
-	if shouldSendProcessingAck(channel.InboundMessage{Text: "/read README.md"}) {
+	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "/read README.md"}) {
 		t.Fatal("expected slash command to skip processing ack")
 	}
-	if !shouldSendProcessingAck(channel.InboundMessage{Text: "hello"}) {
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "hello"}) {
 		t.Fatal("expected normal message to send processing ack")
 	}
-	if shouldSendProcessingAck(channel.InboundMessage{Text: "hello", Metadata: map[string]string{"message_type": "interactive", "card_action": "confirm"}}) {
+	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "hello", Metadata: map[string]string{"message_type": "interactive", "card_action": "confirm"}}) {
 		t.Fatal("expected card action to skip processing ack")
+	}
+}
+
+func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := state.StartTask("needs confirmation")
+	state.Pending = &session.PendingAction{Kind: "confirm_tool", TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认"}) {
+		t.Fatal("expected pending session to skip processing ack")
 	}
 }
 

@@ -73,6 +73,52 @@ func TestRuntimeNewArchivesAndClearsSession(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecallsArchivedTaskIntoNewTaskAfterNewSession(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	oldTask := state.StartTask("总结 README 项目说明")
+	oldTask.Status = "completed"
+	oldTask.Summary = "已总结 README，剩余补充一句差异。"
+	oldTaskID := oldTask.ID
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/new"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "继续之前那个 README 总结任务"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "archive_recall_pending" || !contains(resp.Reply.Text, "接回") {
+		t.Fatalf("expected archive recall confirmation, got %#v", resp.Reply)
+	}
+	afterPrompt, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterPrompt.Pending == nil || afterPrompt.Pending.Kind != "archive_task_recall" {
+		t.Fatalf("expected archive recall pending, got %#v", afterPrompt.Pending)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(estimateAwareCaptureUserTextModel{}, rt.Tools)
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "3", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(resp.Reply.Text, "Archived task ID") || !contains(resp.Reply.Text, oldTaskID) {
+		t.Fatalf("expected archived task context in new task, got %#v", resp.Reply)
+	}
+	updated, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Tasks) != 1 || updated.Tasks[0].ID == oldTaskID {
+		t.Fatalf("expected a new current-session task, got %#v", updated.Tasks)
+	}
+}
+
 func TestCompactMessagesForStorageDropsSystemTruncatesToolAndKeepsRecent(t *testing.T) {
 	var messages []agentcore.Message
 	messages = append(messages, agentcore.Message{Role: agentcore.RoleSystem, Content: "system"})
@@ -196,6 +242,32 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfirmationResumesOriginalTask(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: true},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	target := filepath.Join(home, "out.txt")
+	rt.Pool.agents["main"] = agentcore.NewAgent(&confirmResumeModel{target: target}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "写文件 " + target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected confirmation response, got %#v", resp.Reply)
+	}
+	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "原任务已继续完成" {
+		t.Fatalf("expected resumed task summary, got %#v", resp.Reply)
+	}
+}
+
 func TestRuntimeAssistantQuestionFollowupContinuesTask(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -307,6 +379,7 @@ func TestRuntimeStartsNewTaskAfterCompletedTask(t *testing.T) {
 func TestRuntimeExplicitFollowupReusesRecentTask(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&routeThenCaptureModel{}, rt.Tools)
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "请总结 README"}); err != nil {
 		t.Fatal(err)
 	}
@@ -328,6 +401,7 @@ func TestRuntimeExplicitFollowupReusesRecentTask(t *testing.T) {
 func TestRuntimeShortQuestionFollowupReusesCompletedTask(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&routeThenCaptureModel{}, rt.Tools)
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "查看北京天气"}); err != nil {
 		t.Fatal(err)
 	}
@@ -346,9 +420,33 @@ func TestRuntimeShortQuestionFollowupReusesCompletedTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeModelFollowupRoutesRemainingWorkToRecentTask(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	model := &routeThenCaptureModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建网易邮件 skill"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "你来执行剩下的操作并测试"}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 {
+		t.Fatalf("expected model-routed followup to reuse task, got %#v", state.Tasks)
+	}
+	if !contains(model.firstTaskUserText, "Original task: 创建网易邮件 skill") || !contains(model.firstTaskUserText, "Additional request: 你来执行剩下的操作并测试") {
+		t.Fatalf("expected model-routed continuation text, got %q", model.firstTaskUserText)
+	}
+}
+
 func TestRuntimeOrdinalFollowupReactivatesHistoricalTask(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&routeThenCaptureModel{}, rt.Tools)
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "请总结 README"}); err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +474,7 @@ func TestRuntimeOrdinalFollowupReactivatesHistoricalTask(t *testing.T) {
 func TestRuntimeAmbiguousHistoricalFollowupAsksClarify(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&routeThenCaptureModel{}, rt.Tools)
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "请总结 README"}); err != nil {
 		t.Fatal(err)
 	}
@@ -402,6 +501,7 @@ func TestRuntimeStaleWeakFollowupAsksClarify(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&routeThenCaptureModel{}, rt.Tools)
 	state := session.State{Key: "cli:test"}
 	task := state.StartTask("帮我查今天最新 AI 资讯，给我 5 条高价值信息。")
 	task.Status = "completed"
@@ -421,7 +521,7 @@ func TestRuntimeStaleWeakFollowupAsksClarify(t *testing.T) {
 	}
 }
 
-func TestRuntimeDifferentSessionsDoNotShareFollowupContext(t *testing.T) {
+func TestRuntimeDifferentSessionsWithoutHistoryStartsNewTask(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:a", Text: "请总结 README"}); err != nil {
@@ -431,8 +531,8 @@ func TestRuntimeDifferentSessionsDoNotShareFollowupContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "clarify" {
-		t.Fatalf("expected no cross-session context and clarify, got %#v", resp.Reply)
+	if resp.Reply.Style == "clarify" {
+		t.Fatalf("expected no cross-session context to start normally, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("cli:b")
 	if err != nil {
@@ -923,6 +1023,33 @@ func TestRuntimeAgentProfileProposalPromoteFromReply(t *testing.T) {
 	}
 }
 
+func TestRuntimeSkillWriteDoesNotCreateAgentProfilePending(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "skills", "email", "SKILL.md")
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true, RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(writeProfileModel{target: target, content: "# email\n\nUse IMAP/SMTP."}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "写邮件 skill"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "agent_profile_review_pending" || contains(resp.Reply.Text, "agent 核心 md 草稿") {
+		t.Fatalf("unexpected agent profile review reply: %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil && state.Pending.Kind == "agent_profile_proposal_review" {
+		t.Fatalf("ordinary skill write should not create agent profile pending: %#v", state.Pending)
+	}
+}
+
 func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
@@ -944,7 +1071,7 @@ func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "confirm") {
+	if resp.Reply.Style != "approval_pending" {
 		t.Fatalf("expected tool confirmation first, got %#v", resp.Reply)
 	}
 	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
@@ -1088,6 +1215,12 @@ func TestRuntimeHandlesDanglingToolCallFinalText(t *testing.T) {
 func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "only a plan", SuggestedFollowUp: "continue writing scripts"},
+			{Completed: true, Reason: "done"},
+		}},
+	}, rt.Hooks.Providers...)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, Content: "Next I will write three scripts and run connectivity tests."},
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "email/scripts/list.py", "content": "ok"}}}},
@@ -1110,18 +1243,176 @@ func TestRuntimeContinuesAfterUnfinishedExecutionPlan(t *testing.T) {
 	if len(state.Tasks[0].Steps) != 1 || state.Tasks[0].Steps[0].Tool != "file.write" {
 		t.Fatalf("expected file.write evidence, got %#v", state.Tasks[0].Steps)
 	}
+}
+
+func TestRuntimeCompletionReviewContinuesAfterIntermediateReply(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "only a plan", MissingItems: []string{"files"}, SuggestedFollowUp: "continue writing files"},
+			{Completed: false, Reason: "still verifying", MissingItems: []string{"verification"}, SuggestedFollowUp: "continue verifying"},
+			{Completed: true, Reason: "done"},
+		}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "接下来并行：写文件、验证、发总结。"},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "out.md", "content": "ok"}}}},
+		{Role: agentcore.RoleAssistant, Content: "已创建 out.md，接下来验证。"},
+		{Role: agentcore.RoleAssistant, Content: "已创建 out.md 并完成验证。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建一份 md 文档"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "partial" {
+		t.Fatalf("expected continued completion, got partial reply %q", resp.Reply.Text)
+	}
+	if resp.Reply.Text != "已创建 out.md 并完成验证。" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+}
+
+func TestRuntimeCompletionReviewMarksPartialAfterNoProgress(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "deliverables missing", MissingItems: []string{"pdf", "email"}, SuggestedFollowUp: "continue producing deliverables"},
+			{Completed: false, Reason: "still only planning", MissingItems: []string{"pdf", "email"}, SuggestedFollowUp: "execute tools now"},
+		}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": "."}}}},
+		{Role: agentcore.RoleAssistant, Content: "环境摸清：接下来并行生成 md/pdf、发邮件、创建飞书文档。"},
+		{Role: agentcore.RoleAssistant, Content: "继续计划：下一步会生成 md/pdf、发邮件、创建飞书文档。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		ID:         "1",
+		Channel:    "cli",
+		SessionKey: "cli:test",
+		Text:       "搜索最火爆的 ai 开源课程，整理 md 和 pdf，通过邮件发给我，并创建飞书云文档",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" {
+		t.Fatalf("style = %q, reply %q", resp.Reply.Style, resp.Reply.Text)
+	}
+	if !contains(resp.Reply.Text, "任务还没有完成") {
+		t.Fatalf("partial reply should explain incomplete status, got %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status == "completed" {
+		t.Fatalf("expected non-completed task, got %#v", state.Tasks)
+	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), `"type":"completion_contract_failed"`) {
-		t.Fatalf("trace missing completion check:\n%s", data)
+	if strings.Contains(string(data), `"type":"task_completed"`) {
+		t.Fatalf("partial task should not record completion:\n%s", data)
+	}
+}
+
+func TestRuntimeCompletionReviewFallbackDoesNotComplete(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = []HookProvider{
+		panicCompletionReviewProvider{},
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "接下来我会创建这份 md 文档。"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建一份 md 文档"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" {
+		t.Fatalf("expected partial style when completion review is unavailable, got style=%q text=%q", resp.Reply.Style, resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status == "completed" {
+		t.Fatalf("expected non-completed task, got %#v", state.Tasks)
+	}
+}
+
+func TestRuntimeFinalTextWarningUsesPartialStyle(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "model was too optimistic"}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "接下来我会执行验证。"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "验证脚本"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" || !contains(resp.Reply.Text, "任务还没有完成") {
+		t.Fatalf("expected partial reply for final text warning, got style=%q text=%q", resp.Reply.Style, resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed task, got %#v", state.Tasks)
+	}
+}
+
+func TestRuntimeCompletionReviewAllowsCompletedAndLearning(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "deliverable exists"}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "out.md", "content": "ok"}}}},
+		{Role: agentcore.RoleAssistant, Content: "已创建 out.md。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建一份 md 文档"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "partial" {
+		t.Fatalf("expected completed reply, got %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"kind":"task_completed"`) || !strings.Contains(string(data), `"type":"self_learning"`) {
+		t.Fatalf("completion should record learning event:\n%s", data)
 	}
 }
 
 func TestRuntimeDoesNotCompleteExecutionTaskWithReadOnlyEvidence(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "read only evidence", SuggestedFollowUp: "continue writing files"},
+			{Completed: true, Reason: "done"},
+		}},
+	}, rt.Hooks.Providers...)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": "."}}}},
 		{Role: agentcore.RoleAssistant, Content: "Start writing files now."},
@@ -1147,40 +1438,70 @@ func TestRuntimeDoesNotCompleteExecutionTaskWithReadOnlyEvidence(t *testing.T) {
 	}
 }
 
-func TestLooksLikeUnfinishedExecutionPlan(t *testing.T) {
-	cases := []string{
-		"Next I will create the script and run tests.",
-		"Let me fetch the config and write the file.",
+func TestRuntimeUsesModelFollowupForContinuation(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "only a plan", SuggestedFollowUp: "continue writing the script"},
+			{Completed: false, Reason: "script missing", SuggestedFollowUp: "continue writing the script"},
+			{Completed: true, Reason: "done"},
+		}},
+	}, rt.Hooks.Providers...)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("我要收发邮件")
+	task.Status = "completed"
+	state.ActiveTask = task.ID
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
 	}
-	for _, text := range cases {
-		if !looksLikeUnfinishedExecutionPlan(text) {
-			t.Fatalf("expected unfinished execution plan: %q", text)
-		}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "好，先看 `script.run` 怎么发现 email 脚本，避免脚本放错位置。"},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "email/scripts/mail.py", "content": "ok"}}}},
+		{Role: agentcore.RoleAssistant, Content: "继续确认脚本位置。"},
+		{Role: agentcore.RoleAssistant, Content: "email script written."},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "继续"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if looksLikeUnfinishedExecutionPlan("Scripts were written and verified.") {
-		t.Fatalf("completed evidence should not look unfinished")
+	if resp.Reply.Text != "email script written." {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	updated, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Tasks) != 1 || len(updated.Tasks[0].Steps) != 1 || updated.Tasks[0].Steps[0].Tool != "file.write" {
+		t.Fatalf("expected continuation to write file, got %#v", updated.Tasks)
 	}
 }
 
-func TestCompletionContractRequiresMutationEvidenceForExecutionTasks(t *testing.T) {
-	contract := buildCompletionContract("create an email skill")
-	if len(contract.RequiredTools) != 1 || contract.RequiredTools[0] != "mutation" {
-		t.Fatalf("contract = %#v", contract)
+func TestLooksLikeUnexecutedNextStep(t *testing.T) {
+	cases := []string{
+		"给脚本添加可执行权限。",
+		"测试发送邮件到 QQ 邮箱：",
+		"接下来我会执行验证。",
 	}
-	task := session.TaskNode{CompletionContract: contract}
-	result := checkCompletionContract(task)
-	if result.Satisfied {
-		t.Fatalf("expected missing evidence, got %#v", result)
+	for _, text := range cases {
+		if !looksLikeUnexecutedNextStep(text) {
+			t.Fatalf("expected pending action warning for %q", text)
+		}
 	}
-	task.Steps = []session.TaskStep{{Tool: "project.index", Status: "accepted"}}
-	result = checkCompletionContract(task)
-	if result.Satisfied {
-		t.Fatalf("expected read-only evidence to be insufficient, got %#v", result)
+	if looksLikeUnexecutedNextStep("已创建脚本，并通过 --help 校验。") {
+		t.Fatalf("completed verification text should not look pending")
 	}
-	task.Steps = []session.TaskStep{{Tool: "file.write", Status: "accepted"}}
-	result = checkCompletionContract(task)
-	if !result.Satisfied {
-		t.Fatalf("expected mutation evidence to satisfy contract, got %#v", result)
+}
+
+func TestCompletionHeuristicFlagsColonEndedPlan(t *testing.T) {
+	cases := []string{
+		"找到了：**`Hiragino Sans GB.ttc`**。重写脚本，注册这个 ttc：",
+		"确认了执行环境。先生成 PDF：",
+	}
+	for _, text := range cases {
+		if !looksLikeIncompleteFinalText(text) {
+			t.Fatalf("expected incomplete final text: %q", text)
+		}
 	}
 }
 
@@ -1197,6 +1518,41 @@ func TestRuntimeDangerousTerminalCommandRequiresConfirmationEvenWhenRiskyAllowed
 	}
 	if !contains(resp.Reply.Text, "destructive") {
 		t.Fatalf("expected dangerous command confirmation, got %#v", resp.Reply)
+	}
+}
+
+func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *testing.T) {
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: t.TempDir()},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{{
+		Role:    agentcore.RoleAssistant,
+		Content: "等等，改用 sed 修这一行。",
+		ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "sed -i.bak 's/a/b/' file && rm file.bak"},
+		}},
+	}}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "修复脚本"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != "confirm_tool" {
+		t.Fatalf("expected confirm pending state, got %#v", state.Pending)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "await_confirm" {
+		t.Fatalf("expected task await_confirm, got %#v", state.Tasks)
 	}
 }
 
@@ -1419,6 +1775,46 @@ func TestAgentPoolVisionRolePreferredOverFallbackForImage(t *testing.T) {
 	}
 }
 
+func TestAgentPoolRoleModelUsesProfileThenGlobalRoles(t *testing.T) {
+	t.Setenv("MATEWAY_MAIN_KEY", "main")
+	t.Setenv("MATEWAY_PROFILE_REVIEW_KEY", "profile-review")
+	t.Setenv("MATEWAY_GLOBAL_REVIEW_KEY", "global-review")
+	cfg := &config.Root{
+		App:   config.AppConfig{Home: t.TempDir()},
+		Model: config.ModelSelection{Default: "main", Roles: config.ModelRoles{"review": []string{"global-review"}}},
+		Models: []config.ModelConfig{
+			{Name: "main", API: "openai", APIBase: "https://main.example/v1", Model: "main-model", APIKeyEnv: "MAIN_KEY", Enabled: true},
+			{Name: "profile-review", API: "openai", APIBase: "https://profile.example/v1", Model: "profile-review-model", APIKeyEnv: "PROFILE_REVIEW_KEY", Enabled: true},
+			{Name: "global-review", API: "openai", APIBase: "https://global.example/v1", Model: "global-review-model", APIKeyEnv: "GLOBAL_REVIEW_KEY", Enabled: true},
+		},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{{
+				ID:    "main",
+				Model: config.ModelSelection{Default: "main", Roles: config.ModelRoles{"review": []string{"profile-review"}}},
+			}},
+		},
+	}
+	pool := NewAgentPool(cfg)
+	fallback := pool.AgentForSession("cli:test").Model
+	roleModel := pool.RoleModelForMessage(channel.InboundMessage{Channel: "cli", SessionKey: "cli:test"}, "review", fallback)
+	roleAgentModel, ok := roleModel.(model.AgentModel)
+	if !ok {
+		t.Fatalf("expected AgentModel role model, got %T", roleModel)
+	}
+	if roleAgentModel.Client.Config.Name != "profile-review" {
+		t.Fatalf("expected profile review model first, got %q", roleAgentModel.Client.Config.Name)
+	}
+	if len(roleAgentModel.Fallbacks) != 1 || roleAgentModel.Fallbacks[0].Config.Name != "global-review" {
+		t.Fatalf("expected global review fallback, got %#v", roleAgentModel.Fallbacks)
+	}
+	same := pool.RoleModelForMessage(channel.InboundMessage{Channel: "cli", SessionKey: "cli:test"}, "missing", fallback)
+	sameModel, ok := same.(model.AgentModel)
+	if !ok || sameModel.Client.Config.Name != "main" {
+		t.Fatalf("missing role should return fallback model, got %#v", same)
+	}
+}
+
 func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
@@ -1448,10 +1844,27 @@ func TestBuildRuntimeSystemContextIncludesEnvironmentAndWorkspaceProfile(t *test
 		Search:   config.SearchConfig{ProviderOrder: []string{"searxng"}},
 	}
 	text := buildRuntimeSystemContext(cfg, config.AgentProfileConfig{ID: "main"})
-	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Guidance:", "Prefer fresh official sources"} {
+	for _, want := range []string{"Runtime context:", "Current date:", "Asia/Shanghai", "Operating system:", "Executable environment:", "Task freshness policy:", "use the current date above exactly", "Connector gap policy:", "missing connector", "verification commands", "verify the required executable", "needs real-time", "Workspace profile context:", "Mission: be steady and practical.", "默认使用中文", "用户偏好：回答先给结论。", "searxng", "Discovered skills:", "fresh-search", "Location:", filepath.Join(skillDir, "SKILL.md")} {
 		if !contains(text, want) {
 			t.Fatalf("context missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestBuildRuntimeSystemContextIncludesLongSkillHead(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	skillDir := filepath.Join(workspace, "skills", "mail.163")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	longBody := strings.Repeat("details\n", 900)
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: mail.163\ndescription: Send email through 163 mailbox.\nstage: execution\npriority: 85\n---\n# mail.163\nUse script.run name=mail.163.send.\n"+longBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	text := buildRuntimeSystemContext(&config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}, config.AgentProfileConfig{ID: "main"})
+	if !contains(text, "mail.163") || !contains(text, "Send email through 163 mailbox") {
+		t.Fatalf("expected long skill to be discovered:\n%s", text)
 	}
 }
 
@@ -1564,15 +1977,55 @@ func TestRuntimeContextHookInjectsStaticContextAsSystemMessage(t *testing.T) {
 	if resp.Reply.Text != "ok" {
 		t.Fatalf("reply = %q", resp.Reply.Text)
 	}
-	if !contains(model.systemMessages, "static_runtime_context") || !contains(model.systemMessages, "偏好：保持简短。") {
-		t.Fatalf("expected injected static context, got %q", model.systemMessages)
+	if !contains(model.systemMessages, "Current channel context") || contains(model.systemMessages, "偏好：保持简短。") {
+		t.Fatalf("expected only channel context system message, got %q", model.systemMessages)
 	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), `"type":"hook_event"`) || !contains(string(data), `"sections":["static_runtime_context"]`) {
+	if !contains(string(data), `"type":"hook_event"`) || !contains(string(data), `"sections":["channel_context"]`) {
 		t.Fatalf("expected context hook trace event, got %s", data)
+	}
+}
+
+func TestRuntimePrependsCurrentTaskFocusToSystemPrompt(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	model := &captureRuntimeContextModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "搜索资料并生成 markdown 报告"}); err != nil {
+		t.Fatal(err)
+	}
+	systemPrompt := model.systemPrompt
+	if !strings.HasPrefix(systemPrompt, "Current task focus:\n- Original user task: 搜索资料并生成 markdown 报告") {
+		t.Fatalf("expected task focus at top of system prompt, got %q", systemPrompt)
+	}
+	if !contains(systemPrompt, "Before every tool call or final answer") {
+		t.Fatalf("expected task focus reminder, got %q", systemPrompt)
+	}
+}
+
+func TestRuntimePrependsFollowupTaskFocusToSystemPrompt(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	model := &captureRuntimeContextModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "请总结 README"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "再补充一下工具"}); err != nil {
+		t.Fatal(err)
+	}
+	systemPrompt := model.systemPrompt
+	if !strings.HasPrefix(systemPrompt, "Current task focus:\n- Original user task: 请总结 README") {
+		t.Fatalf("expected original task at top of followup system prompt, got %q", systemPrompt)
+	}
+	if !contains(systemPrompt, "- Additional follow-up request: 再补充一下工具") {
+		t.Fatalf("expected followup request in system prompt, got %q", systemPrompt)
+	}
+	if contains(systemPrompt, "Continue the existing task:") {
+		t.Fatalf("expected merged followup protocol to be normalized, got %q", systemPrompt)
 	}
 }
 
@@ -1599,11 +2052,14 @@ func TestRuntimeContextSkipsUnsafeWorkspacePromptFile(t *testing.T) {
 	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "hello"}); err != nil {
 		t.Fatal(err)
 	}
-	if contains(model.systemMessages, "[TOOL_CALL]") {
-		t.Fatalf("unsafe prompt file should not be injected, got %q", model.systemMessages)
+	if contains(model.systemPrompt, "[TOOL_CALL]") {
+		t.Fatalf("unsafe prompt file should not be injected, got %q", model.systemPrompt)
 	}
-	if !contains(model.systemMessages, "偏好：保持简短。") {
-		t.Fatalf("safe prompt file should still be injected, got %q", model.systemMessages)
+	if !contains(model.systemPrompt, "偏好：保持简短。") {
+		t.Fatalf("safe prompt file should still be injected, got %q", model.systemPrompt)
+	}
+	if !contains(model.systemMessages, "Current channel context") || contains(model.systemMessages, "偏好：保持简短。") {
+		t.Fatalf("context hook should inject only channel context, got %q", model.systemMessages)
 	}
 }
 
@@ -1736,6 +2192,10 @@ type readRememberThenCaptureModel struct {
 	usedRead bool
 }
 
+type routeThenCaptureModel struct {
+	firstTaskUserText string
+}
+
 type writeProfileModel struct {
 	target  string
 	content string
@@ -1748,6 +2208,8 @@ type writeProfileThenCaptureModel struct {
 }
 
 type captureUserTextModel struct{}
+
+type estimateAwareCaptureUserTextModel struct{}
 
 type errorModel struct {
 	err error
@@ -1788,8 +2250,36 @@ func (panicToolPolicyHookProvider) ToolPolicyHook(context.Context, ToolPolicyHoo
 	panic("boom")
 }
 
+type panicCompletionReviewProvider struct{}
+
+func (panicCompletionReviewProvider) Name() string { return "panic_completion_review" }
+
+func (panicCompletionReviewProvider) CompletionReviewHook(context.Context, CompletionReviewInput) (CompletionReviewResult, error) {
+	panic("boom")
+}
+
+type testCompletionReviewProvider struct {
+	results []CompletionReviewResult
+	index   int
+}
+
+func (*testCompletionReviewProvider) Name() string { return "test_completion_review" }
+
+func (p *testCompletionReviewProvider) CompletionReviewHook(context.Context, CompletionReviewInput) (CompletionReviewResult, error) {
+	if len(p.results) == 0 {
+		return CompletionReviewResult{Completed: true, Reason: "test default"}, nil
+	}
+	index := p.index
+	if index >= len(p.results) {
+		index = len(p.results) - 1
+	}
+	p.index++
+	return p.results[index], nil
+}
+
 type captureRuntimeContextModel struct {
 	systemMessages string
+	systemPrompt   string
 }
 
 func contains(text, want string) bool {
@@ -1809,10 +2299,47 @@ func (m staticModel) Next(context.Context, agentcore.Context) (agentcore.Message
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
 }
 
-func (m *scriptedRuntimeModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
+func (m *scriptedRuntimeModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "route user messages") {
+		taskID := "missing"
+		if len(ctx.Messages) > 0 {
+			prompt := ctx.Messages[len(ctx.Messages)-1].Content
+			if idx := strings.LastIndex(prompt, "- id: "); idx >= 0 {
+				taskID = strings.Fields(prompt[idx+len("- id: "):])[0]
+			}
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"continuation","task_id":"` + taskID + `","reason":"test continuation"}`}, nil
+	}
 	msg := m.messages[m.index]
 	m.index++
 	return msg, nil
+}
+
+type confirmResumeModel struct {
+	issuedTool bool
+	target     string
+}
+
+func (m *confirmResumeModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if len(ctx.Tools) == 0 {
+		if strings.Contains(ctx.SystemPrompt, "Summarize a confirmed tool execution") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "原任务已继续完成"}, nil
+		}
+		if strings.Contains(ctx.SystemPrompt, "review whether an agent task is actually complete") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
+		}
+	}
+	for _, msg := range ctx.Messages {
+		if strings.TrimSpace(msg.Content) == "ok" {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "原任务已继续完成"}, nil
+		}
+	}
+	m.issuedTool = true
+	return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": m.target, "content": "ok"},
+	}}}, nil
 }
 
 func (usageModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
@@ -1850,6 +2377,40 @@ func (m *readRememberThenCaptureModel) Next(_ context.Context, ctx agentcore.Con
 	return captureUserTextModel{}.Next(context.Background(), ctx)
 }
 
+func (m *routeThenCaptureModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "route user messages") {
+		taskID := "missing"
+		prompt := ""
+		if len(ctx.Messages) > 0 {
+			prompt = ctx.Messages[len(ctx.Messages)-1].Content
+		}
+		if strings.Contains(prompt, "回到之前那个总结任务") || strings.Contains(prompt, "继续上一轮") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"clarify","task_id":"","reason":"ambiguous historical reference"}`}, nil
+		}
+		if strings.Contains(prompt, "第一个任务") {
+			if _, tail, ok := strings.Cut(prompt, "- id: "); ok {
+				taskID = strings.Fields(tail)[0]
+			}
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"continuation","task_id":"` + taskID + `","reason":"ordinal reference"}`}, nil
+		}
+		if strings.Contains(prompt, "Current user message:\n完全不同的新请求") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"new_task","task_id":"","reason":"unrelated request"}`}, nil
+		}
+		if idx := strings.LastIndex(prompt, "- id: "); idx >= 0 {
+			taskID = strings.Fields(prompt[idx+len("- id: "):])[0]
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"continuation","task_id":"` + taskID + `","reason":"remaining work and test request"}`}, nil
+	}
+	if strings.Contains(ctx.SystemPrompt, "review whether an agent task is actually complete") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
+	}
+	userText := lastUserContent(ctx.Messages)
+	if strings.Contains(userText, "Continue the existing task") {
+		m.firstTaskUserText = userText
+	}
+	return captureUserTextModel{}.Next(context.Background(), ctx)
+}
+
 func (m writeProfileModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
 	if lastConversationMessageForTest(ctx.Messages).Role == agentcore.RoleTool {
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: lastConversationMessageForTest(ctx.Messages).Content}, nil
@@ -1877,12 +2438,19 @@ func (m *writeProfileThenCaptureModel) Next(_ context.Context, ctx agentcore.Con
 }
 
 func (captureUserTextModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "review whether an agent task is actually complete") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
+	}
 	for i := len(ctx.Messages) - 1; i >= 0; i-- {
 		if ctx.Messages[i].Role == agentcore.RoleUser {
 			return agentcore.Message{Role: agentcore.RoleAssistant, Content: ctx.Messages[i].Content}, nil
 		}
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: ""}, nil
+}
+
+func (estimateAwareCaptureUserTextModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	return captureUserTextModel{}.Next(context.Background(), ctx)
 }
 
 func lastConversationMessageForTest(messages []agentcore.Message) agentcore.Message {
@@ -1899,12 +2467,28 @@ func (m errorModel) Next(context.Context, agentcore.Context) (agentcore.Message,
 }
 
 func (m *captureRuntimeContextModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "route user messages") {
+		taskID := "missing"
+		if len(ctx.Messages) > 0 {
+			prompt := ctx.Messages[len(ctx.Messages)-1].Content
+			if idx := strings.LastIndex(prompt, "- id: "); idx >= 0 {
+				taskID = strings.Fields(prompt[idx+len("- id: "):])[0]
+			}
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"continuation","task_id":"` + taskID + `","reason":"test continuation"}`}, nil
+	}
+	if strings.Contains(ctx.SystemPrompt, "review whether an agent task is actually complete") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
+	}
+	m.systemPrompt = ctx.SystemPrompt
 	var parts []string
 	for _, msg := range ctx.Messages {
 		if msg.Role == agentcore.RoleSystem {
 			parts = append(parts, msg.Content)
 		}
 	}
-	m.systemMessages = strings.Join(parts, "\n\n")
+	if len(parts) > 0 {
+		m.systemMessages = strings.Join(parts, "\n\n")
+	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "ok"}, nil
 }

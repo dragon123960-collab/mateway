@@ -118,6 +118,8 @@ func headerTemplateForStyle(style string) string {
 	switch strings.TrimSpace(style) {
 	case "approval_pending":
 		return "orange"
+	case "partial":
+		return "orange"
 	case "input_required":
 		return "blue"
 	case "error":
@@ -151,6 +153,8 @@ func cardFooterNote(reply channel.OutboundMessage) string {
 	switch strings.TrimSpace(reply.Style) {
 	case "approval_pending":
 		return catalog.T(locale, "feishu.footer.approval_pending", nil)
+	case "partial":
+		return catalog.T(locale, "feishu.footer.partial", nil)
 	case "input_required":
 		return catalog.T(locale, "feishu.footer.input_required", nil)
 	case "error":

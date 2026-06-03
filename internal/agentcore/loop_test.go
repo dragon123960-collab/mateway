@@ -169,35 +169,25 @@ func TestRunUnknownToolAppendsErrorResult(t *testing.T) {
 	}
 }
 
-func TestRunMaxIterations(t *testing.T) {
+func TestRunContinuesUntilHookStops(t *testing.T) {
 	model := repeatToolModel{}
 	registry := NewToolRegistry()
 	registry.Register(testEchoTool{})
-	result, err := Run(context.Background(), Config{Model: model, Tools: registry, MaxIterations: 2}, []Message{{Role: RoleUser, Content: "loop"}})
+	result, err := Run(context.Background(), Config{
+		Model: model,
+		Tools: registry,
+		Hooks: Hooks{ShouldStopAfterTurn: func(_ context.Context, turn TurnContext) (bool, error) {
+			return turn.Iteration >= 12, nil
+		}},
+	}, []Message{{Role: RoleUser, Content: "loop"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Iterations != 2 {
+	if result.Iterations != 12 {
 		t.Fatalf("Iterations = %d", result.Iterations)
 	}
-	if !strings.Contains(result.FinalText, "最大工具循环次数") {
-		t.Fatalf("FinalText = %q", result.FinalText)
-	}
-}
-
-func TestRunSynthesizesAfterToolBudget(t *testing.T) {
-	model := budgetAwareModel{}
-	registry := NewToolRegistry()
-	registry.Register(testEchoTool{})
-	result, err := Run(context.Background(), Config{Model: model, Tools: registry, MaxIterations: 2}, []Message{{Role: RoleUser, Content: "use tool"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.FinalText != "summary from existing evidence" {
-		t.Fatalf("FinalText = %q", result.FinalText)
-	}
-	if !containsUserMessage(result.Messages, "Tool budget reached") {
-		t.Fatalf("synthesis instruction not appended: %#v", result.Messages)
+	if len(toolMessages(result.Messages)) != 12 {
+		t.Fatalf("tool executions = %d", len(toolMessages(result.Messages)))
 	}
 }
 
@@ -206,7 +196,7 @@ func TestRunRepairsMalformedToolCall(t *testing.T) {
 		{Role: RoleAssistant, Content: "checking\n[TOOL_CALL]\n{\"id\":\"call_1\""},
 		{Role: RoleAssistant, Content: "recovered answer"},
 	}}
-	result, err := Run(context.Background(), Config{Model: &model, MaxIterations: 2}, []Message{{Role: RoleUser, Content: "use tool"}})
+	result, err := Run(context.Background(), Config{Model: &model}, []Message{{Role: RoleUser, Content: "use tool"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,9 +208,9 @@ func TestRunRepairsMalformedToolCall(t *testing.T) {
 	}
 }
 
-func TestRunSynthesizesMalformedToolCallAtBudget(t *testing.T) {
+func TestRunSynthesizesMalformedToolCallAfterRetries(t *testing.T) {
 	model := malformedAtBudgetModel{}
-	result, err := Run(context.Background(), Config{Model: model, MaxIterations: 1}, []Message{{Role: RoleUser, Content: "use tool"}})
+	result, err := Run(context.Background(), Config{Model: model}, []Message{{Role: RoleUser, Content: "use tool"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,17 +371,6 @@ func (m *scriptedModel) Next(context.Context, Context) (Message, error) {
 type repeatToolModel struct{}
 
 func (repeatToolModel) Next(context.Context, Context) (Message, error) {
-	return Message{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.echo", Args: map[string]any{"text": "again"}}}}, nil
-}
-
-type budgetAwareModel struct{}
-
-func (budgetAwareModel) Next(_ context.Context, ctx Context) (Message, error) {
-	for _, msg := range ctx.Messages {
-		if msg.Role == RoleUser && strings.Contains(msg.Content, "Tool budget reached") {
-			return Message{Role: RoleAssistant, Content: "summary from existing evidence"}, nil
-		}
-	}
 	return Message{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.echo", Args: map[string]any{"text": "again"}}}}, nil
 }
 

@@ -185,7 +185,7 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		react(runCtx, sender, msg.ID, "SMILE")
 	}
 	ackMessageID := ""
-	if shouldSendProcessingAck(msg) {
+	if shouldSendProcessingAck(rt, msg) {
 		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
@@ -249,8 +249,12 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 	})
 }
 
-func shouldSendProcessingAck(msg channel.InboundMessage) bool {
+func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) bool {
 	if isCardAction(msg) {
+		return false
+	}
+	state, err := rt.Store.Load(msg.SessionKey)
+	if err == nil && state.Pending != nil {
 		return false
 	}
 	return !isSlashCommand(msg.Text)
@@ -314,7 +318,7 @@ func isCardAction(msg channel.InboundMessage) bool {
 
 func reactionForReply(reply channel.OutboundMessage) string {
 	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending", "input_required", "clarify":
+	case "approval_pending", "input_required", "clarify", "partial":
 		return "EYES"
 	case "error", "cancelled":
 		return "CROSS_MARK"

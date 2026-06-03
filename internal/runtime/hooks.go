@@ -16,7 +16,11 @@ import (
 	"github.com/dongping/mateway/internal/tool"
 )
 
-const defaultHookTimeout = 2 * time.Second
+const (
+	defaultHookTimeout             = 2 * time.Second
+	defaultFollowupHookTimeout     = 8 * time.Second
+	defaultCompletionReviewTimeout = 15 * time.Second
+)
 
 type ContextHookInput struct {
 	Message  channel.InboundMessage
@@ -55,6 +59,7 @@ type ContextHookProvider interface {
 type FollowupHookInput struct {
 	State session.State
 	Text  string
+	Model agentcore.Model
 }
 
 type FollowupHookProvider interface {
@@ -77,6 +82,26 @@ type ToolPolicyHookResult struct {
 type ToolPolicyHookProvider interface {
 	HookProvider
 	ToolPolicyHook(context.Context, ToolPolicyHookInput) (ToolPolicyHookResult, error)
+}
+
+type CompletionReviewInput struct {
+	UserText           string
+	Task               session.TaskNode
+	FinalText          string
+	TranscriptMessages []agentcore.Message
+	Model              agentcore.Model
+}
+
+type CompletionReviewResult struct {
+	Completed         bool
+	Reason            string
+	MissingItems      []string
+	SuggestedFollowUp string
+}
+
+type CompletionReviewHookProvider interface {
+	HookProvider
+	CompletionReviewHook(context.Context, CompletionReviewInput) (CompletionReviewResult, error)
 }
 
 type ObserveHookInput struct {
@@ -164,10 +189,11 @@ func (h RuntimeHooks) contextMessages(ctx context.Context, input ContextHookInpu
 }
 
 func (h RuntimeHooks) resolveFollowup(ctx context.Context, input FollowupHookInput, trace *traceRecorder) followupDecision {
-	timeout := h.Timeout
-	if timeout <= 0 {
-		timeout = defaultHookTimeout
+	if decision := protocolFollowupDecision(input.State, input.Text); decision.Kind != "" {
+		_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "protocol_guard", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
+		return decision
 	}
+	timeout := defaultFollowupHookTimeout
 	for _, provider := range h.Providers {
 		followupProvider, ok := provider.(FollowupHookProvider)
 		if !ok {
@@ -187,8 +213,8 @@ func (h RuntimeHooks) resolveFollowup(ctx context.Context, input FollowupHookInp
 			return decision
 		}
 	}
-	decision := resolveFollowup(input.State, input.Text)
-	_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "fallback_resolver", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
+	decision := fallbackFollowupDecision(input.State, input.Text, "model followup unavailable")
+	_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "safe_fallback", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
 	return decision
 }
 
@@ -217,6 +243,50 @@ func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput,
 		}
 	}
 	return ToolPolicyHookResult{}
+}
+
+func (h RuntimeHooks) completionReview(ctx context.Context, input CompletionReviewInput, trace *traceRecorder) CompletionReviewResult {
+	timeout := defaultCompletionReviewTimeout
+	sawProvider := false
+	for _, provider := range h.Providers {
+		reviewProvider, ok := provider.(CompletionReviewHookProvider)
+		if !ok {
+			continue
+		}
+		sawProvider = true
+		name := strings.TrimSpace(provider.Name())
+		if name == "" {
+			name = "unknown"
+		}
+		result, err := runCompletionReviewHookProvider(ctx, reviewProvider, input, timeout)
+		if err != nil {
+			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "completion_review_hook", "provider": name, "error": err.Error()})
+			continue
+		}
+		_ = trace.write(map[string]any{
+			"type":               "hook_event",
+			"hook":               "completion_review_hook",
+			"provider":           name,
+			"completed":          result.Completed,
+			"reason":             result.Reason,
+			"missing_items":      result.MissingItems,
+			"suggested_followup": result.SuggestedFollowUp,
+		})
+		if result.Completed || strings.TrimSpace(result.Reason) != "" || len(result.MissingItems) > 0 || strings.TrimSpace(result.SuggestedFollowUp) != "" {
+			return result
+		}
+	}
+	result := heuristicCompletionReview(input)
+	if !sawProvider {
+		return result
+	}
+	if result.Completed {
+		result.Completed = false
+		result.Reason = "completion review unavailable; leaving task incomplete to avoid a false completed state"
+		result.MissingItems = []string{"completion review did not return a decision"}
+		result.SuggestedFollowUp = defaultCompletionFollowUp(result, input)
+	}
+	return result
 }
 
 func (h RuntimeHooks) observe(ctx context.Context, input ObserveHookInput, trace *traceRecorder) ObserveHookResult {
@@ -380,6 +450,39 @@ func runToolPolicyHookProvider(ctx context.Context, provider ToolPolicyHookProvi
 	}
 }
 
+func runCompletionReviewHookProvider(ctx context.Context, provider CompletionReviewHookProvider, input CompletionReviewInput, timeout time.Duration) (result CompletionReviewResult, err error) {
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan struct {
+		result CompletionReviewResult
+		err    error
+	}, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- struct {
+					result CompletionReviewResult
+					err    error
+				}{err: fmt.Errorf("panic: %v", recovered)}
+			}
+		}()
+		result, err := provider.CompletionReviewHook(child, input)
+		done <- struct {
+			result CompletionReviewResult
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case output := <-done:
+		return output.result, output.err
+	case <-child.Done():
+		if err := child.Err(); err != nil {
+			return CompletionReviewResult{}, err
+		}
+		return CompletionReviewResult{}, context.DeadlineExceeded
+	}
+}
+
 func runObserveHookProvider(ctx context.Context, provider ObserveHookProvider, input ObserveHookInput, timeout time.Duration) (result ObserveHookResult, err error) {
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -505,8 +608,8 @@ func (p staticContextHookProvider) ContextHook(_ context.Context, input ContextH
 		return ContextHookResult{}, nil
 	}
 	return ContextHookResult{SystemContextSections: []ContextSection{{
-		Name:    "static_runtime_context",
-		Source:  "buildRuntimeSystemContext",
+		Name:    "channel_context",
+		Source:  "buildRuntimeSystemContextForMessage",
 		Content: contextText,
 	}}}, nil
 }
@@ -596,12 +699,30 @@ func hasMemoryLintErrors(issues []memory.Issue) bool {
 	return false
 }
 
-type ruleFollowupHookProvider struct{}
+type modelFollowupHookProvider struct{}
 
-func (ruleFollowupHookProvider) Name() string { return "rule_followup" }
+func (modelFollowupHookProvider) Name() string { return "model_followup" }
 
-func (ruleFollowupHookProvider) FollowupHook(_ context.Context, input FollowupHookInput) (followupDecision, error) {
-	return resolveFollowup(input.State, input.Text), nil
+func (modelFollowupHookProvider) FollowupHook(ctx context.Context, input FollowupHookInput) (followupDecision, error) {
+	if input.Model == nil {
+		return followupDecision{}, nil
+	}
+	if strings.TrimSpace(input.Text) == "" || len(input.State.Tasks) == 0 {
+		return followupDecision{}, nil
+	}
+	msg, err := input.Model.Next(ctx, agentcore.Context{
+		SystemPrompt: "You route user messages to an existing task or a new task. Return JSON only.",
+		Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: modelFollowupPrompt(input.State, input.Text)}},
+		Tools:        nil,
+	})
+	if err != nil {
+		return followupDecision{}, err
+	}
+	decision, err := parseModelFollowupDecision(msg.Content, input.State, input.Text)
+	if err != nil {
+		return followupDecision{}, err
+	}
+	return decision, nil
 }
 
 type defaultToolPolicyHookProvider struct{}

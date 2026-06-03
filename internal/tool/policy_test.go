@@ -81,7 +81,7 @@ func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
 	}
 }
 
-func TestFileWriteRejectsSkillPlaintextSecret(t *testing.T) {
+func TestFileWriteAllowsSkillPlaintextSecret(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	cfg := &config.Root{
@@ -94,8 +94,120 @@ func TestFileWriteRejectsSkillPlaintextSecret(t *testing.T) {
 		Name: "file.write",
 		Args: map[string]any{"path": target, "content": "# Mail\npassword: supersecret123\n"},
 	})
-	if !result.IsError || !strings.Contains(result.Content, "refusing to write secret-like content") {
-		t.Fatalf("expected secret write rejection, got %#v", result)
+	if result.IsError {
+		t.Fatalf("expected secret-like skill write, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "# Mail\npassword: supersecret123\n" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestFileWriteAllowsRedactedContent(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	target := filepath.Join(home, "note.txt")
+	content := "api_key: [REDACTED_SECRET]\n"
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": content},
+	})
+	if result.IsError {
+		t.Fatalf("expected redacted placeholder write, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestFileWriteAllowsConfigYamlReplacement(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	target := filepath.Join(home, "config", "config.yaml")
+	content := "app:\n  name: mateway\n"
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": content},
+	})
+	if result.IsError {
+		t.Fatalf("expected config write, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestFileWriteAllowsEnvSecretLookupInSkillScript(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	target := filepath.Join(workspace, "skills", "mail", "scripts", "mail.send")
+	content := "#!/usr/bin/env python3\n# mateway.required_secret: id=mail.auth env=MAIL_AUTH\npassword = os.environ.get(\"MAIL_AUTH\")\n"
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": content},
+	})
+	if result.IsError {
+		t.Fatalf("expected env lookup script write, got %#v", result)
+	}
+}
+
+func TestFileWriteAllowsTinyPartialOverwriteOfExistingSkillScript(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	target := filepath.Join(workspace, "skills", "mail", "scripts", "mail.search")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "#!/usr/bin/env python3\n# mateway.name: mail.search\n" + strings.Repeat("print('ok')\n", 40)
+	if err := os.WriteFile(target, []byte(original), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": "    return fixed\n"},
+	})
+	if result.IsError {
+		t.Fatalf("expected partial overwrite, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "    return fixed\n" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestTerminalRunRejectsKnownSecretInCommand(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	if err := (secret.Store{Home: home}).Set("mail.auth", "QBptnPtt6Hnp3awb"); err != nil {
+		t.Fatal(err)
+	}
+	result := TerminalRunTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "terminal.run",
+		Args: map[string]any{"command": "python3 -c 'print(\"QBptnPtt6Hnp3awb\")'"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "secret value") {
+		t.Fatalf("expected terminal secret rejection, got %#v", result)
 	}
 }
 

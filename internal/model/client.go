@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -325,6 +326,10 @@ func buildSystemPrompt(base string, tools []agentcore.Tool, includeTextProtocol 
 		if required := tool.Schema().Required; len(required) > 0 {
 			b.WriteString(" required args: ")
 			b.WriteString(strings.Join(required, ", "))
+		}
+		if optional := optionalSchemaArgs(tool.Schema()); len(optional) > 0 {
+			b.WriteString(" optional args: ")
+			b.WriteString(strings.Join(optional, ", "))
 		}
 		b.WriteString("\n")
 		writeContractLine(&b, "  Use when: ", contract.WhenToUse)
@@ -759,14 +764,24 @@ func openAIChatToolCalls(calls []agentcore.ToolCall) []map[string]any {
 }
 
 func toolParameters(tool agentcore.Tool) map[string]any {
-	required := append([]string(nil), tool.Schema().Required...)
+	schema := tool.Schema()
+	required := append([]string(nil), schema.Required...)
 	properties := map[string]any{}
+	for name, value := range schema.Properties {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		properties[name] = value
+	}
 	for _, name := range required {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
-		properties[name] = map[string]any{"type": "string"}
+		if _, ok := properties[name]; !ok {
+			properties[name] = map[string]any{"type": "string"}
+		}
 	}
 	return map[string]any{
 		"type":                 "object",
@@ -774,6 +789,22 @@ func toolParameters(tool agentcore.Tool) map[string]any {
 		"required":             required,
 		"additionalProperties": true,
 	}
+}
+
+func optionalSchemaArgs(schema agentcore.Schema) []string {
+	required := map[string]bool{}
+	for _, name := range schema.Required {
+		required[strings.TrimSpace(name)] = true
+	}
+	var optional []string
+	for name := range schema.Properties {
+		name = strings.TrimSpace(name)
+		if name != "" && !required[name] {
+			optional = append(optional, name)
+		}
+	}
+	sort.Strings(optional)
+	return optional
 }
 
 func toolDescriptionForAPI(tool agentcore.Tool) string {

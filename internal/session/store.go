@@ -53,6 +53,7 @@ type PendingAction struct {
 	TaskID     string             `json:"task_id"`
 	ProposalID string             `json:"proposal_id,omitempty"`
 	ScheduleID string             `json:"schedule_id,omitempty"`
+	ArchiveID  string             `json:"archive_id,omitempty"`
 	Question   string             `json:"question,omitempty"`
 	ToolCall   agentcore.ToolCall `json:"tool_call,omitempty"`
 	ResumeText string             `json:"resume_text,omitempty"`
@@ -296,7 +297,7 @@ func safeName(key string) string {
 }
 
 func nextTaskID(n int) string {
-	return "task-" + time.Now().Format("20060102150405") + "-" + strings.TrimLeft(strings.ReplaceAll(time.Duration(n).String(), "ns", ""), "0")
+	return "task-" + time.Now().Format("20060102150405.000000") + "-" + strings.TrimLeft(strings.ReplaceAll(time.Duration(n).String(), "ns", ""), "0")
 }
 
 func nextStepID(n int) string {

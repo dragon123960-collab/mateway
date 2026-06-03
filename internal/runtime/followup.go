@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -27,6 +28,42 @@ type followupDecision struct {
 }
 
 func resolveFollowup(state session.State, text string) followupDecision {
+	decision := protocolFollowupDecision(state, text)
+	if decision.Kind != "" {
+		return decision
+	}
+	return followupDecision{Kind: followupNewTask, ResolvedUserText: strings.TrimSpace(text), Reason: "standalone input"}
+}
+
+func fallbackFollowupDecision(state session.State, text, reason string) followupDecision {
+	current := strings.TrimSpace(text)
+	normalized := normalizeFollowupText(current)
+	if isFollowupCue(normalized) || isRetryCue(normalized) || isShortContextDependent(normalized) {
+		if task := latestOpenTask(state); task != nil {
+			return continueTask(*task, current, followupDefaultString(reason, "safe fallback continuation"))
+		}
+		if task := latestTask(state); task != nil && task.Status != "completed" {
+			return continueTask(*task, current, followupDefaultString(reason, "safe fallback continuation"))
+		}
+		if len(state.Tasks) > 0 {
+			return clarify(current, followupDefaultString(reason, "context-dependent followup with no task candidate"))
+		}
+	}
+	return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: followupDefaultString(reason, "standalone input")}
+}
+
+func protocolFollowupDecision(_ session.State, text string) followupDecision {
+	current := strings.TrimSpace(text)
+	if current == "" {
+		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "empty input starts a new task"}
+	}
+	if strings.HasPrefix(current, "/") || isExplicitNewTask(normalizeFollowupText(current)) {
+		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "explicit new task cue"}
+	}
+	return followupDecision{}
+}
+
+func resolveRuleFollowup(state session.State, text string) followupDecision {
 	current := strings.TrimSpace(text)
 	if current == "" {
 		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "empty input starts a new task"}
@@ -79,7 +116,7 @@ func resolveFollowup(state session.State, text string) followupDecision {
 		}
 		return clarify(current, "short context-dependent input had no prior task")
 	}
-	return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "standalone input"}
+	return followupDecision{}
 }
 
 func isStaleWeakFollowup(text string, task session.TaskNode) bool {
@@ -302,4 +339,86 @@ func parseOrdinal(value string) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func modelFollowupPrompt(state session.State, text string) string {
+	var b strings.Builder
+	b.WriteString("Decide whether the current user message continues one of the recent tasks.\n")
+	b.WriteString("Return JSON only with this schema: {\"kind\":\"new_task|continuation|clarify\",\"task_id\":\"\",\"reason\":\"\"}.\n")
+	b.WriteString("Use continuation when the user asks to continue, finish remaining work, execute remaining steps, test, retry, or verify the immediately previous task.\n")
+	b.WriteString("Use new_task for clearly unrelated standalone work. Use clarify only when multiple tasks match.\n\n")
+	b.WriteString("Current user message:\n")
+	b.WriteString(strings.TrimSpace(text))
+	b.WriteString("\n\nRecent tasks, newest last:\n")
+	start := len(state.Tasks) - 5
+	if start < 0 {
+		start = 0
+	}
+	for _, task := range state.Tasks[start:] {
+		b.WriteString("- id: ")
+		b.WriteString(task.ID)
+		b.WriteString("\n  status: ")
+		b.WriteString(task.Status)
+		b.WriteString("\n  goal: ")
+		b.WriteString(task.Goal)
+		if task.Summary != "" {
+			b.WriteString("\n  summary: ")
+			b.WriteString(summarize(task.Summary))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func parseModelFollowupDecision(text string, state session.State, current string) (followupDecision, error) {
+	raw := strings.TrimSpace(text)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	var payload struct {
+		Kind   string `json:"kind"`
+		TaskID string `json:"task_id"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return followupDecision{}, err
+	}
+	kind := strings.TrimSpace(payload.Kind)
+	reason := strings.TrimSpace(payload.Reason)
+	switch kind {
+	case string(followupContinuation):
+		task := taskByID(state, payload.TaskID)
+		if task == nil {
+			return followupDecision{}, fmt.Errorf("model followup task_id %q not found", payload.TaskID)
+		}
+		return continueTask(*task, current, followupDefaultString(reason, "model followup route")), nil
+	case string(followupClarify):
+		return clarify(current, followupDefaultString(reason, "model followup ambiguous")), nil
+	case string(followupNewTask):
+		return followupDecision{Kind: followupNewTask, ResolvedUserText: strings.TrimSpace(current), Reason: followupDefaultString(reason, "model followup new task")}, nil
+	default:
+		return followupDecision{}, fmt.Errorf("unsupported model followup kind %q", kind)
+	}
+}
+
+func taskByID(state session.State, id string) *session.TaskNode {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	for i := range state.Tasks {
+		if state.Tasks[i].ID == id {
+			return &state.Tasks[i]
+		}
+	}
+	return nil
+}
+
+func followupDefaultString(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
 }

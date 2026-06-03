@@ -70,6 +70,29 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 	}
 }
 
+func TestToolParametersIncludesOptionalProperties(t *testing.T) {
+	params := toolParameters(fakeTool{
+		name:     "script.run",
+		required: []string{"name"},
+		properties: map[string]any{
+			"name": map[string]any{"type": "string"},
+			"args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		},
+	})
+	properties, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing properties: %#v", params)
+	}
+	args, ok := properties["args"].(map[string]any)
+	if !ok || args["type"] != "array" {
+		t.Fatalf("expected args array property, got %#v", properties["args"])
+	}
+	required, ok := params["required"].([]string)
+	if !ok || len(required) != 1 || required[0] != "name" {
+		t.Fatalf("unexpected required list: %#v", params["required"])
+	}
+}
+
 func TestParseOpenAIResponsesResultUsage(t *testing.T) {
 	result := parseOpenAIResponsesResult([]byte(`{
 		"output_text":"hello",
@@ -255,14 +278,17 @@ func contains(text, sub string) bool {
 }
 
 type fakeTool struct {
-	name     string
-	required []string
+	name       string
+	required   []string
+	properties map[string]any
 }
 
-func (t fakeTool) Name() string             { return t.name }
-func (t fakeTool) Description() string      { return "fake tool" }
-func (t fakeTool) Schema() agentcore.Schema { return agentcore.Schema{Required: t.required} }
-func (t fakeTool) Risk() agentcore.Risk     { return agentcore.RiskSafeRead }
+func (t fakeTool) Name() string        { return t.name }
+func (t fakeTool) Description() string { return "fake tool" }
+func (t fakeTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: t.required, Properties: t.properties}
+}
+func (t fakeTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (t fakeTool) Run(context.Context, agentcore.ToolCall) agentcore.ToolResult {
 	return agentcore.ToolResult{}
 }

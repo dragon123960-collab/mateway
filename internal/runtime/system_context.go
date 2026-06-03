@@ -11,6 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/session"
 )
 
 func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConfig) string {
@@ -69,13 +70,11 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 }
 
 func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentProfileConfig, msg channel.InboundMessage) string {
-	contextText := buildRuntimeSystemContext(cfg, profile)
 	if strings.TrimSpace(msg.Channel) == "" && strings.TrimSpace(msg.ThreadID) == "" && strings.TrimSpace(msg.SessionKey) == "" {
-		return contextText
+		return ""
 	}
 	var b strings.Builder
-	b.WriteString(contextText)
-	b.WriteString("\n\nCurrent channel context:\n")
+	b.WriteString("Current channel context:\n")
 	writeContextLine(&b, "- channel: ", msg.Channel)
 	writeContextLine(&b, "- thread_id: ", msg.ThreadID)
 	writeContextLine(&b, "- user_id: ", msg.UserID)
@@ -83,6 +82,55 @@ func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentP
 	b.WriteString("- Scheduled tasks are channel-neutral: schedule.create stores the task for later execution, but the scheduler does not automatically send results back to Feishu, email, or other channels.\n")
 	b.WriteString("- If a scheduled task must notify someone, make notification part of the scheduled task itself through an available tool, script, connector, or skill. If no notification channel is configured, explain the gap and ask whether to create a script or skill.\n")
 	return strings.TrimSpace(b.String())
+}
+
+func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText string) string {
+	goal := ""
+	if task != nil {
+		goal = strings.TrimSpace(task.Goal)
+	}
+	current := strings.TrimSpace(userText)
+	if mergedGoal, additional, ok := splitMergedTaskInstruction(current); ok {
+		if goal == "" {
+			goal = mergedGoal
+		}
+		current = additional
+	}
+	if goal == "" && current == "" {
+		return strings.TrimSpace(systemPrompt)
+	}
+	var b strings.Builder
+	b.WriteString("Current task focus:\n")
+	if goal != "" {
+		b.WriteString("- Original user task: ")
+		b.WriteString(goal)
+		b.WriteString("\n")
+	}
+	if current != "" && current != goal {
+		b.WriteString("- Additional follow-up request: ")
+		b.WriteString(current)
+		b.WriteString("\n")
+	}
+	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
+	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
+	if prompt := strings.TrimSpace(systemPrompt); prompt != "" {
+		b.WriteString("\n")
+		b.WriteString(prompt)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func splitMergedTaskInstruction(text string) (string, string, bool) {
+	const prefix = "Continue the existing task:\nOriginal task: "
+	if !strings.HasPrefix(text, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(text, prefix)
+	goal, additional, ok := strings.Cut(rest, "\nAdditional request: ")
+	if !ok {
+		return strings.TrimSpace(rest), "", true
+	}
+	return strings.TrimSpace(goal), strings.TrimSpace(additional), true
 }
 
 func writeContextLine(b *strings.Builder, label, value string) {
@@ -137,6 +185,31 @@ func readPromptContextFile(path string, limit int64) string {
 		return ""
 	}
 	text := strings.TrimSpace(string(data))
+	if text == "" || looksSensitivePromptContext(path, text) || agentprofile.UnsafePromptContext(text) {
+		return ""
+	}
+	return text
+}
+
+func readPromptContextHead(path string, limit int64) string {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() <= 0 {
+		return ""
+	}
+	if limit <= 0 {
+		limit = 4096
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	buf := make([]byte, limit)
+	n, err := file.Read(buf)
+	if err != nil && n == 0 {
+		return ""
+	}
+	text := strings.TrimSpace(string(buf[:n]))
 	if text == "" || looksSensitivePromptContext(path, text) || agentprofile.UnsafePromptContext(text) {
 		return ""
 	}

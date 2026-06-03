@@ -236,3 +236,20 @@ func TestRenderReplyMessageProducesValidCardJSON(t *testing.T) {
 		t.Fatalf("expected header and elements in card payload, got %#v", payload)
 	}
 }
+
+func TestRenderReplyMessageUsesPartialFooter(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Style:  "partial",
+		Locale: "zh-CN",
+		Text:   "任务还没有完成。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "状态：未完成") {
+		t.Fatalf("expected partial footer, got %s", content)
+	}
+	if strings.Contains(content, "状态：completed") || strings.Contains(content, "DONE") {
+		t.Fatalf("partial card should not look completed, got %s", content)
+	}
+}

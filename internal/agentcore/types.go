@@ -109,7 +109,8 @@ func ContractFor(tool Tool) ToolContract {
 }
 
 type Schema struct {
-	Required []string
+	Required   []string
+	Properties map[string]any
 }
 
 type Risk string
@@ -130,7 +131,6 @@ type Config struct {
 	SystemPrompt     string
 	Model            Model
 	Tools            *ToolRegistry
-	MaxIterations    int
 	MaxParallelTools int
 	Hooks            Hooks
 }
