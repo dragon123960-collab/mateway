@@ -43,7 +43,7 @@ func (defaultCompletionReviewHookProvider) CompletionReviewHook(ctx context.Cont
 	if err != nil {
 		return heuristicCompletionReview(input), nil
 	}
-	return normalizeCompletionReview(result, input), nil
+	return result, nil
 }
 
 func parseCompletionReviewJSON(text string) (CompletionReviewResult, error) {
@@ -76,12 +76,18 @@ func normalizeCompletionReview(result CompletionReviewResult, input CompletionRe
 	result.Reason = strings.TrimSpace(result.Reason)
 	result.SuggestedFollowUp = strings.TrimSpace(result.SuggestedFollowUp)
 	result.MissingItems = compactReviewItems(result.MissingItems, 8)
+	if !result.Completed && len(result.MissingItems) == 0 && reviewReasonAffirmsCompletion(result.Reason) && !looksLikeIncompleteFinalText(input.FinalText) {
+		result.Completed = true
+		result.SuggestedFollowUp = ""
+	}
 	if !result.Completed && result.SuggestedFollowUp == "" {
 		result.SuggestedFollowUp = defaultCompletionFollowUp(result, input)
 	}
-	if result.Completed && looksLikeIncompleteFinalText(input.FinalText) {
+	if looksLikeIncompleteFinalText(input.FinalText) {
 		result.Completed = false
-		if result.Reason == "" {
+		if warning := finalTextWarning(input.FinalText); warning != "" {
+			result.Reason = warning
+		} else if result.Reason == "" {
 			result.Reason = "final reply looks like an intermediate plan"
 		}
 		result.SuggestedFollowUp = defaultCompletionFollowUp(result, input)
@@ -94,6 +100,41 @@ func normalizeCompletionReview(result CompletionReviewResult, input CompletionRe
 		}
 	}
 	return result
+}
+
+func reviewReasonAffirmsCompletion(reason string) bool {
+	lower := strings.ToLower(strings.TrimSpace(reason))
+	if lower == "" {
+		return false
+	}
+	affirmative := []string{
+		"comprehensive final answer",
+		"comprehensive final response",
+		"provided a comprehensive final",
+		"final reply contains",
+		"final answer contains",
+		"tool evidence shows",
+		"accepted evidence",
+		"addressing the previously missing item",
+		"not just a plan",
+	}
+	hasAffirmative := false
+	for _, cue := range affirmative {
+		if strings.Contains(lower, cue) {
+			hasAffirmative = true
+			break
+		}
+	}
+	if !hasAffirmative {
+		return false
+	}
+	negative := []string{"missing", "lacks", "not fully", "incomplete", "only a plan", "looks like an intermediate plan", "fails to", "does not", "did not", "doesn't", "didn't", "failed to", "not answer", "not address"}
+	for _, cue := range negative {
+		if strings.Contains(lower, cue) {
+			return false
+		}
+	}
+	return true
 }
 
 func heuristicCompletionReview(input CompletionReviewInput) CompletionReviewResult {

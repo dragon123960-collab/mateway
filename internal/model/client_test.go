@@ -200,6 +200,27 @@ func TestClientRejectsImageWhenModelIsTextOnly(t *testing.T) {
 	}
 }
 
+func TestStripImagePartsKeepsTextOnlyFallbackSafe(t *testing.T) {
+	messages := stripImageParts([]Message{{
+		Role:    "user",
+		Content: "look",
+		Parts: []agentcore.MessagePart{
+			{Type: agentcore.PartText, Text: "look"},
+			{Type: agentcore.PartImage, URI: "data:image/png;base64,abc"},
+		},
+	}})
+	if len(messages) != 1 || messagesRequireImage(messages) {
+		t.Fatalf("expected image parts stripped, got %#v", messages)
+	}
+	if len(messages[0].Parts) != 1 || messages[0].Parts[0].Type != agentcore.PartText {
+		t.Fatalf("expected text part preserved, got %#v", messages[0].Parts)
+	}
+	client := Client{Config: config.ModelConfig{Name: "text-only", Modalities: []string{"text"}}}
+	if _, err := client.Generate(context.Background(), "", messages); err == nil || contains(err.Error(), "does not support image") {
+		t.Fatalf("expected non-image error after stripping, got %v", err)
+	}
+}
+
 func TestParseToolCallTextReturnsMultipleCalls(t *testing.T) {
 	text := `[TOOL_CALL]
 {"id":"call_1","name":"file.read","args":{"path":"agent.md"}}

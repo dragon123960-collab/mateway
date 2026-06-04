@@ -316,6 +316,7 @@ func (h RuntimeHooks) completionReview(ctx context.Context, input CompletionRevi
 			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "completion_review_hook", "provider": name, "error": err.Error()})
 			continue
 		}
+		result = normalizeCompletionReview(result, input)
 		_ = trace.write(map[string]any{
 			"type":               "hook_event",
 			"hook":               "completion_review_hook",

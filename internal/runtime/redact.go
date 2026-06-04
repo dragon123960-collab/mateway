@@ -12,6 +12,7 @@ const redactedSecret = "[REDACTED_SECRET]"
 const (
 	storedRecentMessagesLimit = 20
 	storedToolContentLimit    = 2048
+	traceContentLimit         = 4096
 	modelPromptCharBudget     = 120000
 )
 
@@ -58,6 +59,39 @@ func redactSecrets(value any) any {
 	default:
 		return v
 	}
+}
+
+func compactTraceValue(value any) any {
+	switch v := value.(type) {
+	case agentcore.Message:
+		v.Content = truncateTraceString(v.Content)
+		return v
+	case agentcore.ToolResult:
+		v.Content = truncateTraceString(v.Content)
+		return v
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = compactTraceValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = compactTraceValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func truncateTraceString(text string) string {
+	if len(text) <= traceContentLimit {
+		return text
+	}
+	truncated, _ := truncateMiddle(text, traceContentLimit)
+	return truncated
 }
 
 func redactMessagePart(part agentcore.MessagePart) agentcore.MessagePart {
@@ -182,7 +216,7 @@ func redactPayload(payload map[string]any) map[string]any {
 			out[key] = redactedSecret
 			continue
 		}
-		out[key] = redactSecrets(value)
+		out[key] = compactTraceValue(redactSecrets(value))
 	}
 	return out
 }

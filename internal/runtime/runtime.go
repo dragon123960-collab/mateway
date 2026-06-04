@@ -1133,7 +1133,6 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 			return agentcore.BeforeToolCallResult{}, nil
 		},
 		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
-			noProgressTurns = 0
 			observe := rt.Hooks.observe(context.Background(), ObserveHookInput{
 				Kind:       "tool_result",
 				State:      *state,
@@ -1146,6 +1145,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				state.AddStep(taskID, *observe.TaskStep)
 				switch observe.TaskStep.Status {
 				case "accepted":
+					noProgressTurns = 0
 					lastFailureSignature = ""
 					repeatedToolFailures = 0
 				case "failed", "suspect":

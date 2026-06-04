@@ -106,6 +106,7 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, ag
 	var errors []string
 	nativeMessages := modelMessagesNative(agentMessages)
 	textMessages := modelMessagesText(agentMessages)
+	textOnlyMessages := stripImageParts(textMessages)
 	if messagesRequireImage(nativeMessages) && !m.Client.Config.SupportsModality("image") {
 		if result, err := m.generateViaVision(ctx, buildTextSystemPrompt(system, tools), textMessages); err == nil {
 			return result, nil
@@ -113,7 +114,7 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, ag
 			errors = append(errors, "vision: "+err.Error())
 		}
 	}
-	result, err := m.generateForClient(ctx, m.Client, system, nativeMessages, textMessages, tools)
+	result, err := m.generateForClient(ctx, m.Client, system, nativeMessages, textOnlyMessages, tools)
 	if err == nil {
 		return result, nil
 	}
@@ -144,6 +145,25 @@ func (m AgentModel) generateForClient(ctx context.Context, client Client, system
 		return GenerateResult{}, fmt.Errorf("native tools failed: %v; text fallback failed: %v", err, textErr)
 	}
 	return client.Generate(ctx, buildTextSystemPrompt(system, tools), textMessages)
+}
+
+func stripImageParts(messages []Message) []Message {
+	out := make([]Message, 0, len(messages))
+	for _, msg := range messages {
+		if !messageHasImage(msg) {
+			out = append(out, msg)
+			continue
+		}
+		copy := msg
+		copy.Parts = nil
+		for _, part := range msg.Parts {
+			if part.Type != agentcore.PartImage {
+				copy.Parts = append(copy.Parts, part)
+			}
+		}
+		out = append(out, copy)
+	}
+	return out
 }
 
 func (m AgentModel) generateViaVision(ctx context.Context, system string, messages []Message) (GenerateResult, error) {

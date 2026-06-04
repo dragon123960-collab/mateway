@@ -1538,6 +1538,45 @@ func TestRuntimeCompletionReviewContinuesAfterIntermediateReply(t *testing.T) {
 	}
 }
 
+func TestRuntimeCompletionReviewCorrectsContradictoryIncompleteReview(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{
+			Completed: false,
+			Reason:    "The agent provided a comprehensive final answer with accepted evidence, concrete data, and actionable advice.",
+		}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "纳斯达克今日下跌，已根据搜索证据整理 ETF 影响和风险建议。"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "查询今日纳斯达克情况，我买了etf基金"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == "partial" {
+		t.Fatalf("expected completed response, got %#v", resp)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+}
+
+func TestCompletionReviewDoesNotCorrectNegativeActionableAdviceReason(t *testing.T) {
+	result := normalizeCompletionReview(CompletionReviewResult{
+		Completed: false,
+		Reason:    "It gives actionable advice but fails to answer the requested price/date.",
+	}, CompletionReviewInput{FinalText: "这里是一些投资建议。"})
+	if result.Completed {
+		t.Fatalf("negative actionable-advice reason should not be corrected to completed: %#v", result)
+	}
+	if result.SuggestedFollowUp == "" {
+		t.Fatalf("expected follow-up for incomplete review, got %#v", result)
+	}
+}
+
 func TestRuntimeCompletionReviewMarksPartialAfterNoProgress(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -1589,6 +1628,37 @@ func TestRuntimeCompletionReviewMarksPartialAfterNoProgress(t *testing.T) {
 	}
 	if strings.Contains(string(data), `"kind":"task_completed"`) {
 		t.Fatalf("partial task should not observe completion:\n%s", data)
+	}
+}
+
+func TestRuntimeSuspectToolResultDoesNotResetNoProgress(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Execution: config.ExecutionConfig{MaxNoProgressTurns: 2}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Tools.Register(emptyResultTool{})
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "still incomplete", SuggestedFollowUp: "try again"},
+			{Completed: false, Reason: "still incomplete", SuggestedFollowUp: "try again"},
+		}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "test.empty", Args: map[string]any{}}}},
+		{Role: agentcore.RoleAssistant, Content: "还是没有拿到结果。"},
+		{Role: agentcore.RoleAssistant, Content: "仍然没有拿到结果。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "查一下结果"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" || !resp.Failed {
+		t.Fatalf("expected partial failed response, got %#v", resp)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"task_no_progress"`) {
+		t.Fatalf("expected no-progress stop after suspect tool result:\n%s", data)
 	}
 }
 
@@ -3104,6 +3174,18 @@ func (p *testCompletionReviewProvider) CompletionReviewHook(context.Context, Com
 	}
 	p.index++
 	return p.results[index], nil
+}
+
+type emptyResultTool struct{}
+
+func (emptyResultTool) Name() string        { return "test.empty" }
+func (emptyResultTool) Description() string { return "return an empty result" }
+func (emptyResultTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Properties: map[string]any{}}
+}
+func (emptyResultTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (emptyResultTool) Run(context.Context, agentcore.ToolCall) agentcore.ToolResult {
+	return agentcore.ToolResult{}
 }
 
 type captureRuntimeContextModel struct {
