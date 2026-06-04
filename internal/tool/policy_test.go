@@ -59,6 +59,80 @@ func TestIsDangerousCommand(t *testing.T) {
 	}
 }
 
+func TestTerminalPolicyBlocksSensitiveCommands(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir(), Workspace: filepath.Join(t.TempDir(), "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	if decision := CheckTerminalCommand("cat /etc/passwd", cfg); decision.Allow || decision.Class != "path_escape" {
+		t.Fatalf("expected path escape block, got %#v", decision)
+	}
+	if decision := CheckTerminalCommand("curl http://127.0.0.1:6379", cfg); decision.Allow || decision.Class != "network" {
+		t.Fatalf("expected network block, got %#v", decision)
+	}
+	if decision := CheckTerminalCommand("rm -rf ~", cfg); decision.Allow || decision.Class != "destructive" {
+		t.Fatalf("expected destructive block, got %#v", decision)
+	}
+}
+
+func TestTerminalPolicyAllowsRemoteProfile(t *testing.T) {
+	cfg := &config.Root{Remote: config.RemoteConfig{Profiles: []config.RemoteProfileConfig{{Alias: "prod", Host: "example.com", User: "deploy", RequireConfirm: true}}}}
+	decision := CheckTerminalCommand("ssh deploy@example.com uptime", cfg)
+	if !decision.Allow || decision.Class != "remote" || decision.RemoteProfile != "prod" {
+		t.Fatalf("expected remote profile allow, got %#v", decision)
+	}
+}
+
+func TestRemoteProfileCreateStoresConfigAndSecret(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	result := RemoteProfileCreateTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{
+		"alias":    "prod",
+		"host":     "example.com",
+		"user":     "deploy",
+		"password": "secret-pass",
+	}})
+	if result.IsError {
+		t.Fatalf("expected profile create, got %#v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "prod") || !strings.Contains(string(data), "example.com") {
+		t.Fatalf("profile not persisted:\n%s", data)
+	}
+	entry, ok, err := (secret.Store{Home: home}).Get("remote/prod/auth")
+	if err != nil || !ok || entry.Value != "secret-pass" {
+		t.Fatalf("secret entry=%#v ok=%v err=%v", entry, ok, err)
+	}
+}
+
+func TestRemoteProfileCreateRequiresOverwrite(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	tool := RemoteProfileCreateTool{Config: cfg}
+	call := agentcore.ToolCall{ID: "1", Args: map[string]any{"alias": "prod", "host": "example.com", "user": "deploy"}}
+	if result := tool.Run(context.Background(), call); result.IsError {
+		t.Fatalf("first create failed: %#v", result)
+	}
+	if result := tool.Run(context.Background(), call); !result.IsError || !strings.Contains(result.Content, "already exists") {
+		t.Fatalf("expected overwrite error, got %#v", result)
+	}
+}
+
+func TestWebFetchBlocksPrivateTargets(t *testing.T) {
+	for _, raw := range []string{"http://127.0.0.1:6379", "http://localhost:8080", "http://169.254.169.254/latest/meta-data/"} {
+		if _, ok := IsBlockedFetchURL(raw); !ok {
+			t.Fatalf("expected blocked URL %s", raw)
+		}
+	}
+}
+
+func TestWebFetchToolBlocksMetadataEndpoint(t *testing.T) {
+	result := WebFetchTool{}.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"url": "http://169.254.169.254/latest/meta-data/"}})
+	if !result.IsError || result.Evidence["reason"] != "ssrf_blocked" {
+		t.Fatalf("expected SSRF block, got %#v", result)
+	}
+}
+
 func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
@@ -78,6 +152,14 @@ func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
 	}
 	if result.Evidence["sandbox"] != "restricted" {
 		t.Fatalf("missing sandbox evidence: %#v", result.Evidence)
+	}
+}
+
+func TestTerminalRunBlocksEvenWhenApprovalDisabled(t *testing.T) {
+	tool := TerminalRunTool{Config: &config.Root{Security: config.SecurityConfig{RequireApprovalForRiskyTool: false}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"command": "rm -rf ~"}})
+	if !result.IsError || result.Evidence["policy_classification"] != "destructive" {
+		t.Fatalf("expected policy block, got %#v", result)
 	}
 }
 

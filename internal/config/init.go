@@ -250,7 +250,11 @@ skills:
       trust_level: medium
 
 scripts:
+  auto_discover_skill_scripts: false
   dirs: []
+
+remote:
+  profiles: []
 
 scheduler:
   enabled: false

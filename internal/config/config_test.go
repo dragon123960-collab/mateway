@@ -107,6 +107,20 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestSecurityScriptAndRemoteDefaults(t *testing.T) {
+	root := Root{}
+	root.NormalizeForUse()
+	if root.Scripts.AutoDiscoverSkillScriptsValue() {
+		t.Fatal("external skill scripts should not be auto-authorized by default")
+	}
+	if root.Scripts.Dirs == nil {
+		t.Fatal("expected scripts dirs default")
+	}
+	if root.Remote.Profiles == nil {
+		t.Fatal("expected remote profiles default")
+	}
+}
+
 func TestModelRolesAcceptStringAndList(t *testing.T) {
 	var cfg struct {
 		Model ModelSelection `yaml:"model"`

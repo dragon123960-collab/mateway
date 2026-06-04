@@ -17,6 +17,7 @@ import (
 	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/schedule"
+	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
@@ -1197,6 +1198,11 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			taskID = state.ActiveTask
 		}
 		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
+		if call.Name == "script.run" {
+			if record, err := script.Authorize(rt.Config, strings.TrimSpace(fmt.Sprint(call.Args["name"]))); err == nil {
+				_ = trace.write(map[string]any{"type": "script_authorized", "script": record.Name, "path": record.Path, "source": record.Source, "hash": record.Hash})
+			}
+		}
 		result := rt.Tools.Execute(ctx, call)
 		toolDef, _ := rt.Tools.Get(call.Name)
 		observe := rt.Hooks.observe(ctx, ObserveHookInput{

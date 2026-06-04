@@ -24,6 +24,7 @@ type Root struct {
 	Learning  LearningConfig  `yaml:"learning"`
 	Skills    SkillsConfig    `yaml:"skills"`
 	Scripts   ScriptsConfig   `yaml:"scripts"`
+	Remote    RemoteConfig    `yaml:"remote"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
 	Models    []ModelConfig   `yaml:"-"`
@@ -68,6 +69,13 @@ func DefaultRoot() Root {
 			Enabled:  false,
 			Timezone: "Asia/Shanghai",
 			Interval: "30s",
+		},
+		Scripts: ScriptsConfig{
+			Dirs:                     []string{},
+			AutoDiscoverSkillScripts: boolPtr(false),
+		},
+		Remote: RemoteConfig{
+			Profiles: []RemoteProfileConfig{},
 		},
 		Security: SecurityConfig{
 			EnforceWorkspacePaths:       true,
@@ -370,7 +378,29 @@ type SkillsConfig struct {
 }
 
 type ScriptsConfig struct {
-	Dirs []string `yaml:"dirs"`
+	Dirs                     []string `yaml:"dirs"`
+	AutoDiscoverSkillScripts *bool    `yaml:"auto_discover_skill_scripts"`
+}
+
+func (c ScriptsConfig) AutoDiscoverSkillScriptsValue() bool {
+	if c.AutoDiscoverSkillScripts == nil {
+		return false
+	}
+	return *c.AutoDiscoverSkillScripts
+}
+
+type RemoteConfig struct {
+	Profiles []RemoteProfileConfig `yaml:"profiles"`
+}
+
+type RemoteProfileConfig struct {
+	Alias          string   `yaml:"alias"`
+	Host           string   `yaml:"host"`
+	User           string   `yaml:"user"`
+	Port           int      `yaml:"port"`
+	AuthSecretID   string   `yaml:"auth_secret_id"`
+	AllowedClasses []string `yaml:"allowed_classes"`
+	RequireConfirm bool     `yaml:"require_confirm"`
 }
 
 type SkillCatalogConfig struct {
@@ -737,6 +767,12 @@ func (r *Root) normalizeSkills() {
 func (r *Root) normalizeScripts() {
 	if r.Scripts.Dirs == nil {
 		r.Scripts.Dirs = []string{}
+	}
+	if r.Scripts.AutoDiscoverSkillScripts == nil {
+		r.Scripts.AutoDiscoverSkillScripts = DefaultRoot().Scripts.AutoDiscoverSkillScripts
+	}
+	if r.Remote.Profiles == nil {
+		r.Remote.Profiles = []RemoteProfileConfig{}
 	}
 }
 

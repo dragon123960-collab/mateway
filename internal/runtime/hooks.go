@@ -12,6 +12,8 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/script"
+	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
@@ -743,6 +745,36 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 			ResumeText: catalog.T(locale, "approval.confirm.resume_dangerous", nil),
 		}, nil
 	}
+	if input.ToolCall.Name == "script.run" {
+		name := strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["name"]))
+		scripts, err := script.List(input.Config)
+		if err == nil {
+			for _, candidate := range scripts {
+				if candidate.Name == name && candidate.Source == "external_skill" && !candidate.Authorized {
+					return ToolPolicyHookResult{
+						Block:      true,
+						Reason:     "External skill script " + name + " requires one-time authorization before execution.",
+						ResumeText: "Authorize and continue script.run",
+					}, nil
+				}
+			}
+		}
+	}
+	if input.ToolCall.Name == "secret.set" {
+		id := strings.ToLower(strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["id"])))
+		if !secret.ValidID(id) {
+			return ToolPolicyHookResult{}, nil
+		}
+		if boolArg(input.ToolCall.Args["overwrite"]) {
+			if entry, ok, err := (secret.Store{Home: configHome(input.Config)}).Get(id); err == nil && ok && entry.ID != "" {
+				return ToolPolicyHookResult{
+					Block:      true,
+					Reason:     "Overwriting existing secret " + id + " requires confirmation.",
+					ResumeText: "Continue after confirming secret overwrite",
+				}, nil
+			}
+		}
+	}
 	if input.Tool == nil {
 		return ToolPolicyHookResult{}, nil
 	}
@@ -828,4 +860,22 @@ func taskFromState(state session.State, taskID string) session.TaskNode {
 		}
 	}
 	return session.TaskNode{ID: taskID}
+}
+
+func boolArg(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true") || strings.EqualFold(strings.TrimSpace(v), "yes")
+	default:
+		return false
+	}
+}
+
+func configHome(cfg *config.Root) string {
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		return cfg.App.Home
+	}
+	return config.DefaultHome()
 }
