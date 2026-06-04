@@ -37,6 +37,7 @@ func renderReplyCard(reply channel.OutboundMessage, text string) (string, string
 }
 
 func buildCardElements(reply channel.OutboundMessage, text string) []map[string]any {
+	actions := approvalActions(reply)
 	elements := []map[string]any{
 		{
 			"tag": "div",
@@ -46,13 +47,13 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			},
 		},
 	}
-	if actions := approvalActions(reply); len(actions) > 0 {
+	if len(actions) > 0 {
 		elements = append(elements, map[string]any{
 			"tag":     "action",
 			"actions": actions,
 		})
 	}
-	if note := cardFooterNote(reply); note != "" {
+	if note := cardFooterNote(reply, text, len(actions) > 0); note != "" {
 		elements = append(elements, map[string]any{
 			"tag": "note",
 			"elements": []map[string]any{
@@ -95,7 +96,7 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 				"tag":     "plain_text",
 				"content": catalog.T(locale, "feishu.button.confirm", nil),
 			},
-			"value": value("confirm", "确认"),
+			"value": value("confirm", catalog.T(locale, "aliases.confirm.primary", nil)),
 		},
 		{
 			"tag":  "button",
@@ -104,7 +105,7 @@ func approvalActions(reply channel.OutboundMessage) []map[string]any {
 				"tag":     "plain_text",
 				"content": catalog.T(locale, "feishu.button.cancel", nil),
 			},
-			"value": value("cancel", "取消"),
+			"value": value("cancel", catalog.T(locale, "aliases.cancel.primary", nil)),
 		},
 	}
 }
@@ -147,11 +148,14 @@ func feishuCardTitle(reply channel.OutboundMessage) string {
 	}
 }
 
-func cardFooterNote(reply channel.OutboundMessage) string {
+func cardFooterNote(reply channel.OutboundMessage, text string, hasActions bool) string {
 	catalog := i18n.New(i18n.Config{})
 	locale := feishuReplyLocale(reply)
 	switch strings.TrimSpace(reply.Style) {
 	case "approval_pending":
+		if hasActions || approvalTextMentionsConfirmAndCancel(text) {
+			return ""
+		}
 		return catalog.T(locale, "feishu.footer.approval_pending", nil)
 	case "partial":
 		return catalog.T(locale, "feishu.footer.partial", nil)
@@ -162,6 +166,40 @@ func cardFooterNote(reply channel.OutboundMessage) string {
 	default:
 		return catalog.T(locale, "feishu.footer.default", map[string]string{"status": firstNonEmpty(strings.TrimSpace(reply.Style), "completed")})
 	}
+}
+
+func approvalTextMentionsConfirmAndCancel(text string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return false
+	}
+	catalog := i18n.New(i18n.Config{})
+	hasConfirm := false
+	for _, cue := range splitCardCueList(catalog.T(i18n.LocaleZH, "feishu.approval_text.confirm_cues", nil)) {
+		if strings.Contains(normalized, cue) {
+			hasConfirm = true
+			break
+		}
+	}
+	hasCancel := false
+	for _, cue := range splitCardCueList(catalog.T(i18n.LocaleZH, "feishu.approval_text.cancel_cues", nil)) {
+		if strings.Contains(normalized, cue) {
+			hasCancel = true
+			break
+		}
+	}
+	return hasConfirm && hasCancel
+}
+
+func splitCardCueList(text string) []string {
+	var out []string
+	for _, item := range strings.Split(text, ",") {
+		item = strings.TrimSpace(strings.ToLower(item))
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func sanitizeFeishuText(reply channel.OutboundMessage) string {

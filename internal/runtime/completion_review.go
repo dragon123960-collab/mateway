@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -201,13 +202,7 @@ func looksLikeIncompleteFinalText(text string) bool {
 	if strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "：") {
 		return true
 	}
-	cues := []string{
-		"next i will", "i will now", "will proceed", "will continue", "continue now",
-		"start writing", "start creating", "start sending", "check the script",
-		"接下来", "下一步", "然后我会", "我将", "准备开始", "并行", "继续处理",
-		"环境摸清", "环境梳清", "先摸清", "先生成", "重写脚本", "检查脚本", "预计", "计划",
-	}
-	for _, cue := range cues {
+	for _, cue := range completionCueList("router.completion.incomplete_cues") {
 		if strings.Contains(lower, cue) {
 			return true
 		}
@@ -221,40 +216,27 @@ func looksLikeNonSubstantiveActionAck(text string) bool {
 		return true
 	}
 	normalized := strings.Trim(strings.ToLower(trimmed), " \t\r\n.。!！,，;；")
-	exact := map[string]bool{
-		"received":  true,
-		"noted":     true,
-		"executing": true,
-		"running":   true,
-		"starting":  true,
-		"will do":   true,
-		"on it":     true,
-		"收到":        true,
-		"好的":        true,
-		"执行":        true,
-		"运行":        true,
-		"开始执行":      true,
-		"开始处理":      true,
-		"收到，开始处理":   true,
-		"收到,开始处理":   true,
-		"好的，马上执行":   true,
-		"好的,马上执行":   true,
-		"马上执行":      true,
-		"这就执行":      true,
-		"我来执行":      true,
-	}
-	if exact[normalized] {
+	if containsExactCue(normalized, completionCueList("router.completion.ack_exact")) {
 		return true
 	}
 	if len([]rune(normalized)) <= 12 {
-		shortAckCues := []string{
-			"execut", "running", "starting",
-			"执行", "运行", "开始处理", "马上",
-		}
-		for _, cue := range shortAckCues {
+		for _, cue := range completionCueList("router.completion.ack_short") {
 			if strings.Contains(normalized, cue) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func completionCueList(key string) []string {
+	return splitCatalogCSV(i18n.New(i18n.Config{}).T(i18n.LocaleZH, key, nil))
+}
+
+func containsExactCue(text string, cues []string) bool {
+	for _, cue := range cues {
+		if text == strings.ToLower(strings.TrimSpace(cue)) {
+			return true
 		}
 	}
 	return false

@@ -56,6 +56,12 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 			}
 		}
 	}
+	if isSafeReadOnlyPipeline(command, cfg) {
+		return TerminalDecision{Allow: true, Class: "read_only_pipeline"}
+	}
+	if isProjectInternalCommand(command, fields) {
+		return TerminalDecision{Allow: true, Class: "project_internal"}
+	}
 	if shellControlPattern.MatchString(command) {
 		return TerminalDecision{Class: "unknown_shell", Reason: "compound shell syntax is blocked; use a dedicated tool or a simple allowlisted command"}
 	}
@@ -63,6 +69,145 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 		return TerminalDecision{Allow: true, Class: "local_read_only"}
 	}
 	return TerminalDecision{Class: "unknown", Reason: "terminal command is not in the local read-only allowlist"}
+}
+
+func isSafeReadOnlyPipeline(command string, cfg *config.Root) bool {
+	if strings.ContainsAny(command, ";&`$<>") {
+		return false
+	}
+	main := strings.TrimSpace(command)
+	if strings.Contains(main, "||") {
+		parts := strings.Split(main, "||")
+		if len(parts) != 2 || !isEchoFallback(parts[1]) {
+			return false
+		}
+		main = strings.TrimSpace(parts[0])
+	}
+	if !strings.Contains(main, "|") {
+		return false
+	}
+	for _, segment := range strings.Split(main, "|") {
+		if !isSafeReadOnlyCommandSegment(segment, cfg) {
+			return false
+		}
+	}
+	return true
+}
+
+func isEchoFallback(segment string) bool {
+	fields := strings.Fields(strings.TrimSpace(segment))
+	return len(fields) >= 1 && fields[0] == "echo"
+}
+
+func isSafeReadOnlyCommandSegment(segment string, cfg *config.Root) bool {
+	fields := strings.Fields(strings.TrimSpace(segment))
+	if len(fields) == 0 {
+		return false
+	}
+	if looksLikeNetworkCommand(fields[0]) || IsDangerousCommand(strings.Join(fields, " ")) {
+		return false
+	}
+	if !isAllowlistedLocalCommand(fields) {
+		return false
+	}
+	return commandPathsAllowed(fields, cfg)
+}
+
+func commandPathsAllowed(fields []string, cfg *config.Root) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := filepath.Base(fields[0])
+	switch cmd {
+	case "cat", "ls", "find":
+		for i := 1; i < len(fields); i++ {
+			raw := fields[i]
+			if raw == "" || strings.HasPrefix(raw, "-") || isOptionValue(fields, i) || looksLikePattern(raw) {
+				continue
+			}
+			if _, err := ResolveAllowedPath(raw, cfg); err != nil {
+				return false
+			}
+		}
+	}
+	for i := 1; i < len(fields); i++ {
+		raw := fields[i]
+		if raw == "" || strings.HasPrefix(raw, "-") || isOptionValue(fields, i) || looksLikePattern(raw) || !looksLikePathArg(raw) {
+			continue
+		}
+		if _, err := ResolveAllowedPath(raw, cfg); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func isOptionValue(fields []string, index int) bool {
+	if index == 0 {
+		return false
+	}
+	prev := fields[index-1]
+	switch prev {
+	case "-type", "-name", "-iname", "-maxdepth", "-mindepth", "-mtime", "-size", "-path", "-not", "-print", "-exec", "-e", "-A", "-B", "-C", "-n":
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikePattern(value string) bool {
+	return strings.ContainsAny(value, "*?[]{}()")
+}
+
+func looksLikePathArg(value string) bool {
+	return strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") || strings.Contains(value, string(filepath.Separator))
+}
+
+func isProjectInternalCommand(command string, fields []string) bool {
+	if len(fields) == 0 || strings.ContainsAny(command, ";&|`$<>") {
+		return false
+	}
+	exe := strings.TrimSpace(fields[0])
+	if exe == "" || filepath.Base(exe) != "mateway" {
+		return false
+	}
+	root, ok := currentMatewayProjectRoot()
+	if !ok {
+		return false
+	}
+	if !looksLikePathArg(exe) {
+		return true
+	}
+	resolved, err := filepath.Abs(filepath.Clean(exe))
+	if err != nil {
+		return false
+	}
+	return pathInsideRoot(resolved, root)
+}
+
+func currentMatewayProjectRoot() (string, bool) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	for {
+		modPath := filepath.Join(wd, "go.mod")
+		data, err := os.ReadFile(modPath)
+		if err == nil && strings.Contains(string(data), "module github.com/dongping/mateway") {
+			return wd, true
+		}
+		parent := filepath.Dir(wd)
+		if parent == wd {
+			return "", false
+		}
+		wd = parent
+	}
+}
+
+func pathInsideRoot(path, root string) bool {
+	path = filepath.Clean(path)
+	root = filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
 func looksLikeNetworkCommand(name string) bool {

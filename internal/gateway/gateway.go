@@ -14,6 +14,7 @@ import (
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
@@ -95,7 +96,7 @@ func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
 				downloaded, err := sender.DownloadMessageImages(eventCtx, msg, rt.Home)
 				if err != nil {
 					log.Printf("mateway gateway feishu media download error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "图片下载失败：" + err.Error(), Style: "error"})
+					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Runtime.Config, msg, "gateway.media_download_failed", map[string]string{"error": err.Error()}), Style: "error"})
 					return nil
 				}
 				msg = downloaded
@@ -308,7 +309,7 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
-			Text:     "收到，开始处理。",
+			Text:     gatewayText(rt.Config, msg, "gateway.processing_ack", nil),
 			Style:    "processing",
 		}, msg.ID+":processing")
 		if ackErr != nil {
@@ -324,7 +325,7 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		if !cardAction {
 			react(runCtx, sender, msg.ID, "CROSS_MARK")
 		}
-		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
+		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: "error"})
 		return
 	}
 	replyStart := time.Now()
@@ -501,4 +502,14 @@ func inboundDedupeKey(msg channel.InboundMessage) string {
 		id += ":" + action + ":" + strings.TrimSpace(msg.UserID)
 	}
 	return channelName + ":" + id
+}
+
+func gatewayText(cfg *config.Root, msg channel.InboundMessage, key string, values map[string]string) string {
+	locale := ""
+	catalogDir := ""
+	if cfg != nil {
+		locale = cfg.App.Locale
+		catalogDir = cfg.App.MessageCatalogDir
+	}
+	return i18n.New(i18n.Config{CatalogDir: catalogDir}).T(i18n.ResolveLocale(locale, msg.Text), key, values)
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/i18n"
 )
 
 type DistillModel interface {
@@ -42,6 +43,8 @@ type ProposalNudgeOptions struct {
 	Channels     []string
 	Interval     time.Duration
 	MaxProposals int
+	Locale       string
+	CatalogDir   string
 }
 
 type distillState struct {
@@ -208,7 +211,7 @@ func filterDistillCandidates(sources []distillSource) []distillSource {
 func distillScore(text string) int {
 	lower := strings.ToLower(text)
 	score := 0
-	if HasStrongMemoryCue(lower) || containsAny(lower, []string{"纠正", "以后不要", "以后要", "修复", "失败", "failed", "error", "preference", "remember"}) {
+	if HasStrongMemoryCue(lower) || containsAny(lower, memoryCueList("memory.distill.score_cues")) {
 		score += 2
 	}
 	if strings.Contains(lower, "status: failed") || strings.Contains(lower, " failed") || strings.Contains(lower, "Non-accepted steps:") {
@@ -416,7 +419,7 @@ func PendingProposalNudge(home, sessionKey string, now time.Time, options Propos
 	if maxProposals <= 0 {
 		maxProposals = 3
 	}
-	return renderProposalNudge(pending, maxProposals), nil
+	return renderProposalNudge(pending, maxProposals, options.Locale, options.CatalogDir), nil
 }
 
 func channelAllowed(channel string, allowed []string) bool {
@@ -449,26 +452,31 @@ func parseNudgeTime(value string) time.Time {
 	return time.Time{}
 }
 
-func renderProposalNudge(proposals []Proposal, maxProposals int) string {
+func renderProposalNudge(proposals []Proposal, maxProposals int, locale, catalogDir string) string {
 	if maxProposals > len(proposals) {
 		maxProposals = len(proposals)
 	}
+	catalog := i18n.New(i18n.Config{CatalogDir: catalogDir})
 	var b strings.Builder
-	fmt.Fprintf(&b, "有 %d 条长期记忆候选待审核，我先列 %d 条最值得看的：", len(proposals), maxProposals)
+	b.WriteString(catalog.T(locale, "memory.proposal_nudge.header", map[string]string{"total": fmt.Sprint(len(proposals)), "shown": fmt.Sprint(maxProposals)}))
 	for i := 0; i < maxProposals; i++ {
 		proposal := proposals[i]
 		fmt.Fprintf(&b, "\n\n%d. %s %s\n", i+1, proposal.ID, proposal.Title)
-		fmt.Fprintf(&b, "   类型：%s / %s，置信度：%s\n", defaultString(proposal.Type, "experience"), defaultString(proposal.Scope, "agent"), defaultString(proposal.Confidence, "low"))
+		b.WriteString(catalog.T(locale, "memory.proposal_nudge.type", map[string]string{
+			"type":       defaultString(proposal.Type, "experience"),
+			"scope":      defaultString(proposal.Scope, "agent"),
+			"confidence": defaultString(proposal.Confidence, "low"),
+		}))
 		if value := proposalReasonSummary(proposal); value != "" {
-			fmt.Fprintf(&b, "   价值：%s\n", value)
+			b.WriteString(catalog.T(locale, "memory.proposal_nudge.value", map[string]string{"value": value}))
 		}
 		if len(proposal.Sources) > 0 {
-			fmt.Fprintf(&b, "   来源：%s\n", summarizeNudgeText(strings.Join(proposal.Sources, ", "), 90))
+			b.WriteString(catalog.T(locale, "memory.proposal_nudge.sources", map[string]string{"sources": summarizeNudgeText(strings.Join(proposal.Sources, ", "), 90)}))
 		}
-		fmt.Fprintf(&b, "   查看：`mateway memory proposal show %s`", proposal.ID)
+		b.WriteString(catalog.T(locale, "memory.proposal_nudge.show", map[string]string{"proposal_id": proposal.ID}))
 	}
 	if rest := len(proposals) - maxProposals; rest > 0 {
-		fmt.Fprintf(&b, "\n\n还有 %d 条未展示。查看全部：`mateway memory proposal list`", rest)
+		b.WriteString(catalog.T(locale, "memory.proposal_nudge.more", map[string]string{"rest": fmt.Sprint(rest)}))
 	}
 	return b.String()
 }

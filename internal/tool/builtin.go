@@ -602,6 +602,10 @@ func (ScriptRunTool) Schema() agentcore.Schema {
 				"items":       map[string]any{"type": "string"},
 				"description": "Command-line argv array passed to the script, for example [\"--limit\",\"10\"]. Do not JSON-encode this value.",
 			},
+			"timeout_seconds": map[string]any{
+				"type":        "integer",
+				"description": "Optional timeout in seconds for long-running scripts such as media generation. Defaults to 20.",
+			},
 		},
 	}
 }
@@ -621,9 +625,15 @@ func (ScriptRunTool) ToolContract() agentcore.ToolContract {
 func (ScriptRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	args := stringSliceArg(call.Args["args"])
+	timeoutSeconds := intArg(call.Args["timeout_seconds"])
+	var timeout time.Duration
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
 	result, err := script.Run(ctx, t.Config, script.RunInput{
-		Name: toolArgString(call.Args, "name"),
-		Args: args,
+		Name:    toolArgString(call.Args, "name"),
+		Args:    args,
+		Timeout: timeout,
 	})
 	evidence := map[string]any{}
 	if result.Script.Name != "" {
@@ -1200,6 +1210,25 @@ func stringSliceArg(value any) []string {
 		return strings.Fields(v)
 	default:
 		return nil
+	}
+}
+
+func intArg(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return n
+	default:
+		return 0
 	}
 }
 

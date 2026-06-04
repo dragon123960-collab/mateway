@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -221,10 +222,7 @@ func containsAny(text string, markers []string) bool {
 
 func HasStrongMemoryCue(text string) bool {
 	text = strings.ToLower(strings.TrimSpace(text))
-	return containsAny(text, []string{
-		"记住", "记忆", "长期", "偏好", "规则", "决定", "经验", "流程", "以后",
-		"remember", "memory", "preference", "rule", "decision", "lesson", "workflow", "next time",
-	})
+	return containsAny(text, memoryCueList("memory.learning.strong_cues"))
 }
 
 func shouldReflect(event LearningEvent) bool {
@@ -241,20 +239,17 @@ func shouldReflect(event LearningEvent) bool {
 
 func HasUserCorrectionCue(text string) bool {
 	text = strings.ToLower(strings.TrimSpace(text))
-	return containsAny(text, []string{
-		"不是这样", "不对", "应该", "以后别", "以后不要", "改成", "纠正", "修正",
-		"wrong", "incorrect", "should", "next time don't", "do not do that", "correction",
-	})
+	return containsAny(text, memoryCueList("memory.learning.correction_cues"))
 }
 
 func likelyCause(event LearningEvent) string {
 	for _, step := range event.Task.Steps {
 		summary := strings.ToLower(step.Summary)
 		if step.Status != "accepted" && strings.TrimSpace(step.Summary) != "" {
-			if strings.Contains(summary, "not found") || strings.Contains(summary, "missing") || strings.Contains(summary, "不存在") {
+			if containsAny(summary, memoryCueList("memory.learning.not_found_cues")) {
 				return "The selected tool or path likely lacked the expected resource."
 			}
-			if strings.Contains(summary, "denied") || strings.Contains(summary, "permission") || strings.Contains(summary, "权限") {
+			if containsAny(summary, memoryCueList("memory.learning.permission_cues")) {
 				return "The action likely crossed a permission or confirmation boundary."
 			}
 			return "A tool step was not accepted and needs a safer alternate path."
@@ -264,6 +259,17 @@ func likelyCause(event LearningEvent) string {
 		return "The user corrected the task behavior or expected workflow."
 	}
 	return "No specific cause identified."
+}
+
+func memoryCueList(key string) []string {
+	var out []string
+	for _, item := range strings.Split(i18n.New(i18n.Config{}).T(i18n.LocaleZH, key, nil), ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func alternativeStrategy(event LearningEvent) string {

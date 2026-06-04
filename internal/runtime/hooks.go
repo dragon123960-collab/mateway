@@ -59,9 +59,11 @@ type ContextHookProvider interface {
 }
 
 type FollowupHookInput struct {
-	State session.State
-	Text  string
-	Model agentcore.Model
+	State      session.State
+	Text       string
+	Model      agentcore.Model
+	Locale     string
+	CatalogDir string
 }
 
 type FollowupHookProvider interface {
@@ -69,16 +71,37 @@ type FollowupHookProvider interface {
 	FollowupHook(context.Context, FollowupHookInput) (followupDecision, error)
 }
 
+type PendingIntentInput struct {
+	State      session.State
+	Pending    session.PendingAction
+	Text       string
+	Model      agentcore.Model
+	Locale     string
+	CatalogDir string
+}
+
+type pendingIntentDecision struct {
+	Kind   string
+	Reason string
+}
+
+type PendingIntentHookProvider interface {
+	HookProvider
+	PendingIntentHook(context.Context, PendingIntentInput) (pendingIntentDecision, error)
+}
+
 type ToolPolicyHookInput struct {
 	ToolCall agentcore.ToolCall
 	Tool     agentcore.Tool
 	Config   *config.Root
+	Locale   string
 }
 
 type ToolPolicyHookResult struct {
-	Block      bool
-	Reason     string
-	ResumeText string
+	Block             bool
+	Reason            string
+	ResumeText        string
+	AuthorizationOnly bool
 }
 
 type ToolPolicyHookProvider interface {
@@ -135,6 +158,8 @@ type ObserveHookProvider interface {
 type ResponseHookInput struct {
 	RawText        string
 	LearningResult *memory.LearningResult
+	Locale         string
+	CatalogDir     string
 }
 
 type ResponseHookResult struct {
@@ -215,9 +240,35 @@ func (h RuntimeHooks) resolveFollowup(ctx context.Context, input FollowupHookInp
 			return decision
 		}
 	}
-	decision := fallbackFollowupDecision(input.State, input.Text, "model followup unavailable")
+	decision := fallbackFollowupDecision(input.State, input.Text, input.Locale, input.CatalogDir, "model followup unavailable")
 	_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "safe_fallback", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
 	return decision
+}
+
+func (h RuntimeHooks) pendingIntent(ctx context.Context, input PendingIntentInput, trace *traceRecorder) pendingIntentDecision {
+	timeout := defaultFollowupHookTimeout
+	for _, provider := range h.Providers {
+		intentProvider, ok := provider.(PendingIntentHookProvider)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(provider.Name())
+		if name == "" {
+			name = "unknown"
+		}
+		result, err := runPendingIntentHookProvider(ctx, intentProvider, input, timeout)
+		if err != nil {
+			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "pending_intent_hook", "provider": name, "error": err.Error()})
+			continue
+		}
+		_ = trace.write(map[string]any{"type": "hook_event", "hook": "pending_intent_hook", "provider": name, "decision": result.Kind, "reason": result.Reason})
+		if strings.TrimSpace(result.Kind) != "" {
+			return result
+		}
+	}
+	result := fallbackPendingIntentDecision(input.Pending, input.Text, "model pending intent unavailable")
+	_ = trace.write(map[string]any{"type": "hook_event", "hook": "pending_intent_hook", "provider": "safe_fallback", "decision": result.Kind, "reason": result.Reason})
+	return result
 }
 
 func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput, trace *traceRecorder) ToolPolicyHookResult {
@@ -348,7 +399,7 @@ func (h RuntimeHooks) response(ctx context.Context, input ResponseHookInput, tra
 	}
 	text := sanitizeResponse(input.RawText)
 	if text == "" {
-		text = fallbackFinalReply(input.RawText)
+		text = fallbackFinalReply(input.RawText, input.Locale, input.CatalogDir)
 	}
 	return text
 }
@@ -416,6 +467,39 @@ func runFollowupHookProvider(ctx context.Context, provider FollowupHookProvider,
 			return followupDecision{}, err
 		}
 		return followupDecision{}, context.DeadlineExceeded
+	}
+}
+
+func runPendingIntentHookProvider(ctx context.Context, provider PendingIntentHookProvider, input PendingIntentInput, timeout time.Duration) (result pendingIntentDecision, err error) {
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan struct {
+		result pendingIntentDecision
+		err    error
+	}, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- struct {
+					result pendingIntentDecision
+					err    error
+				}{err: fmt.Errorf("hook panic: %v", r)}
+			}
+		}()
+		result, err := provider.PendingIntentHook(child, input)
+		done <- struct {
+			result pendingIntentDecision
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case output := <-done:
+		return output.result, output.err
+	case <-child.Done():
+		if err := child.Err(); err != nil {
+			return pendingIntentDecision{}, err
+		}
+		return pendingIntentDecision{}, context.DeadlineExceeded
 	}
 }
 
@@ -670,7 +754,7 @@ func shouldSearchMemory(text string) bool {
 		return true
 	}
 	lower := strings.ToLower(text)
-	for _, marker := range []string{"memory", "remember", "preference", "project", "readme", "tool", "记忆", "偏好", "项目", "工具"} {
+	for _, marker := range splitCatalogCSV(i18n.New(i18n.Config{}).T(i18n.LocaleZH, "memory.safe_read.markers", nil)) {
 		if strings.Contains(lower, marker) {
 			return true
 		}
@@ -733,9 +817,11 @@ func (defaultToolPolicyHookProvider) Name() string { return "default_tool_policy
 
 func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input ToolPolicyHookInput) (ToolPolicyHookResult, error) {
 	catalog := i18n.New(i18n.Config{})
-	locale := ""
+	locale := strings.TrimSpace(input.Locale)
 	if input.Config != nil {
-		locale = input.Config.App.Locale
+		if locale == "" {
+			locale = input.Config.App.Locale
+		}
 		catalog = i18n.New(i18n.Config{CatalogDir: input.Config.App.MessageCatalogDir})
 	}
 	if input.ToolCall.Name == "terminal.run" && tool.IsDangerousCommand(fmt.Sprint(input.ToolCall.Args["command"])) {
@@ -745,18 +831,39 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 			ResumeText: catalog.T(locale, "approval.confirm.resume_dangerous", nil),
 		}, nil
 	}
+	if input.ToolCall.Name == "terminal.run" {
+		decision := tool.CheckTerminalCommand(fmt.Sprint(input.ToolCall.Args["command"]), input.Config)
+		if decision.Allow {
+			switch decision.Class {
+			case "local_read_only", "read_only_pipeline", "project_internal":
+				return ToolPolicyHookResult{}, nil
+			case "remote":
+				if !decision.RequireConfirm {
+					return ToolPolicyHookResult{}, nil
+				}
+			}
+		}
+	}
 	if input.ToolCall.Name == "script.run" {
 		name := strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["name"]))
 		scripts, err := script.List(input.Config)
 		if err == nil {
 			for _, candidate := range scripts {
-				if candidate.Name == name && candidate.Source == "external_skill" && !candidate.Authorized {
-					return ToolPolicyHookResult{
-						Block:      true,
-						Reason:     "External skill script " + name + " requires one-time authorization before execution.",
-						ResumeText: "Authorize and continue script.run",
-					}, nil
+				if candidate.Name != name {
+					continue
 				}
+				if candidate.Source == "external_skill" {
+					if !candidate.Authorized {
+						return ToolPolicyHookResult{
+							Block:             true,
+							Reason:            catalog.T(locale, "approval.confirm.external_script", map[string]string{"script": name}),
+							ResumeText:        catalog.T(locale, "approval.confirm.resume_script", nil),
+							AuthorizationOnly: true,
+						}, nil
+					}
+					return ToolPolicyHookResult{}, nil
+				}
+				break
 			}
 		}
 	}
@@ -848,7 +955,7 @@ func (defaultResponseHookProvider) Name() string { return "default_response" }
 func (defaultResponseHookProvider) ResponseHook(_ context.Context, input ResponseHookInput) (ResponseHookResult, error) {
 	text := sanitizeResponse(input.RawText)
 	if text == "" {
-		text = fallbackFinalReply(input.RawText)
+		text = fallbackFinalReply(input.RawText, input.Locale, input.CatalogDir)
 	}
 	return ResponseHookResult{Text: text}, nil
 }

@@ -164,6 +164,23 @@ func TestRenderReplyMessageDisablesApprovalButtonsByDefault(t *testing.T) {
 	}
 }
 
+func TestRenderReplyMessageSkipsRedundantApprovalFooter(t *testing.T) {
+	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "approval_pending",
+		Locale:   "zh-CN",
+		Text:     "继续之前需要确认。回复“确认”继续，或回复“取消”放弃。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, "也可以直接回复") {
+		t.Fatalf("expected redundant approval footer to be omitted, got %s", content)
+	}
+}
+
 func TestRenderReplyMessageUsesEnglishLocale(t *testing.T) {
 	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
@@ -171,7 +188,7 @@ func TestRenderReplyMessageUsesEnglishLocale(t *testing.T) {
 		ThreadID: "thread_123",
 		Style:    "approval_pending",
 		Locale:   "en-US",
-		Text:     "This operation needs confirmation.",
+		Text:     "Confirmation is required before continuing. Reply \"confirm\" to continue, or \"cancel\" to stop.",
 	})
 	if err != nil {
 		t.Fatal(err)

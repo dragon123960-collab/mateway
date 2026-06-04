@@ -44,6 +44,7 @@ func New(cfg *config.Root) Runtime {
 	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, modelFollowupHookProvider{})
+	hooks.Providers = append(hooks.Providers, modelPendingIntentHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultCompletionReviewHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
@@ -96,7 +97,7 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		agent = agentcore.NewAgent(rt.Model, rt.Tools)
 	}
 	followupModel := rt.Pool.RoleModelForMessage(msg, "followup", agent.Model)
-	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text, Model: followupModel}, trace)
+	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text, Model: followupModel, Locale: runtimeLocale(rt.Config, msg), CatalogDir: runtimeCatalogDir(rt.Config)}, trace)
 	if decision.Kind == followupClarify {
 		task := state.StartTask(msg.Text)
 		applyCompletionContract(task, msg.Text)
@@ -147,7 +148,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Reply: channel.OutboundMessage{
 				Channel:  msg.Channel,
 				ThreadID: msg.ThreadID,
-				Text:     "当前会话上下文仍然过大，已停止这次请求。请发送 `/new` 开启干净会话，旧会话会自动归档。",
+				Text:     runtimeText(rt.Config, msg, "runtime.context_budget_exceeded", nil),
 				Style:    "error",
 				Locale:   runtimeLocale(rt.Config, msg),
 			},
@@ -176,13 +177,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	reviewModel := rt.Pool.RoleModelForMessage(msg, "review", agent.Model)
 	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
 	defer stopActivityWatch()
-	agent.Hooks = rt.hooksForState(state, task.ID, userText, reviewModel, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+	agentHooks, runtimeStopReason := rt.hooksForState(state, task.ID, userText, runtimeLocale(rt.Config, msg), reviewModel, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
 		UserText: userText,
 		Profile:  profile,
 	}, trace))
+	agent.Hooks = agentHooks
 	result, err := agent.Continue(runCtx)
 	if err != nil {
 		state.BlockActiveTask("failed")
@@ -190,15 +192,15 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			return Response{}, saveErr
 		}
 		if activityTimedOut() {
-			text := "任务长时间没有新的模型、工具或 hook 活动，已停止执行，避免挂死。Trace 中已记录 task_inactivity_timeout。"
-			resp := rt.reply(msg, renderPartialReply(text), "partial")
+			text := runtimeText(rt.Config, msg, "runtime.activity_timeout", nil)
+			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), "partial")
 			resp.TraceID = trace.id
 			resp.TracePath = trace.path
 			resp.Failed = true
 			_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 			return resp, nil
 		}
-		text := friendlyRuntimeError(err)
+		text := friendlyRuntimeError(rt.Config, msg, err)
 		resp := Response{
 			Reply: channel.OutboundMessage{
 				Channel:  msg.Channel,
@@ -214,6 +216,9 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		_ = trace.write(map[string]any{"type": "model_error", "error": err.Error(), "friendly": text})
 		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 		return resp, nil
+	}
+	if result.StopReason == "" {
+		result.StopReason = runtimeStopReason()
 	}
 
 	state.Messages = redactMessagesForStorage(result.Messages)
@@ -328,13 +333,13 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			}
 		}
 	}
-	text := redactSecretString(rt.Hooks.response(ctx, ResponseHookInput{RawText: finalText, LearningResult: learningResult}, trace))
+	text := redactSecretString(rt.Hooks.response(ctx, ResponseHookInput{RawText: finalText, LearningResult: learningResult, Locale: runtimeLocale(rt.Config, msg), CatalogDir: runtimeCatalogDir(rt.Config)}, trace))
 	var followUps []channel.OutboundMessage
 	if learningResult != nil && learningResult.Proposal != nil {
 		followUps = append(followUps, channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
-			Text:     renderMemoryProposalReview(*learningResult.Proposal),
+			Text:     renderMemoryProposalReview(rt.Config, msg, *learningResult.Proposal),
 			Style:    "memory_proposal_review",
 			Locale:   runtimeLocale(rt.Config, msg),
 		})
@@ -346,7 +351,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	if blockedByFinalWarning {
-		text = renderPartialReply(text)
+		text = renderPartialReply(rt.Config, msg, text)
 	}
 	style := ""
 	if blockedByFinalWarning && style == "" {
@@ -363,6 +368,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		FollowUps: followUps,
 		TraceID:   trace.id,
 		TracePath: trace.path,
+		Failed:    blockedByFinalWarning,
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 	for _, followUp := range followUps {
@@ -371,15 +377,15 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	return resp, nil
 }
 
-func renderPartialReply(text string) string {
+func renderPartialReply(cfg *config.Root, msg channel.InboundMessage, text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return "任务还没有完成：当前没有足够进展继续执行。"
+		return runtimeText(cfg, msg, "runtime.partial.empty", nil)
 	}
-	if strings.Contains(text, "任务还没有完成") || strings.Contains(strings.ToLower(text), "not complete") {
+	if containsAny(strings.ToLower(text), runtimeCueList(cfg, "router.partial.already_marked")) {
 		return text
 	}
-	return "任务还没有完成，当前进展：\n\n" + text
+	return runtimeText(cfg, msg, "runtime.partial.prefix", textValues("text", text))
 }
 
 func (rt Runtime) memoryProposalNudgeOptions(msg channel.InboundMessage) memory.ProposalNudgeOptions {
@@ -388,6 +394,8 @@ func (rt Runtime) memoryProposalNudgeOptions(msg channel.InboundMessage) memory.
 		Channels:     []string{"cli"},
 		Interval:     24 * time.Hour,
 		MaxProposals: 3,
+		Locale:       runtimeLocale(rt.Config, msg),
+		CatalogDir:   runtimeCatalogDir(rt.Config),
 	}
 	if rt.Config == nil {
 		return options
@@ -441,9 +449,9 @@ func (rt Runtime) resetSession(msg channel.InboundMessage, state session.State, 
 		return Response{}, err
 	}
 	_ = trace.write(map[string]any{"type": "session_reset", "session_key": reset.Key, "archive_path": archivePath})
-	text := "已开启新会话。"
+	text := runtimeText(rt.Config, msg, "runtime.session_reset.done", nil)
 	if archivePath != "" {
-		text += "\n旧会话已归档：" + archivePath
+		text += "\n" + runtimeText(rt.Config, msg, "runtime.session_reset.archived", textValues("archive_path", archivePath))
 	}
 	resp := rt.reply(msg, text, "session_reset")
 	resp.TraceID = trace.id
@@ -484,7 +492,7 @@ func (rt Runtime) maybeRecallArchivedTask(_ context.Context, state *session.Stat
 			Kind:       "archive_task_recall",
 			TaskID:     candidate.Task.ID,
 			ArchiveID:  candidate.ArchiveID,
-			Question:   renderArchiveRecallQuestion(candidate),
+			Question:   renderArchiveRecallQuestion(rt.Config, msg, candidate),
 			ResumeText: text,
 		}
 		if err := rt.saveState(state, trace); err != nil {
@@ -493,7 +501,7 @@ func (rt Runtime) maybeRecallArchivedTask(_ context.Context, state *session.Stat
 		_ = trace.write(map[string]any{"type": "archive_task_recall_pending", "archive_id": candidate.ArchiveID, "task_id": candidate.Task.ID, "candidates": 1})
 		return rt.reply(msg, state.Pending.Question, "archive_recall_pending"), true, nil
 	}
-	textOut := renderArchiveRecallCandidates(candidates)
+	textOut := renderArchiveRecallCandidates(rt.Config, msg, candidates)
 	_ = trace.write(map[string]any{"type": "archive_task_recall_clarify", "candidates": len(candidates)})
 	return rt.reply(msg, textOut, "clarify"), true, nil
 }
@@ -516,7 +524,7 @@ func (rt Runtime) archivedTaskCandidates(sessionKey, text string, limit int) ([]
 		for j := len(archived.Tasks) - 1; j >= 0 && len(out) < limit; j-- {
 			task := archived.Tasks[j]
 			haystack := normalizeFollowupText(task.Goal + " " + task.Summary)
-			if tokenOverlap(normalized, haystack) >= 1 || (strings.Contains(normalized, "刚才") || strings.Contains(normalized, "上个") || strings.Contains(normalized, "之前")) {
+			if tokenOverlap(normalized, haystack) >= 1 || containsAny(normalized, runtimeCueList(rt.Config, "router.archive_recall.cues")) {
 				out = append(out, archivedTaskCandidate{ArchiveID: ids[i], Task: task})
 			}
 		}
@@ -524,17 +532,17 @@ func (rt Runtime) archivedTaskCandidates(sessionKey, text string, limit int) ([]
 	return out, nil
 }
 
-func renderArchiveRecallQuestion(candidate archivedTaskCandidate) string {
+func renderArchiveRecallQuestion(cfg *config.Root, msg channel.InboundMessage, candidate archivedTaskCandidate) string {
 	goal := summarize(candidate.Task.Goal)
 	if goal == "" {
 		goal = candidate.Task.ID
 	}
-	return "你是想接回这个已归档任务吗？\n\n- " + goal + "\n\n回复“确认”会在当前新会话里创建一个新任务，并引用这个归档任务作为上下文；回复“取消”则不接回。"
+	return runtimeText(cfg, msg, "runtime.archive_recall.question", textValues("goal", goal))
 }
 
-func renderArchiveRecallCandidates(candidates []archivedTaskCandidate) string {
+func renderArchiveRecallCandidates(cfg *config.Root, msg channel.InboundMessage, candidates []archivedTaskCandidate) string {
 	var b strings.Builder
-	b.WriteString("我找到了多个可能的归档任务，请补充你要接哪一个：\n")
+	b.WriteString(runtimeText(cfg, msg, "runtime.archive_recall.candidates", nil))
 	for i, candidate := range candidates {
 		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, summarize(candidate.Task.Goal)))
 	}
@@ -600,7 +608,7 @@ func channelPartsToAgentParts(text string, parts []channel.MessagePart) []agentc
 
 func IsNewSessionCommand(text string) bool {
 	switch strings.TrimSpace(strings.ToLower(text)) {
-	case "/new", "/新会话", "新会话":
+	case "/new":
 		return true
 	default:
 		return false
@@ -783,6 +791,26 @@ func pendingScheduleID(messages []agentcore.Message) string {
 	return ""
 }
 
+func scheduleCreateRequiresTest(call agentcore.ToolCall) bool {
+	raw := strings.TrimSpace(fmt.Sprint(call.Args["require_test"]))
+	return !strings.EqualFold(raw, "false") && !strings.EqualFold(raw, "no")
+}
+
+func scheduleIDFromToolResult(result agentcore.ToolResult) string {
+	if result.Evidence != nil {
+		if id, ok := result.Evidence["id"].(string); ok && strings.TrimSpace(id) != "" {
+			return strings.TrimSpace(id)
+		}
+	}
+	fields := strings.Fields(result.Content)
+	for i, field := range fields {
+		if field == "scheduled" && i+1 < len(fields) {
+			return strings.TrimSpace(fields[i+1])
+		}
+	}
+	return ""
+}
+
 func pendingAgentProfileProposalID(task *session.TaskNode) string {
 	if task == nil {
 		return ""
@@ -817,38 +845,33 @@ func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIn
 	return ""
 }
 
-func renderMemoryProposalReview(proposal memory.Proposal) string {
+func renderMemoryProposalReview(cfg *config.Root, msg channel.InboundMessage, proposal memory.Proposal) string {
 	var b strings.Builder
-	b.WriteString("我发现一条长期记忆候选，尚未写入长期记忆。\n\n")
+	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.header", nil))
 	b.WriteString(proposal.ID)
 	b.WriteString(" ")
 	b.WriteString(strings.TrimSpace(proposal.Title))
-	b.WriteString("\n类型：")
+	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.type", nil))
 	b.WriteString(defaultText(proposal.Type, "experience"))
 	b.WriteString(" / ")
 	b.WriteString(defaultText(proposal.Scope, "agent"))
 	if strings.TrimSpace(proposal.Confidence) != "" {
-		b.WriteString("，置信度：")
+		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.confidence", nil))
 		b.WriteString(strings.TrimSpace(proposal.Confidence))
 	}
 	if summary := proposalSummary(proposal); summary != "" {
-		b.WriteString("\n摘要：")
+		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.summary", nil))
 		b.WriteString(summary)
 	}
 	if len(proposal.Sources) > 0 {
-		b.WriteString("\n来源：")
+		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.sources", nil))
 		b.WriteString(summarize(strings.Join(proposal.Sources, ", ")))
 	}
-	b.WriteString("\n\n查看详情：`mateway memory proposal show ")
-	b.WriteString(proposal.ID)
-	b.WriteString("`")
-	b.WriteString("\n保存：`mateway memory proposal commit ")
-	b.WriteString(proposal.ID)
-	b.WriteString("`")
-	b.WriteString("\n忽略：`mateway memory proposal reject ")
-	b.WriteString(proposal.ID)
-	b.WriteString("`")
-	b.WriteString("\n\n也可以直接回复 `保存` 或 `忽略`。")
+	values := textValues("proposal_id", proposal.ID)
+	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.show", values))
+	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.commit", values))
+	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.reject", values))
+	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.reply", nil))
 	return b.String()
 }
 
@@ -873,11 +896,12 @@ func proposalSummary(proposal memory.Proposal) string {
 	return ""
 }
 
-func fallbackFinalReply(raw string) string {
+func fallbackFinalReply(raw, locale, catalogDir string) string {
+	catalog := i18n.New(i18n.Config{CatalogDir: catalogDir})
 	if strings.Contains(strings.ToUpper(raw), "[TOOL_CALL]") {
-		return "模型生成了无效的工具调用格式，已停止执行，避免误操作。请重试或把任务说得更具体。"
+		return catalog.T(locale, "runtime.invalid_tool_call", nil)
 	}
-	return "我还没有生成可用回复。"
+	return catalog.T(locale, "runtime.empty_reply", nil)
 }
 
 func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
@@ -937,25 +961,18 @@ func looksLikeActionTask(text string) bool {
 	if strings.HasPrefix(lower, "/read") || strings.HasPrefix(lower, "/search") {
 		return false
 	}
-	infoCues := []string{"读取", "总结", "查看", "检查", "搜索", "记住", "remember", "read", "summarize", "check", "search"}
-	for _, cue := range infoCues {
+	for _, cue := range runtimeCueList(nil, "router.action.info_cues") {
 		if strings.Contains(lower, cue) {
 			return false
 		}
 	}
-	actionCues := []string{
-		"创建", "写", "改", "修改", "更新", "删除", "移除", "发送", "发布", "部署",
-		"执行", "运行", "重启", "关闭", "打开", "安装", "配置", "提交", "push", "commit",
-		"create", "write", "modify", "update", "delete", "remove", "send", "publish",
-		"deploy", "run", "execute", "restart", "close", "open", "install", "configure", "submit",
-	}
-	for _, cue := range actionCues {
+	for _, cue := range runtimeCueList(nil, "router.action.action_cues") {
 		if strings.Contains(lower, cue) {
 			return true
 		}
 	}
-	if strings.Contains(lower, "生成") || strings.Contains(lower, "generate") {
-		for _, artifact := range []string{"文件", "报告", "文档", "markdown", ".md", ".html", ".json", ".yaml", "file", "report", "document"} {
+	if containsAny(lower, runtimeCueList(nil, "router.action.generate_cues")) {
+		for _, artifact := range runtimeCueList(nil, "router.action.generated_artifacts") {
 			if strings.Contains(lower, artifact) {
 				return true
 			}
@@ -970,13 +987,8 @@ func isActionAckFollowup(text string) bool {
 		return false
 	}
 	return looksLikeNonSubstantiveActionAck(text) ||
-		normalized == "确认" ||
-		normalized == "confirm" ||
-		normalized == "继续" ||
-		normalized == "continue" ||
-		strings.Contains(normalized, "你来执行") ||
-		strings.Contains(normalized, "执行剩下") ||
-		strings.Contains(normalized, "继续执行")
+		containsExactCue(normalized, runtimeCueList(nil, "router.action.ack_exact")) ||
+		containsAny(normalized, runtimeCueList(nil, "router.action.ack_contains"))
 }
 
 func completionContractWarning(task session.TaskNode, finalText string) string {
@@ -1018,12 +1030,7 @@ func looksLikeConcreteBlocker(text string) bool {
 	if lower == "" {
 		return false
 	}
-	blockers := []string{
-		"需要你提供", "需要用户", "缺少", "没有权限", "权限不足", "无法访问", "不能访问", "找不到",
-		"api key", "permission denied", "missing", "not found", "cannot access", "need you to provide",
-		"need user input", "requires confirmation", "blocked",
-	}
-	for _, blocker := range blockers {
+	for _, blocker := range runtimeCueList(nil, "router.blocker.cues") {
 		if strings.Contains(lower, blocker) {
 			return true
 		}
@@ -1031,7 +1038,7 @@ func looksLikeConcreteBlocker(text string) bool {
 	return false
 }
 
-func (rt Runtime) hooksForState(state *session.State, taskID, userText string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) (agentcore.Hooks, func() string) {
 	steeringSent := false
 	var followUps []agentcore.Message
 	noProgressTurns := 0
@@ -1039,7 +1046,11 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 	maxRepeatedToolFailures := maxRepeatedToolFailures(rt.Config)
 	lastFailureSignature := ""
 	repeatedToolFailures := 0
-	return agentcore.Hooks{
+	stopReason := ""
+	runtimeStopReason := func() string {
+		return stopReason
+	}
+	hooks := agentcore.Hooks{
 		Emit: trace.emit,
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
 			if steeringSent {
@@ -1078,6 +1089,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 						"reason":        review.Reason,
 						"missing_items": review.MissingItems,
 					})
+					stopReason = "task_no_progress"
 					return true, nil
 				}
 				followUp := strings.TrimSpace(review.SuggestedFollowUp)
@@ -1099,14 +1111,21 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 			return out, nil
 		},
 		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
-			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)
+			approvalKey, approvalClass := taskApprovalKey(input.ToolCall, input.Tool, rt.Config)
+			if state.HasTaskApproval(taskID, approvalKey) && taskApprovalCanReuse(input.ToolCall, rt.Config) {
+				_ = trace.write(map[string]any{"type": "approval_reused", "task_id": taskID, "tool": input.ToolCall.Name, "approval_key": approvalKey, "class": approvalClass})
+				return agentcore.BeforeToolCallResult{}, nil
+			}
+			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config, Locale: locale}, trace)
 			if policy.Block {
+				_ = trace.write(map[string]any{"type": "approval_required", "task_id": taskID, "tool": input.ToolCall.Name, "approval_key": approvalKey, "class": approvalClass, "reason": policy.Reason})
 				state.Pending = &session.PendingAction{
-					Kind:       "confirm_tool",
-					TaskID:     taskID,
-					Question:   policy.Reason,
-					ToolCall:   input.ToolCall,
-					ResumeText: policy.ResumeText,
+					Kind:              "confirm_tool",
+					TaskID:            taskID,
+					Question:          policy.Reason,
+					ToolCall:          input.ToolCall,
+					ResumeText:        policy.ResumeText,
+					AuthorizationOnly: policy.AuthorizationOnly,
 				}
 				state.BlockActiveTask("await_confirm")
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
@@ -1150,9 +1169,9 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 						result.IsError = true
 						result.Content = strings.TrimSpace(result.Content)
 						if result.Content == "" {
-							result.Content = "工具连续返回失败或可疑结果，已停止执行，避免在错误路径上无限循环。"
+							result.Content = runtimeText(rt.Config, channel.InboundMessage{Text: userText}, "runtime.tool_failure_loop", nil)
 						} else {
-							result.Content += "\n\n工具连续返回失败或可疑结果，已停止执行，避免在错误路径上无限循环。"
+							result.Content += "\n\n" + runtimeText(rt.Config, channel.InboundMessage{Text: userText}, "runtime.tool_failure_loop", nil)
 						}
 						return agentcore.AfterToolCallResult{ToolResult: &result, Terminate: true, StopReason: "tool_failure_loop"}, nil
 					}
@@ -1161,6 +1180,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 			return agentcore.AfterToolCallResult{}, nil
 		},
 	}
+	return hooks, runtimeStopReason
 }
 
 func toolFailureSignature(call agentcore.ToolCall) string {
@@ -1172,6 +1192,45 @@ func toolFailureSignature(call agentcore.ToolCall) string {
 	return call.Name + ":" + hex.EncodeToString(sum[:8])
 }
 
+func taskApprovalKey(call agentcore.ToolCall, def agentcore.Tool, cfg *config.Root) (string, string) {
+	class := ""
+	switch call.Name {
+	case "terminal.run":
+		decision := tool.CheckTerminalCommand(fmt.Sprint(call.Args["command"]), cfg)
+		class = decision.Class
+	case "script.run":
+		class = "script"
+	case "secret.set":
+		class = "secret"
+	default:
+		if def != nil {
+			class = string(def.Risk())
+		}
+	}
+	if strings.TrimSpace(class) == "" {
+		class = "guarded_mutation"
+	}
+	return call.Name + ":" + class, class
+}
+
+func taskApprovalCanReuse(call agentcore.ToolCall, cfg *config.Root) bool {
+	switch call.Name {
+	case "secret.set":
+		return false
+	case "script.run":
+		return false
+	case "terminal.run":
+		command := fmt.Sprint(call.Args["command"])
+		if tool.IsDangerousCommand(command) {
+			return false
+		}
+		decision := tool.CheckTerminalCommand(command, cfg)
+		return decision.Allow
+	default:
+		return true
+	}
+}
+
 func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
 	if state.Pending == nil {
 		return Response{}, false, nil
@@ -1179,29 +1238,51 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 	text := strings.TrimSpace(msg.Text)
 	switch state.Pending.Kind {
 	case "confirm_tool":
-		if rt.isCancel(msg, text) {
+		control, hasControl := rt.pendingControl(msg, text)
+		if hasControl {
+			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
+		}
+		if control == "cancel" || (!hasControl && rt.isCancel(msg, text)) {
+			_ = trace.write(map[string]any{"type": "approval_denied", "task_id": state.Pending.TaskID, "tool": state.Pending.ToolCall.Name})
 			state.Pending = nil
 			state.BlockActiveTask("cancelled")
 			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
-			return rt.reply(msg, "已取消。", "cancelled"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.cancelled", nil), "cancelled"), true, nil
 		}
-		if !rt.isConfirm(msg, text) {
+		if !(control == "approve" || control == "continue" || (!hasControl && rt.isConfirm(msg, text))) {
 			return rt.reply(msg, runtimeText(rt.Config, msg, "approval.confirm.generic", nil), "approval_pending"), true, nil
 		}
-		pendingTaskID := state.Pending.TaskID
-		call := state.Pending.ToolCall
+		pending := *state.Pending
+		pendingTaskID := pending.TaskID
+		call := pending.ToolCall
 		state.Pending = nil
 		taskID := strings.TrimSpace(pendingTaskID)
 		if taskID == "" {
 			taskID = state.ActiveTask
 		}
 		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
+		approvalKey, approvalClass := taskApprovalKey(call, nil, rt.Config)
+		if taskApprovalCanReuse(call, rt.Config) {
+			state.AddTaskApproval(taskID, session.TaskApproval{Key: approvalKey, Tool: call.Name, Class: approvalClass})
+			_ = trace.write(map[string]any{"type": "approval_granted", "task_id": taskID, "tool": call.Name, "approval_key": approvalKey, "class": approvalClass})
+		}
+		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "confirm_tool", "command": firstNonEmpty(control, "approve")})
 		if call.Name == "script.run" {
 			if record, err := script.Authorize(rt.Config, strings.TrimSpace(fmt.Sprint(call.Args["name"]))); err == nil {
 				_ = trace.write(map[string]any{"type": "script_authorized", "script": record.Name, "path": record.Path, "source": record.Source, "hash": record.Hash})
 			}
+		}
+		if pending.AuthorizationOnly {
+			task := state.ActivateTask(taskID)
+			if task == nil {
+				task = state.EnsureTask("authorized script")
+			}
+			userText := mergeTaskAndInstruction(task.Goal, firstNonEmpty(pending.ResumeText, text))
+			_ = trace.write(map[string]any{"type": "pending_authorization_only_continue", "task_id": task.ID, "tool_call": call})
+			resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
+			return resp, true, err
 		}
 		result := rt.Tools.Execute(ctx, call)
 		toolDef, _ := rt.Tools.Get(call.Name)
@@ -1235,14 +1316,39 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			return rt.reply(msg, result.Content, "completed"), true, nil
 		}
 		if result.IsError {
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
+			task := state.ActivateTask(taskID)
+			if task == nil {
+				task = state.EnsureTask("confirmed tool result")
 			}
-			return rt.reply(msg, result.Content, "error"), true, nil
+			_ = trace.write(map[string]any{
+				"type":      "pending_tool_failed_continue",
+				"task_id":   task.ID,
+				"tool_call": call,
+				"reason":    result.Content,
+			})
+			resp, err := rt.runTask(ctx, msg, state, task, "", trace)
+			return resp, true, err
 		}
 		task := state.ActivateTask(taskID)
 		if task == nil {
 			task = state.EnsureTask("confirmed tool result")
+		}
+		if call.Name == "schedule.create" && scheduleCreateRequiresTest(call) {
+			scheduleID := scheduleIDFromToolResult(result)
+			if scheduleID != "" {
+				state.Pending = &session.PendingAction{
+					Kind:       "schedule_review",
+					TaskID:     task.ID,
+					ScheduleID: scheduleID,
+					Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
+				}
+				state.BlockActiveTask("await_schedule_test")
+				if err := rt.saveState(state, trace); err != nil {
+					return Response{}, true, err
+				}
+				_ = trace.write(map[string]any{"type": "schedule_review_pending", "schedule_id": scheduleID, "source": "pending_confirmed_tool"})
+				return rt.reply(msg, state.Pending.Question, "schedule_review_pending"), true, nil
+			}
 		}
 		replyText := rt.summarizeConfirmedToolResult(ctx, msg, *task, call, result, trace)
 		state.CompleteActiveTaskWithSummary(summarize(replyText), trace.id, trace.path)
@@ -1251,7 +1357,17 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		}
 		return rt.reply(msg, replyText, "completed"), true, nil
 	case "memory_proposal_review":
+		control, hasControl := rt.pendingControl(msg, text)
+		if hasControl {
+			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
+		}
 		action, ok := rt.parseMemoryProposalReviewAction(msg, text)
+		if !ok && (control == "approve" || control == "continue") {
+			action, ok = "commit", true
+		}
+		if !ok && (control == "ignore" || control == "cancel") {
+			action, ok = "reject", true
+		}
 		if !ok {
 			if rt.shouldBypassMemoryProposalReview(msg, text) {
 				_ = trace.write(map[string]any{"type": "memory_proposal_review_bypassed", "proposal_id": state.Pending.ProposalID, "text": text})
@@ -1268,8 +1384,10 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			}
 			return Response{}, false, nil
 		}
+		taskID := state.Pending.TaskID
 		proposalID := state.Pending.ProposalID
 		state.Pending = nil
+		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "memory_proposal_review", "command": firstNonEmpty(control, action)})
 		store := memory.ProposalStore{Home: rt.home(), MemoryRoot: memoryRootForConfig(rt.Config)}
 		if action == "commit" {
 			proposal, target, err := store.Commit(proposalID)
@@ -1298,7 +1416,17 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		}
 		return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.done", nil), "completed"), true, nil
 	case "agent_profile_proposal_review":
+		control, hasControl := rt.pendingControl(msg, text)
+		if hasControl {
+			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
+		}
 		action, ok := rt.parseAgentProfileProposalReviewAction(msg, text)
+		if !ok && (control == "approve" || control == "continue") {
+			action, ok = "promote", true
+		}
+		if !ok && (control == "ignore" || control == "cancel") {
+			action, ok = "reject", true
+		}
 		if !ok {
 			if rt.shouldBypassAgentProfileProposalReview(msg, text) {
 				_ = trace.write(map[string]any{"type": "agent_profile_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
@@ -1310,8 +1438,10 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			}
 			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.review.pending", nil), "agent_profile_review_pending"), true, nil
 		}
+		taskID := state.Pending.TaskID
 		proposalID := state.Pending.ProposalID
 		state.Pending = nil
+		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "agent_profile_proposal_review", "command": firstNonEmpty(control, action)})
 		store := agentprofile.NewStore(rt.Config)
 		if action == "promote" {
 			proposal, backupDir, err := store.Promote(proposalID)
@@ -1340,7 +1470,17 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		}
 		return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.reject.done", nil), "completed"), true, nil
 	case "schedule_review":
+		control, hasControl := rt.pendingControl(msg, text)
+		if hasControl {
+			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
+		}
 		action, ok := rt.parseScheduleReviewAction(msg, text)
+		if !ok && (control == "run" || control == "approve" || control == "continue") {
+			action, ok = "test", true
+		}
+		if !ok && control == "cancel" {
+			action, ok = "cancel", true
+		}
 		if !ok {
 			if shouldBypassScheduleReview(text) {
 				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
@@ -1355,6 +1495,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		scheduleID := state.Pending.ScheduleID
 		taskID := state.Pending.TaskID
 		state.Pending = nil
+		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "schedule_review", "command": firstNonEmpty(control, action)})
 		if action == "cancel" {
 			store := schedule.Store{Home: rt.home()}
 			if _, err := store.Pause(scheduleID); err != nil {
@@ -1377,7 +1518,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.test.error", textValues("error", err.Error())), "error"), true, nil
 		}
 		state.ActivateTask(taskID)
-		state.CompleteActiveTaskWithSummary("定时任务试运行成功："+task.ID, trace.id, trace.path)
+		state.CompleteActiveTaskWithSummary(runtimeText(rt.Config, msg, "schedule.test.summary", textValues("task_id", task.ID)), trace.id, trace.path)
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
@@ -1390,7 +1531,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
-			return rt.reply(msg, "已取消接回归档任务。", "cancelled"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.archive_recall.cancelled", nil), "cancelled"), true, nil
 		}
 		if !rt.isConfirm(msg, text) {
 			return rt.reply(msg, pending.Question, "archive_recall_pending"), true, nil
@@ -1401,7 +1542,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if saveErr := rt.saveState(state, trace); saveErr != nil {
 				return Response{}, true, saveErr
 			}
-			return rt.reply(msg, "读取归档任务失败："+err.Error(), "error"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.archive_recall.load_error", textValues("error", err.Error())), "error"), true, nil
 		}
 		oldTask := taskByID(archived, pending.TaskID)
 		if oldTask == nil {
@@ -1409,7 +1550,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
-			return rt.reply(msg, "归档里没有找到这个任务，请重新说明要接哪个任务。", "error"), true, nil
+			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.archive_recall.missing", nil), "error"), true, nil
 		}
 		state.Pending = nil
 		userText := archivedTaskRecallText(*oldTask, pending.ArchiveID, text)
@@ -1426,34 +1567,77 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
 		return resp, true, err
 	case "user_input":
-		if shouldBypassUserInputPending(state.Pending, text) {
-			taskID := state.Pending.TaskID
+		pending := *state.Pending
+		if control, ok := rt.pendingControl(msg, text); ok {
+			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": pending.TaskID, "pending_kind": pending.Kind, "text": text, "command": control})
+			taskID := pending.TaskID
+			switch control {
+			case "cancel":
+				state.Pending = nil
+				blockTask(state, taskID, "cancelled")
+				if err := rt.saveState(state, trace); err != nil {
+					return Response{}, true, err
+				}
+				_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "user_input", "command": control})
+				return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.cancelled", nil), "cancelled"), true, nil
+			case "approve", "continue", "run":
+				state.Pending = nil
+				state.Messages = append(state.Messages, agentcore.Message{Role: agentcore.RoleUser, Content: text})
+				if task := state.ActivateTask(taskID); task != nil {
+					userText := mergeTaskAndInstruction(task.Goal, text)
+					if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
+						applyCompletionContract(task, task.Goal)
+					}
+					_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "user_input", "command": control})
+					resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
+					return resp, true, err
+				}
+			}
+		}
+		_ = trace.write(map[string]any{"type": "pending_control_fallback_to_llm", "task_id": pending.TaskID, "pending_kind": pending.Kind, "text": text})
+		intentModel := rt.Pool.RoleModelForMessage(msg, "router", nil)
+		if intentModel == nil {
+			agent := rt.Pool.AgentForMessage(msg)
+			var fallback agentcore.Model
+			if agent != nil {
+				fallback = agent.Model
+			}
+			intentModel = rt.Pool.RoleModelForMessage(msg, "followup", fallback)
+		}
+		catalogDir := ""
+		if rt.Config != nil {
+			catalogDir = rt.Config.App.MessageCatalogDir
+		}
+		intent := rt.Hooks.pendingIntent(ctx, PendingIntentInput{State: *state, Pending: pending, Text: text, Model: intentModel, Locale: runtimeLocale(rt.Config, msg), CatalogDir: catalogDir}, trace)
+		switch intent.Kind {
+		case "new_task":
+			taskID := pending.TaskID
 			state.Pending = nil
 			blockTask(state, taskID, "interrupted")
 			if state.ActiveTask == taskID {
 				state.ActiveTask = ""
 			}
-			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": "standalone task request"})
+			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": intent.Reason})
 			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
 			}
 			return Response{}, false, nil
 		}
-		taskID := state.Pending.TaskID
+		taskID := pending.TaskID
 		state.Pending = nil
 		state.Messages = append(state.Messages,
 			agentcore.Message{Role: agentcore.RoleUser, Content: text},
 		)
-		if task := state.ActivateTask(taskID); task != nil && isActionAckFollowup(text) {
+		if task := state.ActivateTask(taskID); task != nil && intent.Kind == "action_ack" {
 			userText := mergeTaskAndInstruction(task.Goal, text)
-			_ = trace.write(map[string]any{"type": "pending_user_input_bound", "task_id": taskID, "text": text, "reason": "action_ack"})
+			_ = trace.write(map[string]any{"type": "pending_user_input_bound", "task_id": taskID, "text": text, "reason": intent.Reason})
 			if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
 				applyCompletionContract(task, task.Goal)
 			}
 			resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
 			return resp, true, err
 		}
-		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text})
+		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text, "reason": intent.Reason})
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
@@ -1648,14 +1832,8 @@ func shouldBypassUserInputPending(pending *session.PendingAction, text string) b
 }
 
 func looksLikeStandaloneTaskRequest(text string) bool {
-	taskVerbs := []string{
-		"请读取", "请总结", "请查看", "请检查", "请搜索", "请创建", "请生成", "请列出",
-		"帮我读取", "帮我总结", "帮我查看", "帮我检查", "帮我搜索", "帮我创建", "帮我生成",
-		"读取", "总结", "查看", "检查", "搜索", "创建", "生成", "列出",
-		"read", "summarize", "check", "search", "create", "generate", "list",
-	}
 	hasVerb := false
-	for _, verb := range taskVerbs {
+	for _, verb := range runtimeCueList(nil, "router.standalone_task.verbs") {
 		if strings.Contains(text, verb) {
 			hasVerb = true
 			break
@@ -1664,7 +1842,7 @@ func looksLikeStandaloneTaskRequest(text string) bool {
 	if !hasVerb {
 		return false
 	}
-	for _, marker := range []string{"readme", ".md", ".txt", ".json", ".yaml", ".yml", "/", "~", "项目", "文件", "目录", "邮件", "网页", "网站"} {
+	for _, marker := range runtimeCueList(nil, "router.standalone_task.markers") {
 		if strings.Contains(text, marker) {
 			return true
 		}
@@ -1715,6 +1893,21 @@ func (rt Runtime) isCancel(msg channel.InboundMessage, text string) bool {
 	return ok
 }
 
+func (rt Runtime) pendingControl(msg channel.InboundMessage, text string) (string, bool) {
+	action, ok := runtimeAlias(rt.Config, msg, text, "approve", "confirm", "continue", "run", "ignore", "cancel")
+	if !ok {
+		return "", false
+	}
+	switch action {
+	case "confirm":
+		return "approve", true
+	case "approve", "continue", "run", "ignore", "cancel":
+		return action, true
+	default:
+		return "", false
+	}
+}
+
 func isConfirm(text string) bool {
 	_, ok := i18n.New(i18n.Config{}).MatchAlias("", text, "confirm")
 	return ok
@@ -1736,7 +1929,7 @@ func summarize(text string) string {
 func finalTextWarning(text string) string {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	switch {
-	case strings.Contains(lower, "malformed") || strings.Contains(text, "工具调用格式无效"):
+	case containsAny(lower, runtimeCueList(nil, "router.warning.malformed_cues")):
 		return "tool_call_format_issue"
 	case looksLikeNonSubstantiveActionAck(text):
 		return "non_substantive_action_ack"
@@ -1756,25 +1949,13 @@ func looksLikeUnexecutedNextStep(text string) bool {
 	if strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "：") {
 		return true
 	}
-	pendingActionPhrases := []string{
-		"给脚本添加可执行权限", "添加可执行权限", "chmod",
-		"开始测试", "进行测试", "测试发送", "测试脚本",
-	}
-	for _, phrase := range pendingActionPhrases {
+	for _, phrase := range runtimeCueList(nil, "router.unexecuted.pending_phrases") {
 		if strings.Contains(lower, phrase) || strings.Contains(trimmed, phrase) {
 			return true
 		}
 	}
-	actionCues := []string{
-		"now ", "next ", "i will ", "let me ", "going to ",
-		"现在", "接下来", "下一步", "然后", "准备", "开始",
-	}
-	workCues := []string{
-		"chmod", "test", "verify", "run", "execute", "send", "write", "create",
-		"测试", "验证", "执行", "运行", "发送", "写入", "创建", "添加", "注册", "重启",
-	}
 	hasAction := false
-	for _, cue := range actionCues {
+	for _, cue := range runtimeCueList(nil, "router.unexecuted.action_cues") {
 		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
 			hasAction = true
 			break
@@ -1783,7 +1964,7 @@ func looksLikeUnexecutedNextStep(text string) bool {
 	if !hasAction {
 		return false
 	}
-	for _, cue := range workCues {
+	for _, cue := range runtimeCueList(nil, "router.unexecuted.work_cues") {
 		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
 			return true
 		}
@@ -1798,6 +1979,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func containsAny(text string, markers []string) bool {
+	for _, marker := range markers {
+		if marker != "" && strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 type HeuristicModel struct{}
@@ -1837,7 +2027,7 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.create", Args: map[string]any{"run_at": parts[0], "text": parts[1], "session_key": "cli:scheduled"}}}}, nil
 		}
 	}
-	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "收到：" + text}, nil
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: i18n.New(i18n.Config{}).T(i18n.LocaleZH, "runtime.heuristic.echo", textValues("text", text))}, nil
 }
 
 func lastConversationMessage(messages []agentcore.Message) agentcore.Message {
@@ -1854,35 +2044,32 @@ func looksLikeInputRequest(text string) bool {
 	if trimmed == "" {
 		return false
 	}
-	if strings.Contains(trimmed, "需要你") || strings.Contains(trimmed, "请提供") || strings.Contains(trimmed, "请补充") {
+	if containsAny(trimmed, runtimeCueList(nil, "router.input_request.contains")) {
 		return true
 	}
-	if strings.HasSuffix(trimmed, "？") && (strings.Contains(trimmed, "哪个") || strings.Contains(trimmed, "什么") || strings.Contains(trimmed, "是否")) {
-		return true
+	if strings.HasSuffix(trimmed, "？") {
+		for _, cue := range runtimeCueList(nil, "router.input_request.question") {
+			if strings.Contains(trimmed, cue) {
+				return true
+			}
+		}
 	}
 	lower := strings.ToLower(trimmed)
-	return strings.Contains(lower, "please provide") ||
-		strings.Contains(lower, "please clarify") ||
-		strings.Contains(lower, "need you to provide") ||
-		strings.Contains(lower, "missing input") ||
-		strings.Contains(lower, "which ") ||
-		strings.Contains(lower, "what ")
+	return containsAny(lower, runtimeCueList(nil, "router.input_request.contains")) ||
+		containsAny(lower, runtimeCueList(nil, "router.input_request.question"))
 }
 
-func friendlyRuntimeError(err error) string {
+func friendlyRuntimeError(cfg *config.Root, msg channel.InboundMessage, err error) string {
 	raw := strings.TrimSpace(fmt.Sprint(err))
 	lower := strings.ToLower(raw)
 	switch {
 	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout"):
-		return "模型服务这次响应超时了，任务已经停在安全位置。你可以直接回复“重试”或把问题再发一遍，我会接着当前上下文继续。"
+		return runtimeText(cfg, msg, "runtime.error.timeout", nil)
 	case strings.Contains(lower, "model api key is empty"):
-		return "当前模型配置缺少 API Key，任务没有继续执行。请检查模型配置后重试。"
+		return runtimeText(cfg, msg, "runtime.error.missing_api_key", nil)
 	case strings.Contains(lower, "all models failed"):
-		return "当前可用模型都调用失败了，任务已经停在安全位置。你可以稍后回复“重试”，或切换/检查 fallback 模型配置。"
+		return runtimeText(cfg, msg, "runtime.error.all_models_failed", nil)
 	default:
-		if raw == "" {
-			return "任务执行失败了，已经停在安全位置。你可以补充信息后重试。"
-		}
-		return "任务执行失败了，已经停在安全位置。你可以补充信息后重试。"
+		return runtimeText(cfg, msg, "runtime.error.generic", nil)
 	}
 }

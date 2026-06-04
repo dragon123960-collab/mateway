@@ -28,6 +28,7 @@ type TaskNode struct {
 	Status             string             `json:"status"`
 	CompletionContract CompletionContract `json:"completion_contract,omitempty"`
 	Steps              []TaskStep         `json:"steps,omitempty"`
+	Approvals          []TaskApproval     `json:"approvals,omitempty"`
 	TraceID            string             `json:"trace_id,omitempty"`
 	TracePath          string             `json:"trace_path,omitempty"`
 	CreatedAt          time.Time          `json:"created_at"`
@@ -56,15 +57,23 @@ type TaskStep struct {
 	Mutation           bool           `json:"mutation,omitempty"`
 }
 
+type TaskApproval struct {
+	Key       string    `json:"key"`
+	Tool      string    `json:"tool"`
+	Class     string    `json:"class,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type PendingAction struct {
-	Kind       string             `json:"kind"`
-	TaskID     string             `json:"task_id"`
-	ProposalID string             `json:"proposal_id,omitempty"`
-	ScheduleID string             `json:"schedule_id,omitempty"`
-	ArchiveID  string             `json:"archive_id,omitempty"`
-	Question   string             `json:"question,omitempty"`
-	ToolCall   agentcore.ToolCall `json:"tool_call,omitempty"`
-	ResumeText string             `json:"resume_text,omitempty"`
+	Kind              string             `json:"kind"`
+	TaskID            string             `json:"task_id"`
+	ProposalID        string             `json:"proposal_id,omitempty"`
+	ScheduleID        string             `json:"schedule_id,omitempty"`
+	ArchiveID         string             `json:"archive_id,omitempty"`
+	Question          string             `json:"question,omitempty"`
+	ToolCall          agentcore.ToolCall `json:"tool_call,omitempty"`
+	ResumeText        string             `json:"resume_text,omitempty"`
+	AuthorizationOnly bool               `json:"authorization_only,omitempty"`
 }
 
 type Usage struct {
@@ -256,6 +265,48 @@ func (s *State) AddStep(taskID string, step TaskStep) {
 			s.Tasks[i].UpdatedAt = now
 			return
 		}
+	}
+}
+
+func (s *State) HasTaskApproval(taskID, key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	for i := range s.Tasks {
+		if s.Tasks[i].ID != taskID || !IsOpenTaskStatus(s.Tasks[i].Status) {
+			continue
+		}
+		for _, approval := range s.Tasks[i].Approvals {
+			if approval.Key == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *State) AddTaskApproval(taskID string, approval TaskApproval) {
+	approval.Key = strings.TrimSpace(approval.Key)
+	if approval.Key == "" {
+		return
+	}
+	now := time.Now()
+	if approval.CreatedAt.IsZero() {
+		approval.CreatedAt = now
+	}
+	for i := range s.Tasks {
+		if s.Tasks[i].ID != taskID {
+			continue
+		}
+		for _, existing := range s.Tasks[i].Approvals {
+			if existing.Key == approval.Key {
+				return
+			}
+		}
+		s.Tasks[i].Approvals = append(s.Tasks[i].Approvals, approval)
+		s.Tasks[i].UpdatedAt = now
+		return
 	}
 }
 
