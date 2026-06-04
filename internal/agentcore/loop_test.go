@@ -191,6 +191,29 @@ func TestRunContinuesUntilHookStops(t *testing.T) {
 	}
 }
 
+func TestRunStopsAtMaxIterations(t *testing.T) {
+	model := repeatToolModel{}
+	registry := NewToolRegistry()
+	registry.Register(testEchoTool{})
+	result, err := Run(context.Background(), Config{
+		Model:         model,
+		Tools:         registry,
+		MaxIterations: 3,
+	}, []Message{{Role: RoleUser, Content: "loop"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Iterations != 3 {
+		t.Fatalf("Iterations = %d", result.Iterations)
+	}
+	if result.StopReason != "max_iterations_exceeded" {
+		t.Fatalf("StopReason = %q", result.StopReason)
+	}
+	if len(toolMessages(result.Messages)) != 3 {
+		t.Fatalf("tool executions = %d", len(toolMessages(result.Messages)))
+	}
+}
+
 func TestRunRepairsMalformedToolCall(t *testing.T) {
 	model := scriptedModel{messages: []Message{
 		{Role: RoleAssistant, Content: "checking\n[TOOL_CALL]\n{\"id\":\"call_1\""},

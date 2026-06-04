@@ -50,6 +50,7 @@ type AfterToolCallContext struct {
 type AfterToolCallResult struct {
 	ToolResult *ToolResult
 	Terminate  bool
+	StopReason string
 }
 
 type TurnContext struct {

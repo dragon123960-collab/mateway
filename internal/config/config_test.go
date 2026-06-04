@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -78,10 +79,31 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	if root.Execution.MaxParallelTools != 4 {
 		t.Fatalf("default max parallel tools = %d", root.Execution.MaxParallelTools)
 	}
+	if root.Execution.MaxIterationsValue() != 50 {
+		t.Fatalf("default max iterations = %d", root.Execution.MaxIterationsValue())
+	}
+	if root.Execution.InactivityTimeout != "5m" {
+		t.Fatalf("default inactivity timeout = %q", root.Execution.InactivityTimeout)
+	}
+	if root.Execution.InactivityTimeoutDuration() != 5*time.Minute {
+		t.Fatalf("default inactivity timeout duration = %s", root.Execution.InactivityTimeoutDuration())
+	}
+	if root.Execution.MaxNoProgressTurns != 2 {
+		t.Fatalf("default no-progress turns = %d", root.Execution.MaxNoProgressTurns)
+	}
+	if root.Execution.MaxRepeatedToolFailures != 3 {
+		t.Fatalf("default repeated tool failures = %d", root.Execution.MaxRepeatedToolFailures)
+	}
+	zero := 0
 	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
 	root.NormalizeForUse()
 	if root.Execution.MaxParallelTools != 1 {
 		t.Fatalf("configured max parallel tools = %d", root.Execution.MaxParallelTools)
+	}
+	root = Root{Execution: ExecutionConfig{MaxIterations: &zero}}
+	root.NormalizeForUse()
+	if root.Execution.MaxIterationsValue() != 0 {
+		t.Fatalf("configured disabled max iterations = %d", root.Execution.MaxIterationsValue())
 	}
 }
 

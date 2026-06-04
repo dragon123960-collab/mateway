@@ -2,8 +2,12 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
@@ -94,6 +98,7 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text, Model: followupModel}, trace)
 	if decision.Kind == followupClarify {
 		task := state.StartTask(msg.Text)
+		applyCompletionContract(task, msg.Text)
 		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
 		state.BlockActiveTask("await_user_input")
 		if err := rt.saveState(&state, trace); err != nil {
@@ -110,6 +115,9 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		task := state.ActivateTask(decision.TaskID)
 		if task == nil {
 			task = state.StartTask(msg.Text)
+			applyCompletionContract(task, msg.Text)
+		} else if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
+			applyCompletionContract(task, task.Goal)
 		}
 		if strings.TrimSpace(decision.ResolvedUserText) != "" {
 			userText = decision.ResolvedUserText
@@ -117,6 +125,7 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		return rt.runTask(ctx, msg, &state, task, userText, trace)
 	}
 	task := state.StartTask(msg.Text)
+	applyCompletionContract(task, msg.Text)
 	return rt.runTask(ctx, msg, &state, task, userText, trace)
 }
 
@@ -162,7 +171,10 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.SystemPrompt = prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
 	agent.Messages = messages
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
+	agent.MaxIterations = maxIterations(rt.Config)
 	reviewModel := rt.Pool.RoleModelForMessage(msg, "review", agent.Model)
+	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
+	defer stopActivityWatch()
 	agent.Hooks = rt.hooksForState(state, task.ID, userText, reviewModel, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
@@ -170,11 +182,20 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		UserText: userText,
 		Profile:  profile,
 	}, trace))
-	result, err := agent.Continue(ctx)
+	result, err := agent.Continue(runCtx)
 	if err != nil {
 		state.BlockActiveTask("failed")
 		if saveErr := rt.saveState(state, trace); saveErr != nil {
 			return Response{}, saveErr
+		}
+		if activityTimedOut() {
+			text := "任务长时间没有新的模型、工具或 hook 活动，已停止执行，避免挂死。Trace 中已记录 task_inactivity_timeout。"
+			resp := rt.reply(msg, renderPartialReply(text), "partial")
+			resp.TraceID = trace.id
+			resp.TracePath = trace.path
+			resp.Failed = true
+			_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+			return resp, nil
 		}
 		text := friendlyRuntimeError(err)
 		resp := Response{
@@ -217,13 +238,21 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	taskCompleted := false
 	blockedByFinalWarning := false
 	if state.Pending == nil {
-		if looksLikeInputRequest(finalText) {
+		if result.StopReason != "" {
+			blockedByFinalWarning = true
+			state.BlockActiveTask("failed")
+			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
+		} else if looksLikeInputRequest(finalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: finalText}
 			state.BlockActiveTask("await_user_input")
 		} else if warning := finalTextWarning(finalText); warning != "" {
 			blockedByFinalWarning = true
 			state.BlockActiveTask("failed")
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": finalText})
+		} else if warning := completionContractWarning(activeTaskSnapshot(state, task.ID), finalText); warning != "" {
+			blockedByFinalWarning = true
+			state.BlockActiveTask("failed")
+			_ = trace.write(map[string]any{"type": "completion_contract_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "contract": activeTaskSnapshot(state, task.ID).CompletionContract, "text": finalText})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
 			taskCompleted = true
@@ -634,6 +663,89 @@ func maxParallelTools(cfg *config.Root) int {
 	return cfg.Execution.MaxParallelTools
 }
 
+func maxIterations(cfg *config.Root) int {
+	if cfg == nil {
+		return 50
+	}
+	return cfg.Execution.MaxIterationsValue()
+}
+
+func maxNoProgressTurns(cfg *config.Root) int {
+	if cfg == nil || cfg.Execution.MaxNoProgressTurns <= 0 {
+		return 2
+	}
+	return cfg.Execution.MaxNoProgressTurns
+}
+
+func maxRepeatedToolFailures(cfg *config.Root) int {
+	if cfg == nil || cfg.Execution.MaxRepeatedToolFailures <= 0 {
+		return 3
+	}
+	return cfg.Execution.MaxRepeatedToolFailures
+}
+
+func inactivityTimeout(cfg *config.Root) time.Duration {
+	if cfg == nil {
+		return 5 * time.Minute
+	}
+	timeout := cfg.Execution.InactivityTimeoutDuration()
+	if timeout <= 0 {
+		return 0
+	}
+	return timeout
+}
+
+func (rt Runtime) withActivityWatchdog(ctx context.Context, trace *traceRecorder, taskID string) (context.Context, func(), func() bool) {
+	timeout := inactivityTimeout(rt.Config)
+	if timeout <= 0 {
+		return ctx, func() {}, func() bool { return false }
+	}
+	watchCtx, cancel := context.WithCancel(ctx)
+	activity := make(chan struct{}, 1)
+	done := make(chan struct{})
+	var timedOut atomic.Bool
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+			case <-timer.C:
+				timedOut.Store(true)
+				_ = trace.write(map[string]any{"type": "task_inactivity_timeout", "task_id": taskID, "timeout": timeout.String()})
+				cancel()
+				return
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	if trace != nil {
+		trace.onWrite = func() {
+			select {
+			case activity <- struct{}{}:
+			default:
+			}
+		}
+	}
+	return watchCtx, func() {
+		if trace != nil {
+			trace.onWrite = nil
+		}
+		close(done)
+		cancel()
+	}, timedOut.Load
+}
+
 func proposalID(proposal *memory.Proposal) string {
 	if proposal == nil {
 		return ""
@@ -795,10 +907,137 @@ func activeTaskSnapshot(state *session.State, taskID string) session.TaskNode {
 	return session.TaskNode{}
 }
 
+func applyCompletionContract(task *session.TaskNode, text string) {
+	if task == nil {
+		return
+	}
+	if looksLikeActionTask(text) {
+		task.CompletionContract = session.CompletionContract{
+			TaskType:          "action",
+			RequiresMutation:  true,
+			AllowsBlocker:     true,
+			RequiresLLMReview: true,
+			SuccessCondition:  "At least one accepted mutation tool step exists, or the task records a concrete blocker that prevents execution.",
+		}
+		return
+	}
+	task.CompletionContract = session.CompletionContract{
+		TaskType:          "informational",
+		RequiresLLMReview: true,
+		SuccessCondition:  "Final answer is grounded in accepted evidence or clearly states what remains unverified.",
+	}
+}
+
+func looksLikeActionTask(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	if strings.HasPrefix(lower, "/read") || strings.HasPrefix(lower, "/search") {
+		return false
+	}
+	infoCues := []string{"读取", "总结", "查看", "检查", "搜索", "记住", "remember", "read", "summarize", "check", "search"}
+	for _, cue := range infoCues {
+		if strings.Contains(lower, cue) {
+			return false
+		}
+	}
+	actionCues := []string{
+		"创建", "写", "改", "修改", "更新", "删除", "移除", "发送", "发布", "部署",
+		"执行", "运行", "重启", "关闭", "打开", "安装", "配置", "提交", "push", "commit",
+		"create", "write", "modify", "update", "delete", "remove", "send", "publish",
+		"deploy", "run", "execute", "restart", "close", "open", "install", "configure", "submit",
+	}
+	for _, cue := range actionCues {
+		if strings.Contains(lower, cue) {
+			return true
+		}
+	}
+	if strings.Contains(lower, "生成") || strings.Contains(lower, "generate") {
+		for _, artifact := range []string{"文件", "报告", "文档", "markdown", ".md", ".html", ".json", ".yaml", "file", "report", "document"} {
+			if strings.Contains(lower, artifact) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isActionAckFollowup(text string) bool {
+	normalized := normalizeFollowupText(text)
+	if normalized == "" {
+		return false
+	}
+	return looksLikeNonSubstantiveActionAck(text) ||
+		normalized == "确认" ||
+		normalized == "confirm" ||
+		normalized == "继续" ||
+		normalized == "continue" ||
+		strings.Contains(normalized, "你来执行") ||
+		strings.Contains(normalized, "执行剩下") ||
+		strings.Contains(normalized, "继续执行")
+}
+
+func completionContractWarning(task session.TaskNode, finalText string) string {
+	contract := task.CompletionContract
+	if !contract.RequiresMutation {
+		return ""
+	}
+	if hasAcceptedMutationStep(task) {
+		return ""
+	}
+	if contract.AllowsBlocker && looksLikeConcreteBlocker(finalText) {
+		return ""
+	}
+	return "missing_accepted_mutation_evidence"
+}
+
+func hasAcceptedMutationStep(task session.TaskNode) bool {
+	for _, step := range task.Steps {
+		if step.Accepted && step.Mutation {
+			return true
+		}
+		if step.Status == "accepted" {
+			risk := strings.TrimSpace(step.Risk)
+			if risk == string(agentcore.RiskGuardedMutation) || risk == string(agentcore.RiskDangerous) {
+				return true
+			}
+			if accepted, _ := step.Evidence["acceptance"].(string); accepted == "accepted" {
+				if mutation, _ := step.Evidence["mutation"].(bool); mutation {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func looksLikeConcreteBlocker(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	blockers := []string{
+		"需要你提供", "需要用户", "缺少", "没有权限", "权限不足", "无法访问", "不能访问", "找不到",
+		"api key", "permission denied", "missing", "not found", "cannot access", "need you to provide",
+		"need user input", "requires confirmation", "blocked",
+	}
+	for _, blocker := range blockers {
+		if strings.Contains(lower, blocker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (rt Runtime) hooksForState(state *session.State, taskID, userText string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
 	var followUps []agentcore.Message
 	noProgressTurns := 0
+	maxNoProgressTurns := maxNoProgressTurns(rt.Config)
+	maxRepeatedToolFailures := maxRepeatedToolFailures(rt.Config)
+	lastFailureSignature := ""
+	repeatedToolFailures := 0
 	return agentcore.Hooks{
 		Emit: trace.emit,
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
@@ -830,7 +1069,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 			})
 			if !review.Completed {
 				noProgressTurns++
-				if noProgressTurns >= 2 {
+				if maxNoProgressTurns > 0 && noProgressTurns >= maxNoProgressTurns {
 					_ = trace.write(map[string]any{
 						"type":          "task_no_progress",
 						"task_id":       taskID,
@@ -885,10 +1124,51 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, m
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
+				switch observe.TaskStep.Status {
+				case "accepted":
+					lastFailureSignature = ""
+					repeatedToolFailures = 0
+				case "failed", "suspect":
+					signature := toolFailureSignature(input.ToolCall)
+					if signature == lastFailureSignature {
+						repeatedToolFailures++
+					} else {
+						lastFailureSignature = signature
+						repeatedToolFailures = 1
+					}
+					if maxRepeatedToolFailures > 0 && repeatedToolFailures >= maxRepeatedToolFailures {
+						_ = trace.write(map[string]any{
+							"type":      "tool_failure_loop",
+							"task_id":   taskID,
+							"tool":      input.ToolCall.Name,
+							"signature": signature,
+							"count":     repeatedToolFailures,
+							"status":    observe.TaskStep.Status,
+						})
+						result := input.ToolResult
+						result.IsError = true
+						result.Content = strings.TrimSpace(result.Content)
+						if result.Content == "" {
+							result.Content = "工具连续返回失败或可疑结果，已停止执行，避免在错误路径上无限循环。"
+						} else {
+							result.Content += "\n\n工具连续返回失败或可疑结果，已停止执行，避免在错误路径上无限循环。"
+						}
+						return agentcore.AfterToolCallResult{ToolResult: &result, Terminate: true, StopReason: "tool_failure_loop"}, nil
+					}
+				}
 			}
 			return agentcore.AfterToolCallResult{}, nil
 		},
 	}
+}
+
+func toolFailureSignature(call agentcore.ToolCall) string {
+	data, err := json.Marshal(call.Args)
+	if err != nil {
+		data = []byte(fmt.Sprint(call.Args))
+	}
+	sum := sha256.Sum256([]byte(call.Name + "\x00" + string(data)))
+	return call.Name + ":" + hex.EncodeToString(sum[:8])
 }
 
 func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
@@ -1132,6 +1412,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			goal = text
 		}
 		task := state.StartTask(goal)
+		applyCompletionContract(task, goal)
 		_ = trace.write(map[string]any{"type": "archive_task_recall_confirmed", "archive_id": pending.ArchiveID, "old_task_id": pending.TaskID, "new_task_id": task.ID})
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
@@ -1157,6 +1438,15 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		state.Messages = append(state.Messages,
 			agentcore.Message{Role: agentcore.RoleUser, Content: text},
 		)
+		if task := state.ActivateTask(taskID); task != nil && isActionAckFollowup(text) {
+			userText := mergeTaskAndInstruction(task.Goal, text)
+			_ = trace.write(map[string]any{"type": "pending_user_input_bound", "task_id": taskID, "text": text, "reason": "action_ack"})
+			if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
+				applyCompletionContract(task, task.Goal)
+			}
+			resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
+			return resp, true, err
+		}
 		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text})
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
@@ -1383,8 +1673,14 @@ func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string,
 	}
 	if tool != nil {
 		contract := agentcore.ContractFor(tool)
+		risk := tool.Risk()
+		evidence["risk"] = string(risk)
+		evidence["mutation"] = risk == agentcore.RiskGuardedMutation || risk == agentcore.RiskDangerous
 		if contract.Acceptance != "" {
 			evidence["acceptance_criteria"] = contract.Acceptance
+		}
+		if contract.Evidence != "" {
+			evidence["evidence_contract"] = contract.Evidence
 		}
 	}
 	if result.IsError {
@@ -1436,6 +1732,8 @@ func finalTextWarning(text string) string {
 	switch {
 	case strings.Contains(lower, "malformed") || strings.Contains(text, "工具调用格式无效"):
 		return "tool_call_format_issue"
+	case looksLikeNonSubstantiveActionAck(text):
+		return "non_substantive_action_ack"
 	case looksLikeUnexecutedNextStep(text):
 		return "unexecuted_next_step"
 	default:

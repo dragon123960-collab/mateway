@@ -132,6 +132,7 @@ type Config struct {
 	Model            Model
 	Tools            *ToolRegistry
 	MaxParallelTools int
+	MaxIterations    int
 	Hooks            Hooks
 }
 
@@ -139,4 +140,5 @@ type Result struct {
 	Messages   []Message
 	FinalText  string
 	Iterations int
+	StopReason string
 }

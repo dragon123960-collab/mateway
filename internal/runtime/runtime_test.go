@@ -1371,6 +1371,39 @@ func TestRuntimeFinalTextWarningUsesPartialStyle(t *testing.T) {
 	}
 }
 
+func TestRuntimeDoesNotCompleteOnBareExecutionAck(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "model was too optimistic"}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "执行。"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "就是刚才你说你要改配置"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" || !contains(resp.Reply.Text, "任务还没有完成") {
+		t.Fatalf("expected partial reply for bare action ack, got style=%q text=%q", resp.Reply.Style, resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed task, got %#v", state.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"kind":"task_completed"`) {
+		t.Fatalf("bare ack must not record task_completed:\n%s", data)
+	}
+	if !strings.Contains(string(data), "non_substantive_action_ack") {
+		t.Fatalf("trace should record bare ack warning:\n%s", data)
+	}
+}
+
 func TestRuntimeCompletionReviewAllowsCompletedAndLearning(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -1395,12 +1428,51 @@ func TestRuntimeCompletionReviewAllowsCompletedAndLearning(t *testing.T) {
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
 		t.Fatalf("expected completed task, got %#v", state.Tasks)
 	}
+	if len(state.Tasks[0].Steps) != 1 || !state.Tasks[0].Steps[0].Accepted || !state.Tasks[0].Steps[0].Mutation {
+		t.Fatalf("expected accepted mutation step, got %#v", state.Tasks[0].Steps)
+	}
+	if state.Tasks[0].Steps[0].AcceptanceCriteria == "" || state.Tasks[0].Steps[0].EvidenceContract == "" {
+		t.Fatalf("expected structured tool contract on step, got %#v", state.Tasks[0].Steps[0])
+	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(data), `"kind":"task_completed"`) || !strings.Contains(string(data), `"type":"self_learning"`) {
 		t.Fatalf("completion should record learning event:\n%s", data)
+	}
+}
+
+func TestRuntimeBlocksActionCompletionWithoutAcceptedMutationEvidence(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "model says done"}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticModel{text: "已创建文件。"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建一个报告文件"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" {
+		t.Fatalf("expected partial reply, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed task, got %#v", state.Tasks)
+	}
+	if !state.Tasks[0].CompletionContract.RequiresMutation {
+		t.Fatalf("expected action completion contract, got %#v", state.Tasks[0].CompletionContract)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"completion_contract_blocked"`) {
+		t.Fatalf("expected completion contract trace:\n%s", data)
 	}
 }
 
@@ -1435,6 +1507,112 @@ func TestRuntimeDoesNotCompleteExecutionTaskWithReadOnlyEvidence(t *testing.T) {
 	}
 	if len(state.Tasks[0].Steps) != 2 || state.Tasks[0].Steps[1].Tool != "file.write" {
 		t.Fatalf("expected read-only probe followed by file.write, got %#v", state.Tasks[0].Steps)
+	}
+}
+
+func TestRuntimeStopsRepeatedToolFailureLoop(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	cfg.NormalizeForUse()
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "missing.tool", Args: map[string]any{"path": "same"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "missing.tool", Args: map[string]any{"path": "same"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_3", Name: "missing.tool", Args: map[string]any{"path": "same"}}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "一直执行这个工具"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" {
+		t.Fatalf("expected partial reply, got %#v", resp.Reply)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed task, got %#v", state.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"tool_failure_loop"`) {
+		t.Fatalf("expected tool_failure_loop trace:\n%s", data)
+	}
+	if strings.Contains(string(data), `"kind":"task_completed"`) {
+		t.Fatalf("tool failure loop must not complete task:\n%s", data)
+	}
+}
+
+func TestRuntimeBindsPendingActionAckToOriginalTask(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("修改配置文件")
+	applyCompletionContract(task, task.Goal)
+	state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: "确认要执行吗？"}
+	state.BlockActiveTask("await_user_input")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "done"}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": "config.md", "content": "ok"}}}},
+		{Role: agentcore.RoleAssistant, Content: "已修改配置文件。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "执行。"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "partial" {
+		t.Fatalf("expected completed reply, got %#v", resp.Reply)
+	}
+	updated, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Tasks) != 1 || updated.Tasks[0].ID != task.ID || updated.Tasks[0].Status != "completed" {
+		t.Fatalf("expected original task completed, got %#v", updated.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"pending_user_input_bound"`) {
+		t.Fatalf("expected pending bind trace:\n%s", data)
+	}
+}
+
+func TestRuntimeInactivityTimeoutStopsAsPartial(t *testing.T) {
+	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	cfg.NormalizeForUse()
+	cfg.Execution.InactivityTimeout = "1ms"
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(blockingRuntimeModel{}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "跑一个会挂住的任务"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" || !resp.Failed {
+		t.Fatalf("expected failed partial reply, got %#v", resp)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected failed task, got %#v", state.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"task_inactivity_timeout"`) {
+		t.Fatalf("expected inactivity timeout trace:\n%s", data)
 	}
 }
 
@@ -1497,6 +1675,9 @@ func TestCompletionHeuristicFlagsColonEndedPlan(t *testing.T) {
 	cases := []string{
 		"找到了：**`Hiragino Sans GB.ttc`**。重写脚本，注册这个 ttc：",
 		"确认了执行环境。先生成 PDF：",
+		"执行。",
+		"收到，开始处理。",
+		"好的，马上执行。",
 	}
 	for _, text := range cases {
 		if !looksLikeIncompleteFinalText(text) {
@@ -2186,6 +2367,8 @@ type scriptedRuntimeModel struct {
 	index    int
 }
 
+type blockingRuntimeModel struct{}
+
 type readRememberModel struct{}
 
 type readRememberThenCaptureModel struct {
@@ -2313,6 +2496,11 @@ func (m *scriptedRuntimeModel) Next(_ context.Context, ctx agentcore.Context) (a
 	msg := m.messages[m.index]
 	m.index++
 	return msg, nil
+}
+
+func (blockingRuntimeModel) Next(ctx context.Context, _ agentcore.Context) (agentcore.Message, error) {
+	<-ctx.Done()
+	return agentcore.Message{}, ctx.Err()
 }
 
 type confirmResumeModel struct {

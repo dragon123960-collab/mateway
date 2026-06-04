@@ -767,11 +767,27 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 	switch input.Kind {
 	case "tool_result":
 		status, evidence := acceptToolResult(input.Tool, input.ToolResult)
+		risk := ""
+		acceptanceCriteria := ""
+		evidenceContract := ""
+		mutation := false
+		if input.Tool != nil {
+			risk = string(input.Tool.Risk())
+			mutation = input.Tool.Risk() == agentcore.RiskGuardedMutation || input.Tool.Risk() == agentcore.RiskDangerous
+			contract := agentcore.ContractFor(input.Tool)
+			acceptanceCriteria = contract.Acceptance
+			evidenceContract = contract.Evidence
+		}
 		return ObserveHookResult{TaskStep: &session.TaskStep{
-			Tool:     input.ToolCall.Name,
-			Status:   status,
-			Summary:  redactedSummary(input.ToolResult.Content),
-			Evidence: evidence,
+			Tool:               input.ToolCall.Name,
+			Status:             status,
+			Summary:            redactedSummary(input.ToolResult.Content),
+			Evidence:           evidence,
+			Risk:               risk,
+			AcceptanceCriteria: acceptanceCriteria,
+			EvidenceContract:   evidenceContract,
+			Accepted:           status == "accepted",
+			Mutation:           mutation,
 		}}, nil
 	case "task_completed":
 		result, err := memory.RecordTaskCompletion(memory.LearningEvent{

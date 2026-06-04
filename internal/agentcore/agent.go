@@ -12,6 +12,7 @@ type Agent struct {
 	Tools            *ToolRegistry
 	Hooks            Hooks
 	MaxParallelTools int
+	MaxIterations    int
 }
 
 func NewAgent(model Model, tools *ToolRegistry) *Agent {
@@ -32,6 +33,7 @@ func (a *Agent) Prompt(ctx context.Context, messages ...Message) (Result, error)
 		Model:            a.Model,
 		Tools:            a.Tools,
 		MaxParallelTools: a.MaxParallelTools,
+		MaxIterations:    a.MaxIterations,
 		Hooks:            a.Hooks,
 	}, a.Messages)
 	if err != nil {
@@ -47,6 +49,7 @@ func (a *Agent) Continue(ctx context.Context) (Result, error) {
 		Model:            a.Model,
 		Tools:            a.Tools,
 		MaxParallelTools: a.MaxParallelTools,
+		MaxIterations:    a.MaxIterations,
 		Hooks:            a.Hooks,
 	}, a.Messages)
 	if err != nil {

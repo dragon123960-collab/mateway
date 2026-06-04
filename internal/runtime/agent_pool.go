@@ -161,6 +161,7 @@ func cloneAgent(agent *agentcore.Agent) *agentcore.Agent {
 		Tools:            agent.Tools,
 		Hooks:            agent.Hooks,
 		MaxParallelTools: agent.MaxParallelTools,
+		MaxIterations:    agent.MaxIterations,
 	}
 }
 

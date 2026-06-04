@@ -38,14 +38,22 @@ type CompletionContract struct {
 	RequiredTools     []string `json:"required_tools,omitempty"`
 	RequiresLLMReview bool     `json:"requires_llm_review,omitempty"`
 	SuccessCondition  string   `json:"success_condition,omitempty"`
+	TaskType          string   `json:"task_type,omitempty"`
+	RequiresMutation  bool     `json:"requires_mutation,omitempty"`
+	AllowsBlocker     bool     `json:"allows_blocker,omitempty"`
 }
 
 type TaskStep struct {
-	ID       string         `json:"id"`
-	Tool     string         `json:"tool"`
-	Status   string         `json:"status"`
-	Summary  string         `json:"summary,omitempty"`
-	Evidence map[string]any `json:"evidence,omitempty"`
+	ID                 string         `json:"id"`
+	Tool               string         `json:"tool"`
+	Status             string         `json:"status"`
+	Summary            string         `json:"summary,omitempty"`
+	Evidence           map[string]any `json:"evidence,omitempty"`
+	Risk               string         `json:"risk,omitempty"`
+	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
+	EvidenceContract   string         `json:"evidence_contract,omitempty"`
+	Accepted           bool           `json:"accepted,omitempty"`
+	Mutation           bool           `json:"mutation,omitempty"`
 }
 
 type PendingAction struct {

@@ -38,7 +38,7 @@ func resolveFollowup(state session.State, text string) followupDecision {
 func fallbackFollowupDecision(state session.State, text, reason string) followupDecision {
 	current := strings.TrimSpace(text)
 	normalized := normalizeFollowupText(current)
-	if isFollowupCue(normalized) || isRetryCue(normalized) || isShortContextDependent(normalized) {
+	if isFollowupCue(normalized) || isRetryCue(normalized) || isShortContextDependent(normalized) || isActionAckFollowup(current) {
 		if task := latestOpenTask(state); task != nil {
 			return continueTask(*task, current, followupDefaultString(reason, "safe fallback continuation"))
 		}
@@ -73,7 +73,7 @@ func resolveRuleFollowup(state session.State, text string) followupDecision {
 		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "explicit new task cue"}
 	}
 	if task := latestOpenTask(state); task != nil {
-		if isFollowupCue(normalized) || isShortContextDependent(normalized) {
+		if isFollowupCue(normalized) || isShortContextDependent(normalized) || isActionAckFollowup(current) {
 			return continueTask(*task, current, "active task followup cue")
 		}
 	}

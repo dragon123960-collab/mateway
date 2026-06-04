@@ -196,6 +196,10 @@ model:
 
 execution:
   max_parallel_tools: 4
+  max_iterations: 50
+  inactivity_timeout: 5m
+  max_no_progress_turns: 2
+  max_repeated_tool_failures: 3
 
 memory:
   enabled: true

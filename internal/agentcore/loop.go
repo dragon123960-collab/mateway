@@ -19,6 +19,15 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 	iteration := 0
 	malformedAttempts := 0
 	for {
+		if cfg.MaxIterations > 0 && iteration >= cfg.MaxIterations {
+			result := Result{
+				Messages:   transcript,
+				FinalText:  "已达到最大执行轮数，任务已停止，避免无限循环。",
+				Iterations: iteration,
+				StopReason: "max_iterations_exceeded",
+			}
+			return finish(ctx, cfg.Hooks, result)
+		}
 		iteration++
 		if err := emit(ctx, cfg.Hooks, Event{Type: EventTurnStart, Iteration: iteration}); err != nil {
 			return Result{}, err
@@ -91,7 +100,7 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 			return Result{}, fmt.Errorf("assistant requested tools but no registry is configured")
 		}
 		malformedAttempts = 0
-		toolResults, terminate, err := executeToolCalls(ctx, cfg, assistant, iteration)
+		toolResults, stopReason, err := executeToolCalls(ctx, cfg, assistant, iteration)
 		if err != nil {
 			return Result{}, err
 		}
@@ -111,8 +120,8 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 		if err := emit(ctx, cfg.Hooks, Event{Type: EventTurnEnd, Message: assistant, Iteration: iteration}); err != nil {
 			return Result{}, err
 		}
-		if terminate || stop {
-			result := Result{Messages: transcript, FinalText: finalTextForStoppedTurn(assistant, toolResults), Iterations: iteration}
+		if stopReason != "" || stop {
+			result := Result{Messages: transcript, FinalText: finalTextForStoppedTurn(assistant, toolResults), Iterations: iteration, StopReason: stopReason}
 			return finish(ctx, cfg.Hooks, result)
 		}
 	}
@@ -162,6 +171,15 @@ func finalTextForStoppedTurn(message Message, toolResults []ToolResult) string {
 	return ""
 }
 
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func toolsForContext(registry *ToolRegistry) []Tool {
 	if registry == nil {
 		return nil
@@ -190,34 +208,34 @@ func prepareAndExecuteTool(ctx context.Context, cfg Config, message Message, cal
 	return cfg.Tools.Execute(ctx, call), false, nil
 }
 
-func executeToolCalls(ctx context.Context, cfg Config, message Message, iteration int) ([]ToolResult, bool, error) {
+func executeToolCalls(ctx context.Context, cfg Config, message Message, iteration int) ([]ToolResult, string, error) {
 	if shouldRunToolCallsInParallel(cfg, message.ToolCalls) {
 		prepared, blocked, err := prepareParallelToolCalls(ctx, cfg, message, iteration)
 		if err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
 		if blocked != nil {
-			return []ToolResult{*blocked}, true, nil
+			return []ToolResult{*blocked}, "tool_execution_blocked", nil
 		}
 		return executePreparedToolCallsParallel(ctx, cfg, message, iteration, prepared)
 	}
 	return executeToolCallsSerial(ctx, cfg, message, iteration)
 }
 
-func executeToolCallsSerial(ctx context.Context, cfg Config, message Message, iteration int) ([]ToolResult, bool, error) {
+func executeToolCallsSerial(ctx context.Context, cfg Config, message Message, iteration int) ([]ToolResult, string, error) {
 	toolResults := make([]ToolResult, 0, len(message.ToolCalls))
-	terminate := false
+	stopReason := ""
 	for _, call := range message.ToolCalls {
-		result, blocked, err := executeOneToolCall(ctx, cfg, message, call, iteration)
+		result, reason, err := executeOneToolCall(ctx, cfg, message, call, iteration)
 		if err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
-		if blocked {
-			terminate = true
+		if reason != "" {
+			stopReason = reason
 		}
 		toolResults = append(toolResults, result)
 	}
-	return toolResults, terminate, nil
+	return toolResults, stopReason, nil
 }
 
 type preparedToolCall struct {
@@ -266,7 +284,7 @@ func prepareParallelToolCalls(ctx context.Context, cfg Config, message Message, 
 	return prepared, nil, nil
 }
 
-func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message Message, iteration int, prepared []preparedToolCall) ([]ToolResult, bool, error) {
+func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message Message, iteration int, prepared []preparedToolCall) ([]ToolResult, string, error) {
 	limit := cfg.MaxParallelTools
 	if limit <= 0 {
 		limit = 4
@@ -277,7 +295,7 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 	sem := make(chan struct{}, limit)
 	for i, item := range prepared {
 		if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionStart, Message: message, ToolCall: item.Call, Iteration: iteration}); err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
 		wg.Add(1)
 		go func(i int, item preparedToolCall) {
@@ -290,49 +308,55 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 		}(i, item)
 	}
 	wg.Wait()
-	terminate := false
+	stopReason := ""
 	for i, item := range prepared {
 		result := results[i]
 		after, err := afterToolCall(ctx, cfg, message, item.Call, result)
 		if err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
 		if after.ToolResult != nil {
 			result = *after.ToolResult
 		}
 		if after.Terminate {
-			terminate = true
+			stopReason = firstNonEmptyString(after.StopReason, "tool_execution_stopped")
 		}
 		results[i] = result
 		if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: item.Call, ToolResult: result, Iteration: iteration, Duration: durations[i]}); err != nil {
-			return nil, false, err
+			return nil, "", err
 		}
 	}
-	return results, terminate, nil
+	return results, stopReason, nil
 }
 
-func executeOneToolCall(ctx context.Context, cfg Config, message Message, call ToolCall, iteration int) (ToolResult, bool, error) {
+func executeOneToolCall(ctx context.Context, cfg Config, message Message, call ToolCall, iteration int) (ToolResult, string, error) {
 	if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionStart, Message: message, ToolCall: call, Iteration: iteration}); err != nil {
-		return ToolResult{}, false, err
+		return ToolResult{}, "", err
 	}
 	toolStart := time.Now()
 	result, blocked, err := prepareAndExecuteTool(ctx, cfg, message, call)
 	toolDuration := time.Since(toolStart)
 	if err != nil {
-		return ToolResult{}, false, err
+		return ToolResult{}, "", err
 	}
 	after, err := afterToolCall(ctx, cfg, message, call, result)
 	if err != nil {
-		return ToolResult{}, false, err
+		return ToolResult{}, "", err
 	}
 	if after.ToolResult != nil {
 		result = *after.ToolResult
 	}
-	terminate := blocked || after.Terminate
-	if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: call, ToolResult: result, Iteration: iteration, Duration: toolDuration}); err != nil {
-		return ToolResult{}, false, err
+	stopReason := ""
+	if blocked {
+		stopReason = "tool_execution_blocked"
 	}
-	return result, terminate, nil
+	if after.Terminate {
+		stopReason = firstNonEmptyString(after.StopReason, "tool_execution_stopped")
+	}
+	if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: call, ToolResult: result, Iteration: iteration, Duration: toolDuration}); err != nil {
+		return ToolResult{}, "", err
+	}
+	return result, stopReason, nil
 }
 
 func shouldRunToolCallsInParallel(cfg Config, calls []ToolCall) bool {

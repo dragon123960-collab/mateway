@@ -25,6 +25,7 @@ func (defaultCompletionReviewHookProvider) CompletionReviewHook(ctx context.Cont
 			Content: "Review this task completion.\n" +
 				"Schema: {\"completed\":boolean,\"reason\":string,\"missing_items\":[string],\"suggested_followup\":string}\n" +
 				"Mark completed=false when the final reply is only a plan, says it will do more work next, lacks requested deliverables/actions, or only reports environment discovery.\n" +
+				"Mark completed=false when the final reply is only an acknowledgement such as OK, executing, received, or starting, without tool evidence that the requested action actually happened.\n" +
 				"Do not trust claims about files, email, publishing, or remote actions unless the tool steps show accepted evidence.\n" +
 				"If incomplete, suggested_followup should be a short instruction for the agent to continue.\n\n" +
 				"User request:\n" + strings.TrimSpace(input.UserText) + "\n\n" +
@@ -194,6 +195,9 @@ func looksLikeIncompleteFinalText(text string) bool {
 	if lower == "" {
 		return true
 	}
+	if looksLikeNonSubstantiveActionAck(trimmed) {
+		return true
+	}
 	if strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "：") {
 		return true
 	}
@@ -206,6 +210,51 @@ func looksLikeIncompleteFinalText(text string) bool {
 	for _, cue := range cues {
 		if strings.Contains(lower, cue) {
 			return true
+		}
+	}
+	return false
+}
+
+func looksLikeNonSubstantiveActionAck(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return true
+	}
+	normalized := strings.Trim(strings.ToLower(trimmed), " \t\r\n.。!！,，;；")
+	exact := map[string]bool{
+		"received":  true,
+		"noted":     true,
+		"executing": true,
+		"running":   true,
+		"starting":  true,
+		"will do":   true,
+		"on it":     true,
+		"收到":        true,
+		"好的":        true,
+		"执行":        true,
+		"运行":        true,
+		"开始执行":      true,
+		"开始处理":      true,
+		"收到，开始处理":   true,
+		"收到,开始处理":   true,
+		"好的，马上执行":   true,
+		"好的,马上执行":   true,
+		"马上执行":      true,
+		"这就执行":      true,
+		"我来执行":      true,
+	}
+	if exact[normalized] {
+		return true
+	}
+	if len([]rune(normalized)) <= 12 {
+		shortAckCues := []string{
+			"execut", "running", "starting",
+			"执行", "运行", "开始处理", "马上",
+		}
+		for _, cue := range shortAckCues {
+			if strings.Contains(normalized, cue) {
+				return true
+			}
 		}
 	}
 	return false

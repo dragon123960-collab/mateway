@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -37,7 +38,11 @@ func DefaultRoot() Root {
 			Fallbacks: []string{},
 		},
 		Execution: ExecutionConfig{
-			MaxParallelTools: 4,
+			MaxParallelTools:        4,
+			MaxIterations:           intPtr(50),
+			InactivityTimeout:       "5m",
+			MaxNoProgressTurns:      2,
+			MaxRepeatedToolFailures: 3,
 		},
 		Memory: MemoryConfig{
 			Enabled:           true,
@@ -298,7 +303,29 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelTools int `yaml:"max_parallel_tools"`
+	MaxParallelTools        int    `yaml:"max_parallel_tools"`
+	MaxIterations           *int   `yaml:"max_iterations"`
+	InactivityTimeout       string `yaml:"inactivity_timeout"`
+	MaxNoProgressTurns      int    `yaml:"max_no_progress_turns"`
+	MaxRepeatedToolFailures int    `yaml:"max_repeated_tool_failures"`
+}
+
+func (c ExecutionConfig) MaxIterationsValue() int {
+	if c.MaxIterations == nil {
+		return 50
+	}
+	if *c.MaxIterations < 0 {
+		return 50
+	}
+	return *c.MaxIterations
+}
+
+func (c ExecutionConfig) InactivityTimeoutDuration() time.Duration {
+	timeout, err := time.ParseDuration(strings.TrimSpace(c.InactivityTimeout))
+	if err != nil || timeout < 0 {
+		return 0
+	}
+	return timeout
 }
 
 type MemoryConfig struct {
@@ -591,6 +618,20 @@ func (r *Root) applyDefaults() {
 	}
 	if r.Execution.MaxParallelTools <= 0 {
 		r.Execution.MaxParallelTools = defaults.Execution.MaxParallelTools
+	}
+	if r.Execution.MaxIterations == nil {
+		r.Execution.MaxIterations = defaults.Execution.MaxIterations
+	} else if *r.Execution.MaxIterations < 0 {
+		r.Execution.MaxIterations = defaults.Execution.MaxIterations
+	}
+	if strings.TrimSpace(r.Execution.InactivityTimeout) == "" {
+		r.Execution.InactivityTimeout = defaults.Execution.InactivityTimeout
+	}
+	if r.Execution.MaxNoProgressTurns <= 0 {
+		r.Execution.MaxNoProgressTurns = defaults.Execution.MaxNoProgressTurns
+	}
+	if r.Execution.MaxRepeatedToolFailures <= 0 {
+		r.Execution.MaxRepeatedToolFailures = defaults.Execution.MaxRepeatedToolFailures
 	}
 	if r.Memory.RecentDays <= 0 {
 		r.Memory.RecentDays = defaults.Memory.RecentDays
@@ -912,6 +953,10 @@ func firstNonEmpty(values ...string) string {
 }
 
 func boolPtr(value bool) *bool {
+	return &value
+}
+
+func intPtr(value int) *int {
 	return &value
 }
 
