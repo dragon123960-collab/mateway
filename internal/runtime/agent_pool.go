@@ -115,13 +115,24 @@ func (p AgentPool) resolveAgentIDForMessage(msg channel.InboundMessage) string {
 	if peerID == "" {
 		peerID = strings.TrimSpace(msg.ThreadID)
 	}
+	bestAgentID := ""
+	bestScore := -1
 	for _, binding := range p.config.Agents.Bindings {
 		if !bindingMatches(binding, channelName, accountID, peerID) {
 			continue
 		}
-		if strings.TrimSpace(binding.AgentID) != "" {
-			return strings.TrimSpace(binding.AgentID)
+		agentID := strings.TrimSpace(binding.AgentID)
+		if agentID == "" {
+			continue
 		}
+		score := bindingSpecificity(binding)
+		if score > bestScore {
+			bestScore = score
+			bestAgentID = agentID
+		}
+	}
+	if bestAgentID != "" {
+		return bestAgentID
 	}
 	return p.config.Agents.Default
 }
@@ -137,6 +148,17 @@ func bindingMatches(binding config.AgentBindingConfig, channelName, accountID, p
 		return false
 	}
 	return true
+}
+
+func bindingSpecificity(binding config.AgentBindingConfig) int {
+	score := 0
+	if strings.TrimSpace(binding.AccountID) != "" {
+		score++
+	}
+	if strings.TrimSpace(binding.PeerID) != "" {
+		score++
+	}
+	return score
 }
 
 func (p AgentPool) profileByID(agentID string) (config.AgentProfileConfig, bool) {

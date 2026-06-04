@@ -2434,6 +2434,28 @@ func TestAgentPoolMatchesAccountBinding(t *testing.T) {
 	}
 }
 
+func TestAgentPoolPrefersSpecificBinding(t *testing.T) {
+	cfg := &config.Root{
+		App:   config.AppConfig{Home: t.TempDir()},
+		Model: config.ModelSelection{Default: "missing"},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{
+				{ID: "main", Model: config.ModelSelection{Default: "missing"}},
+				{ID: "ops", Model: config.ModelSelection{Default: "missing"}},
+			},
+			Bindings: []config.AgentBindingConfig{
+				{Channel: "feishu", AgentID: "main"},
+				{Channel: "feishu", AccountID: "ops-bot", AgentID: "ops"},
+			},
+		},
+	}
+	pool := NewAgentPool(cfg)
+	if profile := pool.ProfileForMessage(channel.InboundMessage{Channel: "feishu", Metadata: map[string]string{"account_id": "ops-bot"}, ThreadID: "chat"}); profile.ID != "ops" {
+		t.Fatalf("expected specific ops binding, got %#v", profile)
+	}
+}
+
 func TestRuntimeUsesPoolAgent(t *testing.T) {
 	cfg := &config.Root{
 		App: config.AppConfig{Home: t.TempDir()},
