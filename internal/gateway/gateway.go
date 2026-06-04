@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
 )
 
@@ -64,6 +68,7 @@ func enabledChannelStarters(ctx context.Context, cfg Config, dedupe *inboundDedu
 			return spec.Start(ctx, rt)
 		})
 	}
+	starters = append(starters, enabledHeartbeatStarters(ctx, cfg.Config)...)
 	return starters
 }
 
@@ -132,6 +137,120 @@ func runStarters(ctx context.Context, starters []func() error) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func enabledHeartbeatStarters(ctx context.Context, cfg *config.Root) []func() error {
+	if cfg == nil {
+		return nil
+	}
+	cfg.NormalizeForUse()
+	seen := map[string]bool{}
+	var starters []func() error
+	for _, profile := range cfg.Agents.Profiles {
+		if !profile.Heartbeat.Enabled {
+			continue
+		}
+		input := heartbeatInputForProfile(cfg, profile)
+		key := strings.Join([]string{
+			input.MemoryRoot,
+			input.Interval.String(),
+			strings.Join(sortedHeartbeatJobs(input.Jobs), ","),
+		}, "|")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		profileID := strings.TrimSpace(profile.ID)
+		starters = append(starters, func() error {
+			log.Printf("mateway heartbeat starting profile=%s interval=%s jobs=%s", profileID, input.Interval, strings.Join(memory.NormalizeHeartbeatJobs(input.Jobs), ","))
+			return memory.ServeHeartbeat(ctx, input)
+		})
+	}
+	return starters
+}
+
+func sortedHeartbeatJobs(jobs []string) []string {
+	normalized := memory.NormalizeHeartbeatJobs(jobs)
+	sort.Strings(normalized)
+	return normalized
+}
+
+func heartbeatInputForProfile(cfg *config.Root, profile config.AgentProfileConfig) memory.HeartbeatServeInput {
+	interval := 30 * time.Minute
+	if parsed, err := time.ParseDuration(strings.TrimSpace(profile.Heartbeat.Interval)); err == nil && parsed > 0 {
+		interval = parsed
+	}
+	workspace := strings.TrimSpace(cfg.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(cfg.App.Home, "workspace")
+	}
+	memoryRoot := strings.TrimSpace(cfg.Memory.Root)
+	if memoryRoot == "" {
+		memoryRoot = filepath.Join(workspace, "memory")
+	}
+	return memory.HeartbeatServeInput{
+		Home:       cfg.App.Home,
+		Workspace:  workspace,
+		MemoryRoot: memoryRoot,
+		IndexPath:  filepath.Join(cfg.App.Home, "indexes", "memory_index.json"),
+		Interval:   interval,
+		Jobs:       profile.Heartbeat.Jobs,
+		Model:      heartbeatDistillModel(cfg, profile),
+		OnResult: func(result memory.HeartbeatResult) {
+			logHeartbeatResult(profile.ID, result)
+		},
+	}
+}
+
+func heartbeatDistillModel(cfg *config.Root, profile config.AgentProfileConfig) memory.DistillModel {
+	if cfg == nil {
+		return nil
+	}
+	var names []string
+	names = append(names, profile.Model.Roles.Models("memory_distill")...)
+	names = append(names, cfg.Model.Roles.Models("memory_distill")...)
+	if strings.TrimSpace(profile.Model.Default) != "" {
+		names = append(names, profile.Model.Default)
+	}
+	names = append(names, profile.Model.Fallbacks...)
+	if strings.TrimSpace(cfg.Model.Default) != "" {
+		names = append(names, cfg.Model.Default)
+	}
+	names = append(names, cfg.Model.Fallbacks...)
+	var configs []config.ModelConfig
+	seen := map[string]bool{}
+	for _, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		for _, candidate := range cfg.Models {
+			if candidate.Enabled && strings.EqualFold(candidate.Name, key) && strings.TrimSpace(candidate.ResolvedAPIKey()) != "" {
+				configs = append(configs, candidate)
+				break
+			}
+		}
+	}
+	if len(configs) == 0 {
+		return nil
+	}
+	return model.NewFallbackAgentModel(configs)
+}
+
+func logHeartbeatResult(profileID string, result memory.HeartbeatResult) {
+	if result.Files > 0 || result.Entries > 0 || len(result.Issues) > 0 {
+		log.Printf("mateway heartbeat profile=%s lint_index files=%d entries=%d issues=%d", profileID, result.Files, result.Entries, len(result.Issues))
+	}
+	if result.Distill.Scanned > 0 || result.Distill.Created > 0 || result.Distill.Skipped > 0 || result.Distill.Duplicates > 0 || len(result.Distill.Errors) > 0 {
+		log.Printf("mateway heartbeat profile=%s memory_distill scanned=%d created=%d skipped=%d duplicates=%d errors=%d", profileID, result.Distill.Scanned, result.Distill.Created, result.Distill.Skipped, result.Distill.Duplicates, len(result.Distill.Errors))
+	}
+	if result.Learning.Scanned > 0 || result.Learning.Created > 0 || result.Learning.Skipped > 0 || result.Learning.Duplicates > 0 || len(result.Learning.Errors) > 0 {
+		log.Printf("mateway heartbeat profile=%s learning_distill scanned=%d created=%d skipped=%d duplicates=%d errors=%d", profileID, result.Learning.Scanned, result.Learning.Created, result.Learning.Skipped, result.Learning.Duplicates, len(result.Learning.Errors))
+	}
+	if result.Skill.Scanned > 0 || result.Skill.Created > 0 || result.Skill.Skipped > 0 || result.Skill.Duplicates > 0 || len(result.Skill.Errors) > 0 {
+		log.Printf("mateway heartbeat profile=%s skill_learning scanned=%d created=%d skipped=%d duplicates=%d errors=%d", profileID, result.Skill.Scanned, result.Skill.Created, result.Skill.Skipped, result.Skill.Duplicates, len(result.Skill.Errors))
 	}
 }
 

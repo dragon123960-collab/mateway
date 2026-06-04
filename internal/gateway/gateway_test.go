@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +136,77 @@ func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
 	}
 	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认"}) {
 		t.Fatal("expected pending session to skip processing ack")
+	}
+}
+
+func TestEnabledHeartbeatStartersUseProfileConfig(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App: config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{{
+				ID: "main",
+				Heartbeat: config.HeartbeatConfig{
+					Enabled:  true,
+					Interval: "7m",
+					Jobs:     []string{"memory_distill", "learning_distill"},
+				},
+			}},
+		},
+	}
+	input := heartbeatInputForProfile(cfg, cfg.Agents.Profiles[0])
+	if input.Home != home {
+		t.Fatalf("home = %q want %q", input.Home, home)
+	}
+	if input.Workspace != filepath.Join(home, "workspace") {
+		t.Fatalf("workspace = %q", input.Workspace)
+	}
+	if input.MemoryRoot != filepath.Join(home, "workspace", "memory") {
+		t.Fatalf("memory root = %q", input.MemoryRoot)
+	}
+	if input.IndexPath != filepath.Join(home, "indexes", "memory_index.json") {
+		t.Fatalf("index path = %q", input.IndexPath)
+	}
+	if input.Interval != 7*time.Minute {
+		t.Fatalf("interval = %v want 7m", input.Interval)
+	}
+	if strings.Join(input.Jobs, ",") != "memory_distill,learning_distill" {
+		t.Fatalf("jobs = %#v", input.Jobs)
+	}
+	if len(enabledHeartbeatStarters(context.Background(), cfg)) != 1 {
+		t.Fatal("expected one heartbeat starter")
+	}
+}
+
+func TestEnabledHeartbeatStartersDeduplicateEquivalentProfiles(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App: config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{
+				{
+					ID: "main",
+					Heartbeat: config.HeartbeatConfig{
+						Enabled:  true,
+						Interval: "30m",
+						Jobs:     []string{"memory_distill", "learning_distill", "skill_learning", "memory_lint"},
+					},
+				},
+				{
+					ID: "local",
+					Heartbeat: config.HeartbeatConfig{
+						Enabled:  true,
+						Interval: "30m",
+						Jobs:     []string{"memory_lint", "memory_distill", "learning_distill", "skill_learning"},
+					},
+				},
+			},
+		},
+	}
+	if len(enabledHeartbeatStarters(context.Background(), cfg)) != 1 {
+		t.Fatal("expected equivalent heartbeat configs to share one starter")
 	}
 }
 
