@@ -577,14 +577,10 @@ func (c FeishuConfig) AccountConfigs() []FeishuConfig {
 		if account.Enabled != nil {
 			cfg.Enabled = *account.Enabled
 		}
-		cfg.AppID = overlayString(cfg.AppID, account.AppID)
-		cfg.AppIDEnv = overlayString(cfg.AppIDEnv, account.AppIDEnv)
-		cfg.AppSecret = overlayString(cfg.AppSecret, account.AppSecret)
-		cfg.AppSecretEnv = overlayString(cfg.AppSecretEnv, account.AppSecretEnv)
-		cfg.VerificationToken = overlayString(cfg.VerificationToken, account.VerificationToken)
-		cfg.VerificationTokenEnv = overlayString(cfg.VerificationTokenEnv, account.VerificationTokenEnv)
-		cfg.EncryptKey = overlayString(cfg.EncryptKey, account.EncryptKey)
-		cfg.EncryptKeyEnv = overlayString(cfg.EncryptKeyEnv, account.EncryptKeyEnv)
+		cfg.AppID, cfg.AppIDEnv = overlaySecretRef(cfg.AppID, cfg.AppIDEnv, account.AppID, account.AppIDEnv)
+		cfg.AppSecret, cfg.AppSecretEnv = overlaySecretRef(cfg.AppSecret, cfg.AppSecretEnv, account.AppSecret, account.AppSecretEnv)
+		cfg.VerificationToken, cfg.VerificationTokenEnv = overlaySecretRef(cfg.VerificationToken, cfg.VerificationTokenEnv, account.VerificationToken, account.VerificationTokenEnv)
+		cfg.EncryptKey, cfg.EncryptKeyEnv = overlaySecretRef(cfg.EncryptKey, cfg.EncryptKeyEnv, account.EncryptKey, account.EncryptKeyEnv)
 		cfg.BaseURL = overlayString(cfg.BaseURL, account.BaseURL)
 		cfg.BotName = overlayString(cfg.BotName, account.BotName)
 		if account.AutoReply != nil {
@@ -1060,6 +1056,16 @@ func overlayString(base, value string) string {
 		return value
 	}
 	return base
+}
+
+func overlaySecretRef(baseValue, baseEnv, value, env string) (string, string) {
+	if strings.TrimSpace(value) != "" {
+		return value, env
+	}
+	if strings.TrimSpace(env) != "" {
+		return "", env
+	}
+	return baseValue, baseEnv
 }
 
 func overlayFeishuWebhook(base, value FeishuWebhookConfig) FeishuWebhookConfig {

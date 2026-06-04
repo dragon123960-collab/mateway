@@ -103,6 +103,7 @@ func feishuChannelSpec(name string, channelCfg config.FeishuConfig) channelSpec 
 		Name:    name,
 		Enabled: channelCfg.Enabled,
 		Start: func(ctx context.Context, rt channelRuntime) error {
+			log.Printf("mateway feishu channel starting account=%s", strings.TrimSpace(channelCfg.DefaultAccount))
 			sender := feishu.NewSender(channelCfg)
 			return feishu.StartWebSocket(ctx, channelCfg, func(eventCtx context.Context, msg channel.InboundMessage) error {
 				if shouldIgnoreInbound(channelCfg, msg) || prepareInbound(&msg, rt.Dedupe) {

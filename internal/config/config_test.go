@@ -78,7 +78,9 @@ func TestFeishuAccountConfigsOverlayBaseConfig(t *testing.T) {
 	cfg := FeishuConfig{
 		Enabled:              true,
 		DefaultAccount:       "main",
+		AppID:                "base-direct-app",
 		AppIDEnv:             "BASE_APP_ID",
+		AppSecret:            "base-direct-secret",
 		AppSecretEnv:         "BASE_SECRET",
 		BaseURL:              "https://open.feishu.cn",
 		BotName:              "mateway",
@@ -94,10 +96,10 @@ func TestFeishuAccountConfigsOverlayBaseConfig(t *testing.T) {
 	if len(accounts) != 2 {
 		t.Fatalf("expected 2 accounts, got %d", len(accounts))
 	}
-	if accounts[0].DefaultAccount != "ops" || accounts[0].AppIDEnv != "OPS_APP_ID" || accounts[0].AppSecretEnv != "BASE_SECRET" || !accounts[0].Enabled {
+	if accounts[0].DefaultAccount != "ops" || accounts[0].AppID != "" || accounts[0].AppIDEnv != "OPS_APP_ID" || accounts[0].AppSecret != "base-direct-secret" || accounts[0].AppSecretEnv != "BASE_SECRET" || !accounts[0].Enabled {
 		t.Fatalf("unexpected ops account: %#v", accounts[0])
 	}
-	if accounts[1].DefaultAccount != "local" || accounts[1].AppIDEnv != "LOCAL_APP_ID" || accounts[1].AppSecretEnv != "LOCAL_SECRET" || accounts[1].Enabled {
+	if accounts[1].DefaultAccount != "local" || accounts[1].AppID != "" || accounts[1].AppIDEnv != "LOCAL_APP_ID" || accounts[1].AppSecret != "" || accounts[1].AppSecretEnv != "LOCAL_SECRET" || accounts[1].Enabled {
 		t.Fatalf("unexpected local account: %#v", accounts[1])
 	}
 }
