@@ -73,6 +73,35 @@ func TestModelConfigMaxTokensDefaults(t *testing.T) {
 	}
 }
 
+func TestFeishuAccountConfigsOverlayBaseConfig(t *testing.T) {
+	disabled := false
+	cfg := FeishuConfig{
+		Enabled:              true,
+		DefaultAccount:       "main",
+		AppIDEnv:             "BASE_APP_ID",
+		AppSecretEnv:         "BASE_SECRET",
+		BaseURL:              "https://open.feishu.cn",
+		BotName:              "mateway",
+		AutoReply:            true,
+		MentionRequiredGroup: true,
+		WebSocket:            FeishuWebSocketConfig{Enabled: true},
+		Accounts: []FeishuAccountConfig{
+			{ID: "ops", AppIDEnv: "OPS_APP_ID"},
+			{ID: "local", Enabled: &disabled, AppIDEnv: "LOCAL_APP_ID", AppSecretEnv: "LOCAL_SECRET"},
+		},
+	}
+	accounts := cfg.AccountConfigs()
+	if len(accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(accounts))
+	}
+	if accounts[0].DefaultAccount != "ops" || accounts[0].AppIDEnv != "OPS_APP_ID" || accounts[0].AppSecretEnv != "BASE_SECRET" || !accounts[0].Enabled {
+		t.Fatalf("unexpected ops account: %#v", accounts[0])
+	}
+	if accounts[1].DefaultAccount != "local" || accounts[1].AppIDEnv != "LOCAL_APP_ID" || accounts[1].AppSecretEnv != "LOCAL_SECRET" || accounts[1].Enabled {
+		t.Fatalf("unexpected local account: %#v", accounts[1])
+	}
+}
+
 func TestExecutionConfigDefaults(t *testing.T) {
 	root := Root{}
 	root.NormalizeForUse()

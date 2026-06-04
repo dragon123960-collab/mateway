@@ -28,13 +28,16 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 	if strings.TrimSpace(cfg.AppID) == "" || strings.TrimSpace(cfg.AppSecret) == "" {
 		return fmt.Errorf("feishu app_id/app_secret are required")
 	}
+	accountID := strings.TrimSpace(cfg.DefaultAccount)
 	d := dispatcher.NewEventDispatcher(cfg.VerificationToken, cfg.EncryptKey).
 		OnP2MessageReceiveV1(func(eventCtx context.Context, event *larkim.P2MessageReceiveV1) error {
 			msg := NormalizeMessageReceive(event)
+			attachAccountID(&msg, accountID)
 			return receiver(eventCtx, msg)
 		}).
 		OnP2CardActionTrigger(func(eventCtx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 			msg := NormalizeCardAction(event)
+			attachAccountID(&msg, accountID)
 			if err := receiver(eventCtx, msg); err != nil {
 				return nil, err
 			}
@@ -59,6 +62,17 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 		})
 	client := ws.NewClient(cfg.AppID, cfg.AppSecret, ws.WithEventHandler(d))
 	return client.Start(ctx)
+}
+
+func attachAccountID(msg *channel.InboundMessage, accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if msg == nil || accountID == "" {
+		return
+	}
+	if msg.Metadata == nil {
+		msg.Metadata = map[string]string{}
+	}
+	msg.Metadata["account_id"] = accountID
 }
 
 func NormalizeMessageReceive(event *larkim.P2MessageReceiveV1) channel.InboundMessage {

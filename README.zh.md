@@ -480,6 +480,27 @@ Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router�
 
 这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。
 
+飞书也可以在同一个 `channels/feishu.yaml` 里启动多个机器人账号。顶层保留共享默认值，在 `feishu.accounts[]` 里写每个机器人的覆盖项，然后用 `--account-id` 绑定 agent：
+
+```yaml
+feishu:
+  enabled: true
+  websocket:
+    enabled: true
+  accounts:
+    - id: ops-bot
+      app_id_env: MATEWAY_FEISHU_OPS_APP_ID
+      app_secret_env: MATEWAY_FEISHU_OPS_APP_SECRET
+    - id: local-bot
+      app_id_env: MATEWAY_FEISHU_LOCAL_APP_ID
+      app_secret_env: MATEWAY_FEISHU_LOCAL_APP_SECRET
+```
+
+```bash
+mateway agent bind --channel feishu --account-id ops-bot ops
+mateway agent bind --channel feishu --account-id local-bot local
+```
+
 边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
 
 Profile 产品化命令：

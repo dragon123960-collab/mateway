@@ -462,6 +462,7 @@ const localMLXSampleYAMLTemplate = `# Copy this file to local-mlx.yaml.
 
 const feishuYAMLTemplate = `feishu:
   enabled: false
+  default_account: default
   app_id: ""
   app_id_env: MATEWAY_FEISHU_APP_ID
   app_secret: ""
@@ -480,6 +481,16 @@ const feishuYAMLTemplate = `feishu:
     path: /feishu/events
   websocket:
     enabled: true
+  accounts: []
+  # Multiple Feishu bots can share channel: feishu. Each enabled account starts a
+  # WebSocket client and sets metadata.account_id for agent bindings.
+  # accounts:
+  #   - id: ops-bot
+  #     app_id_env: MATEWAY_FEISHU_OPS_APP_ID
+  #     app_secret_env: MATEWAY_FEISHU_OPS_APP_SECRET
+  #   - id: local-bot
+  #     app_id_env: MATEWAY_FEISHU_LOCAL_APP_ID
+  #     app_secret_env: MATEWAY_FEISHU_LOCAL_APP_SECRET
 `
 
 const feishuSampleYAMLTemplate = `# Copy this file to channels/feishu.yaml.

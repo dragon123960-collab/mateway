@@ -77,15 +77,30 @@ func builtinChannelSpecs(cfg Config) []channelSpec {
 	if cfg.Config == nil {
 		return nil
 	}
-	return []channelSpec{
-		feishuChannelSpec(cfg.Config.Channels.Feishu),
-		weixinChannelSpec(cfg.Config.Channels.Weixin),
-	}
+	specs := feishuChannelSpecs(cfg.Config.Channels.Feishu)
+	specs = append(specs, weixinChannelSpec(cfg.Config.Channels.Weixin))
+	return specs
 }
 
-func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
+func feishuChannelSpecs(channelCfg config.FeishuConfig) []channelSpec {
+	accounts := channelCfg.AccountConfigs()
+	if len(accounts) == 0 {
+		accounts = []config.FeishuConfig{channelCfg}
+	}
+	specs := make([]channelSpec, 0, len(accounts))
+	for _, accountCfg := range accounts {
+		name := "feishu"
+		if accountID := strings.TrimSpace(accountCfg.DefaultAccount); accountID != "" && accountID != "default" {
+			name = "feishu:" + accountID
+		}
+		specs = append(specs, feishuChannelSpec(name, accountCfg))
+	}
+	return specs
+}
+
+func feishuChannelSpec(name string, channelCfg config.FeishuConfig) channelSpec {
 	return channelSpec{
-		Name:    "feishu",
+		Name:    name,
 		Enabled: channelCfg.Enabled,
 		Start: func(ctx context.Context, rt channelRuntime) error {
 			sender := feishu.NewSender(channelCfg)

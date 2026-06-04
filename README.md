@@ -483,6 +483,27 @@ Each agent profile uses the same core prompt-facing files: `agent.md`, `soul.md`
 
 This means different channels or session namespaces can select different agent identities, prompt files, skill overrides, and memory scopes while still sharing the same small AgentCore runtime.
 
+Feishu can also run multiple bot accounts from one `channels/feishu.yaml`. Keep shared defaults at the top level, add per-bot overrides under `feishu.accounts[]`, then bind agents with `--account-id`:
+
+```yaml
+feishu:
+  enabled: true
+  websocket:
+    enabled: true
+  accounts:
+    - id: ops-bot
+      app_id_env: MATEWAY_FEISHU_OPS_APP_ID
+      app_secret_env: MATEWAY_FEISHU_OPS_APP_SECRET
+    - id: local-bot
+      app_id_env: MATEWAY_FEISHU_LOCAL_APP_ID
+      app_secret_env: MATEWAY_FEISHU_LOCAL_APP_SECRET
+```
+
+```bash
+mateway agent bind --channel feishu --account-id ops-bot ops
+mateway agent bind --channel feishu --account-id local-bot local
+```
+
 The boundary is deliberate: profiles and bindings are in scope; autonomous multi-agent orchestration is not part of the current release.
 
 Profile productization commands:

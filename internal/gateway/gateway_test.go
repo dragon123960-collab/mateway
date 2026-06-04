@@ -240,3 +240,29 @@ func TestBuiltinChannelSpecsExposeEnabledChannels(t *testing.T) {
 		t.Fatalf("enabled specs = %q", got)
 	}
 }
+
+func TestBuiltinChannelSpecsExposeFeishuAccounts(t *testing.T) {
+	cfg := Config{Config: &config.Root{}}
+	cfg.Config.Channels.Feishu = config.FeishuConfig{
+		Enabled:        true,
+		AppIDEnv:       "BASE_APP_ID",
+		AppSecretEnv:   "BASE_SECRET",
+		WebSocket:      config.FeishuWebSocketConfig{Enabled: true},
+		DefaultAccount: "main",
+		Accounts: []config.FeishuAccountConfig{
+			{ID: "ops", AppIDEnv: "OPS_APP_ID"},
+			{ID: "local", AppIDEnv: "LOCAL_APP_ID"},
+		},
+	}
+	specs := builtinChannelSpecs(cfg)
+	var names []string
+	for _, spec := range specs {
+		if spec.Enabled {
+			names = append(names, spec.Name)
+		}
+	}
+	got := strings.Join(names, ",")
+	if got != "feishu:ops,feishu:local" {
+		t.Fatalf("enabled specs = %q", got)
+	}
+}

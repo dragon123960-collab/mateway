@@ -2412,6 +2412,28 @@ func TestAgentPoolMatchesPeerBinding(t *testing.T) {
 	}
 }
 
+func TestAgentPoolMatchesAccountBinding(t *testing.T) {
+	cfg := &config.Root{
+		App:   config.AppConfig{Home: t.TempDir()},
+		Model: config.ModelSelection{Default: "missing"},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{
+				{ID: "main", Model: config.ModelSelection{Default: "missing"}},
+				{ID: "ops", Model: config.ModelSelection{Default: "missing"}},
+			},
+			Bindings: []config.AgentBindingConfig{{Channel: "feishu", AccountID: "ops-bot", AgentID: "ops"}},
+		},
+	}
+	pool := NewAgentPool(cfg)
+	if profile := pool.ProfileForMessage(channel.InboundMessage{Channel: "feishu", Metadata: map[string]string{"account_id": "ops-bot"}, ThreadID: "chat"}); profile.ID != "ops" {
+		t.Fatalf("expected ops profile, got %#v", profile)
+	}
+	if profile := pool.ProfileForMessage(channel.InboundMessage{Channel: "feishu", Metadata: map[string]string{"account_id": "main-bot"}, ThreadID: "chat"}); profile.ID != "main" {
+		t.Fatalf("expected main profile, got %#v", profile)
+	}
+}
+
 func TestRuntimeUsesPoolAgent(t *testing.T) {
 	cfg := &config.Root{
 		App: config.AppConfig{Home: t.TempDir()},

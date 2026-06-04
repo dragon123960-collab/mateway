@@ -476,6 +476,8 @@ type ChannelsConfig struct {
 
 type FeishuConfig struct {
 	Enabled              bool                  `yaml:"enabled"`
+	DefaultAccount       string                `yaml:"default_account"`
+	Accounts             []FeishuAccountConfig `yaml:"accounts"`
 	AppID                string                `yaml:"app_id"`
 	AppIDEnv             string                `yaml:"app_id_env"`
 	AppSecret            string                `yaml:"app_secret"`
@@ -488,6 +490,25 @@ type FeishuConfig struct {
 	BotName              string                `yaml:"bot_name"`
 	AutoReply            bool                  `yaml:"auto_reply"`
 	MentionRequiredGroup bool                  `yaml:"mention_required_in_group"`
+	Webhook              FeishuWebhookConfig   `yaml:"webhook"`
+	WebSocket            FeishuWebSocketConfig `yaml:"websocket"`
+}
+
+type FeishuAccountConfig struct {
+	ID                   string                `yaml:"id"`
+	Enabled              *bool                 `yaml:"enabled"`
+	AppID                string                `yaml:"app_id"`
+	AppIDEnv             string                `yaml:"app_id_env"`
+	AppSecret            string                `yaml:"app_secret"`
+	AppSecretEnv         string                `yaml:"app_secret_env"`
+	VerificationToken    string                `yaml:"verification_token"`
+	VerificationTokenEnv string                `yaml:"verification_token_env"`
+	EncryptKey           string                `yaml:"encrypt_key"`
+	EncryptKeyEnv        string                `yaml:"encrypt_key_env"`
+	BaseURL              string                `yaml:"base_url"`
+	BotName              string                `yaml:"bot_name"`
+	AutoReply            *bool                 `yaml:"auto_reply"`
+	MentionRequiredGroup *bool                 `yaml:"mention_required_in_group"`
 	Webhook              FeishuWebhookConfig   `yaml:"webhook"`
 	WebSocket            FeishuWebSocketConfig `yaml:"websocket"`
 }
@@ -531,6 +552,52 @@ func (c FeishuConfig) ResolveSecrets() FeishuConfig {
 	c.VerificationToken = firstNonEmpty(c.VerificationToken, getenv(c.VerificationTokenEnv))
 	c.EncryptKey = firstNonEmpty(c.EncryptKey, getenv(c.EncryptKeyEnv))
 	return c
+}
+
+func (c FeishuConfig) AccountConfigs() []FeishuConfig {
+	base := c
+	base.Accounts = nil
+	if strings.TrimSpace(base.DefaultAccount) == "" {
+		base.DefaultAccount = "default"
+	}
+	if len(c.Accounts) == 0 {
+		if strings.TrimSpace(base.AppID) == "" && strings.TrimSpace(base.AppIDEnv) == "" &&
+			strings.TrimSpace(base.AppSecret) == "" && strings.TrimSpace(base.AppSecretEnv) == "" {
+			return nil
+		}
+		return []FeishuConfig{base}
+	}
+	out := make([]FeishuConfig, 0, len(c.Accounts))
+	for _, account := range c.Accounts {
+		cfg := base
+		cfg.Accounts = nil
+		if id := strings.TrimSpace(account.ID); id != "" {
+			cfg.DefaultAccount = id
+		}
+		if account.Enabled != nil {
+			cfg.Enabled = *account.Enabled
+		}
+		cfg.AppID = overlayString(cfg.AppID, account.AppID)
+		cfg.AppIDEnv = overlayString(cfg.AppIDEnv, account.AppIDEnv)
+		cfg.AppSecret = overlayString(cfg.AppSecret, account.AppSecret)
+		cfg.AppSecretEnv = overlayString(cfg.AppSecretEnv, account.AppSecretEnv)
+		cfg.VerificationToken = overlayString(cfg.VerificationToken, account.VerificationToken)
+		cfg.VerificationTokenEnv = overlayString(cfg.VerificationTokenEnv, account.VerificationTokenEnv)
+		cfg.EncryptKey = overlayString(cfg.EncryptKey, account.EncryptKey)
+		cfg.EncryptKeyEnv = overlayString(cfg.EncryptKeyEnv, account.EncryptKeyEnv)
+		cfg.BaseURL = overlayString(cfg.BaseURL, account.BaseURL)
+		cfg.BotName = overlayString(cfg.BotName, account.BotName)
+		if account.AutoReply != nil {
+			cfg.AutoReply = *account.AutoReply
+		}
+		if account.MentionRequiredGroup != nil {
+			cfg.MentionRequiredGroup = *account.MentionRequiredGroup
+		}
+		cfg.Webhook = overlayFeishuWebhook(cfg.Webhook, account.Webhook)
+		cfg.WebSocket = overlayFeishuWebSocket(cfg.WebSocket, account.WebSocket)
+		out = append(out, cfg)
+	}
+	return out
 }
 
 func (c SearchProviderConfig) ResolvedAPIKey() string {
@@ -986,6 +1053,33 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func overlayString(base, value string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return base
+}
+
+func overlayFeishuWebhook(base, value FeishuWebhookConfig) FeishuWebhookConfig {
+	if value.Enabled {
+		base.Enabled = true
+	}
+	if strings.TrimSpace(value.Addr) != "" {
+		base.Addr = value.Addr
+	}
+	if strings.TrimSpace(value.Path) != "" {
+		base.Path = value.Path
+	}
+	return base
+}
+
+func overlayFeishuWebSocket(base, value FeishuWebSocketConfig) FeishuWebSocketConfig {
+	if value.Enabled {
+		base.Enabled = true
+	}
+	return base
 }
 
 func boolPtr(value bool) *bool {
