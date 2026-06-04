@@ -59,6 +59,9 @@ func looksSensitiveValue(value string) bool {
 	if lower == "true" || lower == "false" || lower == "none" || lower == "null" || lower == "todo" || lower == "changeme" || lower == "redacted" || strings.Contains(lower, "redacted") {
 		return false
 	}
+	if strings.Contains(value, "(") {
+		return false
+	}
 	if strings.HasPrefix(value, "$") || strings.HasPrefix(value, "{{") || strings.HasPrefix(value, "<") {
 		return false
 	}

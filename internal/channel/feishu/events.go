@@ -8,6 +8,7 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -40,7 +41,7 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 			return &callback.CardActionTriggerResponse{
 				Toast: &callback.Toast{
 					Type:    "info",
-					Content: "已收到，正在处理",
+					Content: i18n.New(i18n.Config{}).T(i18n.LocaleZH, "gateway.processing_ack", nil),
 				},
 			}, nil
 		}).
@@ -71,6 +72,17 @@ func NormalizeMessageReceive(event *larkim.P2MessageReceiveV1) channel.InboundMe
 	msg.Text = extractText(value(message.Content))
 	msg.Metadata["chat_type"] = value(message.ChatType)
 	msg.Metadata["message_type"] = value(message.MessageType)
+	if imageKey := extractImageKey(value(message.Content)); imageKey != "" {
+		msg.Metadata["image_key"] = imageKey
+		msg.Parts = append(msg.Parts, channel.MessagePart{
+			Type: channel.PartImage,
+			Name: imageKey,
+			Metadata: map[string]string{
+				"channel":   "feishu",
+				"image_key": imageKey,
+			},
+		})
+	}
 	if event.Event.Sender != nil {
 		msg.Metadata["sender_type"] = value(event.Event.Sender.SenderType)
 	}
@@ -123,6 +135,17 @@ func extractText(content string) string {
 	return content
 }
 
+func extractImageKey(content string) string {
+	content = strings.TrimSpace(content)
+	var payload struct {
+		ImageKey string `json:"image_key"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err == nil && payload.ImageKey != "" {
+		return strings.TrimSpace(payload.ImageKey)
+	}
+	return ""
+}
+
 func value(ptr *string) string {
 	if ptr == nil {
 		return ""
@@ -139,9 +162,9 @@ func extractCardActionText(action *callback.CallBackAction) string {
 	}
 	switch extractCardActionDecision(action) {
 	case "confirm":
-		return "确认"
+		return i18n.New(i18n.Config{}).T(i18n.LocaleZH, "aliases.confirm.primary", nil)
 	case "cancel":
-		return "取消"
+		return i18n.New(i18n.Config{}).T(i18n.LocaleZH, "aliases.cancel.primary", nil)
 	}
 	return strings.TrimSpace(action.InputValue)
 }

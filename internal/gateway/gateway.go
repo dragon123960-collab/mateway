@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +14,9 @@ import (
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/i18n"
+	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
 )
 
@@ -64,6 +69,7 @@ func enabledChannelStarters(ctx context.Context, cfg Config, dedupe *inboundDedu
 			return spec.Start(ctx, rt)
 		})
 	}
+	starters = append(starters, enabledHeartbeatStarters(ctx, cfg.Config)...)
 	return starters
 }
 
@@ -87,6 +93,13 @@ func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
 				if shouldIgnoreInbound(channelCfg, msg) || prepareInbound(&msg, rt.Dedupe) {
 					return nil
 				}
+				downloaded, err := sender.DownloadMessageImages(eventCtx, msg, rt.Home)
+				if err != nil {
+					log.Printf("mateway gateway feishu media download error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Runtime.Config, msg, "gateway.media_download_failed", map[string]string{"error": err.Error()}), Style: "error"})
+					return nil
+				}
+				msg = downloaded
 				go runFeishuMessage(rt.Runtime, sender, msg)
 				return nil
 			})
@@ -99,12 +112,12 @@ func weixinChannelSpec(channelCfg config.WeixinConfig) channelSpec {
 		Name:    "weixin",
 		Enabled: channelCfg.Enabled,
 		Start: func(ctx context.Context, rt channelRuntime) error {
-			return weixin.Start(ctx, channelCfg, rt.Home, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundMessage, error) {
+			return weixin.Start(ctx, channelCfg, rt.Home, func(eventCtx context.Context, msg channel.InboundMessage) (channel.OutboundBatch, error) {
 				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
-					return channel.OutboundMessage{}, nil
+					return channel.OutboundBatch{}, nil
 				}
 				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
-				return resp.Reply, err
+				return channel.OutboundBatch{Reply: resp.Reply, FollowUps: resp.FollowUps}, err
 			})
 		},
 	}
@@ -128,6 +141,120 @@ func runStarters(ctx context.Context, starters []func() error) error {
 	}
 }
 
+func enabledHeartbeatStarters(ctx context.Context, cfg *config.Root) []func() error {
+	if cfg == nil {
+		return nil
+	}
+	cfg.NormalizeForUse()
+	seen := map[string]bool{}
+	var starters []func() error
+	for _, profile := range cfg.Agents.Profiles {
+		if !profile.Heartbeat.Enabled {
+			continue
+		}
+		input := heartbeatInputForProfile(cfg, profile)
+		key := strings.Join([]string{
+			input.MemoryRoot,
+			input.Interval.String(),
+			strings.Join(sortedHeartbeatJobs(input.Jobs), ","),
+		}, "|")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		profileID := strings.TrimSpace(profile.ID)
+		starters = append(starters, func() error {
+			log.Printf("mateway heartbeat starting profile=%s interval=%s jobs=%s", profileID, input.Interval, strings.Join(memory.NormalizeHeartbeatJobs(input.Jobs), ","))
+			return memory.ServeHeartbeat(ctx, input)
+		})
+	}
+	return starters
+}
+
+func sortedHeartbeatJobs(jobs []string) []string {
+	normalized := memory.NormalizeHeartbeatJobs(jobs)
+	sort.Strings(normalized)
+	return normalized
+}
+
+func heartbeatInputForProfile(cfg *config.Root, profile config.AgentProfileConfig) memory.HeartbeatServeInput {
+	interval := 30 * time.Minute
+	if parsed, err := time.ParseDuration(strings.TrimSpace(profile.Heartbeat.Interval)); err == nil && parsed > 0 {
+		interval = parsed
+	}
+	workspace := strings.TrimSpace(cfg.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(cfg.App.Home, "workspace")
+	}
+	memoryRoot := strings.TrimSpace(cfg.Memory.Root)
+	if memoryRoot == "" {
+		memoryRoot = filepath.Join(workspace, "memory")
+	}
+	return memory.HeartbeatServeInput{
+		Home:       cfg.App.Home,
+		Workspace:  workspace,
+		MemoryRoot: memoryRoot,
+		IndexPath:  filepath.Join(cfg.App.Home, "indexes", "memory_index.json"),
+		Interval:   interval,
+		Jobs:       profile.Heartbeat.Jobs,
+		Model:      heartbeatDistillModel(cfg, profile),
+		OnResult: func(result memory.HeartbeatResult) {
+			logHeartbeatResult(profile.ID, result)
+		},
+	}
+}
+
+func heartbeatDistillModel(cfg *config.Root, profile config.AgentProfileConfig) memory.DistillModel {
+	if cfg == nil {
+		return nil
+	}
+	var names []string
+	names = append(names, profile.Model.Roles.Models("memory_distill")...)
+	names = append(names, cfg.Model.Roles.Models("memory_distill")...)
+	if strings.TrimSpace(profile.Model.Default) != "" {
+		names = append(names, profile.Model.Default)
+	}
+	names = append(names, profile.Model.Fallbacks...)
+	if strings.TrimSpace(cfg.Model.Default) != "" {
+		names = append(names, cfg.Model.Default)
+	}
+	names = append(names, cfg.Model.Fallbacks...)
+	var configs []config.ModelConfig
+	seen := map[string]bool{}
+	for _, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		for _, candidate := range cfg.Models {
+			if candidate.Enabled && strings.EqualFold(candidate.Name, key) && strings.TrimSpace(candidate.ResolvedAPIKey()) != "" {
+				configs = append(configs, candidate)
+				break
+			}
+		}
+	}
+	if len(configs) == 0 {
+		return nil
+	}
+	return model.NewFallbackAgentModel(configs)
+}
+
+func logHeartbeatResult(profileID string, result memory.HeartbeatResult) {
+	if result.Files > 0 || result.Entries > 0 || len(result.Issues) > 0 {
+		log.Printf("mateway heartbeat profile=%s lint_index files=%d entries=%d issues=%d", profileID, result.Files, result.Entries, len(result.Issues))
+	}
+	if result.Distill.Scanned > 0 || result.Distill.Created > 0 || result.Distill.Skipped > 0 || result.Distill.Duplicates > 0 || len(result.Distill.Errors) > 0 {
+		log.Printf("mateway heartbeat profile=%s memory_distill scanned=%d created=%d skipped=%d duplicates=%d errors=%d", profileID, result.Distill.Scanned, result.Distill.Created, result.Distill.Skipped, result.Distill.Duplicates, len(result.Distill.Errors))
+	}
+	if result.Learning.Scanned > 0 || result.Learning.Created > 0 || result.Learning.Skipped > 0 || result.Learning.Duplicates > 0 || len(result.Learning.Errors) > 0 {
+		log.Printf("mateway heartbeat profile=%s learning_distill scanned=%d created=%d skipped=%d duplicates=%d errors=%d", profileID, result.Learning.Scanned, result.Learning.Created, result.Learning.Skipped, result.Learning.Duplicates, len(result.Learning.Errors))
+	}
+	if result.Skill.Scanned > 0 || result.Skill.Created > 0 || result.Skill.Skipped > 0 || result.Skill.Duplicates > 0 || len(result.Skill.Errors) > 0 {
+		log.Printf("mateway heartbeat profile=%s skill_learning scanned=%d created=%d skipped=%d duplicates=%d errors=%d", profileID, result.Skill.Scanned, result.Skill.Created, result.Skill.Skipped, result.Skill.Duplicates, len(result.Skill.Errors))
+	}
+}
+
 func prepareInbound(msg *channel.InboundMessage, dedupe *inboundDedupe) bool {
 	if msg.SessionKey == "" {
 		msg.SessionKey = SessionKey(*msg)
@@ -136,7 +263,7 @@ func prepareInbound(msg *channel.InboundMessage, dedupe *inboundDedupe) bool {
 }
 
 func shouldIgnoreGeneric(msg channel.InboundMessage) bool {
-	return strings.TrimSpace(msg.Text) == ""
+	return !msg.HasContent()
 }
 
 func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.InboundMessage) (runtime.Response, error) {
@@ -163,6 +290,7 @@ func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.Inbo
 		"reply_duration_ms":   int64(0),
 		"total_duration_ms":   time.Since(start).Milliseconds(),
 		"reply_style":         resp.Reply.Style,
+		"follow_up_count":     len(resp.FollowUps),
 		"failed":              resp.Failed,
 	})
 	return resp, nil
@@ -177,11 +305,11 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		react(runCtx, sender, msg.ID, "SMILE")
 	}
 	ackMessageID := ""
-	if !cardAction {
+	if shouldSendProcessingAck(rt, msg) {
 		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
-			Text:     "收到，开始处理。需要执行本地检查或安装时，我会在完成后更新这条回复。",
+			Text:     gatewayText(rt.Config, msg, "gateway.processing_ack", nil),
 			Style:    "processing",
 		}, msg.ID+":processing")
 		if ackErr != nil {
@@ -197,7 +325,7 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		if !cardAction {
 			react(runCtx, sender, msg.ID, "CROSS_MARK")
 		}
-		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: "处理失败：" + err.Error(), Style: "error"})
+		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: "error"})
 		return
 	}
 	replyStart := time.Now()
@@ -217,6 +345,14 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		}
 		return
 	}
+	for _, followUp := range resp.FollowUps {
+		if strings.TrimSpace(followUp.Text) == "" {
+			continue
+		}
+		if err := sender.Reply(runCtx, msg, followUp); err != nil {
+			log.Printf("mateway gateway follow-up reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
+		}
+	}
 	replyDuration := time.Since(replyStart)
 	if !cardAction {
 		react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
@@ -231,6 +367,21 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		"reply_style":         resp.Reply.Style,
 		"failed":              resp.Failed,
 	})
+}
+
+func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) bool {
+	if isCardAction(msg) {
+		return false
+	}
+	state, err := rt.Store.Load(msg.SessionKey)
+	if err == nil && state.Pending != nil {
+		return false
+	}
+	return !isSlashCommand(msg.Text)
+}
+
+func isSlashCommand(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "/")
 }
 
 func sendFinalReply(ctx context.Context, sender *feishu.Sender, msg channel.InboundMessage, ackMessageID string, reply channel.OutboundMessage) error {
@@ -264,14 +415,14 @@ func SessionKey(msg channel.InboundMessage) string {
 }
 
 func shouldIgnoreInbound(cfg config.FeishuConfig, msg channel.InboundMessage) bool {
-	if strings.TrimSpace(msg.Text) == "" {
+	if !msg.HasContent() {
 		return true
 	}
 	if !strings.EqualFold(strings.TrimSpace(msg.Channel), "feishu") {
 		return false
 	}
 	messageType := strings.TrimSpace(msg.Metadata["message_type"])
-	if messageType != "" && messageType != "text" && !isCardAction(msg) {
+	if messageType != "" && messageType != "text" && messageType != "image" && !isCardAction(msg) {
 		return true
 	}
 	senderType := strings.ToLower(strings.TrimSpace(msg.Metadata["sender_type"]))
@@ -287,7 +438,7 @@ func isCardAction(msg channel.InboundMessage) bool {
 
 func reactionForReply(reply channel.OutboundMessage) string {
 	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending", "input_required", "clarify":
+	case "approval_pending", "input_required", "clarify", "partial":
 		return "EYES"
 	case "error", "cancelled":
 		return "CROSS_MARK"
@@ -351,4 +502,14 @@ func inboundDedupeKey(msg channel.InboundMessage) string {
 		id += ":" + action + ":" + strings.TrimSpace(msg.UserID)
 	}
 	return channelName + ":" + id
+}
+
+func gatewayText(cfg *config.Root, msg channel.InboundMessage, key string, values map[string]string) string {
+	locale := ""
+	catalogDir := ""
+	if cfg != nil {
+		locale = cfg.App.Locale
+		catalogDir = cfg.App.MessageCatalogDir
+	}
+	return i18n.New(i18n.Config{CatalogDir: catalogDir}).T(i18n.ResolveLocale(locale, msg.Text), key, values)
 }

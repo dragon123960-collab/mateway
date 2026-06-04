@@ -113,6 +113,8 @@ Session 是运行时状态，不是无限增长的原始聊天记录。每次调
 
 System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、trace id 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。
 
+飞书图片消息会下载到 `~/.mateway/media`；微信 channel 如果收到带 URL 或本地路径的媒体 item，也会归一化到同一套 message part。Session transcript 只保存媒体引用，不内联图片字节。模型详情、启用开关、`context_window` 和 `max_tokens` 放在 `~/.mateway/config/models/*.yaml`；`config.yaml` 只选择默认模型、fallback 和角色。如果当前模型声明了 `modalities: [text, image]`，用户文字和图片会作为同一个 user turn 一起发送给多模态模型；否则 Mateway 会优先使用 `model.roles.vision`，它可以是单个模型，也可以是 `vision: [glm-4.6v-flash, minimax]` 这样的有序列表，然后再尝试其他支持图片的 fallback 模型。音频、视频和文件 part 已在消息结构中预留，后续再接渠道下载和模型发送。
+
 发送 `/new`、`/新会话` 或 `新会话` 会归档当前 session，并在同一个 `session_key` 下清空 active state。飞书长 thread 仍然保持稳定 session key，但 agent 可以从干净上下文重新开始。
 
 ### 6. Skills 是可编辑行为，不是魔法工具
@@ -123,6 +125,7 @@ Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime
 - `fresh-search`
 - `source-evaluation`
 - `connector-gap`
+- `skillcreate`
 
 Skills 是行为指导，本身不是可执行能力。如果任务需要真实动作，Agent 仍必须调用真实工具或脚本，并给出证据。
 
@@ -140,6 +143,8 @@ Mateway 目前支持：
 - task tree 和 follow-up 绑定
 - 风险工具 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
+- Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
+- 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
 - 本地 secret store：`mateway secret set/get/list/delete`
 - trace 中可见 hook events
 - workspace profile 注入
@@ -293,6 +298,9 @@ Review proposals：
 候选记忆提醒可以在 `~/.mateway/config/config.yaml` 配置：
 
 ```yaml
+execution:
+  max_parallel_tools: 4
+
 memory:
   proposal_nudge:
     enabled: true
@@ -348,6 +356,12 @@ memory:
 
 如果定时任务需要通知某人，请把通知写进任务本身，通过已有 tool、本地脚本、connector 或 skill 完成。没有可用投递渠道时，agent 应说明缺口，并询问是否需要创建相关脚本或 skill。
 
+## 模型工具调用
+
+Mateway 现在优先使用大模型原生 tool/function calling，不再把手写工具 JSON 当作主路径。Anthropic-compatible 模型，例如 MiniMax M3，会使用 Anthropic `tools` / `tool_use`；OpenAI Chat-compatible 模型，例如 GLM Flash，会使用 Chat Completions `tools` / `tool_calls`。旧的 `[TOOL_CALL]` 文本协议只保留为兜底：当某个模型 API 不支持原生工具调用，或原生请求失败时才使用。
+
+所有 runtime 入口共用同一个 AgentCore loop，所以 CLI、飞书、微信和定时任务，只要配置的模型支持原生工具调用，都会走同一条原生工具路径。OpenAI Responses 风格的 `api: openai` 目前保持保守处理，在对应 provider 或代理的原生 Responses tools 验证完成前继续使用 fallback 路径。
+
 ## Trace 命令
 
 ```bash
@@ -395,6 +409,7 @@ Workspace：
     fresh-search/
     source-evaluation/
     connector-gap/
+    skillcreate/
   memory/
     user/
       long/
@@ -435,7 +450,7 @@ required_secrets:
 当前行为：
 
 - Runtime 发现本地 skills，并把短 guidance 注入 context。
-- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps 和 software installation workflow。
+- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps、software installation workflow 和 Mateway skill creation rules。
 - Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
 
 已可用：
@@ -448,7 +463,7 @@ required_secrets:
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
 - heartbeat 生成 skill patch proposal 的审核工作流
 
-Script Bridge 保持小而硬：`~/.mateway/scripts/`、`workspace/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
+Script Bridge 保持小而硬：`workspace/agents/<agent_id>/skills/<skill>/scripts/`、`workspace/skills/<skill>/scripts/`、`workspace/scripts/`、`~/.mateway/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。同名脚本冲突时，agent-specific skill scripts 优先于 shared skill scripts，shared skill scripts 优先于 global scripts。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
 
 ## 多 Agent Profiles
 
@@ -527,7 +542,7 @@ Mateway 不会把这些能力伪装成已经完成：
 ### 下一步
 
 - 更多内置 channel：钉钉、QQ、企业微信、Telegram
-- channel 图片/文件等媒体能力
+- channel 音频/视频/文件等媒体能力
 - user-provided connectors 的 script bridge specification
 - skill source adapters 和 promote workflow
 - safer terminal sandbox wrappers

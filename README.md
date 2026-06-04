@@ -105,6 +105,8 @@ Sessions are runtime state, not an ever-growing raw chat log. Before each model 
 
 System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, trace ids, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt.
 
+Feishu image messages are downloaded under `~/.mateway/media`, and Weixin media items are normalized into the same message part schema when the channel provides a URL or local path. Transcripts store media references, not inline image bytes. Model details, enable switches, `context_window`, and `max_tokens` live in `~/.mateway/config/models/*.yaml`; `config.yaml` only selects defaults, fallbacks, and roles. If the selected model declares `modalities: [text, image]`, the user text and image parts are sent together in the same user turn. Otherwise Mateway can use `model.roles.vision` as a single model or ordered list such as `vision: [glm-4.6v-flash, minimax]` before falling back to other image-capable models. Audio, video, and file parts are reserved in the message schema for future channel support.
+
 Send `/new`, `/新会话`, or `新会话` to archive the current session and clear the active state under the same `session_key`. This is useful for long Feishu threads where the channel session key stays fixed but the agent should start from a clean context.
 
 ### 6. Skills As Editable Behavior, Not Magic Tools
@@ -113,6 +115,8 @@ Mateway discovers local `SKILL.md` files and injects concise guidance into the r
 - `software-install`
 - `fresh-search`
 - `source-evaluation`
+- `connector-gap`
+- `skillcreate`
 
 ### 7. Internationalization Boundary
 
@@ -131,7 +135,6 @@ aliases.confirm:
 aliases.memory_commit:
   - speichern
 ```
-- `connector-gap`
 
 Skills are guidance, not executable capabilities by themselves. If a task needs a real action, the agent must still use an actual tool or script and show evidence.
 
@@ -149,6 +152,8 @@ Mateway currently supports:
 - task tree and follow-up binding
 - pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
+- native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
+- parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
 - local secret store: `mateway secret set/get/list/delete`
 - hook events in trace
 - workspace profile injection
@@ -296,6 +301,9 @@ Review proposals:
 Memory proposal nudges are configurable in `~/.mateway/config/config.yaml`:
 
 ```yaml
+execution:
+  max_parallel_tools: 4
+
 memory:
   proposal_nudge:
     enabled: true
@@ -351,6 +359,12 @@ Run due tasks once or keep a foreground runner alive:
 
 If a scheduled task needs notification, make notification part of the task itself through an available tool, local script, connector, or skill. If no delivery channel exists, the agent should explain the gap and ask whether to create the relevant script or skill.
 
+## Model Tool Calling
+
+Mateway prefers native model tool/function calling instead of asking the model to hand-write tool-call JSON. Anthropic-compatible models such as MiniMax M3 use Anthropic `tools` / `tool_use`; OpenAI Chat-compatible models such as GLM Flash use Chat Completions `tools` / `tool_calls`. The older `[TOOL_CALL]` text protocol remains only as a fallback for model APIs that do not support native tool calling or fail a native request.
+
+All runtime entrypoints share the same AgentCore loop, so CLI, Feishu, Weixin, and scheduled tasks use the same native-tool path whenever their configured model supports it. OpenAI Responses-style `api: openai` is currently treated conservatively and uses the fallback path unless native Responses tools are added and verified for the configured provider or proxy.
+
 ## Trace Commands
 
 ```bash
@@ -398,6 +412,7 @@ Workspace:
     fresh-search/
     source-evaluation/
     connector-gap/
+    skillcreate/
   memory/
     user/
       long/
@@ -438,7 +453,7 @@ required_secrets:
 Current behavior:
 
 - Runtime discovers local skills and injects short guidance into context.
-- Default initialized shared skills cover fresh search, source evaluation, connector gaps, and software installation workflow.
+- Default initialized shared skills cover fresh search, source evaluation, connector gaps, software installation workflow, and Mateway skill creation rules.
 - Agents can inspect existing skills, install local/raw skills, and review skill patch proposals before promotion.
 
 Available:
@@ -451,7 +466,7 @@ Available:
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
 - heartbeat-generated skill patch proposal workflow
 
-Script Bridge is intentionally small: executable scripts under `~/.mateway/scripts/`, `workspace/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
+Script Bridge is intentionally small: executable scripts under `workspace/agents/<agent_id>/skills/<skill>/scripts/`, `workspace/skills/<skill>/scripts/`, `workspace/scripts/`, `~/.mateway/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Agent-specific skill scripts win over shared skill scripts, which win over global scripts when names collide. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
 
 ## Multi-Agent Profiles
 
@@ -529,7 +544,7 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 ### Next
 
 - more built-in channels such as DingTalk, QQ, WeCom, and Telegram
-- richer media handling for channels that support images/files
+- richer audio/video/file handling for channels that support media
 - script bridge specification for user-provided connectors
 - skill source adapters and promote workflow
 - safer terminal sandbox wrappers

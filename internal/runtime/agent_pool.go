@@ -63,6 +63,14 @@ func (p AgentPool) ProfileForMessage(msg channel.InboundMessage) config.AgentPro
 	return p.profileForID(agentID)
 }
 
+func (p AgentPool) RoleModelForMessage(msg channel.InboundMessage, role string, fallback agentcore.Model) agentcore.Model {
+	if p.config == nil {
+		return fallback
+	}
+	profile := p.ProfileForMessage(msg)
+	return resolveModelForRole(p.config, profile, role, fallback)
+}
+
 func (p AgentPool) profileForID(agentID string) config.AgentProfileConfig {
 	if profile, ok := p.profileByID(agentID); ok {
 		return profile
@@ -148,11 +156,12 @@ func cloneAgent(agent *agentcore.Agent) *agentcore.Agent {
 		return nil
 	}
 	return &agentcore.Agent{
-		SystemPrompt:  agent.SystemPrompt,
-		Model:         agent.Model,
-		Tools:         agent.Tools,
-		Hooks:         agent.Hooks,
-		MaxIterations: agent.MaxIterations,
+		SystemPrompt:     agent.SystemPrompt,
+		Model:            agent.Model,
+		Tools:            agent.Tools,
+		Hooks:            agent.Hooks,
+		MaxParallelTools: agent.MaxParallelTools,
+		MaxIterations:    agent.MaxIterations,
 	}
 }
 
@@ -168,6 +177,43 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 	}
 	names = append(names, profile.Model.Fallbacks...)
 	names = append(names, cfg.Model.Fallbacks...)
+	visionNames := append([]string{}, profile.Model.Roles.Models("vision")...)
+	visionNames = append(visionNames, cfg.Model.Roles.Models("vision")...)
+	var configs []config.ModelConfig
+	var visionConfigs []config.ModelConfig
+	seen := map[string]bool{}
+	for _, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if cfg, ok := enabledModelByName(cfg, key); ok && strings.TrimSpace(cfg.ResolvedAPIKey()) != "" {
+			configs = append(configs, cfg)
+		}
+	}
+	for _, name := range visionNames {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			continue
+		}
+		if cfg, ok := enabledModelByName(cfg, key); ok && strings.TrimSpace(cfg.ResolvedAPIKey()) != "" && cfg.SupportsModality("image") {
+			visionConfigs = append(visionConfigs, cfg)
+		}
+	}
+	if len(configs) > 0 {
+		return model.NewRoutedAgentModel(configs, visionConfigs)
+	}
+	return HeuristicModel{}
+}
+
+func resolveModelForRole(cfg *config.Root, profile config.AgentProfileConfig, role string, fallback agentcore.Model) agentcore.Model {
+	if cfg == nil {
+		return fallback
+	}
+	var names []string
+	names = append(names, profile.Model.Roles.Models(role)...)
+	names = append(names, cfg.Model.Roles.Models(role)...)
 	var configs []config.ModelConfig
 	seen := map[string]bool{}
 	for _, name := range names {
@@ -183,7 +229,7 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 	if len(configs) > 0 {
 		return model.NewFallbackAgentModel(configs)
 	}
-	return HeuristicModel{}
+	return fallback
 }
 
 func enabledModelByName(cfg *config.Root, name string) (config.ModelConfig, bool) {

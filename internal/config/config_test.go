@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadModelsSkipsSampleAndExampleFiles(t *testing.T) {
@@ -44,6 +47,99 @@ enabled: true
 	}
 	if models[0].Name != "minimax" || models[0].Model != "MiniMax-M2.7" {
 		t.Fatalf("unexpected model loaded: %#v", models[0])
+	}
+}
+
+func TestModelConfigSupportsModalityDefaultsToText(t *testing.T) {
+	cfg := ModelConfig{}
+	if !cfg.SupportsModality("text") {
+		t.Fatal("expected missing modalities to support text")
+	}
+	if cfg.SupportsModality("image") {
+		t.Fatal("expected missing modalities not to support image")
+	}
+	cfg.Modalities = []string{"text", "image", "audio"}
+	if !cfg.SupportsModality("image") || !cfg.SupportsModality("audio") {
+		t.Fatalf("expected configured modalities to be supported: %#v", cfg.Modalities)
+	}
+}
+
+func TestModelConfigMaxTokensDefaults(t *testing.T) {
+	if got := (ModelConfig{}).MaxTokensValue(); got != 4096 {
+		t.Fatalf("default max tokens = %d", got)
+	}
+	if got := (ModelConfig{MaxTokens: 8192}).MaxTokensValue(); got != 8192 {
+		t.Fatalf("configured max tokens = %d", got)
+	}
+}
+
+func TestExecutionConfigDefaults(t *testing.T) {
+	root := Root{}
+	root.NormalizeForUse()
+	if root.Execution.MaxParallelTools != 4 {
+		t.Fatalf("default max parallel tools = %d", root.Execution.MaxParallelTools)
+	}
+	if root.Execution.MaxIterationsValue() != 50 {
+		t.Fatalf("default max iterations = %d", root.Execution.MaxIterationsValue())
+	}
+	if root.Execution.InactivityTimeout != "5m" {
+		t.Fatalf("default inactivity timeout = %q", root.Execution.InactivityTimeout)
+	}
+	if root.Execution.InactivityTimeoutDuration() != 5*time.Minute {
+		t.Fatalf("default inactivity timeout duration = %s", root.Execution.InactivityTimeoutDuration())
+	}
+	if root.Execution.MaxNoProgressTurns != 2 {
+		t.Fatalf("default no-progress turns = %d", root.Execution.MaxNoProgressTurns)
+	}
+	if root.Execution.MaxRepeatedToolFailures != 3 {
+		t.Fatalf("default repeated tool failures = %d", root.Execution.MaxRepeatedToolFailures)
+	}
+	zero := 0
+	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
+	root.NormalizeForUse()
+	if root.Execution.MaxParallelTools != 1 {
+		t.Fatalf("configured max parallel tools = %d", root.Execution.MaxParallelTools)
+	}
+	root = Root{Execution: ExecutionConfig{MaxIterations: &zero}}
+	root.NormalizeForUse()
+	if root.Execution.MaxIterationsValue() != 0 {
+		t.Fatalf("configured disabled max iterations = %d", root.Execution.MaxIterationsValue())
+	}
+}
+
+func TestSecurityScriptAndRemoteDefaults(t *testing.T) {
+	root := Root{}
+	root.NormalizeForUse()
+	if root.Scripts.AutoDiscoverSkillScriptsValue() {
+		t.Fatal("external skill scripts should not be auto-authorized by default")
+	}
+	if root.Scripts.Dirs == nil {
+		t.Fatal("expected scripts dirs default")
+	}
+	if root.Remote.Profiles == nil {
+		t.Fatal("expected remote profiles default")
+	}
+}
+
+func TestModelRolesAcceptStringAndList(t *testing.T) {
+	var cfg struct {
+		Model ModelSelection `yaml:"model"`
+	}
+	if err := yaml.Unmarshal([]byte(`
+model:
+  roles:
+    vision:
+      - glm-4.6v-flash
+      - minimax
+    strong: minimax
+`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Model.Roles.Models("vision"), ","); got != "glm-4.6v-flash,minimax" {
+		t.Fatalf("vision roles = %q", got)
+	}
+	if got := strings.Join(cfg.Model.Roles.Models("strong"), ","); got != "minimax" {
+		t.Fatalf("strong roles = %q", got)
 	}
 }
 
@@ -155,7 +251,7 @@ func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {
 	if err := EnsureDefaultConfigFiles(home); err != nil {
 		t.Fatalf("ensure default config files: %v", err)
 	}
-	for _, name := range []string{"software-install", "fresh-search", "source-evaluation", "connector-gap"} {
+	for _, name := range []string{"software-install", "fresh-search", "source-evaluation", "connector-gap", "skillcreate"} {
 		path := filepath.Join(home, "workspace", "skills", name, "SKILL.md")
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected default skill %s to exist: %v", path, err)

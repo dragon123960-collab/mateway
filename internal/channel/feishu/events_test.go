@@ -37,6 +37,28 @@ func TestNormalizeMessageReceiveCapturesSenderType(t *testing.T) {
 	}
 }
 
+func TestNormalizeMessageReceiveCapturesImagePart(t *testing.T) {
+	messageID := "om_img"
+	chatID := "oc_1"
+	content := `{"image_key":"img_v2_abc"}`
+	messageType := "image"
+	event := &larkim.P2MessageReceiveV1{Event: &larkim.P2MessageReceiveV1Data{
+		Message: &larkim.EventMessage{
+			MessageId:   &messageID,
+			ChatId:      &chatID,
+			Content:     &content,
+			MessageType: &messageType,
+		},
+	}}
+	msg := NormalizeMessageReceive(event)
+	if msg.Metadata["image_key"] != "img_v2_abc" {
+		t.Fatalf("expected image key metadata, got %#v", msg.Metadata)
+	}
+	if len(msg.Parts) != 1 || msg.Parts[0].Type != channel.PartImage || msg.Parts[0].Metadata["image_key"] != "img_v2_abc" {
+		t.Fatalf("unexpected image parts %#v", msg.Parts)
+	}
+}
+
 func TestRenderReplyMessageStripsToolCallEcho(t *testing.T) {
 	msgType, content, err := renderReplyMessage(channel.OutboundMessage{
 		Style: "reply",
@@ -142,6 +164,23 @@ func TestRenderReplyMessageDisablesApprovalButtonsByDefault(t *testing.T) {
 	}
 }
 
+func TestRenderReplyMessageSkipsRedundantApprovalFooter(t *testing.T) {
+	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "approval_pending",
+		Locale:   "zh-CN",
+		Text:     "继续之前需要确认。回复“确认”继续，或回复“取消”放弃。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, "也可以直接回复") {
+		t.Fatalf("expected redundant approval footer to be omitted, got %s", content)
+	}
+}
+
 func TestRenderReplyMessageUsesEnglishLocale(t *testing.T) {
 	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
@@ -149,7 +188,7 @@ func TestRenderReplyMessageUsesEnglishLocale(t *testing.T) {
 		ThreadID: "thread_123",
 		Style:    "approval_pending",
 		Locale:   "en-US",
-		Text:     "This operation needs confirmation.",
+		Text:     "Confirmation is required before continuing. Reply \"confirm\" to continue, or \"cancel\" to stop.",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -212,5 +251,22 @@ func TestRenderReplyMessageProducesValidCardJSON(t *testing.T) {
 	}
 	if payload["header"] == nil || payload["elements"] == nil {
 		t.Fatalf("expected header and elements in card payload, got %#v", payload)
+	}
+}
+
+func TestRenderReplyMessageUsesPartialFooter(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Style:  "partial",
+		Locale: "zh-CN",
+		Text:   "任务还没有完成。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "状态：未完成") {
+		t.Fatalf("expected partial footer, got %s", content)
+	}
+	if strings.Contains(content, "状态：completed") || strings.Contains(content, "DONE") {
+		t.Fatalf("partial card should not look completed, got %s", content)
 	}
 }

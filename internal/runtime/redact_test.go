@@ -25,6 +25,22 @@ func TestRedactSecretString(t *testing.T) {
 	}
 }
 
+func TestRedactSecretStringKeepsEnvLookupCodeIntact(t *testing.T) {
+	input := "pwd = _get(\"EMAIL_SMTP_PASS\")\ntoken = os.environ.get(\"API_TOKEN\")\n"
+	got := redactSecretString(input)
+	if got != input {
+		t.Fatalf("expected env lookup code to remain intact, got %q", got)
+	}
+}
+
+func TestRedactSecretStringKeepsRequiredSecretDeclarationIntact(t *testing.T) {
+	input := "# mateway.required_secret: id=<secret_id> env=<ENV_NAME>\n# mateway.required_secret: id=netmail163_auth_code env=NETMAIL163_AUTH_CODE"
+	got := redactSecretString(input)
+	if got != input {
+		t.Fatalf("expected required_secret declarations to remain intact, got %q", got)
+	}
+}
+
 func TestRuntimeTraceRedactsToolResultSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
@@ -80,6 +96,24 @@ func TestRuntimeTaskStepSummaryRedactsSecrets(t *testing.T) {
 		if strings.Contains(msg.Content, "PXUj5ftvjscRpPy7") || strings.Contains(msg.Content, "QBptnPtt6Hnp3awb") {
 			t.Fatalf("stored transcript leaked secret: %#v", msg)
 		}
+	}
+}
+
+func TestRuntimeFinalReplyRedactsSecrets(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(secretFinalModel{}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "store this secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(resp.Reply.Text, "QBptnPtt6Hnp3awb") {
+		t.Fatalf("final reply leaked secret: %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, redactedSecret) {
+		t.Fatalf("expected redacted marker in final reply, got %q", resp.Reply.Text)
 	}
 }
 
@@ -146,3 +180,9 @@ func (secretToolModel) Next(_ context.Context, ctx agentcore.Context) (agentcore
 }
 
 var _ agentcore.Tool = secretTool{}
+
+type secretFinalModel struct{}
+
+func (secretFinalModel) Next(_ context.Context, _ agentcore.Context) (agentcore.Message, error) {
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "Secret stored: auth_code=QBptnPtt6Hnp3awb"}, nil
+}

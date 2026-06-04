@@ -29,12 +29,24 @@ func runtimeAlias(cfg *config.Root, msg channel.InboundMessage, text string, act
 	return i18n.New(i18n.Config{CatalogDir: cfg.App.MessageCatalogDir}).MatchAlias(runtimeLocale(cfg, msg), text, actions...)
 }
 
+func runtimeCatalogDir(cfg *config.Root) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.App.MessageCatalogDir
+}
+
 func textValues(pairs ...string) map[string]string {
 	out := map[string]string{}
 	for i := 0; i+1 < len(pairs); i += 2 {
 		out[pairs[i]] = pairs[i+1]
 	}
 	return out
+}
+
+func runtimeCueList(cfg *config.Root, key string) []string {
+	catalogDir := runtimeCatalogDir(cfg)
+	return splitCatalogCSV(i18n.New(i18n.Config{CatalogDir: catalogDir}).T(i18n.LocaleZH, key, nil))
 }
 
 func hasEnglishLocale(cfg *config.Root) bool {

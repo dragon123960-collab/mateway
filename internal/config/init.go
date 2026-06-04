@@ -24,6 +24,12 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: "mateway.env.sample", Content: envSampleTemplate},
 		{RelPath: filepath.Join("models", "minimax.yaml"), Content: minimaxYAMLTemplate},
 		{RelPath: filepath.Join("models", "minimax.sample.yaml"), Content: minimaxSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.7-flash.yaml"), Content: glm47FlashYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.7-flash.sample.yaml"), Content: glm47FlashSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.6v-flash.yaml"), Content: glm46VFlashYAMLTemplate},
+		{RelPath: filepath.Join("models", "glm-4.6v-flash.sample.yaml"), Content: glm46VFlashSampleYAMLTemplate},
+		{RelPath: filepath.Join("models", "agnes-2-flash.yaml"), Content: agnes2FlashYAMLTemplate},
+		{RelPath: filepath.Join("models", "agnes-2-flash.sample.yaml"), Content: agnes2FlashSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "openai-gpt54-mini.yaml"), Content: openAIGPT54MiniYAMLTemplate},
 		{RelPath: filepath.Join("models", "openai-gpt54-mini.sample.yaml"), Content: openAIGPT54MiniSampleYAMLTemplate},
 		{RelPath: filepath.Join("models", "local-mlx.yaml"), Content: localMLXYAMLTemplate},
@@ -43,6 +49,7 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("..", "workspace", "skills", "fresh-search", "SKILL.md"), Content: skillFreshSearchTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "source-evaluation", "SKILL.md"), Content: skillSourceEvaluationTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "connector-gap", "SKILL.md"), Content: skillConnectorGapTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "skillcreate", "SKILL.md"), Content: skillCreateTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "README.md"), Content: memoryReadmeTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "schema.md"), Content: memorySchemaTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "index.md"), Content: memoryIndexTemplate},
@@ -176,8 +183,23 @@ const configYAMLTemplate = `app:
   message_catalog_dir: ""
 
 model:
-  default: minimax
-  fallbacks: []
+  default: glm-4.7-flash
+  fallbacks:
+    - minimax
+  roles:
+    vision:
+      - glm-4.6v-flash
+      - minimax
+    strong: minimax
+    followup: glm-4.7-flash
+    review: glm-4.7-flash
+
+execution:
+  max_parallel_tools: 4
+  max_iterations: 50
+  inactivity_timeout: 5m
+  max_no_progress_turns: 2
+  max_repeated_tool_failures: 3
 
 memory:
   enabled: true
@@ -228,7 +250,11 @@ skills:
       trust_level: medium
 
 scripts:
+  auto_discover_skill_scripts: false
   dirs: []
+
+remote:
+  profiles: []
 
 scheduler:
   enabled: false
@@ -243,9 +269,6 @@ agents:
       name: Main Assistant
       default: true
       session_namespace: main
-      model:
-        default: minimax
-        fallbacks: []
       heartbeat:
         enabled: false
         interval: 30m
@@ -320,10 +343,13 @@ const configSampleYAMLTemplate = `# Copy this file to config.yaml, then adjust m
 const minimaxYAMLTemplate = `name: minimax
 provider: minimax
 api: anthropic
-model: MiniMax-M2.7
+model: MiniMax-M3
 api_base: https://api.minimaxi.com/anthropic
 api_key: ""
 api_key_env: MINIMAX_API_KEY
+modalities: [text, image]
+context_window: 1000000
+max_tokens: 8192
 strip_reasoning: true
 enabled: true
 description: Default remote model for planning, repair, synthesis, and high-reliability tasks.
@@ -334,6 +360,66 @@ const minimaxSampleYAMLTemplate = `# Copy this file to minimax.yaml.
 
 ` + minimaxYAMLTemplate
 
+const glm47FlashYAMLTemplate = `name: glm-4.7-flash
+provider: glm
+api: openai_chat
+model: GLM-4.7-Flash
+api_base: https://open.bigmodel.cn/api/paas/v4
+api_key: ""
+api_key_env: GLM_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 4096
+strip_reasoning: false
+enabled: false
+description: GLM free/flash text model for low-cost reasoning tasks.
+`
+
+const glm47FlashSampleYAMLTemplate = `# Copy this file to glm-4.7-flash.yaml.
+# Put the real key in mateway.env as GLM_API_KEY.
+
+` + glm47FlashYAMLTemplate
+
+const glm46VFlashYAMLTemplate = `name: glm-4.6v-flash
+provider: glm
+api: openai_chat
+model: GLM-4.6V-Flash
+api_base: https://open.bigmodel.cn/api/paas/v4
+api_key: ""
+api_key_env: GLM_API_KEY
+modalities: [text, image]
+context_window: 128000
+max_tokens: 4096
+strip_reasoning: false
+enabled: false
+description: GLM vision-capable flash model for image understanding and multimodal fallback.
+`
+
+const glm46VFlashSampleYAMLTemplate = `# Copy this file to glm-4.6v-flash.yaml.
+# Put the real key in mateway.env as GLM_API_KEY.
+
+` + glm46VFlashYAMLTemplate
+
+const agnes2FlashYAMLTemplate = `name: agnes-2-flash
+provider: agnes
+api: openai_chat
+model: agnes-2.0-flash
+api_base: https://apihub.agnes-ai.com/v1
+api_key: ""
+api_key_env: AGNES_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 8192
+strip_reasoning: false
+enabled: true
+description: agnes-2.0-flash OpenAI-compatible fast agent model for tool workflows, coding, reasoning, and multi-turn production tasks.
+`
+
+const agnes2FlashSampleYAMLTemplate = `# Copy this file to agnes-2-flash.yaml.
+# If the provider requires a key, put it in mateway.env as AGNES_API_KEY.
+
+` + agnes2FlashYAMLTemplate
+
 const openAIGPT54MiniYAMLTemplate = `name: openai-gpt54-mini
 provider: openai
 api: openai
@@ -341,6 +427,9 @@ model: gpt-5.4-mini
 api_base: https://api.openai.com/v1
 api_key: ""
 api_key_env: OPENAI_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 4096
 strip_reasoning: false
 enabled: false
 description: OpenAI GPT-5.4 mini model for optional planning/repair/synthesis experiments.
@@ -358,6 +447,9 @@ model: Qwen2.5-14B-Instruct-4bit
 api_base: http://127.0.0.1:8080/v1
 api_key: local
 api_key_env: ""
+modalities: [text]
+context_window: 32768
+max_tokens: 4096
 strip_reasoning: false
 enabled: false
 description: "Local mlx_lm.server model on 127.0.0.1:8080. Set enabled: true after the server is running."
@@ -662,6 +754,129 @@ Workflow:
    If the runtime is missing, choose an available runtime or stop with setup instructions.
 5. If real credentials, server hostnames, recipients, or platform choices are missing, ask only for those concrete fields.
 6. Never claim that email was sent, a server was checked, or content was published unless a tool/script/action actually did it.
+`
+
+const skillCreateTemplate = `---
+name: skillcreate
+description: Use when creating or updating a Mateway skill, especially when scripts, connectors, credentials, or secrets are involved.
+stage: execution
+priority: 90
+aliases: skill create, create skill, skill creation
+when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to a skill, handling skill secrets
+---
+
+# skillcreate
+
+Use this skill before creating or updating any Mateway skill.
+
+Default behavior: create or update the requested skill files, make scripts executable, then verify discovery and at least one safe execution path. Do not stop after a plan unless required information is missing or a guarded tool requests confirmation.
+
+## Directory rules
+
+Mateway skills live under:
+
+` + "```text" + `
+workspace/agents/<agent_id>/skills/<skill_name>/
+workspace/skills/<skill_name>/
+` + "```" + `
+
+Preferred layout:
+
+` + "```text" + `
+<skill_name>/
+  SKILL.md
+  scripts/
+  references/
+  assets/
+` + "```" + `
+
+- Put skill-specific executable scripts in <skill_name>/scripts/.
+- Use workspace/scripts/, ~/.mateway/scripts/, or configured scripts.dirs only for reusable cross-skill scripts.
+- If script names collide, agent-specific skill scripts win over shared skill scripts, which win over global scripts.
+- Keep SKILL.md concise: trigger description, workflow, script names, required inputs, safety boundaries, and verification steps.
+
+## Secret rules
+
+- Never put plaintext secrets, passwords, tokens, authorization codes, or API keys in SKILL.md.
+- Never hard-code plaintext secrets in scripts/.
+- If the user has provided a concrete secret value in the current task, store it immediately with the secret.set tool. Do not ask the user to run mateway secret manually.
+- Use mateway secret set <secret_id> only as a CLI fallback outside the agent loop; it is not the preferred answer to the user.
+- If the value visible to tools is [REDACTED_SECRET] or any placeholder, do not store it; ask the user to provide the real value again.
+- If the user has not provided a concrete secret value, write only required-secret references and report the missing secret ids.
+- After secret.set succeeds, scripts receive secrets only through environment variables injected by script.run from mateway.required_secret headers.
+- Script headers declare required secrets in the first 30 lines. The format must include both ` + "`id=`" + ` and ` + "`env=`" + ` exactly:
+
+` + "```text" + `
+# mateway.required_secret: id=<secret_id> env=<ENV_NAME>
+` + "```" + `
+
+- Inside scripts, read only the environment variable:
+
+` + "```python" + `
+password = os.environ.get("ENV_NAME")
+if not password:
+    sys.exit("missing required env ENV_NAME")
+` + "```" + `
+
+- Direct local execution may pass env manually; Mateway execution must use script.run, which injects env from secret store.
+- Do not use terminal.run for credentialed endpoint tests. Credentialed tests must go through script.run so required_secret injection is the only credential path.
+- Skill creation can complete without a working credential. Missing or rejected credentials only block the optional credentialed endpoint test, not the structure/install verification.
+- Final answers must never repeat concrete secret values. Refer only to secret ids and env names.
+
+## Script rules
+
+Each executable skill script should include headers:
+
+` + "```text" + `
+# mateway.name: <skill_name>.<action>
+# mateway.description: <short purpose>
+# mateway.risk: safe_read | guarded_mutation
+# mateway.required_secret: id=<secret_id> env=<ENV_NAME>
+` + "```" + `
+
+- Use namespaced script names such as email.receive or email.send.
+- Put scripts under the skill-local scripts directory and run ` + "`chmod +x <script_path>`" + ` after writing each script.
+- Read credentials from environment variables injected by script.run.
+- Validate missing required environment variables before connecting to external services.
+- Use CLI argv arguments. For Mateway calls, script.run args is an argument array, not JSON:
+
+` + "```text" + `
+script.run name=email.receive args=["--limit","10"]
+` + "```" + `
+
+- Scripts should tolerate a leading ` + "`--`" + ` in argv before script-specific flags so manual CLI checks like ` + "`mateway script run name -- --help`" + ` do not become false failures.
+- Print concise machine-readable or clearly structured output.
+- Do not claim external actions succeeded unless the script exits successfully and prints evidence.
+
+## Verification policy
+
+Separate verification into two layers:
+
+1. Structure verification, required for skill creation:
+   - chmod +x every script.
+   - syntax or --help check works without credentials.
+   - mateway script list discovers the expected script names.
+   - script.run can execute a no-secret path such as --help.
+2. Credentialed endpoint verification, optional:
+   - Run only when the real secret is present.
+   - Use script.run, never terminal.run.
+   - If the provider rejects login or the secret is missing, report that credentialed verification is blocked while the skill structure remains installed.
+
+## Creation workflow
+
+1. Determine the smallest useful skill surface from the user's request.
+2. Store any concrete secrets provided in the current task with secret.set.
+3. Create or update SKILL.md.
+4. Add skill-local scripts under scripts/ when deterministic execution is needed.
+5. Add mateway.required_secret headers for each required credential.
+6. Run chmod +x for every script.
+7. Run python/go/node/shell syntax or --help checks.
+8. Run mateway script list to confirm scripts are discovered.
+9. Run script.run with a no-secret safe path such as --help.
+10. If credentials are present, optionally run credentialed endpoint verification through script.run.
+11. Final answer with created files, commands, structure verification evidence, and credentialed verification status, without repeating secret values.
+
+If provider settings are stable and commonly known, encode them directly in the script with comments or references when helpful. Use web search only when the task needs current or uncertain facts; do not spend the whole turn searching before writing a small, testable script.
 `
 
 const memoryReadmeTemplate = `# Mateway Memory Wiki

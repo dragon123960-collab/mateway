@@ -44,6 +44,9 @@ func redactSecrets(value any) any {
 		return out
 	case agentcore.Message:
 		v.Content = redactSecretString(v.Content)
+		for i := range v.Parts {
+			v.Parts[i] = redactMessagePart(v.Parts[i])
+		}
 		for i := range v.ToolCalls {
 			v.ToolCalls[i] = redactToolCall(v.ToolCalls[i])
 		}
@@ -55,6 +58,22 @@ func redactSecrets(value any) any {
 	default:
 		return v
 	}
+}
+
+func redactMessagePart(part agentcore.MessagePart) agentcore.MessagePart {
+	part.Text = redactSecretString(part.Text)
+	if len(part.Metadata) > 0 {
+		metadata := make(map[string]string, len(part.Metadata))
+		for key, value := range part.Metadata {
+			if isSecretKey(key) {
+				metadata[key] = redactedSecret
+				continue
+			}
+			metadata[key] = redactSecretString(value)
+		}
+		part.Metadata = metadata
+	}
+	return part
 }
 
 func redactToolCall(call agentcore.ToolCall) agentcore.ToolCall {
@@ -93,10 +112,56 @@ func redactSecretString(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return text
 	}
+	if strings.Contains(text, "\n") {
+		lines := strings.Split(text, "\n")
+		for i, line := range lines {
+			lines[i] = redactSecretLine(line)
+		}
+		return strings.Join(lines, "\n")
+	}
+	return redactSecretLine(text)
+}
+
+func redactSecretLine(text string) string {
+	if shouldSkipSecretLineRedaction(text) {
+		return text
+	}
 	text = bearerTokenPattern.ReplaceAllString(text, `${1}`+redactedSecret)
-	text = secretAssignmentPattern.ReplaceAllString(text, `${1}${2}${3}`+redactedSecret+`${5}`)
+	text = secretAssignmentPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := secretAssignmentPattern.FindStringSubmatch(match)
+		if len(parts) != 6 {
+			return match
+		}
+		if !shouldRedactAssignedSecretValue(parts[4]) {
+			return match
+		}
+		return parts[1] + parts[2] + parts[3] + redactedSecret + parts[5]
+	})
 	text = strings.ReplaceAll(text, redactedSecret+" "+redactedSecret, redactedSecret)
 	return text
+}
+
+func shouldSkipSecretLineRedaction(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "mateway.required_secret:")
+}
+
+func shouldRedactAssignedSecretValue(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	lower := strings.ToLower(value)
+	if strings.Contains(lower, "redacted") {
+		return false
+	}
+	if strings.Contains(value, "(") {
+		return false
+	}
+	if strings.HasPrefix(value, "$") || strings.HasPrefix(value, "{{") || strings.HasPrefix(value, "<") {
+		return false
+	}
+	return true
 }
 
 func isSecretKey(key string) bool {
@@ -216,6 +281,9 @@ func messageChars(messages []agentcore.Message) int {
 	total := 0
 	for _, msg := range messages {
 		total += len(msg.Content)
+		for _, part := range msg.Parts {
+			total += len(part.Text) + len(part.URI) + len(part.MimeType) + len(part.Name)
+		}
 		for _, call := range msg.ToolCalls {
 			total += len(call.Name) + len(call.ID)
 			for key, value := range call.Args {

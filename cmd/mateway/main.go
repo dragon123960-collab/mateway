@@ -36,6 +36,16 @@ func main() {
 	}
 }
 
+func printRuntimeResponse(resp runtime.Response) {
+	messages := channel.OutboundBatch{Reply: resp.Reply, FollowUps: resp.FollowUps}.Messages()
+	for i, msg := range messages {
+		if i > 0 {
+			fmt.Println()
+		}
+		fmt.Println(msg.Text)
+	}
+}
+
 func run(args []string) error {
 	if len(args) == 0 {
 		printHelp()
@@ -78,7 +88,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println(resp.Reply.Text)
+		printRuntimeResponse(resp)
 		return nil
 	case "test":
 		return runTest(args[1:])
@@ -1552,13 +1562,9 @@ func memoryDistillModel(cfg *config.Root) memory.DistillModel {
 		return nil
 	}
 	names := []string{}
-	if role := strings.TrimSpace(cfg.Model.Roles["memory_distill"]); role != "" {
-		names = append(names, role)
-	}
+	names = append(names, cfg.Model.Roles.Models("memory_distill")...)
 	if profile := defaultAgentProfile(cfg); profile != nil {
-		if role := strings.TrimSpace(profile.Model.Roles["memory_distill"]); role != "" {
-			names = append(names, role)
-		}
+		names = append(names, profile.Model.Roles.Models("memory_distill")...)
 		if strings.TrimSpace(profile.Model.Default) != "" {
 			names = append(names, profile.Model.Default)
 		}
@@ -2055,7 +2061,7 @@ func runTest(args []string) error {
 	fmt.Println("session:", key)
 	fmt.Println("message:", text)
 	fmt.Println()
-	fmt.Println(resp.Reply.Text)
+	printRuntimeResponse(resp)
 	if resp.TracePath != "" {
 		fmt.Println()
 		fmt.Println("trace:", resp.TracePath)
@@ -2095,6 +2101,7 @@ func writeTestRecord(caseName, sessionKey, message string, resp runtime.Response
 		"session":    sessionKey,
 		"message":    message,
 		"reply":      resp.Reply,
+		"follow_ups": resp.FollowUps,
 		"failed":     resp.Failed,
 		"trace_id":   resp.TraceID,
 		"trace_path": resp.TracePath,

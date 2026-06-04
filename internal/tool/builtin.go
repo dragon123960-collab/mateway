@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -24,6 +25,7 @@ import (
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/secret"
+	"gopkg.in/yaml.v3"
 )
 
 func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
@@ -37,10 +39,12 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
 	registry.Register(ScriptRunTool{Config: root})
+	registry.Register(SecretSetTool{Config: root})
 	registry.Register(ScheduleCreateTool{Config: root})
 	registry.Register(ScheduleListTool{Config: root})
+	registry.Register(RemoteProfileCreateTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
-	registry.Register(WebFetchTool{})
+	registry.Register(WebFetchTool{Config: root})
 	return registry
 }
 
@@ -109,11 +113,6 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 			},
 		}
 	}
-	if isSkillMarkdownPath(path) {
-		if err := secret.RejectIfSecretLike(content, path); err != nil {
-			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
-		}
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
@@ -121,11 +120,6 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: "wrote " + path, Evidence: map[string]any{"path": path, "bytes": len(content)}}
-}
-
-func isSkillMarkdownPath(path string) bool {
-	clean := filepath.Clean(path)
-	return strings.EqualFold(filepath.Base(clean), "SKILL.md")
 }
 
 func (ProjectIndexTool) Name() string        { return "project.index" }
@@ -177,8 +171,10 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 
 type TerminalRunTool struct{ Config *config.Root }
 type ScriptRunTool struct{ Config *config.Root }
+type SecretSetTool struct{ Config *config.Root }
 type ScheduleCreateTool struct{ Config *config.Root }
 type ScheduleListTool struct{ Config *config.Root }
+type RemoteProfileCreateTool struct{ Config *config.Root }
 
 func (TerminalRunTool) Name() string        { return "terminal.run" }
 func (TerminalRunTool) Description() string { return "run a local shell command" }
@@ -201,6 +197,18 @@ func (TerminalRunTool) ToolContract() agentcore.ToolContract {
 func (TerminalRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	command := fmt.Sprint(call.Args["command"])
+	if err := rejectCommandContainingKnownSecret(command, t.Config); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"blocked": true, "reason": "secret_literal"}}
+	}
+	decision := CheckTerminalCommand(command, t.Config)
+	if !decision.Allow {
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    decision.Reason,
+			IsError:    true,
+			Evidence:   map[string]any{"command": command, "policy_classification": decision.Class, "decision": "blocked", "reason": decision.Reason},
+		}
+	}
 	timeout := terminalTimeout(t.Config)
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -219,9 +227,12 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		if result == "" {
 			result = err.Error()
 		}
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: map[string]any{"command": command}}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}}
 	}
-	evidence := map[string]any{"command": command}
+	evidence := map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}
+	if decision.RemoteProfile != "" {
+		evidence["remote_profile"] = decision.RemoteProfile
+	}
 	if workdir != "" {
 		evidence["workdir"] = workdir
 	}
@@ -229,6 +240,93 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		evidence["sandbox"] = t.Config.Security.TerminalSandbox.Mode
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: evidence}
+}
+
+func rejectCommandContainingKnownSecret(command string, cfg *config.Root) error {
+	store := secret.Store{Home: configHome(cfg)}
+	entries, err := store.List()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		full, ok, err := store.Get(entry.ID)
+		if err != nil {
+			return err
+		}
+		if !ok || strings.TrimSpace(full.Value) == "" {
+			continue
+		}
+		if len(full.Value) >= 8 && strings.Contains(command, full.Value) {
+			return fmt.Errorf("refusing to run terminal command containing secret value %s; use secret.set and script.run required_secret injection instead", entry.ID)
+		}
+	}
+	return nil
+}
+
+func (SecretSetTool) Name() string { return "secret.set" }
+func (SecretSetTool) Description() string {
+	return "store a local secret value by id without returning the value"
+}
+func (SecretSetTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"id", "value"}}
+}
+func (SecretSetTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user has provided a concrete credential, token, password, authorization code, or API key that must be available to scripts through required_secret injection.",
+		WhenNotToUse:         "Do not use with placeholders, redacted values, examples, or values the user has not actually provided.",
+		OutputContract:       "Return only the normalized secret id and stored=true; never return the secret value.",
+		Evidence:             "Return the secret id, stored=true, and placeholder=true on placeholder rejection.",
+		Acceptance:           "Accepted when the secret store persists the value without exposing it in content or evidence.",
+		SoftFailureSignals:   []string{"redacted placeholder", "secret id is required", "secret value is required"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded local secret mutation; allowed when the user provided the value in the current task.",
+	}
+}
+func (SecretSetTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t SecretSetTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	id := strings.TrimSpace(fmt.Sprint(call.Args["id"]))
+	value := fmt.Sprint(call.Args["value"])
+	overwrite := boolArg(call.Args["overwrite"])
+	if isRedactedPlaceholder(value) {
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    "secret value is a redacted placeholder; ask the user to provide the real value again",
+			IsError:    true,
+			Evidence:   map[string]any{"id": id, "placeholder": true},
+		}
+	}
+	if err := (secret.Store{Home: configHome(t.Config)}).SetWithOptions(id, value, secret.SetOptions{Overwrite: overwrite}); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"id": id}}
+	}
+	return agentcore.ToolResult{
+		ToolCallID: call.ID,
+		Content:    "secret stored: " + strings.ToLower(strings.TrimSpace(id)),
+		Evidence:   map[string]any{"id": strings.ToLower(strings.TrimSpace(id)), "stored": true},
+	}
+}
+
+func boolArg(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true") || strings.EqualFold(strings.TrimSpace(v), "yes")
+	default:
+		return false
+	}
+}
+
+func isRedactedPlaceholder(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return lower == "" || strings.Contains(lower, "redacted") || strings.Contains(lower, "placeholder")
+}
+
+func configHome(cfg *config.Root) string {
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		return strings.TrimSpace(cfg.App.Home)
+	}
+	return config.DefaultHome()
 }
 
 func (ScheduleCreateTool) Name() string        { return "schedule.create" }
@@ -328,6 +426,132 @@ func (t ScheduleListTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"count": len(tasks)}}
 }
 
+func (RemoteProfileCreateTool) Name() string { return "remote.profile.create" }
+func (RemoteProfileCreateTool) Description() string {
+	return "create or update a local remote server connection profile"
+}
+func (RemoteProfileCreateTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"alias", "host", "user"}}
+}
+func (RemoteProfileCreateTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user provides remote server host/IP, user, auth material or alias and wants future remote operations by profile.",
+		WhenNotToUse:         "Do not use for one-off local commands or when host/user are missing.",
+		OutputContract:       "Return profile alias, host, user, auth_secret_id and whether config was updated.",
+		Evidence:             "Return alias, host, user, port, auth_secret_id, allowed_classes.",
+		Acceptance:           "Accepted when the profile is persisted in config and auth material is stored as a secret when provided.",
+		SoftFailureSignals:   []string{"missing alias", "missing host", "missing user", "secret overwrite required"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; require confirmation before persisting remote profile or auth material.",
+	}
+}
+func (RemoteProfileCreateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t RemoteProfileCreateTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	alias := strings.ToLower(strings.TrimSpace(toolArgString(call.Args, "alias")))
+	host := strings.TrimSpace(toolArgString(call.Args, "host"))
+	user := strings.TrimSpace(toolArgString(call.Args, "user"))
+	if alias == "" || host == "" || user == "" {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "alias, host and user are required", IsError: true}
+	}
+	port := 22
+	if raw := strings.TrimSpace(toolArgString(call.Args, "port")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			port = parsed
+		}
+	}
+	authSecretID := strings.TrimSpace(toolArgString(call.Args, "auth_secret_id"))
+	password := toolArgString(call.Args, "password")
+	privateKey := toolArgString(call.Args, "private_key")
+	if strings.TrimSpace(password) != "" || strings.TrimSpace(privateKey) != "" {
+		if authSecretID == "" {
+			authSecretID = "remote/" + alias + "/auth"
+		}
+		value := password
+		if strings.TrimSpace(privateKey) != "" {
+			value = privateKey
+		}
+		if err := (secret.Store{Home: configHome(t.Config)}).SetWithOptions(authSecretID, value, secret.SetOptions{Overwrite: boolArg(call.Args["overwrite_secret"])}); err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"alias": alias, "auth_secret_id": authSecretID}}
+		}
+	}
+	profile := config.RemoteProfileConfig{
+		Alias:          alias,
+		Host:           host,
+		User:           user,
+		Port:           port,
+		AuthSecretID:   authSecretID,
+		AllowedClasses: stringSliceArg(call.Args["allowed_classes"]),
+		RequireConfirm: true,
+	}
+	if len(profile.AllowedClasses) == 0 {
+		profile.AllowedClasses = []string{"read_only"}
+	}
+	if err := persistRemoteProfile(t.Config, profile, boolArg(call.Args["overwrite_profile"])); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"alias": alias, "host": host, "user": user}}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: "remote profile stored: " + alias, Evidence: map[string]any{"alias": alias, "host": host, "user": user, "port": port, "auth_secret_id": authSecretID, "allowed_classes": profile.AllowedClasses}}
+}
+
+func persistRemoteProfile(cfg *config.Root, profile config.RemoteProfileConfig, overwrite bool) error {
+	path := filepath.Join(configHome(cfg), "config", "config.yaml")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		data = []byte("{}\n")
+	} else if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	if root == nil {
+		root = map[string]any{}
+	}
+	remote, _ := root["remote"].(map[string]any)
+	if remote == nil {
+		remote = map[string]any{}
+	}
+	var profiles []any
+	if raw, ok := remote["profiles"].([]any); ok {
+		profiles = raw
+	}
+	entry := map[string]any{
+		"alias":           profile.Alias,
+		"host":            profile.Host,
+		"user":            profile.User,
+		"port":            profile.Port,
+		"auth_secret_id":  profile.AuthSecretID,
+		"allowed_classes": profile.AllowedClasses,
+		"require_confirm": profile.RequireConfirm,
+	}
+	replaced := false
+	for i, raw := range profiles {
+		existing, _ := raw.(map[string]any)
+		if strings.EqualFold(fmt.Sprint(existing["alias"]), profile.Alias) {
+			if !overwrite {
+				return fmt.Errorf("remote profile %s already exists; set overwrite_profile=true to replace it", profile.Alias)
+			}
+			profiles[i] = entry
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		profiles = append(profiles, entry)
+	}
+	remote["profiles"] = profiles
+	root["remote"] = remote
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
 func terminalTimeout(cfg *config.Root) time.Duration {
 	seconds := 20
 	if cfg != nil && cfg.Security.TerminalSandbox.TimeoutSeconds > 0 {
@@ -366,13 +590,30 @@ func terminalWorkdir(cfg *config.Root) (string, error) {
 func (ScriptRunTool) Name() string        { return "script.run" }
 func (ScriptRunTool) Description() string { return "run a discovered local Mateway script" }
 func (ScriptRunTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"name"}}
+	return agentcore.Schema{
+		Required: []string{"name"},
+		Properties: map[string]any{
+			"name": map[string]any{
+				"type":        "string",
+				"description": "Discovered script name, for example email.receive.",
+			},
+			"args": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Command-line argv array passed to the script, for example [\"--limit\",\"10\"]. Do not JSON-encode this value.",
+			},
+			"timeout_seconds": map[string]any{
+				"type":        "integer",
+				"description": "Optional timeout in seconds for long-running scripts such as media generation. Defaults to 20.",
+			},
+		},
+	}
 }
 func (ScriptRunTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
 		WhenToUse:            "Use when a reusable local script exists for a connector-like task such as mail, publishing, or server operations.",
 		WhenNotToUse:         "Do not use if no matching script exists; explain the connector gap instead of fabricating execution.",
-		OutputContract:       "Return script output, exit code, duration, and script path evidence.",
+		OutputContract:       "Return script output, exit code, duration, and script path evidence. Pass script arguments with args as a string array, not as JSON text.",
 		Evidence:             "Return script name, path, args, exit_code, and duration_ms.",
 		Acceptance:           "Accepted when the script exits successfully and returns useful output.",
 		SoftFailureSignals:   []string{"script not found", "missing required secret", "non-zero exit", "timeout"},
@@ -384,9 +625,15 @@ func (ScriptRunTool) ToolContract() agentcore.ToolContract {
 func (ScriptRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	args := stringSliceArg(call.Args["args"])
+	timeoutSeconds := intArg(call.Args["timeout_seconds"])
+	var timeout time.Duration
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
 	result, err := script.Run(ctx, t.Config, script.RunInput{
-		Name: toolArgString(call.Args, "name"),
-		Args: args,
+		Name:    toolArgString(call.Args, "name"),
+		Args:    args,
+		Timeout: timeout,
 	})
 	evidence := map[string]any{}
 	if result.Script.Name != "" {
@@ -406,7 +653,7 @@ func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentco
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result.Output, Evidence: evidence}
 }
 
-type WebFetchTool struct{}
+type WebFetchTool struct{ Config *config.Root }
 
 func (WebFetchTool) Name() string        { return "web.fetch" }
 func (WebFetchTool) Description() string { return "fetch a URL body" }
@@ -429,11 +676,26 @@ func (WebFetchTool) ToolContract() agentcore.ToolContract {
 func (WebFetchTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (WebFetchTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	rawURL := fmt.Sprint(call.Args["url"])
+	if blocked, ok := IsBlockedFetchURL(rawURL); ok {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "web.fetch blocked private or local address: " + blocked, IsError: true, Evidence: map[string]any{"url": rawURL, "blocked": true, "reason": "ssrf_blocked"}}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if blocked, ok := IsBlockedFetchURL(req.URL.String()); ok {
+				return fmt.Errorf("web.fetch redirect blocked private or local address: %s", blocked)
+			}
+			if len(via) >= 5 {
+				return fmt.Errorf("stopped after 5 redirects")
+			}
+			return nil
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		if fallback, ok := fetchFallback(ctx, call.ID, rawURL, err.Error()); ok {
 			return fallback
@@ -948,6 +1210,25 @@ func stringSliceArg(value any) []string {
 		return strings.Fields(v)
 	default:
 		return nil
+	}
+}
+
+func intArg(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return n
+	default:
+		return 0
 	}
 }
 

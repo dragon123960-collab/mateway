@@ -1,12 +1,15 @@
 package runtime
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -27,59 +30,70 @@ type followupDecision struct {
 }
 
 func resolveFollowup(state session.State, text string) followupDecision {
+	decision := protocolFollowupDecision(state, text)
+	if decision.Kind != "" {
+		return decision
+	}
+	return followupDecision{Kind: followupNewTask, ResolvedUserText: strings.TrimSpace(text), Reason: "standalone input"}
+}
+
+func fallbackFollowupDecision(state session.State, text, locale, catalogDir, reason string) followupDecision {
+	current := strings.TrimSpace(text)
+	normalized := normalizeFollowupText(current)
+	cues := followupFallbackCues(locale, catalogDir)
+	if isFollowupCueWithCues(normalized, cues.Followup) || containsCue(normalized, cues.Retry) || isShortContextDependentWithCues(normalized, cues) || isActionAckFollowup(current) {
+		if task := latestOpenTask(state); task != nil {
+			return continueTask(*task, current, followupDefaultString(reason, "safe fallback continuation"))
+		}
+		if task := latestTask(state); task != nil && task.Status != "completed" {
+			return continueTask(*task, current, followupDefaultString(reason, "safe fallback continuation"))
+		}
+		if len(state.Tasks) > 0 {
+			return clarify(current, followupDefaultString(reason, "context-dependent followup with no task candidate"))
+		}
+	}
+	return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: followupDefaultString(reason, "standalone input")}
+}
+
+type followupCueSet struct {
+	Followup    []string
+	Retry       []string
+	ShortSuffix []string
+}
+
+func followupFallbackCues(locale, catalogDir string) followupCueSet {
+	catalog := i18n.New(i18n.Config{CatalogDir: catalogDir})
+	return followupCueSet{
+		Followup:    splitCatalogCSV(catalog.T(locale, "router.followup.cues.followup", nil)),
+		Retry:       splitCatalogCSV(catalog.T(locale, "router.followup.cues.retry", nil)),
+		ShortSuffix: splitCatalogCSV(catalog.T(locale, "router.followup.cues.short_suffix", nil)),
+	}
+}
+
+func splitCatalogCSV(text string) []string {
+	var out []string
+	for _, item := range strings.Split(text, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func followupCueList(key string) []string {
+	return splitCatalogCSV(i18n.New(i18n.Config{}).T(i18n.LocaleZH, key, nil))
+}
+
+func protocolFollowupDecision(_ session.State, text string) followupDecision {
 	current := strings.TrimSpace(text)
 	if current == "" {
 		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "empty input starts a new task"}
 	}
-	normalized := normalizeFollowupText(current)
-	if isExplicitNewTask(normalized) {
-		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "explicit new task cue"}
+	if strings.HasPrefix(current, "/") {
+		return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "slash command starts a new task"}
 	}
-	if task := latestOpenTask(state); task != nil {
-		if isFollowupCue(normalized) || isShortContextDependent(normalized) {
-			return continueTask(*task, current, "active task followup cue")
-		}
-	}
-	if ref, ok := ordinalTaskReference(normalized); ok {
-		task := taskByOrdinal(state, ref)
-		if task == nil {
-			return clarify(current, "ordinal task reference did not match an existing task")
-		}
-		return continueTask(*task, current, "historical ordinal task reference")
-	}
-	if isHistoricalCue(normalized) {
-		candidates := historicalCandidates(state, current)
-		switch len(candidates) {
-		case 0:
-			return clarify(current, "historical cue had no candidate task")
-		case 1:
-			return continueTask(candidates[0], current, "single historical task candidate")
-		default:
-			return clarify(current, "historical cue matched multiple candidate tasks")
-		}
-	}
-	if isFollowupCue(normalized) {
-		if task := latestTask(state); task != nil {
-			if isStaleWeakFollowup(normalized, *task) {
-				return clarify(current, "stale weak followup cue had no fresh task evidence")
-			}
-			return continueTask(*task, current, "recent task followup cue")
-		}
-		return clarify(current, "followup cue had no prior task")
-	}
-	if isRetryCue(normalized) {
-		if task := latestTask(state); task != nil {
-			return continueTask(*task, current, "retry recent task")
-		}
-		return clarify(current, "retry cue had no prior task")
-	}
-	if isShortContextDependent(normalized) {
-		if task := latestTask(state); task != nil {
-			return continueTask(*task, current, "short context-dependent followup")
-		}
-		return clarify(current, "short context-dependent input had no prior task")
-	}
-	return followupDecision{Kind: followupNewTask, ResolvedUserText: current, Reason: "standalone input"}
+	return followupDecision{}
 }
 
 func isStaleWeakFollowup(text string, task session.TaskNode) bool {
@@ -90,8 +104,7 @@ func isStaleWeakFollowup(text string, task session.TaskNode) bool {
 	if tokenOverlap(text, goal) > 0 {
 		return false
 	}
-	weakCues := []string{"上一轮", "上一个", "上一条", "刚才", "那个", "那三个", "那几点"}
-	for _, cue := range weakCues {
+	for _, cue := range followupCueList("router.followup.cues.weak") {
 		if strings.Contains(text, cue) {
 			return true
 		}
@@ -113,7 +126,7 @@ func clarify(current, reason string) followupDecision {
 		Kind:             followupClarify,
 		ResolvedUserText: current,
 		Reason:           reason,
-		ClarifyPrompt:    "我还不能稳定判断你要接哪一个历史任务。请补充更明确的线索，比如第几个任务、主题、文件名或关键词。",
+		ClarifyPrompt:    i18n.New(i18n.Config{}).T(i18n.LocaleZH, "router.followup.clarify", nil),
 	}
 }
 
@@ -147,13 +160,6 @@ func latestTask(state session.State) *session.TaskNode {
 		return nil
 	}
 	return &state.Tasks[len(state.Tasks)-1]
-}
-
-func taskByOrdinal(state session.State, ordinal int) *session.TaskNode {
-	if ordinal <= 0 || ordinal > len(state.Tasks) {
-		return nil
-	}
-	return &state.Tasks[ordinal-1]
 }
 
 func historicalCandidates(state session.State, text string) []session.TaskNode {
@@ -194,8 +200,7 @@ func normalizeFollowupText(text string) string {
 }
 
 func isExplicitNewTask(text string) bool {
-	cues := []string{"新任务", "另一个任务", "换个话题", "重新开始", "不用接上", "不要接上", "start a new task", "new task"}
-	for _, cue := range cues {
+	for _, cue := range followupCueList("router.followup.cues.new_task") {
 		if strings.Contains(text, cue) {
 			return true
 		}
@@ -204,7 +209,10 @@ func isExplicitNewTask(text string) bool {
 }
 
 func isFollowupCue(text string) bool {
-	cues := []string{"继续", "接着", "再", "补充", "扩展", "改成", "换成", "上一个", "上一条", "刚才", "那个", "继续上面", "continue", "expand", "same task"}
+	return isFollowupCueWithCues(text, followupCueList("router.followup.cues.followup"))
+}
+
+func isFollowupCueWithCues(text string, cues []string) bool {
 	for _, cue := range cues {
 		if strings.Contains(text, cue) {
 			return true
@@ -214,8 +222,7 @@ func isFollowupCue(text string) bool {
 }
 
 func isHistoricalCue(text string) bool {
-	cues := []string{"历史", "之前", "前面", "回到", "那个任务", "那件事", "刚才那个", "previous task", "earlier task"}
-	for _, cue := range cues {
+	for _, cue := range followupCueList("router.followup.cues.historical") {
 		if strings.Contains(text, cue) {
 			return true
 		}
@@ -224,7 +231,10 @@ func isHistoricalCue(text string) bool {
 }
 
 func isRetryCue(text string) bool {
-	cues := []string{"重试", "再试", "再来一次", "重新试", "retry", "try again"}
+	return containsCue(text, followupCueList("router.followup.cues.retry"))
+}
+
+func containsCue(text string, cues []string) bool {
 	for _, cue := range cues {
 		if strings.Contains(text, cue) {
 			return true
@@ -234,72 +244,193 @@ func isRetryCue(text string) bool {
 }
 
 func isShortContextDependent(text string) bool {
+	return isShortContextDependentWithCues(text, followupCueSet{
+		Followup:    followupCueList("router.followup.cues.followup"),
+		ShortSuffix: followupCueList("router.followup.cues.short_suffix"),
+	})
+}
+
+func isShortContextDependentWithCues(text string, cues followupCueSet) bool {
 	if utf8.RuneCountInString(text) > 10 {
 		return false
 	}
-	if isFollowupCue(text) {
+	if isFollowupCueWithCues(text, cues.Followup) {
 		return true
 	}
-	return strings.HasSuffix(text, "呢") ||
-		strings.HasSuffix(text, "吗") ||
-		strings.HasSuffix(text, "么") ||
-		strings.HasSuffix(text, "如何") ||
-		strings.HasSuffix(text, "怎么样")
-}
-
-var ordinalPatterns = []struct {
-	re     *regexp.Regexp
-	lookup map[string]int
-}{
-	{regexp.MustCompile(`第\s*([一二三四五六七八九十0-9]+)\s*(个|条|件)?\s*(任务|问题|请求)?`), nil},
-}
-
-func ordinalTaskReference(text string) (int, bool) {
-	for _, pattern := range ordinalPatterns {
-		matches := pattern.re.FindStringSubmatch(text)
-		if len(matches) < 2 {
-			continue
-		}
-		if n, ok := parseOrdinal(matches[1]); ok {
-			return n, true
+	for _, suffix := range cues.ShortSuffix {
+		if strings.HasSuffix(text, suffix) {
+			return true
 		}
 	}
-	return 0, false
+	return false
 }
 
-func parseOrdinal(value string) (int, bool) {
+func modelFollowupPrompt(state session.State, text string) string {
+	var b strings.Builder
+	b.WriteString("Decide whether the current user message continues one of the recent tasks.\n")
+	b.WriteString("Return JSON only with this schema: {\"kind\":\"new_task|continuation|clarify\",\"task_id\":\"\",\"reason\":\"\"}.\n")
+	b.WriteString("Use continuation when the user asks to continue, finish remaining work, execute remaining steps, test, retry, or verify the immediately previous task.\n")
+	b.WriteString("Use new_task for clearly unrelated standalone work. Use clarify only when multiple tasks match.\n\n")
+	b.WriteString("Current user message:\n")
+	b.WriteString(strings.TrimSpace(text))
+	b.WriteString("\n\nRecent tasks, newest last:\n")
+	start := len(state.Tasks) - 5
+	if start < 0 {
+		start = 0
+	}
+	for _, task := range state.Tasks[start:] {
+		b.WriteString("- id: ")
+		b.WriteString(task.ID)
+		b.WriteString("\n  status: ")
+		b.WriteString(task.Status)
+		b.WriteString("\n  goal: ")
+		b.WriteString(task.Goal)
+		if task.Summary != "" {
+			b.WriteString("\n  summary: ")
+			b.WriteString(summarize(task.Summary))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func parseModelFollowupDecision(text string, state session.State, current string) (followupDecision, error) {
+	raw := strings.TrimSpace(text)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	var payload struct {
+		Kind   string `json:"kind"`
+		TaskID string `json:"task_id"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return followupDecision{}, err
+	}
+	kind := strings.TrimSpace(payload.Kind)
+	reason := strings.TrimSpace(payload.Reason)
+	switch kind {
+	case string(followupContinuation):
+		task := taskByID(state, payload.TaskID)
+		if task == nil {
+			return followupDecision{}, fmt.Errorf("model followup task_id %q not found", payload.TaskID)
+		}
+		return continueTask(*task, current, followupDefaultString(reason, "model followup route")), nil
+	case string(followupClarify):
+		return clarify(current, followupDefaultString(reason, "model followup ambiguous")), nil
+	case string(followupNewTask):
+		return followupDecision{Kind: followupNewTask, ResolvedUserText: strings.TrimSpace(current), Reason: followupDefaultString(reason, "model followup new task")}, nil
+	default:
+		return followupDecision{}, fmt.Errorf("unsupported model followup kind %q", kind)
+	}
+}
+
+type modelPendingIntentHookProvider struct{}
+
+func (modelPendingIntentHookProvider) Name() string { return "model_pending_intent" }
+
+func (modelPendingIntentHookProvider) PendingIntentHook(ctx context.Context, input PendingIntentInput) (pendingIntentDecision, error) {
+	if input.Model == nil {
+		return pendingIntentDecision{}, nil
+	}
+	if strings.TrimSpace(input.Text) == "" || input.Pending.Kind != "user_input" {
+		return pendingIntentDecision{}, nil
+	}
+	msg, err := input.Model.Next(ctx, agentcore.Context{
+		SystemPrompt: "You classify how a user message relates to a pending question. Return JSON only. Do not call tools.",
+		Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: modelPendingIntentPrompt(input)}},
+		Tools:        nil,
+	})
+	if err != nil {
+		return pendingIntentDecision{}, err
+	}
+	return parseModelPendingIntentDecision(msg.Content)
+}
+
+func modelPendingIntentPrompt(input PendingIntentInput) string {
+	task := taskByID(input.State, input.Pending.TaskID)
+	var b strings.Builder
+	b.WriteString("Classify the current user message while a task is awaiting user input.\n")
+	b.WriteString("Return JSON only: {\"kind\":\"answer_pending|action_ack|new_task|unclear\",\"reason\":\"\"}.\n")
+	b.WriteString("Use answer_pending when the message supplies missing information or answers the pending question.\n")
+	b.WriteString("Use action_ack when the user gives a short approval/continue signal for the pending task.\n")
+	b.WriteString("Use new_task when the message is a standalone unrelated task.\n")
+	b.WriteString("Use unclear only when it is ambiguous and should remain pending.\n\n")
+	examples := strings.TrimSpace(i18n.New(i18n.Config{CatalogDir: input.CatalogDir}).T(input.Locale, "router.pending_intent.examples", nil))
+	if examples != "" && examples != "router.pending_intent.examples" {
+		b.WriteString("Examples:\n")
+		b.WriteString(examples)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Pending question:\n")
+	b.WriteString(strings.TrimSpace(input.Pending.Question))
+	b.WriteString("\n\nCurrent user message:\n")
+	b.WriteString(strings.TrimSpace(input.Text))
+	if task != nil {
+		b.WriteString("\n\nPending task:\n- id: ")
+		b.WriteString(task.ID)
+		b.WriteString("\n- status: ")
+		b.WriteString(task.Status)
+		b.WriteString("\n- goal: ")
+		b.WriteString(task.Goal)
+		if task.Summary != "" {
+			b.WriteString("\n- summary: ")
+			b.WriteString(summarize(task.Summary))
+		}
+	}
+	return b.String()
+}
+
+func parseModelPendingIntentDecision(text string) (pendingIntentDecision, error) {
+	raw := strings.TrimSpace(text)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	var payload struct {
+		Kind   string `json:"kind"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return pendingIntentDecision{}, err
+	}
+	kind := strings.TrimSpace(payload.Kind)
+	switch kind {
+	case "answer_pending", "action_ack", "new_task", "unclear":
+		return pendingIntentDecision{Kind: kind, Reason: strings.TrimSpace(payload.Reason)}, nil
+	default:
+		return pendingIntentDecision{}, fmt.Errorf("unsupported pending intent kind %q", kind)
+	}
+}
+
+func fallbackPendingIntentDecision(pending session.PendingAction, text, reason string) pendingIntentDecision {
+	if shouldBypassUserInputPending(&pending, text) {
+		return pendingIntentDecision{Kind: "new_task", Reason: followupDefaultString(reason, "standalone task request")}
+	}
+	if isActionAckFollowup(text) {
+		return pendingIntentDecision{Kind: "action_ack", Reason: followupDefaultString(reason, "action acknowledgement")}
+	}
+	return pendingIntentDecision{Kind: "answer_pending", Reason: followupDefaultString(reason, "answer pending question")}
+}
+
+func taskByID(state session.State, id string) *session.TaskNode {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	for i := range state.Tasks {
+		if state.Tasks[i].ID == id {
+			return &state.Tasks[i]
+		}
+	}
+	return nil
+}
+
+func followupDefaultString(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return 0, false
+		return fallback
 	}
-	if value[0] >= '0' && value[0] <= '9' {
-		var n int
-		if _, err := fmt.Sscanf(value, "%d", &n); err == nil && n > 0 {
-			return n, true
-		}
-	}
-	switch value {
-	case "一":
-		return 1, true
-	case "二":
-		return 2, true
-	case "三":
-		return 3, true
-	case "四":
-		return 4, true
-	case "五":
-		return 5, true
-	case "六":
-		return 6, true
-	case "七":
-		return 7, true
-	case "八":
-		return 8, true
-	case "九":
-		return 9, true
-	case "十":
-		return 10, true
-	default:
-		return 0, false
-	}
+	return value
 }

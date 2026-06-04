@@ -48,3 +48,24 @@ func TestStoreWritesPrivateFile(t *testing.T) {
 		t.Fatalf("mode = %v", info.Mode().Perm())
 	}
 }
+
+func TestStoreRejectsReservedIDAndRequiresOverwrite(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Home: home}
+	if err := store.Set("system/foo", "secret"); err == nil {
+		t.Fatal("expected reserved id rejection")
+	}
+	if err := store.Set("mail.token", "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set("mail.token", "two"); err == nil {
+		t.Fatal("expected overwrite rejection")
+	}
+	if err := store.SetWithOptions("mail.token", "two", SetOptions{Overwrite: true}); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, err := store.Get("mail.token")
+	if err != nil || !ok || entry.Value != "two" {
+		t.Fatalf("entry=%#v ok=%v err=%v", entry, ok, err)
+	}
+}

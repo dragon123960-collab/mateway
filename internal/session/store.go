@@ -21,34 +21,59 @@ type State struct {
 }
 
 type TaskNode struct {
-	ID        string     `json:"id"`
-	ParentID  string     `json:"parent_id,omitempty"`
-	Goal      string     `json:"goal"`
-	Summary   string     `json:"summary,omitempty"`
-	Status    string     `json:"status"`
-	Steps     []TaskStep `json:"steps,omitempty"`
-	TraceID   string     `json:"trace_id,omitempty"`
-	TracePath string     `json:"trace_path,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID                 string             `json:"id"`
+	ParentID           string             `json:"parent_id,omitempty"`
+	Goal               string             `json:"goal"`
+	Summary            string             `json:"summary,omitempty"`
+	Status             string             `json:"status"`
+	CompletionContract CompletionContract `json:"completion_contract,omitempty"`
+	Steps              []TaskStep         `json:"steps,omitempty"`
+	Approvals          []TaskApproval     `json:"approvals,omitempty"`
+	TraceID            string             `json:"trace_id,omitempty"`
+	TracePath          string             `json:"trace_path,omitempty"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+}
+
+type CompletionContract struct {
+	RequiredTools     []string `json:"required_tools,omitempty"`
+	RequiresLLMReview bool     `json:"requires_llm_review,omitempty"`
+	SuccessCondition  string   `json:"success_condition,omitempty"`
+	TaskType          string   `json:"task_type,omitempty"`
+	RequiresMutation  bool     `json:"requires_mutation,omitempty"`
+	AllowsBlocker     bool     `json:"allows_blocker,omitempty"`
 }
 
 type TaskStep struct {
-	ID       string         `json:"id"`
-	Tool     string         `json:"tool"`
-	Status   string         `json:"status"`
-	Summary  string         `json:"summary,omitempty"`
-	Evidence map[string]any `json:"evidence,omitempty"`
+	ID                 string         `json:"id"`
+	Tool               string         `json:"tool"`
+	Status             string         `json:"status"`
+	Summary            string         `json:"summary,omitempty"`
+	Evidence           map[string]any `json:"evidence,omitempty"`
+	Risk               string         `json:"risk,omitempty"`
+	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
+	EvidenceContract   string         `json:"evidence_contract,omitempty"`
+	Accepted           bool           `json:"accepted,omitempty"`
+	Mutation           bool           `json:"mutation,omitempty"`
+}
+
+type TaskApproval struct {
+	Key       string    `json:"key"`
+	Tool      string    `json:"tool"`
+	Class     string    `json:"class,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type PendingAction struct {
-	Kind       string             `json:"kind"`
-	TaskID     string             `json:"task_id"`
-	ProposalID string             `json:"proposal_id,omitempty"`
-	ScheduleID string             `json:"schedule_id,omitempty"`
-	Question   string             `json:"question,omitempty"`
-	ToolCall   agentcore.ToolCall `json:"tool_call,omitempty"`
-	ResumeText string             `json:"resume_text,omitempty"`
+	Kind              string             `json:"kind"`
+	TaskID            string             `json:"task_id"`
+	ProposalID        string             `json:"proposal_id,omitempty"`
+	ScheduleID        string             `json:"schedule_id,omitempty"`
+	ArchiveID         string             `json:"archive_id,omitempty"`
+	Question          string             `json:"question,omitempty"`
+	ToolCall          agentcore.ToolCall `json:"tool_call,omitempty"`
+	ResumeText        string             `json:"resume_text,omitempty"`
+	AuthorizationOnly bool               `json:"authorization_only,omitempty"`
 }
 
 type Usage struct {
@@ -243,6 +268,48 @@ func (s *State) AddStep(taskID string, step TaskStep) {
 	}
 }
 
+func (s *State) HasTaskApproval(taskID, key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	for i := range s.Tasks {
+		if s.Tasks[i].ID != taskID || !IsOpenTaskStatus(s.Tasks[i].Status) {
+			continue
+		}
+		for _, approval := range s.Tasks[i].Approvals {
+			if approval.Key == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *State) AddTaskApproval(taskID string, approval TaskApproval) {
+	approval.Key = strings.TrimSpace(approval.Key)
+	if approval.Key == "" {
+		return
+	}
+	now := time.Now()
+	if approval.CreatedAt.IsZero() {
+		approval.CreatedAt = now
+	}
+	for i := range s.Tasks {
+		if s.Tasks[i].ID != taskID {
+			continue
+		}
+		for _, existing := range s.Tasks[i].Approvals {
+			if existing.Key == approval.Key {
+				return
+			}
+		}
+		s.Tasks[i].Approvals = append(s.Tasks[i].Approvals, approval)
+		s.Tasks[i].UpdatedAt = now
+		return
+	}
+}
+
 func (s *State) CompleteActiveTask() {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {
@@ -289,7 +356,7 @@ func safeName(key string) string {
 }
 
 func nextTaskID(n int) string {
-	return "task-" + time.Now().Format("20060102150405") + "-" + strings.TrimLeft(strings.ReplaceAll(time.Duration(n).String(), "ns", ""), "0")
+	return "task-" + time.Now().Format("20060102150405.000000") + "-" + strings.TrimLeft(strings.ReplaceAll(time.Duration(n).String(), "ns", ""), "0")
 }
 
 func nextStepID(n int) string {

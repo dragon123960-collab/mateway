@@ -60,3 +60,78 @@ func TestRunScriptMissingSecretFails(t *testing.T) {
 		t.Fatalf("expected missing secret error, got %v", err)
 	}
 }
+
+func TestListIncludesSkillLocalScriptsWithPrecedence(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	agentScript := filepath.Join(workspace, "agents", "main", "skills", "mail", "scripts", "run")
+	sharedScript := filepath.Join(workspace, "skills", "mail", "scripts", "run")
+	globalScript := filepath.Join(workspace, "scripts", "run")
+	for _, path := range []string{agentScript, sharedScript, globalScript} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(agentScript, []byte("#!/bin/sh\n# mateway.name: mail.run\necho agent\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedScript, []byte("#!/bin/sh\n# mateway.name: mail.run\necho shared\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(globalScript, []byte("#!/bin/sh\n# mateway.name: mail.run\necho global\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Agents: config.AgentsConfig{Default: "main"}}
+	cfg.NormalizeForUse()
+	scripts, err := List(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scripts) != 1 || scripts[0].Name != "mail.run" || scripts[0].Path != agentScript {
+		t.Fatalf("expected agent script to win, got %#v", scripts)
+	}
+	result, err := Run(context.Background(), cfg, RunInput{Name: "mail.run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.Output) != "agent" {
+		t.Fatalf("expected agent output, got %#v", result)
+	}
+}
+
+func TestExternalSkillScriptRequiresAuthorizationAndHashMatch(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	scriptPath := filepath.Join(workspace, "skills", "external", "scripts", "run")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho external\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}}
+	cfg.NormalizeForUse()
+	scripts, err := List(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scripts) != 1 || scripts[0].Source != "external_skill" || scripts[0].Authorized {
+		t.Fatalf("expected unauthorized external script, got %#v", scripts)
+	}
+	if _, err := Run(context.Background(), cfg, RunInput{Name: "run"}); err == nil || !strings.Contains(err.Error(), "requires authorization") {
+		t.Fatalf("expected authorization error, got %v", err)
+	}
+	if _, err := Authorize(cfg, "run"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Run(context.Background(), cfg, RunInput{Name: "run"})
+	if err != nil || strings.TrimSpace(result.Output) != "external" {
+		t.Fatalf("expected authorized run, result=%#v err=%v", result, err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho changed\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(context.Background(), cfg, RunInput{Name: "run"}); err == nil || !strings.Contains(err.Error(), "requires authorization") {
+		t.Fatalf("expected hash-change authorization error, got %v", err)
+	}
+}

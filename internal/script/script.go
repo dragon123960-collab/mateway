@@ -3,7 +3,11 @@ package script
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +25,19 @@ type Script struct {
 	Description     string
 	Risk            string
 	RequiredSecrets []SecretRef
+	Source          string
+	Hash            string
+	Authorized      bool
+}
+
+type Record struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Source     string `json:"source"`
+	Risk       string `json:"risk"`
+	Hash       string `json:"hash"`
+	Authorized bool   `json:"authorized"`
+	UpdatedAt  string `json:"updated_at"`
 }
 
 type SecretRef struct {
@@ -66,6 +83,9 @@ func List(cfg *config.Root) ([]Script, error) {
 			if err != nil {
 				return nil, err
 			}
+			script.Source = scriptSource(path, cfg)
+			script.Hash = fileHash(path)
+			script.Authorized = script.Source != "external_skill" || isAuthorized(cfg, script)
 			key := strings.ToLower(script.Name)
 			if key == "" || seen[key] {
 				continue
@@ -96,6 +116,9 @@ func Run(ctx context.Context, cfg *config.Root, input RunInput) (RunResult, erro
 	}
 	if selected.Name == "" {
 		return RunResult{}, fmt.Errorf("script %q not found", name)
+	}
+	if selected.Source == "external_skill" && !selected.Authorized {
+		return RunResult{}, fmt.Errorf("script %q requires authorization before first run", name)
 	}
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -139,6 +162,13 @@ func scriptDirs(cfg *config.Root) []string {
 	var dirs []string
 	home := home(cfg)
 	workspace := workspace(cfg)
+	agentID := defaultAgentID(cfg)
+	if workspace != "" && agentID != "" {
+		dirs = append(dirs, skillScriptDirs(filepath.Join(workspace, "agents", agentID, "skills"))...)
+	}
+	if workspace != "" {
+		dirs = append(dirs, skillScriptDirs(filepath.Join(workspace, "skills"))...)
+	}
 	dirs = append(dirs, filepath.Join(home, "scripts"))
 	if workspace != "" {
 		dirs = append(dirs, filepath.Join(workspace, "scripts"))
@@ -161,6 +191,116 @@ func scriptDirs(cfg *config.Root) []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+func Authorize(cfg *config.Root, name string) (Record, error) {
+	scripts, err := List(cfg)
+	if err != nil {
+		return Record{}, err
+	}
+	for _, script := range scripts {
+		if script.Name != name {
+			continue
+		}
+		record := Record{Name: script.Name, Path: script.Path, Source: script.Source, Risk: script.Risk, Hash: script.Hash, Authorized: true, UpdatedAt: time.Now().UTC().Format(time.RFC3339)}
+		records, err := loadRecords(cfg)
+		if err != nil {
+			return Record{}, err
+		}
+		records[recordKey(script)] = record
+		return record, saveRecords(cfg, records)
+	}
+	return Record{}, fmt.Errorf("script %q not found", name)
+}
+
+func scriptSource(path string, cfg *config.Root) string {
+	clean, _ := filepath.Abs(filepath.Clean(path))
+	home := home(cfg)
+	workspace := workspace(cfg)
+	if home != "" && strings.HasPrefix(clean, filepath.Join(home, "scripts")+string(filepath.Separator)) {
+		return "local"
+	}
+	if workspace != "" && strings.Contains(clean, string(filepath.Separator)+"agents"+string(filepath.Separator)) {
+		return "agent"
+	}
+	if workspace != "" && strings.Contains(clean, string(filepath.Separator)+"skills"+string(filepath.Separator)) {
+		return "external_skill"
+	}
+	return "configured"
+}
+
+func fileHash(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	sum := sha256.New()
+	_, _ = io.Copy(sum, file)
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+func recordKey(script Script) string {
+	return script.Path + "\x00" + script.Hash
+}
+
+func isAuthorized(cfg *config.Root, script Script) bool {
+	records, err := loadRecords(cfg)
+	if err != nil {
+		return false
+	}
+	record, ok := records[recordKey(script)]
+	return ok && record.Authorized
+}
+
+func recordsPath(cfg *config.Root) string {
+	return filepath.Join(home(cfg), "scripts", "records.json")
+}
+
+func loadRecords(cfg *config.Root) (map[string]Record, error) {
+	data, err := os.ReadFile(recordsPath(cfg))
+	if os.IsNotExist(err) {
+		return map[string]Record{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var records map[string]Record
+	if err := json.Unmarshal(data, &records); err != nil {
+		return nil, err
+	}
+	if records == nil {
+		records = map[string]Record{}
+	}
+	return records, nil
+}
+
+func saveRecords(cfg *config.Root, records map[string]Record) error {
+	path := recordsPath(cfg)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func skillScriptDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(root, entry.Name(), "scripts"))
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 func parseScript(path string) (Script, error) {
@@ -230,6 +370,13 @@ func workspace(cfg *config.Root) string {
 		return strings.TrimSpace(cfg.App.Workspace)
 	}
 	return filepath.Join(home(cfg), "workspace")
+}
+
+func defaultAgentID(cfg *config.Root) string {
+	if cfg != nil && strings.TrimSpace(cfg.Agents.Default) != "" {
+		return strings.TrimSpace(cfg.Agents.Default)
+	}
+	return "main"
 }
 
 func expandHome(path string) string {

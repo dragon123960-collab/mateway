@@ -2,12 +2,15 @@ package gateway
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/session"
 )
 
 func TestSessionKeyUsesChannelNamespace(t *testing.T) {
@@ -62,6 +65,17 @@ func TestShouldIgnoreFeishuNonTextEvents(t *testing.T) {
 	}
 }
 
+func TestShouldIgnoreFeishuImageMessages(t *testing.T) {
+	msg := channel.InboundMessage{
+		Channel:  "feishu",
+		Metadata: map[string]string{"message_type": "image", "chat_type": "p2p"},
+		Parts:    []channel.MessagePart{{Type: channel.PartImage, Metadata: map[string]string{"image_key": "img_1"}}},
+	}
+	if shouldIgnoreInbound(config.FeishuConfig{}, msg) {
+		t.Fatal("expected image message accepted")
+	}
+}
+
 func TestShouldIgnoreFeishuGroupWithoutMentionWhenRequired(t *testing.T) {
 	cfg := config.FeishuConfig{MentionRequiredGroup: true}
 	msg := channel.InboundMessage{Channel: "feishu", Text: "hello", Metadata: map[string]string{"message_type": "text", "chat_type": "group", "is_mentioned": "false"}}
@@ -78,6 +92,7 @@ func TestReactionForReply(t *testing.T) {
 	cases := map[string]string{
 		"approval_pending": "EYES",
 		"input_required":   "EYES",
+		"partial":          "EYES",
 		"clarify":          "EYES",
 		"error":            "CROSS_MARK",
 		"cancelled":        "CROSS_MARK",
@@ -89,6 +104,109 @@ func TestReactionForReply(t *testing.T) {
 		if got := reactionForReply(channel.OutboundMessage{Style: style}); got != want {
 			t.Fatalf("style %q reaction = %q want %q", style, got, want)
 		}
+	}
+}
+
+func TestShouldSendProcessingAckSkipsNewSessionCommand(t *testing.T) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "/new"}) {
+		t.Fatal("expected /new to skip processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "/read README.md"}) {
+		t.Fatal("expected slash command to skip processing ack")
+	}
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "hello"}) {
+		t.Fatal("expected normal message to send processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "hello", Metadata: map[string]string{"message_type": "interactive", "card_action": "confirm"}}) {
+		t.Fatal("expected card action to skip processing ack")
+	}
+}
+
+func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := state.StartTask("needs confirmation")
+	state.Pending = &session.PendingAction{Kind: "confirm_tool", TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认"}) {
+		t.Fatal("expected pending session to skip processing ack")
+	}
+}
+
+func TestEnabledHeartbeatStartersUseProfileConfig(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App: config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{{
+				ID: "main",
+				Heartbeat: config.HeartbeatConfig{
+					Enabled:  true,
+					Interval: "7m",
+					Jobs:     []string{"memory_distill", "learning_distill"},
+				},
+			}},
+		},
+	}
+	input := heartbeatInputForProfile(cfg, cfg.Agents.Profiles[0])
+	if input.Home != home {
+		t.Fatalf("home = %q want %q", input.Home, home)
+	}
+	if input.Workspace != filepath.Join(home, "workspace") {
+		t.Fatalf("workspace = %q", input.Workspace)
+	}
+	if input.MemoryRoot != filepath.Join(home, "workspace", "memory") {
+		t.Fatalf("memory root = %q", input.MemoryRoot)
+	}
+	if input.IndexPath != filepath.Join(home, "indexes", "memory_index.json") {
+		t.Fatalf("index path = %q", input.IndexPath)
+	}
+	if input.Interval != 7*time.Minute {
+		t.Fatalf("interval = %v want 7m", input.Interval)
+	}
+	if strings.Join(input.Jobs, ",") != "memory_distill,learning_distill" {
+		t.Fatalf("jobs = %#v", input.Jobs)
+	}
+	if len(enabledHeartbeatStarters(context.Background(), cfg)) != 1 {
+		t.Fatal("expected one heartbeat starter")
+	}
+}
+
+func TestEnabledHeartbeatStartersDeduplicateEquivalentProfiles(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App: config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{
+				{
+					ID: "main",
+					Heartbeat: config.HeartbeatConfig{
+						Enabled:  true,
+						Interval: "30m",
+						Jobs:     []string{"memory_distill", "learning_distill", "skill_learning", "memory_lint"},
+					},
+				},
+				{
+					ID: "local",
+					Heartbeat: config.HeartbeatConfig{
+						Enabled:  true,
+						Interval: "30m",
+						Jobs:     []string{"memory_lint", "memory_distill", "learning_distill", "skill_learning"},
+					},
+				},
+			},
+		},
+	}
+	if len(enabledHeartbeatStarters(context.Background(), cfg)) != 1 {
+		t.Fatal("expected equivalent heartbeat configs to share one starter")
 	}
 }
 

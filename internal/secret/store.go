@@ -21,10 +21,21 @@ type Entry struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+type SetOptions struct {
+	Overwrite bool
+}
+
 func (s Store) Set(id, value string) error {
+	return s.SetWithOptions(id, value, SetOptions{})
+}
+
+func (s Store) SetWithOptions(id, value string, options SetOptions) error {
 	id = normalizeID(id)
 	if id == "" {
 		return fmt.Errorf("secret id is required")
+	}
+	if !ValidID(id) {
+		return fmt.Errorf("invalid or reserved secret id %q", id)
 	}
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("secret value is required")
@@ -35,6 +46,9 @@ func (s Store) Set(id, value string) error {
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	entry := data[id]
+	if entry.ID != "" && !options.Overwrite {
+		return fmt.Errorf("secret %s already exists; set overwrite=true to replace it", id)
+	}
 	if entry.ID == "" {
 		entry = Entry{ID: id, CreatedAt: now}
 	}
@@ -42,6 +56,28 @@ func (s Store) Set(id, value string) error {
 	entry.UpdatedAt = now
 	data[id] = entry
 	return s.save(data)
+}
+
+func ValidID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, prefix := range []string{"system/", "mateway/", "internal/"} {
+		if strings.HasPrefix(id, prefix) {
+			return false
+		}
+	}
+	for i, r := range id {
+		ok := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' || r == '/'
+		if !ok {
+			return false
+		}
+		if i == 0 && !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s Store) Get(id string) (Entry, bool, error) {

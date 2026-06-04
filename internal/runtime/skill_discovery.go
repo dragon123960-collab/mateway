@@ -93,7 +93,7 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 			continue
 		}
 		path := filepath.Join(root, entry.Name(), "SKILL.md")
-		text := readPromptContextFile(path, 4096)
+		text := readPromptContextHead(path, 8192)
 		if text == "" {
 			continue
 		}
@@ -150,9 +150,9 @@ func skillsPrompt(skills []discoveredSkill) string {
 	}
 	var b strings.Builder
 	b.WriteString("Discovered skills:\n")
-	b.WriteString("- Skills are optional guidance, not tools. Use them to decide search strategy, source evaluation, installation workflow, or answer style.\n")
-	b.WriteString("- Do not claim a skill was executed unless an actual tool was called.\n")
-	b.WriteString("- A skill under workspace/skills is already installed as a shared skill. Agent-specific skills under workspace/agents/<agent>/skills only override shared skills; do not ask the user to copy or symlink a shared skill unless they want an override.\n")
+	b.WriteString("- Skills provide specialized instructions for matching tasks.\n")
+	b.WriteString("- When a task matches a skill description, read the skill file with file.read before relying on its workflow.\n")
+	b.WriteString("- Resolve relative paths in a skill file against the skill directory.\n")
 	for _, skill := range skills {
 		b.WriteString("- ")
 		b.WriteString(skill.Name)
@@ -173,17 +173,9 @@ func skillsPrompt(skills []discoveredSkill) string {
 			b.WriteString(skill.Description)
 		}
 		b.WriteString("\n")
-		if guidance := skillGuidance(skill.Path, 1200); guidance != "" {
-			b.WriteString("  Guidance:\n")
-			for _, line := range strings.Split(guidance, "\n") {
-				if strings.TrimSpace(line) == "" {
-					continue
-				}
-				b.WriteString("  ")
-				b.WriteString(line)
-				b.WriteString("\n")
-			}
-		}
+		b.WriteString("  Location: ")
+		b.WriteString(skill.Path)
+		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -194,30 +186,6 @@ func skillPriority(skill discoveredSkill) int {
 		return 0
 	}
 	return priority
-}
-
-func skillGuidance(path string, limit int) string {
-	text := readPromptContextFile(path, int64(limit*4))
-	if text == "" {
-		return ""
-	}
-	text = stripSkillFrontMatter(text)
-	lines := strings.Split(text, "\n")
-	var out []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			if len(out) > 0 && out[len(out)-1] != "" {
-				out = append(out, "")
-			}
-			continue
-		}
-		out = append(out, trimmed)
-		if len(strings.Join(out, "\n")) >= limit {
-			break
-		}
-	}
-	return truncateString(strings.TrimSpace(strings.Join(out, "\n")), limit)
 }
 
 func stripSkillFrontMatter(text string) string {

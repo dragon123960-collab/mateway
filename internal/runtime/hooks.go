@@ -12,11 +12,17 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
+	"github.com/dongping/mateway/internal/script"
+	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
 
-const defaultHookTimeout = 2 * time.Second
+const (
+	defaultHookTimeout             = 2 * time.Second
+	defaultFollowupHookTimeout     = 8 * time.Second
+	defaultCompletionReviewTimeout = 15 * time.Second
+)
 
 type ContextHookInput struct {
 	Message  channel.InboundMessage
@@ -53,8 +59,11 @@ type ContextHookProvider interface {
 }
 
 type FollowupHookInput struct {
-	State session.State
-	Text  string
+	State      session.State
+	Text       string
+	Model      agentcore.Model
+	Locale     string
+	CatalogDir string
 }
 
 type FollowupHookProvider interface {
@@ -62,21 +71,62 @@ type FollowupHookProvider interface {
 	FollowupHook(context.Context, FollowupHookInput) (followupDecision, error)
 }
 
+type PendingIntentInput struct {
+	State      session.State
+	Pending    session.PendingAction
+	Text       string
+	Model      agentcore.Model
+	Locale     string
+	CatalogDir string
+}
+
+type pendingIntentDecision struct {
+	Kind   string
+	Reason string
+}
+
+type PendingIntentHookProvider interface {
+	HookProvider
+	PendingIntentHook(context.Context, PendingIntentInput) (pendingIntentDecision, error)
+}
+
 type ToolPolicyHookInput struct {
 	ToolCall agentcore.ToolCall
 	Tool     agentcore.Tool
 	Config   *config.Root
+	Locale   string
 }
 
 type ToolPolicyHookResult struct {
-	Block      bool
-	Reason     string
-	ResumeText string
+	Block             bool
+	Reason            string
+	ResumeText        string
+	AuthorizationOnly bool
 }
 
 type ToolPolicyHookProvider interface {
 	HookProvider
 	ToolPolicyHook(context.Context, ToolPolicyHookInput) (ToolPolicyHookResult, error)
+}
+
+type CompletionReviewInput struct {
+	UserText           string
+	Task               session.TaskNode
+	FinalText          string
+	TranscriptMessages []agentcore.Message
+	Model              agentcore.Model
+}
+
+type CompletionReviewResult struct {
+	Completed         bool
+	Reason            string
+	MissingItems      []string
+	SuggestedFollowUp string
+}
+
+type CompletionReviewHookProvider interface {
+	HookProvider
+	CompletionReviewHook(context.Context, CompletionReviewInput) (CompletionReviewResult, error)
 }
 
 type ObserveHookInput struct {
@@ -108,6 +158,8 @@ type ObserveHookProvider interface {
 type ResponseHookInput struct {
 	RawText        string
 	LearningResult *memory.LearningResult
+	Locale         string
+	CatalogDir     string
 }
 
 type ResponseHookResult struct {
@@ -164,10 +216,11 @@ func (h RuntimeHooks) contextMessages(ctx context.Context, input ContextHookInpu
 }
 
 func (h RuntimeHooks) resolveFollowup(ctx context.Context, input FollowupHookInput, trace *traceRecorder) followupDecision {
-	timeout := h.Timeout
-	if timeout <= 0 {
-		timeout = defaultHookTimeout
+	if decision := protocolFollowupDecision(input.State, input.Text); decision.Kind != "" {
+		_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "protocol_guard", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
+		return decision
 	}
+	timeout := defaultFollowupHookTimeout
 	for _, provider := range h.Providers {
 		followupProvider, ok := provider.(FollowupHookProvider)
 		if !ok {
@@ -187,9 +240,35 @@ func (h RuntimeHooks) resolveFollowup(ctx context.Context, input FollowupHookInp
 			return decision
 		}
 	}
-	decision := resolveFollowup(input.State, input.Text)
-	_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "fallback_resolver", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
+	decision := fallbackFollowupDecision(input.State, input.Text, input.Locale, input.CatalogDir, "model followup unavailable")
+	_ = trace.write(map[string]any{"type": "hook_event", "hook": "followup_hook", "provider": "safe_fallback", "decision": decision.Kind, "task_id": decision.TaskID, "reason": decision.Reason})
 	return decision
+}
+
+func (h RuntimeHooks) pendingIntent(ctx context.Context, input PendingIntentInput, trace *traceRecorder) pendingIntentDecision {
+	timeout := defaultFollowupHookTimeout
+	for _, provider := range h.Providers {
+		intentProvider, ok := provider.(PendingIntentHookProvider)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(provider.Name())
+		if name == "" {
+			name = "unknown"
+		}
+		result, err := runPendingIntentHookProvider(ctx, intentProvider, input, timeout)
+		if err != nil {
+			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "pending_intent_hook", "provider": name, "error": err.Error()})
+			continue
+		}
+		_ = trace.write(map[string]any{"type": "hook_event", "hook": "pending_intent_hook", "provider": name, "decision": result.Kind, "reason": result.Reason})
+		if strings.TrimSpace(result.Kind) != "" {
+			return result
+		}
+	}
+	result := fallbackPendingIntentDecision(input.Pending, input.Text, "model pending intent unavailable")
+	_ = trace.write(map[string]any{"type": "hook_event", "hook": "pending_intent_hook", "provider": "safe_fallback", "decision": result.Kind, "reason": result.Reason})
+	return result
 }
 
 func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput, trace *traceRecorder) ToolPolicyHookResult {
@@ -217,6 +296,50 @@ func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput,
 		}
 	}
 	return ToolPolicyHookResult{}
+}
+
+func (h RuntimeHooks) completionReview(ctx context.Context, input CompletionReviewInput, trace *traceRecorder) CompletionReviewResult {
+	timeout := defaultCompletionReviewTimeout
+	sawProvider := false
+	for _, provider := range h.Providers {
+		reviewProvider, ok := provider.(CompletionReviewHookProvider)
+		if !ok {
+			continue
+		}
+		sawProvider = true
+		name := strings.TrimSpace(provider.Name())
+		if name == "" {
+			name = "unknown"
+		}
+		result, err := runCompletionReviewHookProvider(ctx, reviewProvider, input, timeout)
+		if err != nil {
+			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "completion_review_hook", "provider": name, "error": err.Error()})
+			continue
+		}
+		_ = trace.write(map[string]any{
+			"type":               "hook_event",
+			"hook":               "completion_review_hook",
+			"provider":           name,
+			"completed":          result.Completed,
+			"reason":             result.Reason,
+			"missing_items":      result.MissingItems,
+			"suggested_followup": result.SuggestedFollowUp,
+		})
+		if result.Completed || strings.TrimSpace(result.Reason) != "" || len(result.MissingItems) > 0 || strings.TrimSpace(result.SuggestedFollowUp) != "" {
+			return result
+		}
+	}
+	result := heuristicCompletionReview(input)
+	if !sawProvider {
+		return result
+	}
+	if result.Completed {
+		result.Completed = false
+		result.Reason = "completion review unavailable; leaving task incomplete to avoid a false completed state"
+		result.MissingItems = []string{"completion review did not return a decision"}
+		result.SuggestedFollowUp = defaultCompletionFollowUp(result, input)
+	}
+	return result
 }
 
 func (h RuntimeHooks) observe(ctx context.Context, input ObserveHookInput, trace *traceRecorder) ObserveHookResult {
@@ -276,7 +399,7 @@ func (h RuntimeHooks) response(ctx context.Context, input ResponseHookInput, tra
 	}
 	text := sanitizeResponse(input.RawText)
 	if text == "" {
-		text = fallbackFinalReply(input.RawText)
+		text = fallbackFinalReply(input.RawText, input.Locale, input.CatalogDir)
 	}
 	return text
 }
@@ -347,6 +470,39 @@ func runFollowupHookProvider(ctx context.Context, provider FollowupHookProvider,
 	}
 }
 
+func runPendingIntentHookProvider(ctx context.Context, provider PendingIntentHookProvider, input PendingIntentInput, timeout time.Duration) (result pendingIntentDecision, err error) {
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan struct {
+		result pendingIntentDecision
+		err    error
+	}, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- struct {
+					result pendingIntentDecision
+					err    error
+				}{err: fmt.Errorf("hook panic: %v", r)}
+			}
+		}()
+		result, err := provider.PendingIntentHook(child, input)
+		done <- struct {
+			result pendingIntentDecision
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case output := <-done:
+		return output.result, output.err
+	case <-child.Done():
+		if err := child.Err(); err != nil {
+			return pendingIntentDecision{}, err
+		}
+		return pendingIntentDecision{}, context.DeadlineExceeded
+	}
+}
+
 func runToolPolicyHookProvider(ctx context.Context, provider ToolPolicyHookProvider, input ToolPolicyHookInput, timeout time.Duration) (result ToolPolicyHookResult, err error) {
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -377,6 +533,39 @@ func runToolPolicyHookProvider(ctx context.Context, provider ToolPolicyHookProvi
 			return ToolPolicyHookResult{}, err
 		}
 		return ToolPolicyHookResult{}, context.DeadlineExceeded
+	}
+}
+
+func runCompletionReviewHookProvider(ctx context.Context, provider CompletionReviewHookProvider, input CompletionReviewInput, timeout time.Duration) (result CompletionReviewResult, err error) {
+	child, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan struct {
+		result CompletionReviewResult
+		err    error
+	}, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- struct {
+					result CompletionReviewResult
+					err    error
+				}{err: fmt.Errorf("panic: %v", recovered)}
+			}
+		}()
+		result, err := provider.CompletionReviewHook(child, input)
+		done <- struct {
+			result CompletionReviewResult
+			err    error
+		}{result: result, err: err}
+	}()
+	select {
+	case output := <-done:
+		return output.result, output.err
+	case <-child.Done():
+		if err := child.Err(); err != nil {
+			return CompletionReviewResult{}, err
+		}
+		return CompletionReviewResult{}, context.DeadlineExceeded
 	}
 }
 
@@ -505,8 +694,8 @@ func (p staticContextHookProvider) ContextHook(_ context.Context, input ContextH
 		return ContextHookResult{}, nil
 	}
 	return ContextHookResult{SystemContextSections: []ContextSection{{
-		Name:    "static_runtime_context",
-		Source:  "buildRuntimeSystemContext",
+		Name:    "channel_context",
+		Source:  "buildRuntimeSystemContextForMessage",
 		Content: contextText,
 	}}}, nil
 }
@@ -565,7 +754,7 @@ func shouldSearchMemory(text string) bool {
 		return true
 	}
 	lower := strings.ToLower(text)
-	for _, marker := range []string{"memory", "remember", "preference", "project", "readme", "tool", "记忆", "偏好", "项目", "工具"} {
+	for _, marker := range splitCatalogCSV(i18n.New(i18n.Config{}).T(i18n.LocaleZH, "memory.safe_read.markers", nil)) {
 		if strings.Contains(lower, marker) {
 			return true
 		}
@@ -596,12 +785,30 @@ func hasMemoryLintErrors(issues []memory.Issue) bool {
 	return false
 }
 
-type ruleFollowupHookProvider struct{}
+type modelFollowupHookProvider struct{}
 
-func (ruleFollowupHookProvider) Name() string { return "rule_followup" }
+func (modelFollowupHookProvider) Name() string { return "model_followup" }
 
-func (ruleFollowupHookProvider) FollowupHook(_ context.Context, input FollowupHookInput) (followupDecision, error) {
-	return resolveFollowup(input.State, input.Text), nil
+func (modelFollowupHookProvider) FollowupHook(ctx context.Context, input FollowupHookInput) (followupDecision, error) {
+	if input.Model == nil {
+		return followupDecision{}, nil
+	}
+	if strings.TrimSpace(input.Text) == "" || len(input.State.Tasks) == 0 {
+		return followupDecision{}, nil
+	}
+	msg, err := input.Model.Next(ctx, agentcore.Context{
+		SystemPrompt: "You route user messages to an existing task or a new task. Return JSON only.",
+		Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: modelFollowupPrompt(input.State, input.Text)}},
+		Tools:        nil,
+	})
+	if err != nil {
+		return followupDecision{}, err
+	}
+	decision, err := parseModelFollowupDecision(msg.Content, input.State, input.Text)
+	if err != nil {
+		return followupDecision{}, err
+	}
+	return decision, nil
 }
 
 type defaultToolPolicyHookProvider struct{}
@@ -610,9 +817,11 @@ func (defaultToolPolicyHookProvider) Name() string { return "default_tool_policy
 
 func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input ToolPolicyHookInput) (ToolPolicyHookResult, error) {
 	catalog := i18n.New(i18n.Config{})
-	locale := ""
+	locale := strings.TrimSpace(input.Locale)
 	if input.Config != nil {
-		locale = input.Config.App.Locale
+		if locale == "" {
+			locale = input.Config.App.Locale
+		}
 		catalog = i18n.New(i18n.Config{CatalogDir: input.Config.App.MessageCatalogDir})
 	}
 	if input.ToolCall.Name == "terminal.run" && tool.IsDangerousCommand(fmt.Sprint(input.ToolCall.Args["command"])) {
@@ -621,6 +830,57 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 			Reason:     catalog.T(locale, "approval.confirm.reason", nil),
 			ResumeText: catalog.T(locale, "approval.confirm.resume_dangerous", nil),
 		}, nil
+	}
+	if input.ToolCall.Name == "terminal.run" {
+		decision := tool.CheckTerminalCommand(fmt.Sprint(input.ToolCall.Args["command"]), input.Config)
+		if decision.Allow {
+			switch decision.Class {
+			case "local_read_only", "read_only_pipeline", "project_internal":
+				return ToolPolicyHookResult{}, nil
+			case "remote":
+				if !decision.RequireConfirm {
+					return ToolPolicyHookResult{}, nil
+				}
+			}
+		}
+	}
+	if input.ToolCall.Name == "script.run" {
+		name := strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["name"]))
+		scripts, err := script.List(input.Config)
+		if err == nil {
+			for _, candidate := range scripts {
+				if candidate.Name != name {
+					continue
+				}
+				if candidate.Source == "external_skill" {
+					if !candidate.Authorized {
+						return ToolPolicyHookResult{
+							Block:             true,
+							Reason:            catalog.T(locale, "approval.confirm.external_script", map[string]string{"script": name}),
+							ResumeText:        catalog.T(locale, "approval.confirm.resume_script", nil),
+							AuthorizationOnly: true,
+						}, nil
+					}
+					return ToolPolicyHookResult{}, nil
+				}
+				break
+			}
+		}
+	}
+	if input.ToolCall.Name == "secret.set" {
+		id := strings.ToLower(strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["id"])))
+		if !secret.ValidID(id) {
+			return ToolPolicyHookResult{}, nil
+		}
+		if boolArg(input.ToolCall.Args["overwrite"]) {
+			if entry, ok, err := (secret.Store{Home: configHome(input.Config)}).Get(id); err == nil && ok && entry.ID != "" {
+				return ToolPolicyHookResult{
+					Block:      true,
+					Reason:     "Overwriting existing secret " + id + " requires confirmation.",
+					ResumeText: "Continue after confirming secret overwrite",
+				}, nil
+			}
+		}
 	}
 	if input.Tool == nil {
 		return ToolPolicyHookResult{}, nil
@@ -646,11 +906,27 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 	switch input.Kind {
 	case "tool_result":
 		status, evidence := acceptToolResult(input.Tool, input.ToolResult)
+		risk := ""
+		acceptanceCriteria := ""
+		evidenceContract := ""
+		mutation := false
+		if input.Tool != nil {
+			risk = string(input.Tool.Risk())
+			mutation = input.Tool.Risk() == agentcore.RiskGuardedMutation || input.Tool.Risk() == agentcore.RiskDangerous
+			contract := agentcore.ContractFor(input.Tool)
+			acceptanceCriteria = contract.Acceptance
+			evidenceContract = contract.Evidence
+		}
 		return ObserveHookResult{TaskStep: &session.TaskStep{
-			Tool:     input.ToolCall.Name,
-			Status:   status,
-			Summary:  redactedSummary(input.ToolResult.Content),
-			Evidence: evidence,
+			Tool:               input.ToolCall.Name,
+			Status:             status,
+			Summary:            redactedSummary(input.ToolResult.Content),
+			Evidence:           evidence,
+			Risk:               risk,
+			AcceptanceCriteria: acceptanceCriteria,
+			EvidenceContract:   evidenceContract,
+			Accepted:           status == "accepted",
+			Mutation:           mutation,
 		}}, nil
 	case "task_completed":
 		result, err := memory.RecordTaskCompletion(memory.LearningEvent{
@@ -679,10 +955,7 @@ func (defaultResponseHookProvider) Name() string { return "default_response" }
 func (defaultResponseHookProvider) ResponseHook(_ context.Context, input ResponseHookInput) (ResponseHookResult, error) {
 	text := sanitizeResponse(input.RawText)
 	if text == "" {
-		text = fallbackFinalReply(input.RawText)
-	}
-	if input.LearningResult != nil && input.LearningResult.Proposal != nil {
-		text = appendMemoryReviewBlock(text, *input.LearningResult.Proposal)
+		text = fallbackFinalReply(input.RawText, input.Locale, input.CatalogDir)
 	}
 	return ResponseHookResult{Text: text}, nil
 }
@@ -694,4 +967,22 @@ func taskFromState(state session.State, taskID string) session.TaskNode {
 		}
 	}
 	return session.TaskNode{ID: taskID}
+}
+
+func boolArg(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true") || strings.EqualFold(strings.TrimSpace(v), "yes")
+	default:
+		return false
+	}
+}
+
+func configHome(cfg *config.Root) string {
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		return cfg.App.Home
+	}
+	return config.DefaultHome()
 }

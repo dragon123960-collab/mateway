@@ -12,8 +12,9 @@ import (
 )
 
 type traceRecorder struct {
-	id   string
-	path string
+	id      string
+	path    string
+	onWrite func()
 }
 
 func newTraceRecorder(cfg *config.Root) (*traceRecorder, error) {
@@ -52,6 +53,9 @@ func (r *traceRecorder) emit(ctx context.Context, event agentcore.Event) error {
 func (r *traceRecorder) write(payload map[string]any) error {
 	if r == nil {
 		return nil
+	}
+	if r.onWrite != nil {
+		r.onWrite()
 	}
 	payload = redactPayload(payload)
 	payload["trace_id"] = r.id

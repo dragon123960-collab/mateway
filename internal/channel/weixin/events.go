@@ -11,7 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/config"
 )
 
-type Receiver func(context.Context, channel.InboundMessage) (channel.OutboundMessage, error)
+type Receiver func(context.Context, channel.InboundMessage) (channel.OutboundBatch, error)
 
 func Start(ctx context.Context, cfg config.WeixinConfig, home string, receiver Receiver) error {
 	cfg = cfg.ResolveSecrets()
@@ -95,14 +95,20 @@ func Start(ctx context.Context, cfg config.WeixinConfig, home string, receiver R
 }
 
 func handleMessage(ctx context.Context, client Client, msg channel.InboundMessage, receiver Receiver) {
-	reply, err := receiver(ctx, msg)
+	batch, err := receiver(ctx, msg)
 	if err != nil {
 		log.Printf("mateway weixin receiver error message_id=%s: %v", msg.ID, err)
 		return
 	}
-	if strings.TrimSpace(reply.Text) == "" {
-		return
+	for _, reply := range batch.Messages() {
+		if strings.TrimSpace(reply.Text) == "" {
+			continue
+		}
+		sendReply(ctx, client, msg, reply)
 	}
+}
+
+func sendReply(ctx context.Context, client Client, msg channel.InboundMessage, reply channel.OutboundMessage) {
 	outbound := ReplyToMessage(msg, reply)
 	log.Printf("mateway weixin sending reply message_id=%s to=%s client_id=%s", msg.ID, safeID(outbound.ToUserID), outbound.ClientID)
 	resp, err := client.SendMessage(ctx, outbound)
