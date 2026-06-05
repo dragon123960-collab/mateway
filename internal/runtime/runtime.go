@@ -1358,6 +1358,41 @@ func latestExecutionEvent(frame session.ExecutionFrame) session.ExecutionEvent {
 	return frame.Events[len(frame.Events)-1]
 }
 
+func noProgressSignature(review CompletionReviewResult) string {
+	parts := []string{
+		normalizeSignatureText(review.Reason),
+		normalizeSignatureText(strings.Join(review.MissingItems, "\n")),
+		normalizeSignatureText(review.SuggestedFollowUp),
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func normalizeSignatureText(text string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(text))), " ")
+}
+
+func containsSpecificToolFollowUp(text string) bool {
+	lower := strings.ToLower(text)
+	for _, toolName := range []string{
+		"script.run",
+		"file.read",
+		"file.write",
+		"project.index",
+		"terminal.run",
+		"web.search",
+		"web.fetch",
+		"secret.set",
+		"schedule.create",
+		"schedule.list",
+		"remote.profile.create",
+	} {
+		if strings.Contains(lower, toolName) {
+			return true
+		}
+	}
+	return false
+}
+
 func forceToolExecutionFollowUp(task session.TaskNode, reviewFollowUp string, cfg *config.Root) string {
 	var b strings.Builder
 	b.WriteString("The previous assistant reply did not call any tool, so it made no executable progress on this action task.\n")
@@ -1418,6 +1453,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 	noProgressTurns := 0
 	maxNoProgressTurns := maxNoProgressTurns(rt.Config)
 	maxRepeatedToolFailures := maxRepeatedToolFailures(rt.Config)
+	lastNoProgressSignature := ""
 	lastFailureSignature := ""
 	repeatedToolFailures := 0
 	stopReason := ""
@@ -1476,7 +1512,23 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				"suggested_followup": review.SuggestedFollowUp,
 			})
 			if !review.Completed {
-				noProgressTurns++
+				followUp := strings.TrimSpace(review.SuggestedFollowUp)
+				if followUp == "" {
+					followUp = "Continue now. Immediately execute the next required step with tools. If you cannot call a tool, state the concrete blocker and what user input or permission is needed. Do not only describe a plan."
+				}
+				if task.CompletionContract.RequiresMutation && len(turn.Message.ToolCalls) == 0 {
+					followUp = forceToolExecutionFollowUp(task, followUp, rt.Config)
+				}
+				signature := noProgressSignature(review)
+				if signature != lastNoProgressSignature && containsSpecificToolFollowUp(review.SuggestedFollowUp) {
+					lastNoProgressSignature = signature
+					noProgressTurns = 1
+				} else {
+					if lastNoProgressSignature == "" {
+						lastNoProgressSignature = signature
+					}
+					noProgressTurns++
+				}
 				if maxNoProgressTurns > 0 && noProgressTurns >= maxNoProgressTurns {
 					frame := activeTaskSnapshot(state, taskID).Execution
 					_ = trace.write(map[string]any{
@@ -1485,6 +1537,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 						"turns":                noProgressTurns,
 						"reason":               review.Reason,
 						"missing_items":        review.MissingItems,
+						"suggested_followup":   review.SuggestedFollowUp,
 						"frame_status":         frame.Status,
 						"frame_current_step":   frame.CurrentStepID,
 						"frame_recent_event":   latestExecutionEvent(frame),
@@ -1494,16 +1547,11 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 					stopReason = "task_no_progress"
 					return true, nil
 				}
-				followUp := strings.TrimSpace(review.SuggestedFollowUp)
-				if followUp == "" {
-					followUp = "Continue now. Immediately execute the next required step with tools. If you cannot call a tool, state the concrete blocker and what user input or permission is needed. Do not only describe a plan."
-				}
-				if task.CompletionContract.RequiresMutation && len(turn.Message.ToolCalls) == 0 {
-					followUp = forceToolExecutionFollowUp(task, followUp, rt.Config)
-				}
+				_ = trace.write(map[string]any{"type": "completion_followup_injected", "task_id": taskID, "turns": noProgressTurns, "text": followUp})
 				followUps = append(followUps, agentcore.Message{Role: agentcore.RoleUser, Content: followUp})
 			} else {
 				noProgressTurns = 0
+				lastNoProgressSignature = ""
 			}
 			return false, nil
 		},
@@ -1580,6 +1628,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				switch observe.TaskStep.Status {
 				case "accepted":
 					noProgressTurns = 0
+					lastNoProgressSignature = ""
 					lastFailureSignature = ""
 					repeatedToolFailures = 0
 				case "failed", "suspect":

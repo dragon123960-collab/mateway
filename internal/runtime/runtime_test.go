@@ -500,7 +500,10 @@ func TestRuntimeConfirmedToolSuccessDoesNotAskUserToContinue(t *testing.T) {
 	}
 	rt := New(cfg)
 	rt.Hooks.Providers = append([]HookProvider{
-		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: false, Reason: "still incomplete", SuggestedFollowUp: "continue with tools"}}},
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "still incomplete", MissingItems: []string{"create Feishu doc"}, SuggestedFollowUp: "continue with tools"},
+			{Completed: false, Reason: "still incomplete", MissingItems: []string{"create Feishu doc"}, SuggestedFollowUp: "continue with tools"},
+		}},
 	}, rt.Hooks.Providers...)
 	state := session.State{Key: "cli:test"}
 	task := state.StartTask("/Users/dongping/.mateway/workspace/ai-magician-templates.md这个文档给我创一个飞书云文档")
@@ -2003,6 +2006,75 @@ func TestRuntimeCompletionReviewMarksPartialAfterNoProgress(t *testing.T) {
 	}
 	if strings.Contains(string(data), `"kind":"task_completed"`) {
 		t.Fatalf("partial task should not observe completion:\n%s", data)
+	}
+}
+
+func TestRuntimeCompletionReviewAllowsSpecificFollowupBeforeNoProgress(t *testing.T) {
+	home := t.TempDir()
+	scriptDir := filepath.Join(home, "scripts")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(scriptDir, "feishu.docs.create")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n# mateway.name: feishu.docs.create\necho created https://feishu.example/doc/abc\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mdPath := filepath.Join(home, "workspace", "ai-magician-templates.md")
+	if err := os.MkdirAll(filepath.Dir(mdPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mdPath, []byte("# AI Magician\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	cfg.NormalizeForUse()
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "only a plan", MissingItems: []string{"discover feishu script"}, SuggestedFollowUp: "check whether the Feishu script exists"},
+			{Completed: false, Reason: "tool not called", MissingItems: []string{"create Feishu doc"}, SuggestedFollowUp: "call script.run with name=feishu.docs.create and args including --title and --markdown-file " + mdPath},
+			{Completed: true, Reason: "document created"},
+		}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&followupAwareFeishuCreateModel{markdownPath: mdPath}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
+		ID:         "1",
+		Channel:    "cli",
+		SessionKey: "cli:test",
+		Text:       mdPath + "这个文档给我创一个飞书云文档",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == "partial" {
+		t.Fatalf("expected successful continuation after specific follow-up, got %#v", resp)
+	}
+	if !contains(resp.Reply.Text, "https://feishu.example/doc/abc") {
+		t.Fatalf("expected document URL in reply, got %q", resp.Reply.Text)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+	if len(state.Tasks[0].Steps) != 1 || state.Tasks[0].Steps[0].Tool != "script.run" {
+		t.Fatalf("expected script.run step, got %#v", state.Tasks[0].Steps)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"completion_followup_injected"`) || !strings.Contains(string(data), "feishu.docs.create") {
+		t.Fatalf("expected injected specific follow-up trace:\n%s", data)
+	}
+	if strings.Contains(string(data), `"type":"task_no_progress"`) {
+		t.Fatalf("should not stop as no progress before executing specific follow-up:\n%s", data)
 	}
 }
 
@@ -3765,6 +3837,39 @@ func (emptyResultTool) Schema() agentcore.Schema {
 func (emptyResultTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (emptyResultTool) Run(context.Context, agentcore.ToolCall) agentcore.ToolResult {
 	return agentcore.ToolResult{}
+}
+
+type followupAwareFeishuCreateModel struct {
+	markdownPath string
+	calls        int
+}
+
+func (m *followupAwareFeishuCreateModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	m.calls++
+	for i := len(ctx.Messages) - 1; i >= 0; i-- {
+		if ctx.Messages[i].Role == agentcore.RoleTool && strings.Contains(ctx.Messages[i].Content, "https://feishu.example/doc/abc") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "飞书云文档已创建：https://feishu.example/doc/abc"}, nil
+		}
+	}
+	for i := len(ctx.Messages) - 1; i >= 0; i-- {
+		if ctx.Messages[i].Role != agentcore.RoleUser {
+			continue
+		}
+		if strings.Contains(ctx.Messages[i].Content, "feishu.docs.create") && strings.Contains(ctx.Messages[i].Content, "--markdown-file") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+				ID:   "call_1",
+				Name: "script.run",
+				Args: map[string]any{
+					"name": "feishu.docs.create",
+					"args": []any{"--title", "AI Magician Templates", "--markdown-file", m.markdownPath},
+				},
+			}}}, nil
+		}
+	}
+	if m.calls == 1 {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "我先分别查看本地是否有飞书相关的脚本或 skill。"}, nil
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "我先用更简单的命令检查本地是否有飞书相关的脚本。"}, nil
 }
 
 type captureRuntimeContextModel struct {
