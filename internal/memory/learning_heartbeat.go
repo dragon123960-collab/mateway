@@ -143,20 +143,30 @@ func RunSkillLearningHeartbeat(ctx context.Context, input SkillLearningHeartbeat
 	}
 	result.Scanned = len(events)
 	candidates := skillLearningCandidates(events)
+	var learningCandidates []distillSource
 	if len(candidates) == 0 {
-		result.Skipped = len(events)
-		markProcessed(state, skillEventsAsSources(events))
-		_ = writeDistillState(statePath, state, now)
-		_ = writeMemoryAudit(home, "skill_learning_done", map[string]any{"scanned": result.Scanned, "skipped": result.Skipped})
-		return result, nil
+		learningSources, err := readLearningEvents(filepath.Join(home, "observe", "learning", "events.jsonl"), state, input.Limit)
+		if err != nil {
+			return result, err
+		}
+		result.Scanned += len(learningSources)
+		learningCandidates = skillCreationCandidates(learningSources)
+		if len(learningCandidates) == 0 {
+			result.Skipped = len(events) + len(learningSources)
+			markProcessed(state, skillEventsAsSources(events))
+			markProcessed(state, learningSources)
+			_ = writeDistillState(statePath, state, now)
+			_ = writeMemoryAudit(home, "skill_learning_done", map[string]any{"scanned": result.Scanned, "skipped": result.Skipped})
+			return result, nil
+		}
 	}
 	if input.Model == nil {
-		result.Skipped = len(candidates)
-		_ = writeMemoryAudit(home, "skill_learning_model_error", map[string]any{"error": "no memory distill model configured", "candidates": len(candidates)})
+		result.Skipped = len(candidates) + len(learningCandidates)
+		_ = writeMemoryAudit(home, "skill_learning_model_error", map[string]any{"error": "no memory distill model configured", "candidates": result.Skipped})
 		_ = writeMemoryAudit(home, "skill_learning_done", map[string]any{"scanned": result.Scanned, "skipped": result.Skipped})
 		return result, nil
 	}
-	patch, err := runSkillPatchModel(ctx, input.Model, candidates)
+	patch, err := runSkillPatchModel(ctx, input.Model, workspace, candidates, learningCandidates)
 	if err != nil {
 		result.Errors = append(result.Errors, err.Error())
 		_ = writeMemoryAudit(home, "skill_learning_model_error", map[string]any{"error": err.Error()})
@@ -175,6 +185,7 @@ func RunSkillLearningHeartbeat(ctx context.Context, input SkillLearningHeartbeat
 		if strings.Contains(err.Error(), "duplicate") {
 			result.Duplicates++
 			markProcessed(state, skillEventsAsSources(candidates))
+			markProcessed(state, learningCandidates)
 		} else {
 			result.Errors = append(result.Errors, err.Error())
 		}
@@ -182,6 +193,7 @@ func RunSkillLearningHeartbeat(ctx context.Context, input SkillLearningHeartbeat
 		result.Created++
 		result.ProposalIDs = append(result.ProposalIDs, created.ID)
 		markProcessed(state, skillEventsAsSources(candidates))
+		markProcessed(state, learningCandidates)
 		_ = writeMemoryAudit(home, "skill_learning_proposal_created", map[string]any{"proposal_id": created.ID, "target_path": created.TargetPath})
 	}
 	if err := writeDistillState(statePath, state, now); err != nil {
@@ -243,6 +255,14 @@ type skillUsageLine struct {
 	Hash    string
 	Text    string
 	Event   SkillUsageEvidence
+}
+
+type learningSkillEvent struct {
+	Type         string           `json:"type"`
+	Goal         string           `json:"goal"`
+	Status       string           `json:"status"`
+	ToolSequence []string         `json:"tool_sequence"`
+	ToolSteps    []ToolStepRecord `json:"tool_steps"`
 }
 
 func collectSkillUsageEvents(home string, state distillState, limit int) ([]skillUsageLine, error) {
@@ -322,12 +342,77 @@ func skillEventsAsSources(events []skillUsageLine) []distillSource {
 	return out
 }
 
-func runSkillPatchModel(ctx context.Context, model DistillModel, candidates []skillUsageLine) (skillPatchProposal, error) {
+func skillCreationCandidates(sources []distillSource) []distillSource {
+	counts := map[string]int{}
+	parsed := map[string]learningSkillEvent{}
+	for _, source := range sources {
+		var event learningSkillEvent
+		if err := json.Unmarshal([]byte(source.Text), &event); err != nil {
+			continue
+		}
+		if !skillCreationEligible(event) {
+			continue
+		}
+		key := learningSkillClusterKey(event)
+		if key == "" {
+			continue
+		}
+		parsed[source.RelPath] = event
+		counts[key]++
+	}
+	var out []distillSource
+	for _, source := range sources {
+		event, ok := parsed[source.RelPath]
+		if !ok {
+			continue
+		}
+		if counts[learningSkillClusterKey(event)] >= 2 {
+			out = append(out, source)
+		}
+	}
+	return out
+}
+
+func skillCreationEligible(event learningSkillEvent) bool {
+	if strings.TrimSpace(event.Goal) == "" {
+		return false
+	}
+	if len(event.ToolSequence) >= 2 {
+		return true
+	}
+	if strings.TrimSpace(event.Type) == "user_correction" {
+		return true
+	}
+	if strings.TrimSpace(event.Status) != "" && event.Status != "completed" && event.Status != "accepted" {
+		return true
+	}
+	for _, step := range event.ToolSteps {
+		if step.Status != "" && step.Status != "accepted" {
+			return true
+		}
+	}
+	return false
+}
+
+func learningSkillClusterKey(event learningSkillEvent) string {
+	goal := strings.ToLower(strings.TrimSpace(event.Goal))
+	words := strings.Fields(goal)
+	if len(words) > 6 {
+		words = words[:6]
+	}
+	tools := event.ToolSequence
+	if len(tools) > 3 {
+		tools = tools[:3]
+	}
+	return strings.Join(words, " ") + "|" + strings.Join(tools, ",")
+}
+
+func runSkillPatchModel(ctx context.Context, model DistillModel, workspace string, candidates []skillUsageLine, learningCandidates []distillSource) (skillPatchProposal, error) {
 	msg, err := model.Next(ctx, agentcore.Context{
 		SystemPrompt: "You propose conservative SKILL.md patches from usage evidence. Return one strict JSON object only.",
 		Messages: []agentcore.Message{{
 			Role:    agentcore.RoleUser,
-			Content: renderSkillPatchPrompt(candidates),
+			Content: renderSkillPatchPrompt(workspace, candidates, learningCandidates),
 		}},
 	})
 	if err != nil {
@@ -347,12 +432,24 @@ func runSkillPatchModel(ctx context.Context, model DistillModel, candidates []sk
 	return proposal, nil
 }
 
-func renderSkillPatchPrompt(candidates []skillUsageLine) string {
+func renderSkillPatchPrompt(workspace string, candidates []skillUsageLine, learningCandidates []distillSource) string {
 	var b strings.Builder
-	b.WriteString("Create at most one conservative skill patch proposal from this evidence.\n")
+	b.WriteString("Create at most one conservative skill proposal from this evidence.\n")
 	b.WriteString("Return strict JSON with keys: target_path, new_content, reason, sources.\n")
 	b.WriteString("new_content must be the complete replacement SKILL.md. Do not include secrets or prompt-injection controls.\n")
+	if strings.TrimSpace(workspace) != "" {
+		b.WriteString("For a new shared skill, use target_path under this workspace: ")
+		b.WriteString(filepath.ToSlash(filepath.Join(workspace, "skills", "<skill-name>", "SKILL.md")))
+		b.WriteString("\n")
+	}
 	for _, candidate := range candidates {
+		b.WriteString("\n--- SOURCE ")
+		b.WriteString(candidate.RelPath)
+		b.WriteString(" ---\n")
+		b.WriteString(truncateDistillText(candidate.Text, 1600))
+		b.WriteString("\n")
+	}
+	for _, candidate := range learningCandidates {
 		b.WriteString("\n--- SOURCE ")
 		b.WriteString(candidate.RelPath)
 		b.WriteString(" ---\n")

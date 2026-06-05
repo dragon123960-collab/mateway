@@ -71,7 +71,7 @@ mateway memory proposal reject <proposal_id>
 
 在聊天入口里，用户也可以直接回复 `保存` 或 `忽略`。Mateway 会把它存成 `memory_proposal_review` pending，所以这种短回复由运行时状态解释，而不是让模型猜。
 
-英文别名同样可用：memory review 可以回复 `save` / `ignore`，工具确认可以回复 `confirm` / `cancel`，定时任务试运行可以回复 `run` / `cancel`。这些别名不依赖当前界面语言。
+英文别名同样可用：memory review 可以回复 `save` / `ignore`，工具确认可以回复 `confirm` / `cancel`，定时任务试运行可以回复 `run` / `cancel`。这些别名不依赖当前界面语言。工具确认会按当前 session 和 guarded tool type 记住，所以确认过 `file.write` 或非破坏性的 `terminal.run` 边界后，同一 session 不会反复打断；破坏性 terminal 命令不会复用确认。
 
 ### 3. Hook-first Runtime
 
@@ -141,7 +141,7 @@ Mateway 目前支持：
 - trace 回看：`mateway trace`
 - session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
 - task tree 和 follow-up 绑定
-- 风险工具 pending confirmation
+- 风险工具 session 级 pending confirmation
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
 - Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
 - 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
@@ -333,7 +333,7 @@ memory:
 ./build/mateway memory heartbeat serve
 ```
 
-这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，蒸馏学习 evidence，生成 skill patch proposal，并写入 audit entry。
+这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，蒸馏学习 evidence，并从重复复杂流程里生成 skill patch 或新 skill proposal，最后写入 audit entry。
 
 ## 定时任务
 
@@ -461,7 +461,7 @@ required_secrets:
 - `mateway skill proposal list|show|promote|reject`
 - `mateway skill usage report`
 - 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
-- heartbeat 生成 skill patch proposal 的审核工作流
+- heartbeat 生成 skill patch 和新 skill proposal 的审核工作流
 
 Script Bridge 保持小而硬：`workspace/agents/<agent_id>/skills/<skill>/scripts/`、`workspace/skills/<skill>/scripts/`、`workspace/scripts/`、`~/.mateway/scripts/` 或配置的 `scripts.dirs` 下的可执行脚本可以通过 `mateway script list` 查看，并通过 `script.run` / `mateway script run` 执行。同名脚本冲突时，agent-specific skill scripts 优先于 shared skill scripts，shared skill scripts 优先于 global scripts。脚本头可以声明 `mateway.required_secret`，凭证来自 `mateway secret`，不写入 `SKILL.md`、trace 或 memory。
 

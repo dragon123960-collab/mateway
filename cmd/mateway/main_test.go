@@ -13,6 +13,7 @@ import (
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/skill"
 )
 
 func TestTestCaseMessage(t *testing.T) {
@@ -488,6 +489,30 @@ func TestMemoryHeartbeatDistillCommandNoModel(t *testing.T) {
 	}
 	if !strings.Contains(string(audit), "memory_distill_model_error") {
 		t.Fatalf("missing distill audit:\n%s", audit)
+	}
+}
+
+func TestPrintSkillProposalSummariesShowsTargetAndReason(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "skills", "demo", "SKILL.md")
+	store := skill.ProposalStore{Home: home, Workspace: workspace}
+	proposal, err := store.Create(skill.CreateProposalInput{
+		TargetPath: target,
+		NewContent: "---\nname: demo\n---\n# Demo\n\nNew guidance.\n",
+		Reason:     "Repeated workflow.",
+		Sources:    []string{"observe/learning/events.jsonl:1"},
+		ModelRole:  "memory_distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error {
+		printSkillProposalSummaries(store, []string{proposal.ID})
+		return nil
+	})
+	if !strings.Contains(out, "skill_proposal_target: "+target) || !strings.Contains(out, "skill_proposal_reason: Repeated workflow.") || !strings.Contains(out, "skill_proposal_summary:") {
+		t.Fatalf("unexpected skill proposal summary:\n%s", out)
 	}
 }
 

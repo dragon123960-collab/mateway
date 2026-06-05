@@ -52,6 +52,40 @@ func TestSkillProposalPromoteBacksUpAndWritesSkill(t *testing.T) {
 	}
 }
 
+func TestSkillProposalPromoteCreatesNewSkill(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "skills", "demo-new", "SKILL.md")
+	store := ProposalStore{Home: home, Workspace: workspace}
+	created, err := store.Create(CreateProposalInput{
+		TargetPath: target,
+		NewContent: "---\nname: demo-new\n---\n# Demo New\n\nFresh guidance.\n",
+		Reason:     "Repeated workflow.",
+		Sources:    []string{"observe/learning/events.jsonl:1", "observe/learning/events.jsonl:2"},
+		ModelRole:  "memory_distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.OldContent != "" || !strings.Contains(created.Diff, "+Fresh guidance.") {
+		t.Fatalf("unexpected new skill proposal: %#v", created)
+	}
+	promoted, backupDir, err := store.Promote(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Status != "promoted" || backupDir != "" {
+		t.Fatalf("unexpected promote: %#v backup=%q", promoted, backupDir)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "Fresh guidance.") {
+		t.Fatalf("target not created:\n%s", data)
+	}
+}
+
 func TestSkillProposalRejectsUnsafeContent(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")

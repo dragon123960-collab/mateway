@@ -1400,6 +1400,7 @@ func runMemoryHeartbeat(args []string) error {
 			Model:     memoryDistillModel(cfg),
 		})
 		printSkillLearningResult(result)
+		printSkillProposalSummaries(skill.NewProposalStore(cfg), result.ProposalIDs)
 		return err
 	case "serve":
 		fs := flag.NewFlagSet("mateway memory heartbeat serve", flag.ContinueOnError)
@@ -1542,6 +1543,36 @@ func printSkillLearningResult(result memory.SkillLearningHeartbeatResult) {
 	for _, errText := range result.Errors {
 		fmt.Println("skill_learning_error:", errText)
 	}
+}
+
+func printSkillProposalSummaries(store skill.ProposalStore, ids []string) {
+	for _, id := range ids {
+		proposal, err := store.Read(id)
+		if err != nil {
+			continue
+		}
+		fmt.Println("skill_proposal:", proposal.ID)
+		fmt.Println("skill_proposal_target:", proposal.TargetPath)
+		if proposal.Reason != "" {
+			fmt.Println("skill_proposal_reason:", proposal.Reason)
+		}
+		if summary := firstDiffLine(proposal.Diff); summary != "" {
+			fmt.Println("skill_proposal_summary:", summary)
+		}
+	}
+}
+
+func firstDiffLine(diff string) string {
+	for _, line := range strings.Split(diff, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+			return line
+		}
+	}
+	return ""
 }
 
 func printLearningReport(report memory.LearningReport) {

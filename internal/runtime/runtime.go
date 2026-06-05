@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -268,22 +269,24 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		return Response{}, err
 	}
 	if proposalID := pendingAgentProfileProposalID(task); proposalID != "" {
+		question := renderAgentProfileProposalReview(rt.Config, msg, proposalID)
 		state.Pending = &session.PendingAction{
 			Kind:       "agent_profile_proposal_review",
 			TaskID:     task.ID,
 			ProposalID: proposalID,
-			Question:   runtimeText(rt.Config, msg, "agent_profile.review.question", nil),
+			Question:   question,
 		}
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
 	}
 	if scheduleID := pendingScheduleID(result.Messages); scheduleID != "" {
+		question := renderScheduleReview(rt.Config, msg, rt.home(), scheduleID)
 		state.Pending = &session.PendingAction{
 			Kind:       "schedule_review",
 			TaskID:     task.ID,
 			ScheduleID: scheduleID,
-			Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
+			Question:   question,
 		}
 		state.BlockActiveTask("await_schedule_test")
 		if err := rt.saveState(state, trace); err != nil {
@@ -875,6 +878,97 @@ func renderMemoryProposalReview(cfg *config.Root, msg channel.InboundMessage, pr
 	return b.String()
 }
 
+func renderAgentProfileProposalReview(cfg *config.Root, msg channel.InboundMessage, proposalID string) string {
+	proposal, err := agentprofile.NewStore(cfg).Read(proposalID)
+	if err != nil {
+		return runtimeText(cfg, msg, "agent_profile.review.question", nil)
+	}
+	if strings.HasPrefix(runtimeLocale(cfg, msg), "zh") {
+		var b strings.Builder
+		b.WriteString("检测到 agent 核心 md 修改草稿，等待审核。\n\n")
+		b.WriteString("草稿：")
+		b.WriteString(proposal.ID)
+		b.WriteString("\n目标：")
+		b.WriteString(proposal.TargetPath)
+		if summary := diffSummary(proposal.Diff); summary != "" {
+			b.WriteString("\n摘要：")
+			b.WriteString(summary)
+		}
+		b.WriteString("\n\n回复“确认”生效，回复“忽略”放弃；也可以继续发新任务。")
+		return b.String()
+	}
+	var b strings.Builder
+	b.WriteString("Detected an agent core md draft waiting for review.\n\n")
+	b.WriteString("Draft: ")
+	b.WriteString(proposal.ID)
+	b.WriteString("\nTarget: ")
+	b.WriteString(proposal.TargetPath)
+	if summary := diffSummary(proposal.Diff); summary != "" {
+		b.WriteString("\nSummary: ")
+		b.WriteString(summary)
+	}
+	b.WriteString("\n\nReply \"confirm\" to promote it, or \"ignore\" to reject it. You can also send a new task.")
+	return b.String()
+}
+
+func renderScheduleReview(cfg *config.Root, msg channel.InboundMessage, home, scheduleID string) string {
+	task, err := (schedule.Store{Home: home}).Get(scheduleID)
+	if err != nil {
+		return runtimeText(cfg, msg, "schedule.review.question", textValues("schedule_id", scheduleID))
+	}
+	if strings.HasPrefix(runtimeLocale(cfg, msg), "zh") {
+		var b strings.Builder
+		b.WriteString("定时任务已记录为待试运行。\n\n")
+		b.WriteString("任务：")
+		b.WriteString(task.ID)
+		b.WriteString("\n内容：")
+		b.WriteString(summarize(task.Text))
+		b.WriteString("\n执行时间：")
+		b.WriteString(task.RunAt)
+		if strings.TrimSpace(task.Interval) != "" {
+			b.WriteString("\n重复间隔：")
+			b.WriteString(task.Interval)
+		}
+		b.WriteString("\n\n回复“执行”现在试运行，试运行成功后我会激活它；回复“取消”放弃。也可以稍后手动执行：`mateway schedule test ")
+		b.WriteString(task.ID)
+		b.WriteString("`。")
+		return b.String()
+	}
+	var b strings.Builder
+	b.WriteString("The scheduled task is recorded and waiting for a test run.\n\n")
+	b.WriteString("Task: ")
+	b.WriteString(task.ID)
+	b.WriteString("\nText: ")
+	b.WriteString(summarize(task.Text))
+	b.WriteString("\nRun at: ")
+	b.WriteString(task.RunAt)
+	if strings.TrimSpace(task.Interval) != "" {
+		b.WriteString("\nInterval: ")
+		b.WriteString(task.Interval)
+	}
+	b.WriteString("\n\nReply \"run\" to test it now; I will activate it after a successful test. Reply \"cancel\" to discard it. You can also run it later: `mateway schedule test ")
+	b.WriteString(task.ID)
+	b.WriteString("`.")
+	return b.String()
+}
+
+func diffSummary(diff string) string {
+	var parts []string
+	for _, line := range strings.Split(diff, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+			parts = append(parts, line)
+		}
+		if len(parts) >= 4 {
+			break
+		}
+	}
+	return summarize(strings.Join(parts, " "))
+}
+
 func defaultText(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -1122,7 +1216,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				state.Pending = &session.PendingAction{
 					Kind:              "confirm_tool",
 					TaskID:            taskID,
-					Question:          policy.Reason,
+					Question:          renderToolApprovalQuestion(locale, input.ToolCall, approvalClass, policy.Reason),
 					ToolCall:          input.ToolCall,
 					ResumeText:        policy.ResumeText,
 					AuthorizationOnly: policy.AuthorizationOnly,
@@ -1196,8 +1290,7 @@ func taskApprovalKey(call agentcore.ToolCall, def agentcore.Tool, cfg *config.Ro
 	class := ""
 	switch call.Name {
 	case "terminal.run":
-		decision := tool.CheckTerminalCommand(fmt.Sprint(call.Args["command"]), cfg)
-		class = decision.Class
+		class = "terminal_guarded"
 	case "script.run":
 		class = "script"
 	case "secret.set":
@@ -1229,6 +1322,49 @@ func taskApprovalCanReuse(call agentcore.ToolCall, cfg *config.Root) bool {
 	default:
 		return true
 	}
+}
+
+func renderToolApprovalQuestion(locale string, call agentcore.ToolCall, class, reason string) string {
+	action := toolApprovalActionSummary(call)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "Confirmation is required before continuing."
+		if strings.HasPrefix(locale, "zh") {
+			reason = "继续之前需要确认。"
+		}
+	}
+	if strings.HasPrefix(locale, "zh") {
+		return strings.TrimSpace(fmt.Sprintf("继续之前需要确认。\n\n工具：%s\n风险：%s\n将执行：%s\n原因：%s\n\n回复“确认”或 confirm 继续；回复“取消”或 cancel 放弃。", call.Name, firstNonEmpty(class, "guarded_mutation"), action, reason))
+	}
+	return strings.TrimSpace(fmt.Sprintf("Confirmation is required before continuing.\n\nTool: %s\nRisk: %s\nAction: %s\nReason: %s\n\nReply \"confirm\" to continue, or \"cancel\" to stop.", call.Name, firstNonEmpty(class, "guarded_mutation"), action, reason))
+}
+
+func toolApprovalActionSummary(call agentcore.ToolCall) string {
+	if call.Name == "terminal.run" {
+		return "command: " + redactSecretString(fmt.Sprint(call.Args["command"]))
+	}
+	if len(call.Args) == 0 {
+		return call.Name
+	}
+	keys := make([]string, 0, len(call.Args))
+	for key := range call.Args {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+": "+compactApprovalValue(call.Args[key]))
+	}
+	return call.Name + " args: " + strings.Join(parts, ", ")
+}
+
+func compactApprovalValue(value any) string {
+	text := redactSecretString(fmt.Sprint(redactSecrets(value)))
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 160 {
+		return text[:157] + "..."
+	}
+	return text
 }
 
 func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
@@ -1265,7 +1401,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
 		approvalKey, approvalClass := taskApprovalKey(call, nil, rt.Config)
 		if taskApprovalCanReuse(call, rt.Config) {
-			state.AddTaskApproval(taskID, session.TaskApproval{Key: approvalKey, Tool: call.Name, Class: approvalClass})
+			state.AddSessionApproval(session.TaskApproval{Key: approvalKey, Tool: call.Name, Class: approvalClass})
 			_ = trace.write(map[string]any{"type": "approval_granted", "task_id": taskID, "tool": call.Name, "approval_key": approvalKey, "class": approvalClass})
 		}
 		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "confirm_tool", "command": firstNonEmpty(control, "approve")})
@@ -1304,11 +1440,12 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": redactToolResult(result), "acceptance": status, "evidence": redactSecrets(evidence)})
 		state.Messages = append(state.Messages, agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content})
 		if proposalID := proposalIDFromEvidence(evidence); proposalID != "" {
+			question := renderAgentProfileProposalReview(rt.Config, msg, proposalID)
 			state.Pending = &session.PendingAction{
 				Kind:       "agent_profile_proposal_review",
 				TaskID:     taskID,
 				ProposalID: proposalID,
-				Question:   runtimeText(rt.Config, msg, "agent_profile.review.question", nil),
+				Question:   question,
 			}
 			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, true, err
@@ -1336,11 +1473,12 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if call.Name == "schedule.create" && scheduleCreateRequiresTest(call) {
 			scheduleID := scheduleIDFromToolResult(result)
 			if scheduleID != "" {
+				question := renderScheduleReview(rt.Config, msg, rt.home(), scheduleID)
 				state.Pending = &session.PendingAction{
 					Kind:       "schedule_review",
 					TaskID:     task.ID,
 					ScheduleID: scheduleID,
-					Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
+					Question:   question,
 				}
 				state.BlockActiveTask("await_schedule_test")
 				if err := rt.saveState(state, trace); err != nil {

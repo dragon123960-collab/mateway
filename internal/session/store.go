@@ -15,6 +15,7 @@ type State struct {
 	Messages   []agentcore.Message `json:"messages"`
 	Tasks      []TaskNode          `json:"tasks,omitempty"`
 	ActiveTask string              `json:"active_task,omitempty"`
+	Approvals  []TaskApproval      `json:"approvals,omitempty"`
 	Pending    *PendingAction      `json:"pending,omitempty"`
 	Usage      Usage               `json:"usage,omitempty"`
 	UpdatedAt  time.Time           `json:"updated_at"`
@@ -273,6 +274,11 @@ func (s *State) HasTaskApproval(taskID, key string) bool {
 	if key == "" {
 		return false
 	}
+	for _, approval := range s.Approvals {
+		if approval.Key == key {
+			return true
+		}
+	}
 	for i := range s.Tasks {
 		if s.Tasks[i].ID != taskID || !IsOpenTaskStatus(s.Tasks[i].Status) {
 			continue
@@ -284,6 +290,24 @@ func (s *State) HasTaskApproval(taskID, key string) bool {
 		}
 	}
 	return false
+}
+
+func (s *State) AddSessionApproval(approval TaskApproval) {
+	approval.Key = strings.TrimSpace(approval.Key)
+	if approval.Key == "" {
+		return
+	}
+	now := time.Now()
+	if approval.CreatedAt.IsZero() {
+		approval.CreatedAt = now
+	}
+	for _, existing := range s.Approvals {
+		if existing.Key == approval.Key {
+			return
+		}
+	}
+	s.Approvals = append(s.Approvals, approval)
+	s.UpdatedAt = now
 }
 
 func (s *State) AddTaskApproval(taskID string, approval TaskApproval) {

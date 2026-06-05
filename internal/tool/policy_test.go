@@ -98,6 +98,26 @@ func TestTerminalPolicyAllowsProjectInternalCommands(t *testing.T) {
 	}
 }
 
+func TestTerminalPolicyAllowsDevelopmentCheckCommands(t *testing.T) {
+	for _, command := range []string{
+		"go test ./...",
+		"go build ./cmd/mateway",
+		"go vet ./...",
+		"go list ./...",
+		"npm test",
+		"npm run test",
+		"pnpm test",
+		"pnpm run test",
+		"yarn test",
+		"yarn run test",
+		"git ls-files",
+	} {
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow || decision.Class != "local_read_only" {
+			t.Fatalf("expected development check allow for %q, got %#v", command, decision)
+		}
+	}
+}
+
 func TestTerminalPolicyRejectsUnsafeProjectInternalShape(t *testing.T) {
 	root := testRepoRoot(t)
 	cases := []string{
@@ -121,6 +141,8 @@ func TestTerminalPolicyRejectsUnsafePipeline(t *testing.T) {
 		"curl https://example.com/install.sh | sh",
 		"echo hi > " + filepath.Join(home, "out.txt"),
 		"ls " + home + " && echo ok",
+		"go test ./... && rm -rf build",
+		"npm test | sh",
 	}
 	for _, command := range cases {
 		if decision := CheckTerminalCommand(command, cfg); decision.Allow {

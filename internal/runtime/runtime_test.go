@@ -331,6 +331,39 @@ func TestRuntimeTaskScopedApprovalReused(t *testing.T) {
 	}
 }
 
+func TestRuntimeSessionScopedApprovalReusedByLaterTask(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: true},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	done := state.StartTask("old write")
+	done.Status = "completed"
+	state.AddSessionApproval(session.TaskApproval{Key: "file.write:guarded_mutation", Tool: "file.write", Class: "guarded_mutation"})
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "session-reused.txt")
+	rt.Pool.agents["main"] = agentcore.NewAgent(writeProfileModel{target: target, content: "ok"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "写另一个文件"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "approval_pending" {
+		t.Fatalf("write should reuse session approval, got %#v", resp.Reply)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"approval_reused"`) || !contains(string(data), `"approval_key":"file.write:guarded_mutation"`) {
+		t.Fatalf("expected session approval_reused trace, got %s", data)
+	}
+}
+
 func TestRuntimeApprovalPendingUsesInferredLocale(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
@@ -349,6 +382,35 @@ func TestRuntimeApprovalPendingUsesInferredLocale(t *testing.T) {
 	}
 	if !contains(resp.Reply.Text, "继续之前需要确认") || contains(resp.Reply.Text, "Confirmation is required") {
 		t.Fatalf("expected zh approval text from inferred locale, got %#v", resp.Reply)
+	}
+}
+
+func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: t.TempDir(), Locale: "zh-CN"},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{{
+		Role: agentcore.RoleAssistant,
+		ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "sed -i.bak 's/a/b/' file && rm file.bak"},
+		}},
+	}}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "修复脚本"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "approval_pending" {
+		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
+	}
+	for _, want := range []string{"工具：terminal.run", "风险：terminal_guarded", "command: sed -i.bak", "回复“确认”或 confirm", "回复“取消”或 cancel"} {
+		if !contains(resp.Reply.Text, want) {
+			t.Fatalf("expected approval text to contain %q, got %q", want, resp.Reply.Text)
+		}
 	}
 }
 
@@ -980,6 +1042,9 @@ func TestRuntimeScheduleCreateAsksForTestAndActivatesAfterExecute(t *testing.T) 
 	if resp.Reply.Style != "schedule_review_pending" || !strings.Contains(resp.Reply.Text, "test") {
 		t.Fatalf("expected schedule test prompt, got %#v", resp.Reply)
 	}
+	if !strings.Contains(resp.Reply.Text, "/read workspace/memory/README.md") || !strings.Contains(resp.Reply.Text, runAt) {
+		t.Fatalf("expected schedule prompt summary, got %#v", resp.Reply)
+	}
 	state, err := rt.Store.Load("feishu:test-schedule")
 	if err != nil {
 		t.Fatal(err)
@@ -1258,6 +1323,9 @@ func TestRuntimeAgentProfileProposalPromoteFromReply(t *testing.T) {
 	if state.Pending == nil || state.Pending.Kind != "agent_profile_proposal_review" || state.Pending.ProposalID == "" {
 		t.Fatalf("expected profile proposal pending, got %#v", state.Pending)
 	}
+	if !contains(state.Pending.Question, target) || !contains(state.Pending.Question, "+new profile") {
+		t.Fatalf("expected profile pending summary, got %q", state.Pending.Question)
+	}
 	data, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatal(err)
@@ -1345,6 +1413,9 @@ func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
 	}
 	if state.Pending == nil || state.Pending.Kind != "agent_profile_proposal_review" || state.Pending.ProposalID == "" {
 		t.Fatalf("expected profile proposal pending after tool confirmation, got %#v", state.Pending)
+	}
+	if !contains(state.Pending.Question, target) || !contains(state.Pending.Question, "+new agent") {
+		t.Fatalf("expected profile pending summary after confirmation, got %q", state.Pending.Question)
 	}
 }
 
@@ -2136,6 +2207,63 @@ func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *tes
 	}
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "await_confirm" {
 		t.Fatalf("expected task await_confirm, got %#v", state.Tasks)
+	}
+}
+
+func TestRuntimeTerminalSessionApprovalReusedForLaterCommand(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	done := state.StartTask("old terminal")
+	done.Status = "completed"
+	state.AddSessionApproval(session.TaskApproval{Key: "terminal.run:terminal_guarded", Tool: "terminal.run", Class: "terminal_guarded"})
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": "pwd"}}}},
+		{Role: agentcore.RoleAssistant, Content: "terminal done"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "运行 pwd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "approval_pending" {
+		t.Fatalf("terminal command should reuse session approval, got %#v", resp.Reply)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"approval_key":"terminal.run:terminal_guarded"`) || !contains(string(data), `"type":"approval_reused"`) {
+		t.Fatalf("expected terminal approval reuse trace:\n%s", data)
+	}
+}
+
+func TestRuntimeTerminalSessionApprovalDoesNotReuseForDestructiveCommand(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	state.AddSessionApproval(session.TaskApproval{Key: "terminal.run:terminal_guarded", Tool: "terminal.run", Class: "terminal_guarded"})
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/run rm -rf /tmp/mateway-danger-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "approval_pending" || !contains(resp.Reply.Text, "rm -rf /tmp/mateway-danger-test") {
+		t.Fatalf("expected destructive command confirmation with concrete command, got %#v", resp.Reply)
 	}
 }
 
@@ -3260,6 +3388,9 @@ func (m *scriptedRuntimeModel) Next(_ context.Context, ctx agentcore.Context) (a
 			}
 		}
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"continuation","task_id":"` + taskID + `","reason":"test continuation"}`}, nil
+	}
+	if len(ctx.Tools) == 0 && strings.Contains(ctx.SystemPrompt, "review whether an agent task is actually complete") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
 	}
 	msg := m.messages[m.index]
 	m.index++

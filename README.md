@@ -124,7 +124,7 @@ Mateway keeps internal machine interfaces in English: config keys, trace keys, a
 
 Default config uses `app.locale: auto`: Chinese user text receives Chinese prompts; other text receives English prompts. You can force a language with `app.locale: en-US` or `app.locale: zh-CN`. Additional locales can be added through `app.message_catalog_dir` by placing files such as `de-DE.yaml` or `fr-FR.yaml` with stable message keys and `aliases.<action>` entries.
 
-Review aliases are locale-independent. For example, tool approval accepts `confirm` / `cancel` and `确认` / `取消`; memory review accepts `save` / `ignore` and `保存` / `忽略`; schedule review accepts `run` / `cancel` and `执行` / `取消`.
+Review aliases are locale-independent. For example, tool approval accepts `confirm` / `cancel` and `确认` / `取消`; memory review accepts `save` / `ignore` and `保存` / `忽略`; schedule review accepts `run` / `cancel` and `执行` / `取消`. Tool approvals are remembered for the current session by guarded tool type, so a confirmed `file.write` or non-destructive `terminal.run` boundary does not repeatedly interrupt the same session; destructive terminal commands are never reused.
 
 Example catalog fragment:
 
@@ -150,7 +150,7 @@ Mateway currently supports:
 - trace review: `mateway trace`
 - session inspect/archive commands: `mateway session list`, `mateway session show`, `mateway session archive list/show`
 - task tree and follow-up binding
-- pending confirmation for risky tools
+- session-scoped pending confirmation for risky tools
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
 - native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
 - parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
@@ -336,7 +336,7 @@ Run heartbeat maintenance in a foreground loop:
 ./build/mateway memory heartbeat serve
 ```
 
-The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, distills learning evidence, proposes skill patches, and writes audit entries.
+The heartbeat command lints Markdown memory, rebuilds `indexes/memory_index.json` when safe, distills learning evidence, proposes skill patches or new skill proposals from repeated complex workflows, and writes audit entries.
 
 ## Scheduled Tasks
 
@@ -464,7 +464,7 @@ Available:
 - `mateway skill proposal list|show|promote|reject`
 - `mateway skill usage report`
 - external skill catalog integration. Planned initial sources: `skills.sh`, `skillhub.cn`, and `clawhub.ai`
-- heartbeat-generated skill patch proposal workflow
+- heartbeat-generated skill patch and new-skill proposal workflow
 
 Script Bridge is intentionally small: executable scripts under `workspace/agents/<agent_id>/skills/<skill>/scripts/`, `workspace/skills/<skill>/scripts/`, `workspace/scripts/`, `~/.mateway/scripts/`, or configured `scripts.dirs` can be listed with `mateway script list` and run through `script.run` / `mateway script run`. Agent-specific skill scripts win over shared skill scripts, which win over global scripts when names collide. Script headers may declare `mateway.required_secret` entries so credentials come from `mateway secret`, not from `SKILL.md`, trace, or memory.
 

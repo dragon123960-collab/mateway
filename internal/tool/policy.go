@@ -229,13 +229,21 @@ func isAllowlistedLocalCommand(fields []string) bool {
 	case "pwd", "ls", "find", "grep", "rg", "head", "tail", "wc", "sed":
 		return true
 	case "go":
-		return len(fields) >= 2 && fields[1] == "test"
+		return len(fields) >= 2 && oneOf(fields[1], "test", "build", "vet", "list")
+	case "npm", "pnpm", "yarn":
+		if len(fields) < 2 {
+			return false
+		}
+		if fields[1] == "test" {
+			return true
+		}
+		return len(fields) >= 3 && fields[1] == "run" && fields[2] == "test"
 	case "git":
 		if len(fields) < 2 {
 			return false
 		}
 		switch fields[1] {
-		case "status", "diff", "log", "show", "branch", "remote", "rev-parse":
+		case "status", "diff", "log", "show", "branch", "remote", "rev-parse", "ls-files":
 			return true
 		default:
 			return false
@@ -243,6 +251,15 @@ func isAllowlistedLocalCommand(fields []string) bool {
 	default:
 		return false
 	}
+}
+
+func oneOf(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func matchRemoteProfile(fields []string, cfg *config.Root) (config.RemoteProfileConfig, bool) {

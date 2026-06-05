@@ -72,11 +72,13 @@ func (s ProposalStore) Create(input CreateProposalInput) (Proposal, error) {
 	if err := ValidateSkillContent(target, content); err != nil {
 		return Proposal{}, err
 	}
-	oldData, err := os.ReadFile(target)
-	if err != nil {
+	oldContent := ""
+	if oldData, err := os.ReadFile(target); err == nil {
+		oldContent = string(oldData)
+	} else if !os.IsNotExist(err) {
 		return Proposal{}, err
 	}
-	if strings.TrimSpace(string(oldData)) == content {
+	if strings.TrimSpace(oldContent) == content {
 		return Proposal{}, fmt.Errorf("skill proposal has no content change")
 	}
 	now := time.Now().Format(time.RFC3339Nano)
@@ -91,9 +93,9 @@ func (s ProposalStore) Create(input CreateProposalInput) (Proposal, error) {
 		UpdatedAt:  now,
 		Reason:     strings.TrimSpace(input.Reason),
 		Sources:    cleanStrings(input.Sources),
-		OldContent: string(oldData),
+		OldContent: oldContent,
 		NewContent: content,
-		Diff:       agentprofile.UnifiedDiff(string(oldData), content),
+		Diff:       agentprofile.UnifiedDiff(oldContent, content),
 		ModelRole:  strings.TrimSpace(input.ModelRole),
 	}
 	if s.isDuplicate(proposal) {
@@ -164,11 +166,19 @@ func (s ProposalStore) Promote(id string) (Proposal, string, error) {
 	if err := ValidateSkillContent(target, proposal.NewContent); err != nil {
 		return Proposal{}, "", err
 	}
-	backupDir, err := s.backupSkill(target)
-	if err != nil {
+	backupDir := ""
+	if _, err := os.Stat(target); err == nil {
+		backupDir, err = s.backupSkill(target)
+		if err != nil {
+			return Proposal{}, "", err
+		}
+	} else if !os.IsNotExist(err) {
 		return Proposal{}, "", err
 	}
 	tmp := target + ".tmp." + proposal.ID
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return Proposal{}, "", err
+	}
 	if err := os.WriteFile(tmp, []byte(proposal.NewContent), 0o644); err != nil {
 		return Proposal{}, "", err
 	}

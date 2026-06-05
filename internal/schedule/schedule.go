@@ -110,6 +110,10 @@ func (s Store) List() ([]Task, error) {
 	return tasks, nil
 }
 
+func (s Store) Get(id string) (Task, error) {
+	return s.read(id)
+}
+
 func (s Store) Due(now time.Time) ([]Task, error) {
 	tasks, err := s.List()
 	if err != nil {

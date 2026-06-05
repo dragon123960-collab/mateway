@@ -70,4 +70,33 @@ func TestRunSkillLearningHeartbeatCreatesProposal(t *testing.T) {
 	}
 }
 
+func TestRunSkillLearningHeartbeatCreatesNewSkillProposalFromRepeatedLearning(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(filepath.Join(home, "observe", "learning"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	event := `{"type":"task_completed","task_id":"task-1","goal":"整理会议纪要并生成周报","status":"completed","tool_sequence":["calendar.list","minutes.fetch","file.write"],"tool_steps":[{"tool":"calendar.list","status":"accepted"},{"tool":"minutes.fetch","status":"accepted"},{"tool":"file.write","status":"accepted"}],"sources":["trace:one"]}`
+	second := strings.ReplaceAll(event, "task-1", "task-2")
+	if err := os.WriteFile(filepath.Join(home, "observe", "learning", "events.jsonl"), []byte(event+"\n"+second+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(workspace, "skills", "meeting-weekly", "SKILL.md")
+	model := distillStaticModel{text: `{"target_path":"` + filepath.ToSlash(target) + `","new_content":"---\nname: meeting-weekly\n---\n# Meeting Weekly\n\nUse calendar.list, minutes.fetch, then file.write for recurring meeting weekly reports.","reason":"Repeated successful meeting weekly workflow.","sources":["observe/learning/events.jsonl:1","observe/learning/events.jsonl:2"]}`}
+	result, err := RunSkillLearningHeartbeat(context.Background(), SkillLearningHeartbeatInput{Home: home, Workspace: workspace, Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 1 || len(result.ProposalIDs) != 1 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "skill_proposals", result.ProposalIDs[0]+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "meeting-weekly") || !strings.Contains(string(data), "Repeated successful meeting weekly workflow") {
+		t.Fatalf("unexpected new skill proposal:\n%s", data)
+	}
+}
+
 var _ agentcore.Model = distillStaticModel{}
