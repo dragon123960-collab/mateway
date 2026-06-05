@@ -409,7 +409,7 @@ var builtinZH = map[string]string{
 	"router.completion.ack_exact":       "收到,好的,执行,运行,开始执行,开始处理,收到，开始处理,收到,开始处理,好的，马上执行,好的,马上执行,马上执行,这就执行,我来执行,received,noted,executing,running,starting,will do,on it",
 	"router.completion.ack_short":       "执行,运行,开始处理,马上,execut,running,starting",
 	"router.action.info_cues":           "读取,总结,查看,检查,搜索,记住,remember,read,summarize,check,search",
-	"router.action.action_cues":         "创建,写,改,修改,更新,删除,移除,发送,发布,部署,执行,运行,重启,关闭,打开,安装,配置,提交,push,commit,create,write,modify,update,delete,remove,send,publish,deploy,run,execute,restart,close,open,install,configure,submit",
+	"router.action.action_cues":         "创,创建,写,改,修改,更新,删除,移除,发送,发布,部署,执行,运行,重启,关闭,打开,安装,配置,提交,push,commit,create,write,modify,update,delete,remove,send,publish,deploy,run,execute,restart,close,open,install,configure,submit",
 	"router.action.generate_cues":       "生成,generate",
 	"router.action.generated_artifacts": "文件,报告,文档,markdown,.md,.html,.json,.yaml,file,report,document",
 	"router.action.ack_exact":           "确认,confirm,继续,continue,需要,要,是的,yes,y",

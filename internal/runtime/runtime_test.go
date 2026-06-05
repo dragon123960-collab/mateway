@@ -628,6 +628,37 @@ func TestRuntimeAcceptedInformationalEvidenceSkipsLLMReviewVeto(t *testing.T) {
 	}
 }
 
+func TestRuntimeActionTaskReadOnlyEvidenceDoesNotComplete(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "source.md")
+	if err := os.WriteFile(target, []byte("# Source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	review := &testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: false, Reason: "document not created", SuggestedFollowUp: "create the document"}}}
+	rt.Hooks.Providers = append([]HookProvider{review}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": target}}}},
+		{Role: agentcore.RoleAssistant, Content: "我先查看文件内容，然后创建云文档。"},
+		{Role: agentcore.RoleAssistant, Content: "仍需创建云文档。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: target + "这个文档给我创一个飞书云文档"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed || resp.Reply.Style != "partial" {
+		t.Fatalf("expected action task to remain incomplete without mutation, got %#v", resp)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(data), "accepted_informational_evidence") {
+		t.Fatalf("action task should not complete from read-only evidence:\n%s", data)
+	}
+}
+
 func TestRuntimePureInformationalReplySkipsLLMReview(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
@@ -2685,6 +2716,52 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	}
 	if !contains(string(data), `"command":"ls `+scriptsDir) {
 		t.Fatalf("expected simple retry command trace:\n%s", data)
+	}
+}
+
+func TestRuntimeExecutesConfirmedNonDestructiveTerminalCommand(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "confirmed command ran"}}},
+	}, rt.Hooks.Providers...)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("确认后运行探测命令")
+	state.Pending = &session.PendingAction{
+		Kind:   "confirm_tool",
+		TaskID: task.ID,
+		ToolCall: agentcore.ToolCall{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "echo approved-terminal"},
+		},
+		Question: "确认执行？",
+	}
+	state.BlockActiveTask("await_confirm")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "confirmed terminal command completed."},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == "partial" {
+		t.Fatalf("expected confirmed command continuation, got %#v", resp)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), "approved-terminal") || contains(string(data), `"decision":"blocked"`) {
+		t.Fatalf("expected confirmed terminal command to execute, trace:\n%s", data)
 	}
 }
 

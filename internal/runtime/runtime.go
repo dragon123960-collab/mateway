@@ -1064,6 +1064,9 @@ func looksLikeActionTask(text string) bool {
 	if strings.HasPrefix(lower, "/read") || strings.HasPrefix(lower, "/search") {
 		return false
 	}
+	if looksLikeArtifactAction(lower) {
+		return true
+	}
 	for _, cue := range runtimeCueList(nil, "router.action.info_cues") {
 		if strings.Contains(lower, cue) {
 			return false
@@ -1075,6 +1078,27 @@ func looksLikeActionTask(text string) bool {
 		}
 	}
 	if containsAny(lower, runtimeCueList(nil, "router.action.generate_cues")) {
+		for _, artifact := range runtimeCueList(nil, "router.action.generated_artifacts") {
+			if strings.Contains(lower, artifact) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func looksLikeArtifactAction(lower string) bool {
+	if containsAny(lower, runtimeCueList(nil, "router.action.generate_cues")) {
+		for _, artifact := range runtimeCueList(nil, "router.action.generated_artifacts") {
+			if strings.Contains(lower, artifact) {
+				return true
+			}
+		}
+	}
+	for _, action := range runtimeCueList(nil, "router.action.action_cues") {
+		if !strings.Contains(lower, action) {
+			continue
+		}
 		for _, artifact := range runtimeCueList(nil, "router.action.generated_artifacts") {
 			if strings.Contains(lower, artifact) {
 				return true
@@ -1594,6 +1618,16 @@ func taskApprovalCanReuse(call agentcore.ToolCall, cfg *config.Root) bool {
 	}
 }
 
+func markToolCallApproved(call agentcore.ToolCall, cfg *config.Root) agentcore.ToolCall {
+	if call.Args == nil {
+		call.Args = map[string]any{}
+	}
+	if call.Name == "terminal.run" {
+		call.Args["_mateway_approval_token"] = tool.TerminalRunApprovalToken(fmt.Sprint(call.Args["command"]), cfg)
+	}
+	return call
+}
+
 func renderToolApprovalQuestion(locale string, call agentcore.ToolCall, class, reason string) string {
 	action := toolApprovalActionSummary(call)
 	reason = strings.TrimSpace(reason)
@@ -1720,6 +1754,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 				_ = trace.write(map[string]any{"type": "script_authorized", "script": record.Name, "path": record.Path, "source": record.Source, "hash": record.Hash})
 			}
 		}
+		call = markToolCallApproved(call, rt.Config)
 		if pending.AuthorizationOnly {
 			task := state.ActivateTask(taskID)
 			if task == nil {
