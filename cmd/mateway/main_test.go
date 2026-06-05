@@ -10,6 +10,7 @@ import (
 
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
@@ -26,9 +27,32 @@ func TestTestCaseMessage(t *testing.T) {
 	}
 }
 
+func TestTestCaseApprovalWriteUsesConfiguredHome(t *testing.T) {
+	home := t.TempDir()
+	msg, err := testCaseMessage("approval-write", &config.Root{App: config.AppConfig{Home: home}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(msg, "/write ") || !strings.Contains(msg, filepath.Join(home, "tmp", "mateway-test-approval.txt")) {
+		t.Fatalf("message = %q", msg)
+	}
+}
+
 func TestTestCaseCustomRequiresMessage(t *testing.T) {
 	if _, err := testCaseMessage("custom"); err == nil {
 		t.Fatal("expected custom case to require --message")
+	}
+}
+
+func TestTestApprovalHelpers(t *testing.T) {
+	if got := normalizedTestApproval("", true); got != "confirm" {
+		t.Fatalf("expected confirm from flag, got %q", got)
+	}
+	if got := normalizedTestApproval("cancel", false); got != "cancel" {
+		t.Fatalf("expected cancel, got %q", got)
+	}
+	if got := testApprovalMessage("cancel"); got != "取消" {
+		t.Fatalf("expected cancel message, got %q", got)
 	}
 }
 
@@ -39,7 +63,7 @@ func TestWriteTestRecord(t *testing.T) {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
-	path, err := writeTestRecord("read-readme", "test:one", "hello", runtime.Response{Reply: channel.OutboundMessage{Text: "ok"}, TracePath: "/tmp/trace.jsonl"}, map[string]any{"ok": true})
+	path, err := writeTestRecord("read-readme", "test:one", "hello", runtime.Response{Reply: channel.OutboundMessage{Text: "ok"}, TracePath: "/tmp/trace.jsonl"}, map[string]any{"ok": true}, []testInteraction{{Message: "hello", Response: runtime.Response{Reply: channel.OutboundMessage{Text: "ok"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +79,9 @@ func TestWriteTestRecord(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"trace_path": "/tmp/trace.jsonl"`) {
 		t.Fatalf("record missing trace path = %s", data)
+	}
+	if !strings.Contains(string(data), `"interactions"`) {
+		t.Fatalf("record missing interactions = %s", data)
 	}
 }
 

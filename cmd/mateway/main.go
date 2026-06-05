@@ -2051,6 +2051,8 @@ func runTest(args []string) error {
 	message := fs.String("message", "", "custom task message")
 	sessionKey := fs.String("session-key", "", "session key to reuse")
 	home := fs.String("home", "", "override MATEWAY_HOME for this run")
+	confirm := fs.Bool("confirm", false, "when the first reply is approval_pending, send a confirm follow-up")
+	approval := fs.String("approval", "", "approval follow-up to send when pending: confirm or cancel")
 	record := fs.Bool("record", true, "write test result JSON under testdata/runs")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2073,6 +2075,7 @@ func runTest(args []string) error {
 		key = "test:" + strings.ReplaceAll(strings.ToLower(strings.TrimSpace(*caseName)), " ", "-") + "-" + time.Now().Format("20060102150405")
 	}
 	rt := runtime.New(cfg)
+	interactions := []testInteraction{}
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{
 		ID:         "test",
 		Channel:    "test",
@@ -2084,6 +2087,24 @@ func runTest(args []string) error {
 	if err != nil {
 		return err
 	}
+	interactions = append(interactions, testInteraction{Message: text, Response: resp})
+	action := normalizedTestApproval(*approval, *confirm)
+	if resp.Reply.Style == "approval_pending" && action != "" {
+		followup := testApprovalMessage(action)
+		followResp, err := rt.Handle(context.Background(), channel.InboundMessage{
+			ID:         "test-approval",
+			Channel:    "test",
+			ThreadID:   key,
+			UserID:     "local",
+			SessionKey: key,
+			Text:       followup,
+		})
+		if err != nil {
+			return err
+		}
+		interactions = append(interactions, testInteraction{Message: followup, Response: followResp})
+		resp = followResp
+	}
 	state, err := rt.Store.Load(key)
 	if err != nil {
 		return err
@@ -2092,7 +2113,14 @@ func runTest(args []string) error {
 	fmt.Println("session:", key)
 	fmt.Println("message:", text)
 	fmt.Println()
-	printRuntimeResponse(resp)
+	for i, interaction := range interactions {
+		if i > 0 {
+			fmt.Println()
+			fmt.Println("follow-up:", interaction.Message)
+			fmt.Println()
+		}
+		printRuntimeResponse(interaction.Response)
+	}
 	if resp.TracePath != "" {
 		fmt.Println()
 		fmt.Println("trace:", resp.TracePath)
@@ -2110,7 +2138,7 @@ func runTest(args []string) error {
 		}
 	}
 	if *record {
-		path, err := writeTestRecord(*caseName, key, text, resp, state)
+		path, err := writeTestRecord(*caseName, key, text, resp, state, interactions)
 		if err != nil {
 			return err
 		}
@@ -2120,14 +2148,45 @@ func runTest(args []string) error {
 	return nil
 }
 
-func writeTestRecord(caseName, sessionKey, message string, resp runtime.Response, state any) (string, error) {
+type testInteraction struct {
+	Message  string           `json:"message"`
+	Response runtime.Response `json:"response"`
+}
+
+func normalizedTestApproval(value string, confirm bool) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" && confirm {
+		return "confirm"
+	}
+	switch value {
+	case "", "none", "no":
+		return ""
+	case "confirm", "approve", "yes", "y", "ok", "run":
+		return "confirm"
+	case "cancel", "reject", "stop", "nope":
+		return "cancel"
+	default:
+		return value
+	}
+}
+
+func testApprovalMessage(action string) string {
+	switch normalizedTestApproval(action, false) {
+	case "cancel":
+		return "取消"
+	default:
+		return "确认"
+	}
+}
+
+func writeTestRecord(caseName, sessionKey, message string, resp runtime.Response, state any, interactions ...[]testInteraction) (string, error) {
 	dir := filepath.Join("testdata", "runs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	name := time.Now().Format("20060102-150405") + "-" + sanitizeFilePart(caseName) + ".json"
 	path := filepath.Join(dir, name)
-	data, err := json.MarshalIndent(map[string]any{
+	record := map[string]any{
 		"case":       caseName,
 		"session":    sessionKey,
 		"message":    message,
@@ -2138,7 +2197,11 @@ func writeTestRecord(caseName, sessionKey, message string, resp runtime.Response
 		"trace_path": resp.TracePath,
 		"state":      state,
 		"created_at": time.Now().Format(time.RFC3339),
-	}, "", "  ")
+	}
+	if len(interactions) > 0 {
+		record["interactions"] = interactions[0]
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -2186,6 +2249,12 @@ func testCaseMessage(name string, cfg ...*config.Root) (string, error) {
 		return "请查看 " + cwd + " 的项目结构，并说明最重要的目录各自负责什么。", nil
 	case "web-search":
 		return "请搜索今天 OpenAI API 的最新公开信息，并用两句话总结来源。", nil
+	case "approval-write":
+		home := config.DefaultHome()
+		if len(cfg) > 0 && cfg[0] != nil && strings.TrimSpace(cfg[0].App.Home) != "" {
+			home = cfg[0].App.Home
+		}
+		return "/write " + filepath.Join(home, "tmp", "mateway-test-approval.txt") + " hello approval", nil
 	case "custom":
 		return "", fmt.Errorf("custom case requires --message")
 	default:
@@ -2225,7 +2294,7 @@ func printHelp() {
 Usage:
   mateway init
   mateway ask <message>
-  mateway test [--case read-readme|project-index|web-search] [--message <task>] [--record=false]
+  mateway test [--case read-readme|project-index|web-search|approval-write] [--message <task>] [--confirm|--approval confirm|cancel] [--record=false]
   mateway trace <trace-jsonl-path>
   mateway workspace report
   mateway session list

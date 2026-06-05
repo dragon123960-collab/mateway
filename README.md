@@ -228,6 +228,7 @@ Validate configuration:
 ./build/mateway test --case read-readme
 ./build/mateway test --case project-index
 ./build/mateway test --case web-search
+./build/mateway test --case approval-write --confirm
 ```
 
 Custom task:

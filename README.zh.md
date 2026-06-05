@@ -224,6 +224,7 @@ vim ~/.mateway/config/config.yaml
 ./build/mateway test --case read-readme
 ./build/mateway test --case project-index
 ./build/mateway test --case web-search
+./build/mateway test --case approval-write --confirm
 ```
 
 自定义任务：
