@@ -8,7 +8,6 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -44,7 +43,7 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 			return &callback.CardActionTriggerResponse{
 				Toast: &callback.Toast{
 					Type:    "info",
-					Content: i18n.New(i18n.Config{}).T(i18n.LocaleZH, "gateway.processing_ack", nil),
+					Content: "Processing...",
 				},
 			}, nil
 		}).
@@ -176,9 +175,9 @@ func extractCardActionText(action *callback.CallBackAction) string {
 	}
 	switch extractCardActionDecision(action) {
 	case "confirm":
-		return i18n.New(i18n.Config{}).T(i18n.LocaleZH, "aliases.confirm.primary", nil)
+		return "1"
 	case "cancel":
-		return i18n.New(i18n.Config{}).T(i18n.LocaleZH, "aliases.cancel.primary", nil)
+		return "2"
 	}
 	return strings.TrimSpace(action.InputValue)
 }

@@ -2,7 +2,6 @@ package feishu
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 
@@ -120,81 +119,23 @@ func TestRenderReplyMessageStripsBareJSONToolPlan(t *testing.T) {
 	if strings.Contains(content, "file.read") || strings.Contains(content, `"tool"`) {
 		t.Fatalf("expected json tool plan stripped, got %s", content)
 	}
-	if !strings.Contains(content, "完成。") {
+	if !strings.Contains(content, "Done.") {
 		t.Fatalf("expected fallback text, got %s", content)
 	}
 }
 
-func TestRenderReplyMessageBuildsApprovalCardActions(t *testing.T) {
-	t.Setenv("MATEWAY_FEISHU_APPROVAL_BUTTONS", "1")
+func TestRenderReplyMessageUsesEnglishRuntimeText(t *testing.T) {
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
 		Channel:  "feishu",
 		ThreadID: "thread_123",
-		Style:    "approval_pending",
-		Title:    "Mateway 等待确认",
-		Text:     "这个操作会修改本地环境，执行前需要你确认。",
+		Style:    "input_required",
+		Text:     "Please provide the missing path.",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(content, `"tag":"action"`) || !strings.Contains(content, `"decision":"confirm"`) || !strings.Contains(content, `"decision":"cancel"`) {
-		t.Fatalf("expected approval buttons, got %s", content)
-	}
-	if !strings.Contains(content, `"mateway_session_key":"feishu:thread_123"`) {
-		t.Fatalf("expected approval button to preserve session key, got %s", content)
-	}
-}
-
-func TestRenderReplyMessageDisablesApprovalButtonsByDefault(t *testing.T) {
-	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
-	_, content, err := renderReplyMessage(channel.OutboundMessage{
-		Channel:  "feishu",
-		ThreadID: "thread_123",
-		Style:    "approval_pending",
-		Text:     "这个操作会修改外部系统，执行前需要你确认。",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(content, `"tag":"button"`) || strings.Contains(content, `"tag":"action"`) {
-		t.Fatalf("expected no approval buttons by default, got %s", content)
-	}
-	if !strings.Contains(content, "直接回复") {
-		t.Fatalf("expected text confirmation fallback, got %s", content)
-	}
-}
-
-func TestRenderReplyMessageSkipsRedundantApprovalFooter(t *testing.T) {
-	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
-	_, content, err := renderReplyMessage(channel.OutboundMessage{
-		Channel:  "feishu",
-		ThreadID: "thread_123",
-		Style:    "approval_pending",
-		Locale:   "zh-CN",
-		Text:     "继续之前需要确认。回复“确认”继续，或回复“取消”放弃。",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(content, "也可以直接回复") {
-		t.Fatalf("expected redundant approval footer to be omitted, got %s", content)
-	}
-}
-
-func TestRenderReplyMessageUsesEnglishLocale(t *testing.T) {
-	_ = os.Unsetenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")
-	_, content, err := renderReplyMessage(channel.OutboundMessage{
-		Channel:  "feishu",
-		ThreadID: "thread_123",
-		Style:    "approval_pending",
-		Locale:   "en-US",
-		Text:     "Confirmation is required before continuing. Reply \"confirm\" to continue, or \"cancel\" to stop.",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(content, "Mateway Waiting for Confirmation") || !strings.Contains(content, "confirm") || !strings.Contains(content, "cancel") {
-		t.Fatalf("expected English approval card, got %s", content)
+	if !strings.Contains(content, "Mateway Needs More Information") || !strings.Contains(content, "Please reply directly with the missing information.") {
+		t.Fatalf("expected English input-required card, got %s", content)
 	}
 }
 
@@ -256,17 +197,16 @@ func TestRenderReplyMessageProducesValidCardJSON(t *testing.T) {
 
 func TestRenderReplyMessageUsesPartialFooter(t *testing.T) {
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
-		Style:  "partial",
-		Locale: "zh-CN",
-		Text:   "任务还没有完成。",
+		Style: "partial",
+		Text:  "任务还没有完成。",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(content, "状态：未完成") {
+	if !strings.Contains(content, "Status: partial") {
 		t.Fatalf("expected partial footer, got %s", content)
 	}
-	if strings.Contains(content, "状态：completed") || strings.Contains(content, "DONE") {
+	if strings.Contains(content, "Status: completed") || strings.Contains(content, "DONE") {
 		t.Fatalf("partial card should not look completed, got %s", content)
 	}
 }

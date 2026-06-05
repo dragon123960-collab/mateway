@@ -72,23 +72,23 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 
 func TestToolParametersIncludesOptionalProperties(t *testing.T) {
 	params := toolParameters(fakeTool{
-		name:     "script.run",
-		required: []string{"name"},
+		name:     "terminal.run",
+		required: []string{"command"},
 		properties: map[string]any{
-			"name": map[string]any{"type": "string"},
-			"args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"command":     map[string]any{"type": "string"},
+			"env_secrets": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 		},
 	})
 	properties, ok := params["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("missing properties: %#v", params)
 	}
-	args, ok := properties["args"].(map[string]any)
-	if !ok || args["type"] != "array" {
-		t.Fatalf("expected args array property, got %#v", properties["args"])
+	envSecrets, ok := properties["env_secrets"].(map[string]any)
+	if !ok || envSecrets["type"] != "array" {
+		t.Fatalf("expected env_secrets array property, got %#v", properties["env_secrets"])
 	}
 	required, ok := params["required"].([]string)
-	if !ok || len(required) != 1 || required[0] != "name" {
+	if !ok || len(required) != 1 || required[0] != "command" {
 		t.Fatalf("unexpected required list: %#v", params["required"])
 	}
 }

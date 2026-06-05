@@ -90,15 +90,14 @@ func TestShouldIgnoreFeishuGroupWithoutMentionWhenRequired(t *testing.T) {
 
 func TestReactionForReply(t *testing.T) {
 	cases := map[string]string{
-		"approval_pending": "EYES",
-		"input_required":   "EYES",
-		"partial":          "EYES",
-		"clarify":          "EYES",
-		"error":            "CROSS_MARK",
-		"cancelled":        "CROSS_MARK",
-		"completed":        "DONE",
-		"processing":       "DONE",
-		"":                 "DONE",
+		"input_required": "EYES",
+		"partial":        "EYES",
+		"clarify":        "EYES",
+		"error":          "CROSS_MARK",
+		"cancelled":      "CROSS_MARK",
+		"completed":      "DONE",
+		"processing":     "DONE",
+		"":               "DONE",
 	}
 	for style, want := range cases {
 		if got := reactionForReply(channel.OutboundMessage{Style: style}); got != want {
@@ -129,12 +128,12 @@ func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	task := state.StartTask("needs confirmation")
-	state.Pending = &session.PendingAction{Kind: "confirm_tool", TaskID: task.ID}
+	task := state.StartTask("review memory proposal")
+	state.Pending = &session.PendingAction{Kind: "memory_proposal_review", TaskID: task.ID, ProposalID: "prop_test"}
 	if err := rt.Store.Save(state); err != nil {
 		t.Fatal(err)
 	}
-	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认"}) {
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "1"}) {
 		t.Fatal("expected pending session to skip processing ack")
 	}
 }

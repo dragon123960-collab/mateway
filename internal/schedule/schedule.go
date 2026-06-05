@@ -40,6 +40,14 @@ type CreateInput struct {
 	Activate    bool
 }
 
+type UpdateInput struct {
+	ID       string
+	Text     *string
+	RunAt    *time.Time
+	Interval *time.Duration
+	Status   *string
+}
+
 type RunRecord struct {
 	ID         string `json:"id"`
 	TaskID     string `json:"task_id"`
@@ -159,6 +167,59 @@ func (s Store) Pause(id string) (Task, error) {
 		return Task{}, err
 	}
 	return task, nil
+}
+
+func (s Store) Update(input UpdateInput) (Task, error) {
+	task, err := s.read(input.ID)
+	if err != nil {
+		return Task{}, err
+	}
+	if input.Text != nil {
+		text := strings.TrimSpace(*input.Text)
+		if text == "" {
+			return Task{}, fmt.Errorf("schedule text is required")
+		}
+		task.Text = text
+	}
+	if input.RunAt != nil {
+		if input.RunAt.IsZero() {
+			return Task{}, fmt.Errorf("run_at is required")
+		}
+		task.RunAt = input.RunAt.Format(time.RFC3339)
+	}
+	if input.Interval != nil {
+		if *input.Interval <= 0 {
+			task.Interval = ""
+		} else {
+			task.Interval = input.Interval.String()
+		}
+	}
+	if input.Status != nil {
+		status := strings.TrimSpace(*input.Status)
+		switch status {
+		case "active", "paused", "pending", "done", "error":
+			task.Status = status
+		case "":
+		default:
+			return Task{}, fmt.Errorf("unsupported schedule status %q", status)
+		}
+	}
+	task.UpdatedAt = s.now().Format(time.RFC3339)
+	if err := s.write(task); err != nil {
+		return Task{}, err
+	}
+	return task, nil
+}
+
+func (s Store) Delete(id string) (bool, error) {
+	path := filepath.Join(s.dir(), strings.TrimSpace(id)+".json")
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s Store) MarkTested(task Task, finishedAt time.Time, record RunRecord) error {

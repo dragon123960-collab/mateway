@@ -15,35 +15,23 @@ type State struct {
 	Messages   []agentcore.Message `json:"messages"`
 	Tasks      []TaskNode          `json:"tasks,omitempty"`
 	ActiveTask string              `json:"active_task,omitempty"`
-	Approvals  []TaskApproval      `json:"approvals,omitempty"`
 	Pending    *PendingAction      `json:"pending,omitempty"`
 	Usage      Usage               `json:"usage,omitempty"`
 	UpdatedAt  time.Time           `json:"updated_at"`
 }
 
 type TaskNode struct {
-	ID                 string             `json:"id"`
-	ParentID           string             `json:"parent_id,omitempty"`
-	Goal               string             `json:"goal"`
-	Summary            string             `json:"summary,omitempty"`
-	Status             string             `json:"status"`
-	Execution          ExecutionFrame     `json:"execution,omitempty"`
-	CompletionContract CompletionContract `json:"completion_contract,omitempty"`
-	Steps              []TaskStep         `json:"steps,omitempty"`
-	Approvals          []TaskApproval     `json:"approvals,omitempty"`
-	TraceID            string             `json:"trace_id,omitempty"`
-	TracePath          string             `json:"trace_path,omitempty"`
-	CreatedAt          time.Time          `json:"created_at"`
-	UpdatedAt          time.Time          `json:"updated_at"`
-}
-
-type CompletionContract struct {
-	RequiredTools     []string `json:"required_tools,omitempty"`
-	RequiresLLMReview bool     `json:"requires_llm_review,omitempty"`
-	SuccessCondition  string   `json:"success_condition,omitempty"`
-	TaskType          string   `json:"task_type,omitempty"`
-	RequiresMutation  bool     `json:"requires_mutation,omitempty"`
-	AllowsBlocker     bool     `json:"allows_blocker,omitempty"`
+	ID        string         `json:"id"`
+	ParentID  string         `json:"parent_id,omitempty"`
+	Goal      string         `json:"goal"`
+	Summary   string         `json:"summary,omitempty"`
+	Status    string         `json:"status"`
+	Execution ExecutionFrame `json:"execution,omitempty"`
+	Steps     []TaskStep     `json:"steps,omitempty"`
+	TraceID   string         `json:"trace_id,omitempty"`
+	TracePath string         `json:"trace_path,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
 }
 
 type TaskStep struct {
@@ -66,21 +54,8 @@ type ExecutionFrame struct {
 	OriginalTask  string           `json:"original_task,omitempty"`
 	CurrentStepID string           `json:"current_step_id,omitempty"`
 	CurrentNodeID string           `json:"current_node_id,omitempty"`
-	ResumeContext ResumeContext    `json:"resume_context,omitempty"`
 	Events        []ExecutionEvent `json:"events,omitempty"`
 	UpdatedAt     time.Time        `json:"updated_at,omitempty"`
-}
-
-type ResumeContext struct {
-	OriginalTask      string         `json:"original_task,omitempty"`
-	PendingTool       string         `json:"pending_tool,omitempty"`
-	PendingArgs       map[string]any `json:"pending_args,omitempty"`
-	PolicyClass       string         `json:"policy_class,omitempty"`
-	Reason            string         `json:"reason,omitempty"`
-	ActionSummary     string         `json:"action_summary,omitempty"`
-	AfterSuccess      string         `json:"after_success,omitempty"`
-	AfterFailure      string         `json:"after_failure,omitempty"`
-	AuthorizationOnly bool           `json:"authorization_only,omitempty"`
 }
 
 type ExecutionEvent struct {
@@ -94,25 +69,11 @@ type ExecutionEvent struct {
 	CreatedAt time.Time      `json:"created_at,omitempty"`
 }
 
-type TaskApproval struct {
-	Key       string    `json:"key"`
-	Tool      string    `json:"tool"`
-	Class     string    `json:"class,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
 type PendingAction struct {
-	Kind              string             `json:"kind"`
-	TaskID            string             `json:"task_id"`
-	ProposalID        string             `json:"proposal_id,omitempty"`
-	ScheduleID        string             `json:"schedule_id,omitempty"`
-	ArchiveID         string             `json:"archive_id,omitempty"`
-	Question          string             `json:"question,omitempty"`
-	ToolCall          agentcore.ToolCall `json:"tool_call,omitempty"`
-	ResumeText        string             `json:"resume_text,omitempty"`
-	FrameID           string             `json:"frame_id,omitempty"`
-	ResumeContext     ResumeContext      `json:"resume_context,omitempty"`
-	AuthorizationOnly bool               `json:"authorization_only,omitempty"`
+	Kind       string `json:"kind"`
+	TaskID     string `json:"task_id"`
+	ProposalID string `json:"proposal_id,omitempty"`
+	Question   string `json:"question,omitempty"`
 }
 
 type Usage struct {
@@ -290,7 +251,7 @@ func (s *State) ActivateTask(taskID string) *TaskNode {
 
 func IsOpenTaskStatus(status string) bool {
 	switch strings.TrimSpace(status) {
-	case "", "running", "await_confirm", "await_user_input", "resuming":
+	case "", "running", "await_user_input", "resuming", "failed":
 		return true
 	default:
 		return false
@@ -314,71 +275,6 @@ func (s *State) AddStep(taskID string, step TaskStep) {
 	}
 }
 
-func (s *State) HasTaskApproval(taskID, key string) bool {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	for _, approval := range s.Approvals {
-		if approval.Key == key {
-			return true
-		}
-	}
-	for i := range s.Tasks {
-		if s.Tasks[i].ID != taskID || !IsOpenTaskStatus(s.Tasks[i].Status) {
-			continue
-		}
-		for _, approval := range s.Tasks[i].Approvals {
-			if approval.Key == key {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (s *State) AddSessionApproval(approval TaskApproval) {
-	approval.Key = strings.TrimSpace(approval.Key)
-	if approval.Key == "" {
-		return
-	}
-	now := time.Now()
-	if approval.CreatedAt.IsZero() {
-		approval.CreatedAt = now
-	}
-	for _, existing := range s.Approvals {
-		if existing.Key == approval.Key {
-			return
-		}
-	}
-	s.Approvals = append(s.Approvals, approval)
-	s.UpdatedAt = now
-}
-
-func (s *State) AddTaskApproval(taskID string, approval TaskApproval) {
-	approval.Key = strings.TrimSpace(approval.Key)
-	if approval.Key == "" {
-		return
-	}
-	now := time.Now()
-	if approval.CreatedAt.IsZero() {
-		approval.CreatedAt = now
-	}
-	for i := range s.Tasks {
-		if s.Tasks[i].ID != taskID {
-			continue
-		}
-		for _, existing := range s.Tasks[i].Approvals {
-			if existing.Key == approval.Key {
-				return
-			}
-		}
-		s.Tasks[i].Approvals = append(s.Tasks[i].Approvals, approval)
-		s.Tasks[i].UpdatedAt = now
-		return
-	}
-}
-
 func (s *State) CompleteActiveTask() {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {
@@ -388,6 +284,7 @@ func (s *State) CompleteActiveTask() {
 			s.Tasks[i].Execution.Status = "completed"
 			s.Tasks[i].Execution.UpdatedAt = now
 			s.Tasks[i].UpdatedAt = now
+			s.ActiveTask = ""
 			return
 		}
 	}
@@ -405,6 +302,7 @@ func (s *State) CompleteActiveTaskWithSummary(summary, traceID, tracePath string
 			s.Tasks[i].Execution.Status = "completed"
 			s.Tasks[i].Execution.UpdatedAt = now
 			s.Tasks[i].UpdatedAt = now
+			s.ActiveTask = ""
 			return
 		}
 	}
@@ -447,23 +345,6 @@ func (s *State) SetExecutionStatus(taskID, status string) {
 			return
 		}
 	}
-}
-
-func (s *State) SetResumeContext(taskID string, resume ResumeContext) string {
-	now := time.Now()
-	for i := range s.Tasks {
-		if s.Tasks[i].ID == taskID {
-			ensureExecutionFrame(&s.Tasks[i], now)
-			if strings.TrimSpace(resume.OriginalTask) == "" {
-				resume.OriginalTask = s.Tasks[i].Execution.OriginalTask
-			}
-			s.Tasks[i].Execution.ResumeContext = resume
-			s.Tasks[i].Execution.UpdatedAt = now
-			s.Tasks[i].UpdatedAt = now
-			return s.Tasks[i].Execution.ID
-		}
-	}
-	return ""
 }
 
 func (s *State) AddExecutionEvent(taskID string, event ExecutionEvent) {

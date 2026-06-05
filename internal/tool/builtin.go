@@ -25,8 +25,8 @@ import (
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/schedule"
-	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/secret"
+	"github.com/dongping/mateway/internal/session"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,11 +40,16 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(FileWriteTool{Config: root})
 	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
-	registry.Register(ScriptRunTool{Config: root})
 	registry.Register(SecretSetTool{Config: root})
 	registry.Register(ScheduleCreateTool{Config: root})
 	registry.Register(ScheduleListTool{Config: root})
-	registry.Register(RemoteProfileCreateTool{Config: root})
+	registry.Register(ScheduleUpdateTool{Config: root})
+	registry.Register(SchedulePauseTool{Config: root})
+	registry.Register(ScheduleResumeTool{Config: root})
+	registry.Register(ScheduleDeleteTool{Config: root})
+	registry.Register(ScheduleRunNowTool{Config: root})
+	registry.Register(TaskSearchTool{Config: root})
+	registry.Register(TaskResumeTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
 	registry.Register(WebFetchTool{Config: root})
 	return registry
@@ -89,7 +94,7 @@ func (FileWriteTool) ToolContract() agentcore.ToolContract {
 		SoftFailureSignals:   []string{"permission denied", "outside allowed roots", "no such file or directory"},
 		ParallelMode:         "forbid",
 		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
+		ConfirmationBoundary: "guarded mutation; path policy and secret scanning are enforced before writing.",
 	}
 }
 func (FileWriteTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
@@ -172,28 +177,44 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 }
 
 type TerminalRunTool struct{ Config *config.Root }
-type ScriptRunTool struct{ Config *config.Root }
 type SecretSetTool struct{ Config *config.Root }
 type ScheduleCreateTool struct{ Config *config.Root }
 type ScheduleListTool struct{ Config *config.Root }
+type ScheduleUpdateTool struct{ Config *config.Root }
+type SchedulePauseTool struct{ Config *config.Root }
+type ScheduleResumeTool struct{ Config *config.Root }
+type ScheduleDeleteTool struct{ Config *config.Root }
+type ScheduleRunNowTool struct{ Config *config.Root }
+type TaskSearchTool struct{ Config *config.Root }
+type TaskResumeTool struct{ Config *config.Root }
 type RemoteProfileCreateTool struct{ Config *config.Root }
 
 func (TerminalRunTool) Name() string        { return "terminal.run" }
 func (TerminalRunTool) Description() string { return "run a local shell command" }
 func (TerminalRunTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"command"}}
+	return agentcore.Schema{
+		Required: []string{"command"},
+		Properties: map[string]any{
+			"command":         map[string]any{"type": "string"},
+			"timeout_seconds": map[string]any{"type": "integer"},
+			"env_secrets": map[string]any{
+				"type":        "array",
+				"description": "Optional secret ids to inject as environment variables. Items use {\"id\":\"secret/id\",\"env\":\"ENV_NAME\"}.",
+			},
+		},
+	}
 }
 func (TerminalRunTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
 		WhenToUse:            "Use for local verification commands such as tests, builds, or simple shell inspection.",
 		WhenNotToUse:         "Do not use for destructive commands, secret exfiltration, or long-running services unless explicitly requested.",
 		OutputContract:       "Return combined stdout/stderr, trimmed, with command evidence.",
-		Evidence:             "Return the command and combined output.",
+		Evidence:             "Return the command, combined output, and redacted env secret ids when injected.",
 		Acceptance:           "Accepted when the command exits successfully; failed when the command returns an error.",
 		SoftFailureSignals:   []string{"non-zero exit", "timeout", "command not found", "permission denied"},
 		ParallelMode:         "forbid",
 		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
+		ConfirmationBoundary: "guarded mutation; destructive commands are blocked instead of confirmed.",
 	}
 }
 func (TerminalRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
@@ -218,10 +239,20 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		}
 	}
 	timeout := terminalTimeout(t.Config)
+	if seconds := intArg(call.Args["timeout_seconds"]); seconds > 0 {
+		timeout = time.Duration(seconds) * time.Second
+	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	execName, execArgs := terminalCommand(t.Config, command)
 	cmd := exec.CommandContext(timeoutCtx, execName, execArgs...)
+	envSecrets, err := terminalEnvSecrets(call.Args["env_secrets"], t.Config)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"command": command}}
+	}
+	if len(envSecrets.Env) > 0 {
+		cmd.Env = append(os.Environ(), envSecrets.Env...)
+	}
 	workdir, err := terminalWorkdir(t.Config)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"command": command}}
@@ -235,9 +266,16 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		if result == "" {
 			result = err.Error()
 		}
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}}
+		evidence := map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}
+		if len(envSecrets.Evidence) > 0 {
+			evidence["env_secrets"] = envSecrets.Evidence
+		}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: evidence}
 	}
 	evidence := map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}
+	if len(envSecrets.Evidence) > 0 {
+		evidence["env_secrets"] = envSecrets.Evidence
+	}
 	if decision.RemoteProfile != "" {
 		evidence["remote_profile"] = decision.RemoteProfile
 	}
@@ -274,10 +312,66 @@ func rejectCommandContainingKnownSecret(command string, cfg *config.Root) error 
 			continue
 		}
 		if len(full.Value) >= 8 && strings.Contains(command, full.Value) {
-			return fmt.Errorf("refusing to run terminal command containing secret value %s; use secret.set and script.run required_secret injection instead", entry.ID)
+			return fmt.Errorf("refusing to run terminal command containing secret value %s; use secret.set and terminal.run env_secrets instead", entry.ID)
 		}
 	}
 	return nil
+}
+
+type terminalEnvSecretResult struct {
+	Env      []string
+	Evidence []map[string]string
+}
+
+func terminalEnvSecrets(value any, cfg *config.Root) (terminalEnvSecretResult, error) {
+	items, err := mapListArg(value)
+	if err != nil {
+		return terminalEnvSecretResult{}, err
+	}
+	if len(items) == 0 {
+		return terminalEnvSecretResult{}, nil
+	}
+	store := secret.Store{Home: configHome(cfg)}
+	var result terminalEnvSecretResult
+	for _, item := range items {
+		id := strings.TrimSpace(fmt.Sprint(item["id"]))
+		envName := strings.TrimSpace(fmt.Sprint(item["env"]))
+		if id == "" || envName == "" {
+			return terminalEnvSecretResult{}, fmt.Errorf("env_secrets items require id and env")
+		}
+		entry, ok, err := store.Get(id)
+		if err != nil {
+			return terminalEnvSecretResult{}, err
+		}
+		if !ok {
+			return terminalEnvSecretResult{}, fmt.Errorf("missing required secret %s", id)
+		}
+		result.Env = append(result.Env, envName+"="+entry.Value)
+		result.Evidence = append(result.Evidence, map[string]string{"id": strings.ToLower(strings.TrimSpace(id)), "env": envName})
+	}
+	return result, nil
+}
+
+func mapListArg(value any) ([]map[string]any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	switch v := value.(type) {
+	case []map[string]any:
+		return v, nil
+	case []any:
+		out := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("env_secrets must be a list of objects")
+			}
+			out = append(out, m)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("env_secrets must be a list")
+	}
 }
 
 func (SecretSetTool) Name() string { return "secret.set" }
@@ -353,15 +447,15 @@ func (ScheduleCreateTool) Schema() agentcore.Schema {
 }
 func (ScheduleCreateTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to run a task later. Scheduled tasks are channel-neutral and should be tested before activation unless the user explicitly waives testing.",
+		WhenToUse:            "Use when the user asks to run a task later. Scheduled tasks are channel-neutral and are created directly without chat approval.",
 		WhenNotToUse:         "Do not use for immediate tasks; execute those directly.",
-		OutputContract:       "Return scheduled task id, status, run time, interval when any, and the next test/activate step.",
+		OutputContract:       "Return scheduled task id, status, run time, and interval when any.",
 		Evidence:             "Return id, status, run_at, interval, session_key.",
 		Acceptance:           "Accepted when the task is persisted under the local schedule store.",
 		SoftFailureSignals:   []string{"invalid run_at", "missing text"},
 		ParallelMode:         "forbid",
 		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
+		ConfirmationBoundary: "guarded mutation; destructive schedule operations are enforced by tool policy, not chat approval.",
 	}
 }
 func (ScheduleCreateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
@@ -377,9 +471,11 @@ func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agen
 			return agentcore.ToolResult{ToolCallID: call.ID, Content: "interval must be a Go duration such as 30m or 24h", IsError: true}
 		}
 	}
-	requireTest := true
+	requireTest := false
 	if raw := strings.ToLower(toolArgString(call.Args, "require_test")); raw == "false" || raw == "no" {
 		requireTest = false
+	} else if raw == "true" || raw == "yes" {
+		requireTest = true
 	}
 	store := schedule.Store{Home: config.DefaultHome()}
 	if t.Config != nil && strings.TrimSpace(t.Config.App.Home) != "" {
@@ -398,7 +494,7 @@ func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	}
 	return agentcore.ToolResult{
 		ToolCallID: call.ID,
-		Content:    fmt.Sprintf("scheduled %s status=%s at %s; test with mateway schedule test %s before activation", task.ID, task.Status, task.RunAt, task.ID),
+		Content:    fmt.Sprintf("scheduled %s status=%s at %s", task.ID, task.Status, task.RunAt),
 		Evidence: map[string]any{
 			"id":          task.ID,
 			"status":      task.Status,
@@ -441,6 +537,334 @@ func (t ScheduleListTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 		lines = append(lines, fmt.Sprintf("%s status=%s run_at=%s interval=%s last=%s text=%s", task.ID, task.Status, task.RunAt, task.Interval, task.LastRunStatus, summarizeToolText(task.Text, 80)))
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"count": len(tasks)}}
+}
+
+func (ScheduleUpdateTool) Name() string        { return "schedule.update" }
+func (ScheduleUpdateTool) Description() string { return "update a local scheduled task" }
+func (ScheduleUpdateTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"id"}}
+}
+func (ScheduleUpdateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t ScheduleUpdateTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	input := schedule.UpdateInput{ID: toolArgString(call.Args, "id")}
+	if raw := toolArgString(call.Args, "text"); raw != "" {
+		input.Text = &raw
+	}
+	if raw := toolArgString(call.Args, "run_at"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: "run_at must be RFC3339", IsError: true}
+		}
+		input.RunAt = &parsed
+	}
+	if raw := toolArgString(call.Args, "interval"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: "interval must be a Go duration such as 30m or 24h", IsError: true}
+		}
+		input.Interval = &parsed
+	}
+	if raw := toolArgString(call.Args, "status"); raw != "" {
+		input.Status = &raw
+	}
+	task, err := scheduleStore(t.Config).Update(input)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	return scheduleToolResult(call.ID, "updated", task)
+}
+
+func (SchedulePauseTool) Name() string        { return "schedule.pause" }
+func (SchedulePauseTool) Description() string { return "pause a local scheduled task" }
+func (SchedulePauseTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"id"}}
+}
+func (SchedulePauseTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t SchedulePauseTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	task, err := scheduleStore(t.Config).Pause(toolArgString(call.Args, "id"))
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	return scheduleToolResult(call.ID, "paused", task)
+}
+
+func (ScheduleResumeTool) Name() string        { return "schedule.resume" }
+func (ScheduleResumeTool) Description() string { return "resume a local scheduled task" }
+func (ScheduleResumeTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"id"}}
+}
+func (ScheduleResumeTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t ScheduleResumeTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	task, err := scheduleStore(t.Config).Activate(toolArgString(call.Args, "id"))
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	return scheduleToolResult(call.ID, "resumed", task)
+}
+
+func (ScheduleDeleteTool) Name() string        { return "schedule.delete" }
+func (ScheduleDeleteTool) Description() string { return "delete a local scheduled task" }
+func (ScheduleDeleteTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"id"}}
+}
+func (ScheduleDeleteTool) Risk() agentcore.Risk { return agentcore.RiskDangerous }
+func (t ScheduleDeleteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	id := toolArgString(call.Args, "id")
+	deleted, err := scheduleStore(t.Config).Delete(id)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	if !deleted {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "schedule not found: " + id, IsError: true, Evidence: map[string]any{"id": id, "deleted": false}}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: "deleted schedule " + id, Evidence: map[string]any{"id": id, "deleted": true}}
+}
+
+func (ScheduleRunNowTool) Name() string        { return "schedule.run_now" }
+func (ScheduleRunNowTool) Description() string { return "mark a local scheduled task due now" }
+func (ScheduleRunNowTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"id"}}
+}
+func (ScheduleRunNowTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t ScheduleRunNowTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	now := time.Now()
+	input := schedule.UpdateInput{ID: toolArgString(call.Args, "id"), RunAt: &now}
+	status := "active"
+	input.Status = &status
+	task, err := scheduleStore(t.Config).Update(input)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	return scheduleToolResult(call.ID, "scheduled to run now", task)
+}
+
+func scheduleStore(cfg *config.Root) schedule.Store {
+	store := schedule.Store{Home: config.DefaultHome()}
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		store.Home = cfg.App.Home
+	}
+	return store
+}
+
+func scheduleToolResult(callID, action string, task schedule.Task) agentcore.ToolResult {
+	return agentcore.ToolResult{
+		ToolCallID: callID,
+		Content:    fmt.Sprintf("%s schedule %s status=%s run_at=%s", action, task.ID, task.Status, task.RunAt),
+		Evidence: map[string]any{
+			"id":          task.ID,
+			"status":      task.Status,
+			"run_at":      task.RunAt,
+			"interval":    task.Interval,
+			"session_key": task.SessionKey,
+		},
+	}
+}
+
+type taskCandidate struct {
+	SessionKey string
+	ArchiveID  string
+	Task       session.TaskNode
+}
+
+func (TaskSearchTool) Name() string        { return "task.search" }
+func (TaskSearchTool) Description() string { return "search current and archived session tasks" }
+func (TaskSearchTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"query"}}
+}
+func (TaskSearchTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (t TaskSearchTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	query := strings.TrimSpace(toolArgString(call.Args, "query"))
+	sessionKey := strings.TrimSpace(toolArgString(call.Args, "session_key"))
+	limit := intArg(call.Args["limit"])
+	if limit <= 0 {
+		limit = 8
+	}
+	store := session.NewStore(configHome(t.Config))
+	candidates, err := searchTasks(store, sessionKey, query, limit)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	lines := make([]string, 0, len(candidates))
+	evidence := make([]map[string]any, 0, len(candidates))
+	for i, candidate := range candidates {
+		task := candidate.Task
+		lines = append(lines, fmt.Sprintf("%d. session=%s archive=%s task=%s status=%s updated=%s goal=%s summary=%s", i+1, candidate.SessionKey, candidate.ArchiveID, task.ID, task.Status, task.UpdatedAt.Format(time.RFC3339), summarizeToolText(task.Goal, 90), summarizeToolText(task.Summary, 90)))
+		evidence = append(evidence, taskCandidateEvidence(candidate))
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"count": len(candidates), "candidates": evidence}}
+}
+
+func (TaskResumeTool) Name() string        { return "task.resume" }
+func (TaskResumeTool) Description() string { return "load historical task context for continuation" }
+func (TaskResumeTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"task_id"}}
+}
+func (TaskResumeTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (t TaskResumeTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	store := session.NewStore(configHome(t.Config))
+	sessionKey := strings.TrimSpace(toolArgString(call.Args, "session_key"))
+	archiveID := strings.TrimSpace(toolArgString(call.Args, "archive_id"))
+	taskID := strings.TrimSpace(toolArgString(call.Args, "task_id"))
+	task, source, err := loadHistoricalTask(store, sessionKey, archiveID, taskID)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+	}
+	message := strings.TrimSpace(toolArgString(call.Args, "message"))
+	var b strings.Builder
+	b.WriteString("Historical task context loaded.\n")
+	b.WriteString("Source: ")
+	b.WriteString(source)
+	b.WriteString("\nTask ID: ")
+	b.WriteString(task.ID)
+	b.WriteString("\nGoal: ")
+	b.WriteString(strings.TrimSpace(task.Goal))
+	if strings.TrimSpace(task.Summary) != "" {
+		b.WriteString("\nSummary: ")
+		b.WriteString(strings.TrimSpace(task.Summary))
+	}
+	if strings.TrimSpace(task.TracePath) != "" {
+		b.WriteString("\nTrace: ")
+		b.WriteString(strings.TrimSpace(task.TracePath))
+	}
+	if message != "" {
+		b.WriteString("\nCurrent request: ")
+		b.WriteString(message)
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: b.String(), Evidence: taskCandidateEvidence(taskCandidate{SessionKey: sessionKey, ArchiveID: archiveID, Task: task})}
+}
+
+func searchTasks(store session.Store, sessionKey, query string, limit int) ([]taskCandidate, error) {
+	keys := []string{}
+	if sessionKey != "" {
+		keys = append(keys, sessionKey)
+	} else {
+		listed, err := store.List()
+		if err != nil {
+			return nil, err
+		}
+		keys = listed
+	}
+	query = normalizeTaskSearch(query)
+	var out []taskCandidate
+	for _, key := range keys {
+		state, err := store.Load(key)
+		if err == nil {
+			addTaskMatches(&out, key, "", state.Tasks, query, limit)
+		}
+		if len(out) >= limit {
+			break
+		}
+		archives, err := store.ListArchives(key)
+		if err != nil {
+			continue
+		}
+		for i := len(archives) - 1; i >= 0 && len(out) < limit; i-- {
+			archived, _, err := store.LoadArchive(key, archives[i])
+			if err != nil {
+				continue
+			}
+			addTaskMatches(&out, key, archives[i], archived.Tasks, query, limit)
+		}
+	}
+	return out, nil
+}
+
+func addTaskMatches(out *[]taskCandidate, sessionKey, archiveID string, tasks []session.TaskNode, query string, limit int) {
+	for i := len(tasks) - 1; i >= 0 && len(*out) < limit; i-- {
+		task := tasks[i]
+		haystack := normalizeTaskSearch(task.Goal + " " + task.Summary + " " + task.ID)
+		if query == "" || strings.Contains(haystack, query) || tokenOverlapCount(query, haystack) > 0 {
+			*out = append(*out, taskCandidate{SessionKey: sessionKey, ArchiveID: archiveID, Task: task})
+		}
+	}
+}
+
+func loadHistoricalTask(store session.Store, sessionKey, archiveID, taskID string) (session.TaskNode, string, error) {
+	if taskID == "" {
+		return session.TaskNode{}, "", fmt.Errorf("task_id is required")
+	}
+	if sessionKey != "" && archiveID != "" {
+		state, _, err := store.LoadArchive(sessionKey, archiveID)
+		if err != nil {
+			return session.TaskNode{}, "", err
+		}
+		if task := findTaskByID(state.Tasks, taskID); task != nil {
+			return *task, "archive:" + archiveID, nil
+		}
+		return session.TaskNode{}, "", fmt.Errorf("task %s not found in archive %s", taskID, archiveID)
+	}
+	keys, err := store.List()
+	if err != nil {
+		return session.TaskNode{}, "", err
+	}
+	if sessionKey != "" {
+		keys = []string{sessionKey}
+	}
+	for _, key := range keys {
+		state, err := store.Load(key)
+		if err == nil {
+			if task := findTaskByID(state.Tasks, taskID); task != nil {
+				return *task, "session:" + key, nil
+			}
+		}
+		archives, err := store.ListArchives(key)
+		if err != nil {
+			continue
+		}
+		for i := len(archives) - 1; i >= 0; i-- {
+			archived, _, err := store.LoadArchive(key, archives[i])
+			if err != nil {
+				continue
+			}
+			if task := findTaskByID(archived.Tasks, taskID); task != nil {
+				return *task, "archive:" + archives[i], nil
+			}
+		}
+	}
+	return session.TaskNode{}, "", fmt.Errorf("task %s not found", taskID)
+}
+
+func findTaskByID(tasks []session.TaskNode, taskID string) *session.TaskNode {
+	for i := range tasks {
+		if tasks[i].ID == taskID {
+			return &tasks[i]
+		}
+	}
+	return nil
+}
+
+func taskCandidateEvidence(candidate taskCandidate) map[string]any {
+	return map[string]any{
+		"session_key": candidate.SessionKey,
+		"archive_id":  candidate.ArchiveID,
+		"task_id":     candidate.Task.ID,
+		"goal":        candidate.Task.Goal,
+		"summary":     candidate.Task.Summary,
+		"status":      candidate.Task.Status,
+		"updated_at":  candidate.Task.UpdatedAt.Format(time.RFC3339),
+		"trace_path":  candidate.Task.TracePath,
+	}
+}
+
+func normalizeTaskSearch(text string) string {
+	replacer := strings.NewReplacer("，", " ", "。", " ", "？", " ", "！", " ", "：", " ", "；", " ", ",", " ", ".", " ", "?", " ", "!", " ", "\n", " ", "\t", " ")
+	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(text)))), " ")
+}
+
+func tokenOverlapCount(a, b string) int {
+	seen := map[string]bool{}
+	for _, token := range strings.Fields(a) {
+		if utf8.RuneCountInString(token) >= 2 {
+			seen[token] = true
+		}
+	}
+	count := 0
+	for _, token := range strings.Fields(b) {
+		if seen[token] {
+			count++
+		}
+	}
+	return count
 }
 
 func (RemoteProfileCreateTool) Name() string { return "remote.profile.create" }
@@ -499,7 +923,6 @@ func (t RemoteProfileCreateTool) Run(_ context.Context, call agentcore.ToolCall)
 		Port:           port,
 		AuthSecretID:   authSecretID,
 		AllowedClasses: stringSliceArg(call.Args["allowed_classes"]),
-		RequireConfirm: true,
 	}
 	if len(profile.AllowedClasses) == 0 {
 		profile.AllowedClasses = []string{"read_only"}
@@ -540,7 +963,6 @@ func persistRemoteProfile(cfg *config.Root, profile config.RemoteProfileConfig, 
 		"port":            profile.Port,
 		"auth_secret_id":  profile.AuthSecretID,
 		"allowed_classes": profile.AllowedClasses,
-		"require_confirm": profile.RequireConfirm,
 	}
 	replaced := false
 	for i, raw := range profiles {
@@ -602,72 +1024,6 @@ func terminalWorkdir(cfg *config.Root) (string, error) {
 		return "", nil
 	}
 	return ResolveAllowedPath(raw, cfg)
-}
-
-func (ScriptRunTool) Name() string        { return "script.run" }
-func (ScriptRunTool) Description() string { return "run a discovered local Mateway script" }
-func (ScriptRunTool) Schema() agentcore.Schema {
-	return agentcore.Schema{
-		Required: []string{"name"},
-		Properties: map[string]any{
-			"name": map[string]any{
-				"type":        "string",
-				"description": "Discovered script name, for example email.receive.",
-			},
-			"args": map[string]any{
-				"type":        "array",
-				"items":       map[string]any{"type": "string"},
-				"description": "Command-line argv array passed to the script, for example [\"--limit\",\"10\"]. Do not JSON-encode this value.",
-			},
-			"timeout_seconds": map[string]any{
-				"type":        "integer",
-				"description": "Optional timeout in seconds for long-running scripts such as media generation. Defaults to 20.",
-			},
-		},
-	}
-}
-func (ScriptRunTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when a reusable local script exists for a connector-like task such as mail, publishing, or server operations.",
-		WhenNotToUse:         "Do not use if no matching script exists; explain the connector gap instead of fabricating execution.",
-		OutputContract:       "Return script output, exit code, duration, and script path evidence. Pass script arguments with args as a string array, not as JSON text.",
-		Evidence:             "Return script name, path, args, exit_code, and duration_ms.",
-		Acceptance:           "Accepted when the script exits successfully and returns useful output.",
-		SoftFailureSignals:   []string{"script not found", "missing required secret", "non-zero exit", "timeout"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "stable_if_script_unchanged",
-		ConfirmationBoundary: "guarded mutation; require confirmation when security.require_approval_for_risky_tools is true.",
-	}
-}
-func (ScriptRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t ScriptRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	args := stringSliceArg(call.Args["args"])
-	timeoutSeconds := intArg(call.Args["timeout_seconds"])
-	var timeout time.Duration
-	if timeoutSeconds > 0 {
-		timeout = time.Duration(timeoutSeconds) * time.Second
-	}
-	result, err := script.Run(ctx, t.Config, script.RunInput{
-		Name:    toolArgString(call.Args, "name"),
-		Args:    args,
-		Timeout: timeout,
-	})
-	evidence := map[string]any{}
-	if result.Script.Name != "" {
-		evidence["script"] = result.Script.Name
-		evidence["path"] = result.Script.Path
-		evidence["args"] = args
-		evidence["exit_code"] = result.ExitCode
-		evidence["duration_ms"] = result.Duration.Milliseconds()
-	}
-	if err != nil {
-		content := strings.TrimSpace(result.Output)
-		if content == "" {
-			content = err.Error()
-		}
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: content, IsError: true, Evidence: evidence}
-	}
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: result.Output, Evidence: evidence}
 }
 
 type WebFetchTool struct{ Config *config.Root }

@@ -119,12 +119,6 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	if root.Execution.InactivityTimeoutDuration() != 5*time.Minute {
 		t.Fatalf("default inactivity timeout duration = %s", root.Execution.InactivityTimeoutDuration())
 	}
-	if root.Execution.MaxNoProgressTurns != 2 {
-		t.Fatalf("default no-progress turns = %d", root.Execution.MaxNoProgressTurns)
-	}
-	if root.Execution.MaxRepeatedToolFailures != 3 {
-		t.Fatalf("default repeated tool failures = %d", root.Execution.MaxRepeatedToolFailures)
-	}
 	zero := 0
 	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
 	root.NormalizeForUse()
@@ -138,15 +132,9 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestSecurityScriptAndRemoteDefaults(t *testing.T) {
+func TestRemoteDefaults(t *testing.T) {
 	root := Root{}
 	root.NormalizeForUse()
-	if root.Scripts.AutoDiscoverSkillScriptsValue() {
-		t.Fatal("external skill scripts should not be auto-authorized by default")
-	}
-	if root.Scripts.Dirs == nil {
-		t.Fatal("expected scripts dirs default")
-	}
 	if root.Remote.Profiles == nil {
 		t.Fatal("expected remote profiles default")
 	}
@@ -267,14 +255,6 @@ func TestEnsureDefaultConfigFilesCreatesSamplesAndRealConfig(t *testing.T) {
 	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "agent.md"), []string{"# Main Assistant agent", "## Operating Rules", "Do not claim a tool"})
 	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "soul.md"), []string{"# Main Assistant soul", "You are Main Assistant", "## Boundaries"})
 	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "user.md"), []string{"No stable user preferences recorded yet.", "## Communication Preferences", "Do not store passwords"})
-}
-
-func TestDefaultConfigLocale(t *testing.T) {
-	cfg := DefaultRoot()
-	cfg.NormalizeForUse()
-	if cfg.App.Locale != "auto" {
-		t.Fatalf("expected locale auto, got %q", cfg.App.Locale)
-	}
 }
 
 func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {

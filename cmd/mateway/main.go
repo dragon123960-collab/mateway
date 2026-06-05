@@ -22,7 +22,6 @@ import (
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
-	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/skill"
@@ -138,8 +137,6 @@ func run(args []string) error {
 		return runAgentProfile(args[1:])
 	case "agent":
 		return runAgent(args[1:])
-	case "script":
-		return runScript(args[1:])
 	case "sandbox":
 		return runSandbox(args[1:])
 	case "schedule":
@@ -540,7 +537,6 @@ func runWorkspace(args []string) error {
 	memReport, _ := memory.BuildReport(memory.ReportInput{Home: cfg.App.Home, MemoryRoot: memoryRoot(cfg)})
 	learningReport, _ := memory.BuildLearningReport(memory.LearningReportInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace})
 	skills, _ := skill.List(cfg.App.Workspace)
-	scripts, _ := script.List(cfg)
 	schedules, _ := schedule.Store{Home: cfg.App.Home}.List()
 	traceCount := countFiles(filepath.Join(cfg.App.Home, "trace"), ".jsonl")
 	fmt.Println("home:", cfg.App.Home)
@@ -554,7 +550,6 @@ func runWorkspace(args []string) error {
 	fmt.Println("skill_usage:", learningReport.SkillUsage)
 	fmt.Println("skill_pending_proposals:", learningReport.SkillProposalsPending)
 	fmt.Println("skills:", len(skills))
-	fmt.Println("scripts:", len(scripts))
 	fmt.Println("schedules:", len(schedules))
 	fmt.Println("sandbox_enabled:", cfg.Security.TerminalSandbox.Enabled)
 	return nil
@@ -1010,64 +1005,6 @@ func runSchedule(args []string) error {
 		}
 	default:
 		return fmt.Errorf("usage: mateway schedule <create|list|test|activate|pause|run-due|serve>")
-	}
-}
-
-func runScript(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway script <list|report|run>")
-	}
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	switch args[0] {
-	case "list", "report":
-		scripts, err := script.List(cfg)
-		if err != nil {
-			return err
-		}
-		fmt.Println("scripts:", len(scripts))
-		for _, item := range scripts {
-			fmt.Printf("- %s risk=%s path=%s", item.Name, item.Risk, item.Path)
-			if item.Description != "" {
-				fmt.Printf(" description=%s", item.Description)
-			}
-			if len(item.RequiredSecrets) > 0 {
-				var refs []string
-				for _, ref := range item.RequiredSecrets {
-					refs = append(refs, ref.ID+"->"+ref.Env)
-				}
-				fmt.Printf(" required_secrets=%s", strings.Join(refs, ","))
-			}
-			fmt.Println()
-		}
-		return nil
-	case "run":
-		fs := flag.NewFlagSet("mateway script run", flag.ContinueOnError)
-		timeoutFlag := fs.Duration("timeout", 20*time.Second, "script timeout")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() < 1 {
-			return fmt.Errorf("usage: mateway script run <name> [args...]")
-		}
-		result, err := script.Run(context.Background(), cfg, script.RunInput{
-			Name:    fs.Arg(0),
-			Args:    fs.Args()[1:],
-			Timeout: *timeoutFlag,
-		})
-		fmt.Println("script:", result.Script.Name)
-		fmt.Println("path:", result.Script.Path)
-		fmt.Println("exit_code:", result.ExitCode)
-		fmt.Println("duration_ms:", result.Duration.Milliseconds())
-		if result.Output != "" {
-			fmt.Println("output:")
-			fmt.Println(result.Output)
-		}
-		return err
-	default:
-		return fmt.Errorf("usage: mateway script <list|report|run>")
 	}
 }
 
@@ -2051,8 +1988,6 @@ func runTest(args []string) error {
 	message := fs.String("message", "", "custom task message")
 	sessionKey := fs.String("session-key", "", "session key to reuse")
 	home := fs.String("home", "", "override MATEWAY_HOME for this run")
-	confirm := fs.Bool("confirm", false, "when the first reply is approval_pending, send a confirm follow-up")
-	approval := fs.String("approval", "", "approval follow-up to send when pending: confirm or cancel")
 	record := fs.Bool("record", true, "write test result JSON under testdata/runs")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2088,23 +2023,6 @@ func runTest(args []string) error {
 		return err
 	}
 	interactions = append(interactions, testInteraction{Message: text, Response: resp})
-	action := normalizedTestApproval(*approval, *confirm)
-	if resp.Reply.Style == "approval_pending" && action != "" {
-		followup := testApprovalMessage(action)
-		followResp, err := rt.Handle(context.Background(), channel.InboundMessage{
-			ID:         "test-approval",
-			Channel:    "test",
-			ThreadID:   key,
-			UserID:     "local",
-			SessionKey: key,
-			Text:       followup,
-		})
-		if err != nil {
-			return err
-		}
-		interactions = append(interactions, testInteraction{Message: followup, Response: followResp})
-		resp = followResp
-	}
 	state, err := rt.Store.Load(key)
 	if err != nil {
 		return err
@@ -2151,32 +2069,6 @@ func runTest(args []string) error {
 type testInteraction struct {
 	Message  string           `json:"message"`
 	Response runtime.Response `json:"response"`
-}
-
-func normalizedTestApproval(value string, confirm bool) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" && confirm {
-		return "confirm"
-	}
-	switch value {
-	case "", "none", "no":
-		return ""
-	case "confirm", "approve", "yes", "y", "ok", "run":
-		return "confirm"
-	case "cancel", "reject", "stop", "nope":
-		return "cancel"
-	default:
-		return value
-	}
-}
-
-func testApprovalMessage(action string) string {
-	switch normalizedTestApproval(action, false) {
-	case "cancel":
-		return "取消"
-	default:
-		return "确认"
-	}
 }
 
 func writeTestRecord(caseName, sessionKey, message string, resp runtime.Response, state any, interactions ...[]testInteraction) (string, error) {
@@ -2249,7 +2141,7 @@ func testCaseMessage(name string, cfg ...*config.Root) (string, error) {
 		return "请查看 " + cwd + " 的项目结构，并说明最重要的目录各自负责什么。", nil
 	case "web-search":
 		return "请搜索今天 OpenAI API 的最新公开信息，并用两句话总结来源。", nil
-	case "write-file", "approval-write":
+	case "write-file":
 		home := config.DefaultHome()
 		if len(cfg) > 0 && cfg[0] != nil && strings.TrimSpace(cfg[0].App.Home) != "" {
 			home = cfg[0].App.Home
@@ -2294,7 +2186,7 @@ func printHelp() {
 Usage:
   mateway init
   mateway ask <message>
-  mateway test [--case read-readme|project-index|web-search|write-file] [--message <task>] [--confirm|--approval confirm|cancel] [--record=false]
+  mateway test [--case read-readme|project-index|web-search|write-file] [--message <task>] [--record=false]
   mateway trace <trace-jsonl-path>
   mateway workspace report
   mateway session list
@@ -2332,9 +2224,6 @@ Usage:
   mateway schedule run-due
   mateway schedule serve
   mateway sandbox report
-  mateway script list
-  mateway script report
-  mateway script run <name> [args...]
   mateway home report
   mateway skill list
   mateway skill catalog report

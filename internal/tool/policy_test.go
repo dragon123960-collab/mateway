@@ -234,7 +234,7 @@ func testRepoRoot(t *testing.T) string {
 }
 
 func TestTerminalPolicyAllowsRemoteProfile(t *testing.T) {
-	cfg := &config.Root{Remote: config.RemoteConfig{Profiles: []config.RemoteProfileConfig{{Alias: "prod", Host: "example.com", User: "deploy", RequireConfirm: true}}}}
+	cfg := &config.Root{Remote: config.RemoteConfig{Profiles: []config.RemoteProfileConfig{{Alias: "prod", Host: "example.com", User: "deploy"}}}}
 	decision := CheckTerminalCommand("ssh deploy@example.com uptime", cfg)
 	if !decision.Allow || decision.Class != "remote" || decision.RemoteProfile != "prod" {
 		t.Fatalf("expected remote profile allow, got %#v", decision)
@@ -317,7 +317,7 @@ func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
 }
 
 func TestTerminalRunBlocksEvenWhenApprovalDisabled(t *testing.T) {
-	tool := TerminalRunTool{Config: &config.Root{Security: config.SecurityConfig{RequireApprovalForRiskyTool: false}}}
+	tool := TerminalRunTool{Config: &config.Root{}}
 	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"command": "rm -rf ~"}})
 	if !result.IsError || result.Evidence["policy_classification"] != "destructive" {
 		t.Fatalf("expected policy block, got %#v", result)
@@ -607,7 +607,7 @@ func TestScheduleCreateToolWritesTask(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected schedule error: %#v", result)
 	}
-	if result.Evidence["status"] != "pending" || result.Evidence["session_key"] != "feishu:chat_1" {
+	if result.Evidence["status"] != "active" || result.Evidence["session_key"] != "feishu:chat_1" {
 		t.Fatalf("unexpected evidence: %#v", result.Evidence)
 	}
 	if entries, err := os.ReadDir(filepath.Join(home, "schedules")); err != nil || len(entries) != 1 {

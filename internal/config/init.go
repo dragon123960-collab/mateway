@@ -49,6 +49,7 @@ func EnsureDefaultConfigFiles(home string) error {
 		{RelPath: filepath.Join("..", "workspace", "skills", "fresh-search", "SKILL.md"), Content: skillFreshSearchTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "source-evaluation", "SKILL.md"), Content: skillSourceEvaluationTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "connector-gap", "SKILL.md"), Content: skillConnectorGapTemplate},
+		{RelPath: filepath.Join("..", "workspace", "skills", "task-recall", "SKILL.md"), Content: skillTaskRecallTemplate},
 		{RelPath: filepath.Join("..", "workspace", "skills", "skillcreate", "SKILL.md"), Content: skillCreateTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "README.md"), Content: memoryReadmeTemplate},
 		{RelPath: filepath.Join("..", "workspace", "memory", "schema.md"), Content: memorySchemaTemplate},
@@ -179,8 +180,6 @@ const configYAMLTemplate = `app:
   name: mateway
   home: ""
   workspace: ""
-  locale: auto
-  message_catalog_dir: ""
 
 model:
   default: glm-4.7-flash
@@ -191,15 +190,11 @@ model:
       - glm-4.6v-flash
       - minimax
     strong: minimax
-    followup: glm-4.7-flash
-    review: glm-4.7-flash
 
 execution:
   max_parallel_tools: 4
   max_iterations: 50
   inactivity_timeout: 5m
-  max_no_progress_turns: 2
-  max_repeated_tool_failures: 3
 
 memory:
   enabled: true
@@ -207,11 +202,6 @@ memory:
   recent_days: 3
   auto_propose: true
   auto_commit_low_risk: false
-  require_confirm_for:
-    - user_preference
-    - org_knowledge
-    - long_memory
-    - skill_candidate
   proposal_nudge:
     enabled: true
     interval: 24h
@@ -225,8 +215,6 @@ learning:
     enabled: true
     success_threshold: 3
     min_confidence: medium
-    require_user_confirm: true
-    ask_timing: next_interaction
 
 skills:
   catalogs:
@@ -248,10 +236,6 @@ skills:
       search_url: "https://clawhub.ai/search?q={query}"
       install_url: ""
       trust_level: medium
-
-scripts:
-  auto_discover_skill_scripts: false
-  dirs: []
 
 remote:
   profiles: []
@@ -298,7 +282,6 @@ agents:
 
 security:
   enforce_workspace_paths: true
-  require_approval_for_risky_tools: false
   accessible_paths: []
   terminal_sandbox:
     enabled: false
@@ -755,8 +738,8 @@ Workflow:
    - available CLIs with command -v
    - local app configuration
    - documented config files
-   - existing scripts under the workspace or ~/.mateway
-3. If a script can bridge the gap, propose or create a small script with:
+   - existing ordinary scripts under the workspace
+3. If a small script can bridge the gap, create it as a normal shell, Python, Go, or Node file and run it with terminal.run:
    - required inputs
    - environment variables
    - safety boundaries
@@ -768,7 +751,36 @@ Workflow:
    - Shell script with external tools: command -v for each required executable
    If the runtime is missing, choose an available runtime or stop with setup instructions.
 5. If real credentials, server hostnames, recipients, or platform choices are missing, ask only for those concrete fields.
-6. Never claim that email was sent, a server was checked, or content was published unless a tool/script/action actually did it.
+6. Use secret.set for concrete user-provided credentials and terminal.run env_secrets to inject them. Do not write plaintext secrets into SKILL.md or script files.
+7. Never claim that email was sent, a server was checked, or content was published unless a tool/script/action actually did it.
+`
+
+const skillTaskRecallTemplate = `---
+name: task-recall
+description: Use when the user asks to continue, recover, resume, find, or refer back to a previous or older task.
+stage: planning
+priority: 88
+aliases: previous task, last task, old task, resume task, task search, task recall
+when_to_use: previous task, last time, continue old work, recover a task, find a past task, user replies with a numbered candidate
+---
+
+# task-recall
+
+Goal: help the user recover prior work without runtime guessing.
+
+Rules:
+
+1. Do not claim that you found an old task from memory alone.
+2. Use task.search when the user mentions prior work, old tasks, "last time", "previous", "resume", "continue that task", or gives a numbered choice after you listed candidates.
+3. Search with concrete clues from the user:
+   - keywords
+   - approximate time
+   - file, project, or task content
+   - current session key when available
+4. If exactly one candidate is clearly correct, call task.resume with its session_key, task_id, and archive_id when present.
+5. If several candidates are plausible, list them by number with short goal/summary/status clues and ask the user to choose a number.
+6. If the user description is too short or ambiguous, ask for more keywords, an approximate time, or task content.
+7. When task.resume returns context, continue from that context in the current active task. Do not mutate historical archives.
 `
 
 const skillCreateTemplate = `---
@@ -784,7 +796,7 @@ when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to
 
 Use this skill before creating or updating any Mateway skill.
 
-Default behavior: create or update the requested skill files, make scripts executable, then verify discovery and at least one safe execution path. Do not stop after a plan unless required information is missing or a destructive command is blocked.
+Default behavior: create or update the requested skill files, make any helper scripts executable, then verify at least one safe execution path with terminal.run. Do not stop after a plan unless required information is missing or a destructive command is blocked.
 
 ## Directory rules
 
@@ -806,9 +818,8 @@ Preferred layout:
 ` + "```" + `
 
 - Put skill-specific executable scripts in <skill_name>/scripts/.
-- Use workspace/scripts/, ~/.mateway/scripts/, or configured scripts.dirs only for reusable cross-skill scripts.
-- If script names collide, agent-specific skill scripts win over shared skill scripts, which win over global scripts.
-- Keep SKILL.md concise: trigger description, workflow, script names, required inputs, safety boundaries, and verification steps.
+- Scripts are ordinary files. There is no Mateway script registry or script.run bridge.
+- Keep SKILL.md concise: trigger description, workflow, command templates, required inputs, safety boundaries, and verification steps.
 
 ## Secret rules
 
@@ -818,12 +829,8 @@ Preferred layout:
 - Use mateway secret set <secret_id> only as a CLI fallback outside the agent loop; it is not the preferred answer to the user.
 - If the value visible to tools is [REDACTED_SECRET] or any placeholder, do not store it; ask the user to provide the real value again.
 - If the user has not provided a concrete secret value, write only required-secret references and report the missing secret ids.
-- After secret.set succeeds, scripts receive secrets only through environment variables injected by script.run from mateway.required_secret headers.
-- Script headers declare required secrets in the first 30 lines. The format must include both ` + "`id=`" + ` and ` + "`env=`" + ` exactly:
-
-` + "```text" + `
-# mateway.required_secret: id=<secret_id> env=<ENV_NAME>
-` + "```" + `
+- After secret.set succeeds, commands receive secrets only through terminal.run env_secrets, using entries such as ` + "`{\"id\":\"service/token\",\"env\":\"SERVICE_TOKEN\"}`" + `.
+- SKILL.md should document only secret ids and env var names, never secret values.
 
 - Inside scripts, read only the environment variable:
 
@@ -833,33 +840,18 @@ if not password:
     sys.exit("missing required env ENV_NAME")
 ` + "```" + `
 
-- Direct local execution may pass env manually; Mateway execution must use script.run, which injects env from secret store.
-- Do not use terminal.run for credentialed endpoint tests. Credentialed tests must go through script.run so required_secret injection is the only credential path.
+- Direct local execution may pass env manually; Mateway execution must use terminal.run env_secrets.
+- Credentialed endpoint tests must use terminal.run env_secrets so the trace records only secret ids and env names.
 - Skill creation can complete without a working credential. Missing or rejected credentials only block the optional credentialed endpoint test, not the structure/install verification.
 - Final answers must never repeat concrete secret values. Refer only to secret ids and env names.
 
 ## Script rules
 
-Each executable skill script should include headers:
-
-` + "```text" + `
-# mateway.name: <skill_name>.<action>
-# mateway.description: <short purpose>
-# mateway.risk: safe_read | guarded_mutation
-# mateway.required_secret: id=<secret_id> env=<ENV_NAME>
-` + "```" + `
-
-- Use namespaced script names such as email.receive or email.send.
-- Put scripts under the skill-local scripts directory and run ` + "`chmod +x <script_path>`" + ` after writing each script.
-- Read credentials from environment variables injected by script.run.
+- Use clear script file names such as email_receive.py or email_send.sh.
+- Put scripts under the skill-local scripts directory when deterministic execution is useful, and run ` + "`chmod +x <script_path>`" + ` after writing executable scripts.
+- Read credentials from environment variables injected by terminal.run env_secrets.
 - Validate missing required environment variables before connecting to external services.
-- Use CLI argv arguments. For Mateway calls, script.run args is an argument array, not JSON:
-
-` + "```text" + `
-script.run name=email.receive args=["--limit","10"]
-` + "```" + `
-
-- Scripts should tolerate a leading ` + "`--`" + ` in argv before script-specific flags so manual CLI checks like ` + "`mateway script run name -- --help`" + ` do not become false failures.
+- Use CLI argv arguments and document terminal.run command templates in SKILL.md.
 - Print concise machine-readable or clearly structured output.
 - Do not claim external actions succeeded unless the script exits successfully and prints evidence.
 
@@ -870,11 +862,10 @@ Separate verification into two layers:
 1. Structure verification, required for skill creation:
    - chmod +x every script.
    - syntax or --help check works without credentials.
-   - mateway script list discovers the expected script names.
-   - script.run can execute a no-secret path such as --help.
+   - terminal.run can execute a no-secret path such as --help.
 2. Credentialed endpoint verification, optional:
    - Run only when the real secret is present.
-   - Use script.run, never terminal.run.
+   - Use terminal.run env_secrets.
    - If the provider rejects login or the secret is missing, report that credentialed verification is blocked while the skill structure remains installed.
 
 ## Creation workflow
@@ -883,13 +874,12 @@ Separate verification into two layers:
 2. Store any concrete secrets provided in the current task with secret.set.
 3. Create or update SKILL.md.
 4. Add skill-local scripts under scripts/ when deterministic execution is needed.
-5. Add mateway.required_secret headers for each required credential.
+5. Document each required credential as a secret id plus env var.
 6. Run chmod +x for every script.
 7. Run python/go/node/shell syntax or --help checks.
-8. Run mateway script list to confirm scripts are discovered.
-9. Run script.run with a no-secret safe path such as --help.
-10. If credentials are present, optionally run credentialed endpoint verification through script.run.
-11. Final answer with created files, commands, structure verification evidence, and credentialed verification status, without repeating secret values.
+8. Run terminal.run with a no-secret safe path such as --help.
+9. If credentials are present, optionally run credentialed endpoint verification through terminal.run env_secrets.
+10. Final answer with created files, commands, structure verification evidence, and credentialed verification status, without repeating secret values.
 
 If provider settings are stable and commonly known, encode them directly in the script with comments or references when helpful. Use web search only when the task needs current or uncertain facts; do not spend the whole turn searching before writing a small, testable script.
 `

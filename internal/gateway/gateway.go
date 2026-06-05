@@ -14,7 +14,6 @@ import (
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
@@ -454,7 +453,7 @@ func isCardAction(msg channel.InboundMessage) bool {
 
 func reactionForReply(reply channel.OutboundMessage) string {
 	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending", "input_required", "clarify", "partial":
+	case "input_required", "clarify", "partial":
 		return "EYES"
 	case "error", "cancelled":
 		return "CROSS_MARK"
@@ -521,11 +520,10 @@ func inboundDedupeKey(msg channel.InboundMessage) string {
 }
 
 func gatewayText(cfg *config.Root, msg channel.InboundMessage, key string, values map[string]string) string {
-	locale := ""
-	catalogDir := ""
-	if cfg != nil {
-		locale = cfg.App.Locale
-		catalogDir = cfg.App.MessageCatalogDir
+	switch key {
+	case "gateway.processing_ack":
+		return "Processing..."
+	default:
+		return key
 	}
-	return i18n.New(i18n.Config{CatalogDir: catalogDir}).T(i18n.ResolveLocale(locale, msg.Text), key, values)
 }

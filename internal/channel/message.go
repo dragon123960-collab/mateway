@@ -27,7 +27,6 @@ type OutboundMessage struct {
 	Text     string
 	Title    string
 	Style    string
-	Locale   string
 }
 
 type OutboundBatch struct {

@@ -23,7 +23,6 @@ type Root struct {
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
 	Skills    SkillsConfig    `yaml:"skills"`
-	Scripts   ScriptsConfig   `yaml:"scripts"`
 	Remote    RemoteConfig    `yaml:"remote"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
@@ -39,18 +38,15 @@ func DefaultRoot() Root {
 			Fallbacks: []string{},
 		},
 		Execution: ExecutionConfig{
-			MaxParallelTools:        4,
-			MaxIterations:           intPtr(50),
-			InactivityTimeout:       "5m",
-			MaxNoProgressTurns:      2,
-			MaxRepeatedToolFailures: 3,
+			MaxParallelTools:  4,
+			MaxIterations:     intPtr(50),
+			InactivityTimeout: "5m",
 		},
 		Memory: MemoryConfig{
 			Enabled:           true,
 			RecentDays:        3,
 			AutoPropose:       true,
 			AutoCommitLowRisk: false,
-			RequireConfirmFor: []string{"user_preference", "org_knowledge", "long_memory", "skill_candidate"},
 			ProposalNudge: ProposalNudgeConfig{
 				Enabled:      boolPtr(true),
 				Interval:     "24h",
@@ -59,28 +55,21 @@ func DefaultRoot() Root {
 			},
 		},
 		Learning: LearningConfig{Enabled: true, SkillCrystallization: SkillCrystallizationConfig{
-			Enabled:            true,
-			SuccessThreshold:   3,
-			MinConfidence:      "medium",
-			RequireUserConfirm: true,
-			AskTiming:          "next_interaction",
+			Enabled:          true,
+			SuccessThreshold: 3,
+			MinConfidence:    "medium",
 		}},
 		Scheduler: SchedulerConfig{
 			Enabled:  false,
 			Timezone: "Asia/Shanghai",
 			Interval: "30s",
 		},
-		Scripts: ScriptsConfig{
-			Dirs:                     []string{},
-			AutoDiscoverSkillScripts: boolPtr(false),
-		},
 		Remote: RemoteConfig{
 			Profiles: []RemoteProfileConfig{},
 		},
 		Security: SecurityConfig{
-			EnforceWorkspacePaths:       true,
-			RequireApprovalForRiskyTool: false,
-			AccessiblePaths:             []string{},
+			EnforceWorkspacePaths: true,
+			AccessiblePaths:       []string{},
 			TerminalSandbox: TerminalSandboxConfig{
 				Enabled:        false,
 				Mode:           "restricted",
@@ -131,18 +120,15 @@ func DefaultRoot() Root {
 }
 
 type AppConfig struct {
-	Name              string `yaml:"name"`
-	Home              string `yaml:"home"`
-	Workspace         string `yaml:"workspace"`
-	Locale            string `yaml:"locale"`
-	MessageCatalogDir string `yaml:"message_catalog_dir"`
+	Name      string `yaml:"name"`
+	Home      string `yaml:"home"`
+	Workspace string `yaml:"workspace"`
 }
 
 type SecurityConfig struct {
-	EnforceWorkspacePaths       bool                  `yaml:"enforce_workspace_paths"`
-	RequireApprovalForRiskyTool bool                  `yaml:"require_approval_for_risky_tools"`
-	AccessiblePaths             []string              `yaml:"accessible_paths"`
-	TerminalSandbox             TerminalSandboxConfig `yaml:"terminal_sandbox"`
+	EnforceWorkspacePaths bool                  `yaml:"enforce_workspace_paths"`
+	AccessiblePaths       []string              `yaml:"accessible_paths"`
+	TerminalSandbox       TerminalSandboxConfig `yaml:"terminal_sandbox"`
 }
 
 type TerminalSandboxConfig struct {
@@ -311,11 +297,9 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelTools        int    `yaml:"max_parallel_tools"`
-	MaxIterations           *int   `yaml:"max_iterations"`
-	InactivityTimeout       string `yaml:"inactivity_timeout"`
-	MaxNoProgressTurns      int    `yaml:"max_no_progress_turns"`
-	MaxRepeatedToolFailures int    `yaml:"max_repeated_tool_failures"`
+	MaxParallelTools  int    `yaml:"max_parallel_tools"`
+	MaxIterations     *int   `yaml:"max_iterations"`
+	InactivityTimeout string `yaml:"inactivity_timeout"`
 }
 
 func (c ExecutionConfig) MaxIterationsValue() int {
@@ -342,7 +326,6 @@ type MemoryConfig struct {
 	RecentDays        int                 `yaml:"recent_days"`
 	AutoPropose       bool                `yaml:"auto_propose"`
 	AutoCommitLowRisk bool                `yaml:"auto_commit_low_risk"`
-	RequireConfirmFor []string            `yaml:"require_confirm_for"`
 	ProposalNudge     ProposalNudgeConfig `yaml:"proposal_nudge"`
 }
 
@@ -366,27 +349,13 @@ type LearningConfig struct {
 }
 
 type SkillCrystallizationConfig struct {
-	Enabled            bool   `yaml:"enabled"`
-	SuccessThreshold   int    `yaml:"success_threshold"`
-	MinConfidence      string `yaml:"min_confidence"`
-	RequireUserConfirm bool   `yaml:"require_user_confirm"`
-	AskTiming          string `yaml:"ask_timing"`
+	Enabled          bool   `yaml:"enabled"`
+	SuccessThreshold int    `yaml:"success_threshold"`
+	MinConfidence    string `yaml:"min_confidence"`
 }
 
 type SkillsConfig struct {
 	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
-}
-
-type ScriptsConfig struct {
-	Dirs                     []string `yaml:"dirs"`
-	AutoDiscoverSkillScripts *bool    `yaml:"auto_discover_skill_scripts"`
-}
-
-func (c ScriptsConfig) AutoDiscoverSkillScriptsValue() bool {
-	if c.AutoDiscoverSkillScripts == nil {
-		return false
-	}
-	return *c.AutoDiscoverSkillScripts
 }
 
 type RemoteConfig struct {
@@ -400,7 +369,6 @@ type RemoteProfileConfig struct {
 	Port           int      `yaml:"port"`
 	AuthSecretID   string   `yaml:"auth_secret_id"`
 	AllowedClasses []string `yaml:"allowed_classes"`
-	RequireConfirm bool     `yaml:"require_confirm"`
 }
 
 type SkillCatalogConfig struct {
@@ -688,7 +656,7 @@ func (r *Root) NormalizeForUse() {
 	r.applyDefaults()
 	r.normalizeSearch()
 	r.normalizeSkills()
-	r.normalizeScripts()
+	r.normalizeRemote()
 	r.normalizeAgents()
 }
 
@@ -696,9 +664,6 @@ func (r *Root) applyDefaults() {
 	defaults := DefaultRoot()
 	if strings.TrimSpace(r.App.Name) == "" {
 		r.App.Name = defaults.App.Name
-	}
-	if strings.TrimSpace(r.App.Locale) == "" {
-		r.App.Locale = "auto"
 	}
 	if strings.TrimSpace(r.Model.Default) == "" {
 		r.Model.Default = defaults.Model.Default
@@ -720,17 +685,8 @@ func (r *Root) applyDefaults() {
 	if strings.TrimSpace(r.Execution.InactivityTimeout) == "" {
 		r.Execution.InactivityTimeout = defaults.Execution.InactivityTimeout
 	}
-	if r.Execution.MaxNoProgressTurns <= 0 {
-		r.Execution.MaxNoProgressTurns = defaults.Execution.MaxNoProgressTurns
-	}
-	if r.Execution.MaxRepeatedToolFailures <= 0 {
-		r.Execution.MaxRepeatedToolFailures = defaults.Execution.MaxRepeatedToolFailures
-	}
 	if r.Memory.RecentDays <= 0 {
 		r.Memory.RecentDays = defaults.Memory.RecentDays
-	}
-	if len(r.Memory.RequireConfirmFor) == 0 {
-		r.Memory.RequireConfirmFor = defaults.Memory.RequireConfirmFor
 	}
 	proposalNudgeUnset := strings.TrimSpace(r.Memory.ProposalNudge.Interval) == "" && len(r.Memory.ProposalNudge.Channels) == 0 && r.Memory.ProposalNudge.MaxProposals == 0 && r.Memory.ProposalNudge.Enabled == nil
 	if proposalNudgeUnset {
@@ -750,9 +706,6 @@ func (r *Root) applyDefaults() {
 	}
 	if r.Learning.SkillCrystallization.SuccessThreshold <= 0 {
 		r.Learning.SkillCrystallization.SuccessThreshold = defaults.Learning.SkillCrystallization.SuccessThreshold
-	}
-	if strings.TrimSpace(r.Learning.SkillCrystallization.AskTiming) == "" {
-		r.Learning.SkillCrystallization.AskTiming = defaults.Learning.SkillCrystallization.AskTiming
 	}
 	if strings.TrimSpace(r.Scheduler.Timezone) == "" {
 		r.Scheduler.Timezone = defaults.Scheduler.Timezone
@@ -827,13 +780,7 @@ func (r *Root) normalizeSkills() {
 	}
 }
 
-func (r *Root) normalizeScripts() {
-	if r.Scripts.Dirs == nil {
-		r.Scripts.Dirs = []string{}
-	}
-	if r.Scripts.AutoDiscoverSkillScripts == nil {
-		r.Scripts.AutoDiscoverSkillScripts = DefaultRoot().Scripts.AutoDiscoverSkillScripts
-	}
+func (r *Root) normalizeRemote() {
 	if r.Remote.Profiles == nil {
 		r.Remote.Profiles = []RemoteProfileConfig{}
 	}

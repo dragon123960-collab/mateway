@@ -128,28 +128,28 @@ func TestPendingProposalNudgeOncePerDay(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
-	text, err := PendingProposalNudge(home, "cli:test", now, ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3, Locale: "zh-CN"})
+	text, err := PendingProposalNudge(home, "cli:test", now, ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text, "1 条长期记忆候选") || !strings.Contains(text, "mateway memory proposal show") || !strings.Contains(text, "Body") {
+	if !strings.Contains(text, "Pending memory proposals") || !strings.Contains(text, "mateway memory proposal show") || !strings.Contains(text, "Body") {
 		t.Fatalf("unexpected nudge: %q", text)
 	}
-	text, err = PendingProposalNudge(home, "cli:test", now.Add(time.Hour), ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3, Locale: "zh-CN"})
+	text, err = PendingProposalNudge(home, "cli:test", now.Add(time.Hour), ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if text != "" {
 		t.Fatalf("expected same-day nudge suppressed, got %q", text)
 	}
-	text, err = PendingProposalNudge(home, "cli:test", now.Add(24*time.Hour), ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3, Locale: "zh-CN"})
+	text, err = PendingProposalNudge(home, "cli:test", now.Add(24*time.Hour), ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if text == "" {
 		t.Fatal("expected next-day nudge")
 	}
-	text, err = PendingProposalNudge(home, "weixin:test", now.Add(48*time.Hour), ProposalNudgeOptions{Channel: "weixin", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3, Locale: "zh-CN"})
+	text, err = PendingProposalNudge(home, "weixin:test", now.Add(48*time.Hour), ProposalNudgeOptions{Channel: "weixin", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3})
 	if err != nil {
 		t.Fatal(err)
 	}

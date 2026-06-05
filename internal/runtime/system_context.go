@@ -39,7 +39,7 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 	if cfg != nil {
 		writeContextLine(&b, "- Mateway home: ", cfg.App.Home)
 		writeContextLine(&b, "- Workspace root: ", cfg.App.Workspace)
-		b.WriteString(fmt.Sprintf("- Security: enforce_workspace_paths=%v, require_approval_for_risky_tools=%v\n", cfg.Security.EnforceWorkspacePaths, cfg.Security.RequireApprovalForRiskyTool))
+		b.WriteString(fmt.Sprintf("- Security: enforce_workspace_paths=%v, terminal_sandbox=%v\n", cfg.Security.EnforceWorkspacePaths, cfg.Security.TerminalSandbox.Enabled))
 		if len(cfg.Search.ProviderOrder) > 0 {
 			b.WriteString("- Web search provider order: ")
 			b.WriteString(strings.Join(cfg.Search.ProviderOrder, ", "))

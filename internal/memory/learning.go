@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -262,14 +261,15 @@ func likelyCause(event LearningEvent) string {
 }
 
 func memoryCueList(key string) []string {
-	var out []string
-	for _, item := range strings.Split(i18n.New(i18n.Config{}).T(i18n.LocaleZH, key, nil), ",") {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
+	return memoryCueLists[key]
+}
+
+var memoryCueLists = map[string][]string{
+	"memory.learning.strong_cues":     {"remember", "memory", "preference", "rule", "decision", "lesson", "workflow", "next time", "记住", "记忆", "偏好", "规则", "以后"},
+	"memory.learning.correction_cues": {"wrong", "incorrect", "should", "next time don't", "do not do that", "correction", "不对", "错误", "应该", "以后不要", "纠正"},
+	"memory.learning.not_found_cues":  {"not found", "missing", "找不到", "缺少"},
+	"memory.learning.permission_cues": {"denied", "permission", "权限"},
+	"memory.distill.score_cues":       {"failed", "error", "preference", "remember", "纠正", "以后不要", "以后要", "修复", "失败"},
 }
 
 func alternativeStrategy(event LearningEvent) string {

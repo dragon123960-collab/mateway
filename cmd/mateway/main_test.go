@@ -44,18 +44,6 @@ func TestTestCaseCustomRequiresMessage(t *testing.T) {
 	}
 }
 
-func TestTestApprovalHelpers(t *testing.T) {
-	if got := normalizedTestApproval("", true); got != "confirm" {
-		t.Fatalf("expected confirm from flag, got %q", got)
-	}
-	if got := normalizedTestApproval("cancel", false); got != "cancel" {
-		t.Fatalf("expected cancel, got %q", got)
-	}
-	if got := testApprovalMessage("cancel"); got != "取消" {
-		t.Fatalf("expected cancel message, got %q", got)
-	}
-}
-
 func TestWriteTestRecord(t *testing.T) {
 	cwd := t.TempDir()
 	old, _ := os.Getwd()
@@ -604,33 +592,18 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 	}
 }
 
-func TestScriptSandboxAndWorkspaceReports(t *testing.T) {
+func TestSandboxAndWorkspaceReports(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
 	if err := run([]string{"init", "--home", home}); err != nil {
 		t.Fatal(err)
 	}
-	scriptPath := filepath.Join(home, "scripts", "hello")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n# mateway.name: hello\n# mateway.description: says hi\necho hi $1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	out := captureStdout(t, func() error { return run([]string{"script", "list"}) })
-	if !strings.Contains(out, "hello") || !strings.Contains(out, "says hi") {
-		t.Fatalf("unexpected script list:\n%s", out)
-	}
-	out = captureStdout(t, func() error { return run([]string{"script", "run", "hello", "there"}) })
-	if !strings.Contains(out, "exit_code: 0") || !strings.Contains(out, "hi there") {
-		t.Fatalf("unexpected script run:\n%s", out)
-	}
-	out = captureStdout(t, func() error { return run([]string{"sandbox", "report"}) })
+	out := captureStdout(t, func() error { return run([]string{"sandbox", "report"}) })
 	if !strings.Contains(out, "sandbox_enabled:") || !strings.Contains(out, "timeout_seconds:") {
 		t.Fatalf("unexpected sandbox report:\n%s", out)
 	}
 	out = captureStdout(t, func() error { return run([]string{"workspace", "report"}) })
-	if !strings.Contains(out, "workspace:") || !strings.Contains(out, "skills:") || !strings.Contains(out, "scripts:") {
+	if !strings.Contains(out, "workspace:") || !strings.Contains(out, "skills:") || strings.Contains(out, "scripts:") {
 		t.Fatalf("unexpected workspace report:\n%s", out)
 	}
 }
