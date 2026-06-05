@@ -1105,6 +1105,104 @@ func completionContractWarning(task session.TaskNode, finalText string) string {
 	return "missing_accepted_mutation_evidence"
 }
 
+type deterministicCompletionResult struct {
+	Completed bool
+	Reason    string
+	Evidence  map[string]any
+}
+
+func deterministicCompletionDecision(task session.TaskNode, finalText string) deterministicCompletionResult {
+	contract := task.CompletionContract
+	text := strings.TrimSpace(finalText)
+	if text == "" || looksLikeNonSubstantiveActionAck(text) {
+		return deterministicCompletionResult{}
+	}
+	if stronglyLooksIncompleteFinalText(text) {
+		return deterministicCompletionResult{}
+	}
+	if warning := finalTextWarning(text); warning != "" {
+		if !(contract.TaskType == "informational" && hasAcceptedReadOnlyEvidenceStep(task)) {
+			return deterministicCompletionResult{}
+		}
+	}
+	if contract.RequiresMutation {
+		return deterministicCompletionResult{}
+	}
+	if contract.TaskType == "informational" && hasAcceptedReadOnlyEvidenceStep(task) {
+		return deterministicCompletionResult{
+			Completed: true,
+			Reason:    "accepted_informational_evidence",
+			Evidence:  completionEvidenceSummary(task),
+		}
+	}
+	return deterministicCompletionResult{}
+}
+
+func completionEvidenceSummary(task session.TaskNode) map[string]any {
+	out := map[string]any{}
+	accepted := 0
+	mutations := 0
+	var tools []string
+	seen := map[string]bool{}
+	for _, step := range task.Steps {
+		if !(step.Accepted || step.Status == "accepted") {
+			continue
+		}
+		accepted++
+		if step.Mutation {
+			mutations++
+		}
+		if step.Tool != "" && !seen[step.Tool] {
+			tools = append(tools, step.Tool)
+			seen[step.Tool] = true
+		}
+	}
+	out["accepted_steps"] = accepted
+	out["accepted_mutations"] = mutations
+	if len(tools) > 0 {
+		out["tools"] = tools
+	}
+	if task.Execution.Status != "" {
+		out["frame_status"] = task.Execution.Status
+	}
+	return out
+}
+
+func stronglyLooksIncompleteFinalText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || looksLikeNonSubstantiveActionAck(trimmed) || strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "：") {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	strong := []string{
+		"环境摸清",
+		"环境梳清",
+		"继续计划",
+		"继续处理",
+		"接下来并行",
+		"下一步会",
+		"然后我会",
+		"我将",
+		"准备开始",
+		"先摸清",
+		"先生成",
+		"next i will",
+		"i will now",
+		"will proceed",
+		"will continue",
+		"continue now",
+		"start writing",
+		"start creating",
+		"start sending",
+	}
+	for _, cue := range strong {
+		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
+			return true
+		}
+	}
+	return false
+}
+
 func hasAcceptedMutationStep(task session.TaskNode) bool {
 	for _, step := range task.Steps {
 		if step.Accepted && step.Mutation {
@@ -1149,6 +1247,34 @@ func hasAcceptedEvidenceStep(task session.TaskNode) bool {
 	}
 	for _, event := range task.Execution.Events {
 		if event.Status == "accepted" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAcceptedReadOnlyEvidenceStep(task session.TaskNode) bool {
+	for _, step := range task.Steps {
+		if !(step.Accepted || step.Status == "accepted") {
+			continue
+		}
+		if step.Mutation {
+			continue
+		}
+		risk := strings.TrimSpace(step.Risk)
+		if risk == "" || risk == string(agentcore.RiskSafeRead) {
+			return true
+		}
+	}
+	for _, event := range task.Execution.Events {
+		if event.Status != "accepted" {
+			continue
+		}
+		if mutation, _ := event.Evidence["mutation"].(bool); mutation {
+			continue
+		}
+		risk, _ := event.Evidence["risk"].(string)
+		if strings.TrimSpace(risk) == "" || risk == string(agentcore.RiskSafeRead) {
 			return true
 		}
 	}
@@ -1205,6 +1331,23 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				return false, nil
 			}
 			task := activeTaskSnapshot(state, taskID)
+			if decision := deterministicCompletionDecision(task, turn.Message.Content); decision.Completed {
+				lastCompletionReview = CompletionReviewResult{
+					Completed:         true,
+					Reason:            decision.Reason,
+					MissingItems:       nil,
+					SuggestedFollowUp: "",
+				}
+				_ = trace.write(map[string]any{
+					"type":      "completion_deterministic",
+					"task_id":   taskID,
+					"completed": true,
+					"reason":    decision.Reason,
+					"evidence":  decision.Evidence,
+				})
+				noProgressTurns = 0
+				return true, nil
+			}
 			review := rt.Hooks.completionReview(context.Background(), CompletionReviewInput{
 				UserText:           userText,
 				Task:               task,

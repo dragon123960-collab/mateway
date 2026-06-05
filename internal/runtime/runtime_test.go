@@ -567,7 +567,7 @@ func TestRuntimeCompletedEvidenceAnswerDoesNotBecomeUserInputPending(t *testing.
 	}, rt.Hooks.Providers...)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": target}}}},
-		{Role: agentcore.RoleAssistant, Content: "已总结项目当前目标。下一阶段包括运行更多检查和执行发布流程。需要验证任一点，告诉我读哪个文件。"},
+		{Role: agentcore.RoleAssistant, Content: "已总结项目当前目标。Roadmap Next 包括运行更多检查和执行发布流程。需要验证任一点，告诉我读哪个文件。"},
 	}}, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "读取 README 并总结项目当前目标"})
 	if err != nil {
@@ -585,6 +585,46 @@ func TestRuntimeCompletedEvidenceAnswerDoesNotBecomeUserInputPending(t *testing.
 	}
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
 		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+}
+
+func TestRuntimeAcceptedInformationalEvidenceSkipsLLMReviewVeto(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "README.md")
+	if err := os.WriteFile(target, []byte("# Mateway\n\nCurrent goal: small runtime.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	review := &testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: false, Reason: "review veto", SuggestedFollowUp: "continue forever"}}}
+	rt.Hooks.Providers = append([]HookProvider{review}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": target}}}},
+		{Role: agentcore.RoleAssistant, Content: "已总结项目当前目标。Roadmap Next 包括运行更多检查和执行发布流程。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "读取 README 并总结项目当前目标"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == "partial" {
+		t.Fatalf("expected deterministic completion, got %#v", resp)
+	}
+	if review.index != 0 {
+		t.Fatalf("expected LLM review skipped, got %d calls", review.index)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"type":"completion_deterministic"`) || contains(string(data), `"type":"completion_review"`) {
+		t.Fatalf("expected deterministic completion without review loop:\n%s", data)
 	}
 }
 
@@ -2190,6 +2230,21 @@ func TestRuntimeDangerousTerminalCommandRejectedEvenWhenRiskyAllowed(t *testing.
 	}
 	if resp.Reply.Style == "approval_pending" || !contains(resp.Reply.Text, "destructive") {
 		t.Fatalf("expected dangerous command rejection without confirmation, got %#v", resp.Reply)
+	}
+}
+
+func TestStronglyLooksIncompleteFinalText(t *testing.T) {
+	if !stronglyLooksIncompleteFinalText("环境摸清：接下来并行生成 md/pdf、发邮件。") {
+		t.Fatalf("expected strong incomplete plan")
+	}
+	if !stronglyLooksIncompleteFinalText("继续计划：下一步会生成 md/pdf。") {
+		t.Fatalf("expected next-step plan")
+	}
+	if stronglyLooksIncompleteFinalText("Roadmap Next 包括运行更多检查和执行发布流程。") {
+		t.Fatalf("roadmap summary should not be a strong incomplete signal")
+	}
+	if stronglyLooksIncompleteFinalText("下一阶段重点：更多通道和连接器包。") {
+		t.Fatalf("section summary should not be a strong incomplete signal")
 	}
 }
 
