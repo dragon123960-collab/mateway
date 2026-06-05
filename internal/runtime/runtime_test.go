@@ -244,6 +244,48 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	}
 }
 
+func TestRuntimePendingConfirmationCancelUpdatesExecutionFrame(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:    config.AppConfig{Home: home},
+		Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("写文件")
+	resume := session.ResumeContext{OriginalTask: task.Goal, PendingTool: "file.write", ActionSummary: "file.write args: path: out.txt"}
+	frameID := state.SetResumeContext(task.ID, resume)
+	state.Pending = &session.PendingAction{
+		Kind:          "confirm_tool",
+		TaskID:        task.ID,
+		ToolCall:      agentcore.ToolCall{ID: "call_1", Name: "file.write", Args: map[string]any{"path": filepath.Join(home, "out.txt"), "content": "hi"}},
+		Question:      "确认执行？",
+		FrameID:       frameID,
+		ResumeContext: resume,
+	}
+	state.BlockActiveTask("await_confirm")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "取消"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "cancelled" {
+		t.Fatalf("expected cancelled reply, got %#v", resp.Reply)
+	}
+	state, err = rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil || len(state.Tasks) != 1 || state.Tasks[0].Status != "cancelled" || state.Tasks[0].Execution.Status != "cancelled" {
+		t.Fatalf("expected cancelled frame/task, got %#v", state)
+	}
+	if !executionEventsContain(state.Tasks[0].Execution.Events, "confirmation_cancelled") {
+		t.Fatalf("expected cancellation event, got %#v", state.Tasks[0].Execution.Events)
+	}
+}
+
 func TestRuntimePendingControlBypassesPendingIntentHook(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
@@ -2211,6 +2253,19 @@ func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *tes
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "await_confirm" {
 		t.Fatalf("expected task await_confirm, got %#v", state.Tasks)
 	}
+	frame := state.Tasks[0].Execution
+	if frame.Mode != "agent_loop" || frame.Status != "awaiting_confirmation" || frame.OriginalTask != "修复脚本" {
+		t.Fatalf("expected awaiting confirmation frame, got %#v", frame)
+	}
+	if state.Pending.FrameID == "" || state.Pending.ResumeContext.PendingTool != "terminal.run" || !contains(state.Pending.ResumeContext.ActionSummary, "touch") {
+		t.Fatalf("expected pending checkpoint with terminal command, got %#v", state.Pending)
+	}
+	if state.Pending.ResumeContext.AfterSuccess == "" || state.Pending.ResumeContext.AfterFailure == "" {
+		t.Fatalf("expected resume context instructions, got %#v", state.Pending.ResumeContext)
+	}
+	if !executionEventsContain(frame.Events, "await_confirmation") {
+		t.Fatalf("expected await_confirmation event, got %#v", frame.Events)
+	}
 }
 
 func TestRuntimeAllowsReadOnlyTerminalChainWithoutApproval(t *testing.T) {
@@ -2493,6 +2548,12 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
 		t.Fatalf("expected task completed after retry, got %#v", state.Tasks)
 	}
+	if state.Tasks[0].Execution.Status != "completed" {
+		t.Fatalf("expected completed execution frame, got %#v", state.Tasks[0].Execution)
+	}
+	if !executionEventsContain(state.Tasks[0].Execution.Events, "confirmation_approved") || !executionEventsContain(state.Tasks[0].Execution.Events, "confirmed_tool_result") || !executionEventsContain(state.Tasks[0].Execution.Events, "completed") {
+		t.Fatalf("expected confirmation/tool/completed frame events, got %#v", state.Tasks[0].Execution.Events)
+	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
@@ -2508,6 +2569,15 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	if !contains(string(data), `"command":"ls `+scriptsDir) {
 		t.Fatalf("expected simple retry command trace:\n%s", data)
 	}
+}
+
+func executionEventsContain(events []session.ExecutionEvent, eventType string) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRuntimeContinuesAfterBlockedToolResultDuringAgentLoop(t *testing.T) {

@@ -248,20 +248,25 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		if result.StopReason != "" {
 			blockedByFinalWarning = true
 			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
 			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
 		} else if looksLikeInputRequest(finalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: finalText}
 			state.BlockActiveTask("await_user_input")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "awaiting_user_input", Summary: summarize(finalText)})
 		} else if warning := finalTextWarning(finalText); warning != "" {
 			blockedByFinalWarning = true
 			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "blocked", Status: "failed", Summary: warning, Evidence: map[string]any{"text": finalText}})
 			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": finalText})
 		} else if warning := completionContractWarning(activeTaskSnapshot(state, task.ID), finalText); warning != "" {
 			blockedByFinalWarning = true
 			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completion_contract_blocked", Status: "failed", Summary: warning, Evidence: map[string]any{"text": finalText}})
 			_ = trace.write(map[string]any{"type": "completion_contract_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "contract": activeTaskSnapshot(state, task.ID).CompletionContract, "text": finalText})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
 			taskCompleted = true
 		}
 	}
@@ -289,6 +294,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Question:   question,
 		}
 		state.BlockActiveTask("await_schedule_test")
+		state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_schedule_review", Status: "awaiting_user_input", Summary: "schedule review pending", Evidence: map[string]any{"schedule_id": scheduleID}})
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
@@ -1116,7 +1122,26 @@ func hasAcceptedMutationStep(task session.TaskNode) bool {
 			}
 		}
 	}
+	for _, event := range task.Execution.Events {
+		if event.Status != "accepted" {
+			continue
+		}
+		if mutation, _ := event.Evidence["mutation"].(bool); mutation {
+			return true
+		}
+		risk, _ := event.Evidence["risk"].(string)
+		if risk == string(agentcore.RiskGuardedMutation) || risk == string(agentcore.RiskDangerous) {
+			return true
+		}
+	}
 	return false
+}
+
+func latestExecutionEvent(frame session.ExecutionFrame) session.ExecutionEvent {
+	if len(frame.Events) == 0 {
+		return session.ExecutionEvent{}
+	}
+	return frame.Events[len(frame.Events)-1]
 }
 
 func looksLikeConcreteBlocker(text string) bool {
@@ -1176,12 +1201,18 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 			if !review.Completed {
 				noProgressTurns++
 				if maxNoProgressTurns > 0 && noProgressTurns >= maxNoProgressTurns {
+					frame := activeTaskSnapshot(state, taskID).Execution
 					_ = trace.write(map[string]any{
-						"type":          "task_no_progress",
-						"task_id":       taskID,
-						"turns":         noProgressTurns,
-						"reason":        review.Reason,
-						"missing_items": review.MissingItems,
+						"type":                 "task_no_progress",
+						"task_id":              taskID,
+						"turns":                noProgressTurns,
+						"reason":               review.Reason,
+						"missing_items":        review.MissingItems,
+						"frame_status":         frame.Status,
+						"frame_current_step":   frame.CurrentStepID,
+						"frame_recent_event":   latestExecutionEvent(frame),
+						"frame_current_node":   frame.CurrentNodeID,
+						"frame_execution_mode": frame.Mode,
 					})
 					stopReason = "task_no_progress"
 					return true, nil
@@ -1212,13 +1243,30 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 			}
 			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config, Locale: locale}, trace)
 			if policy.Block {
-				_ = trace.write(map[string]any{"type": "approval_required", "task_id": taskID, "tool": input.ToolCall.Name, "approval_key": approvalKey, "class": approvalClass, "reason": policy.Reason})
+				task := activeTaskSnapshot(state, taskID)
+				resume := buildToolResumeContext(task, input.ToolCall, approvalClass, policy.Reason, policy.AuthorizationOnly)
+				frameID := state.SetResumeContext(taskID, resume)
+				state.SetExecutionStatus(taskID, "awaiting_confirmation")
+				state.AddExecutionEvent(taskID, session.ExecutionEvent{
+					Type:    "await_confirmation",
+					Status:  "awaiting_confirmation",
+					Tool:    input.ToolCall.Name,
+					Summary: resume.ActionSummary,
+					Evidence: map[string]any{
+						"approval_key": approvalKey,
+						"class":        approvalClass,
+						"reason":       policy.Reason,
+					},
+				})
+				_ = trace.write(map[string]any{"type": "approval_required", "task_id": taskID, "frame_id": frameID, "tool": input.ToolCall.Name, "approval_key": approvalKey, "class": approvalClass, "reason": policy.Reason, "resume_context": resume})
 				state.Pending = &session.PendingAction{
 					Kind:              "confirm_tool",
 					TaskID:            taskID,
 					Question:          renderToolApprovalQuestion(locale, input.ToolCall, approvalClass, policy.Reason),
 					ToolCall:          input.ToolCall,
 					ResumeText:        policy.ResumeText,
+					FrameID:           frameID,
+					ResumeContext:     resume,
 					AuthorizationOnly: policy.AuthorizationOnly,
 				}
 				state.BlockActiveTask("await_confirm")
@@ -1237,6 +1285,18 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
+				state.AddExecutionEvent(taskID, session.ExecutionEvent{
+					Type:    "tool_result",
+					Status:  observe.TaskStep.Status,
+					Tool:    input.ToolCall.Name,
+					StepID:  observe.TaskStep.ID,
+					Summary: observe.TaskStep.Summary,
+					Evidence: map[string]any{
+						"accepted": observe.TaskStep.Accepted,
+						"mutation": observe.TaskStep.Mutation,
+						"risk":     observe.TaskStep.Risk,
+					},
+				})
 				switch observe.TaskStep.Status {
 				case "accepted":
 					noProgressTurns = 0
@@ -1358,6 +1418,36 @@ func toolApprovalActionSummary(call agentcore.ToolCall) string {
 	return call.Name + " args: " + strings.Join(parts, ", ")
 }
 
+func buildToolResumeContext(task session.TaskNode, call agentcore.ToolCall, class, reason string, authorizationOnly bool) session.ResumeContext {
+	action := toolApprovalActionSummary(call)
+	originalTask := strings.TrimSpace(task.Execution.OriginalTask)
+	if originalTask == "" {
+		originalTask = strings.TrimSpace(task.Goal)
+	}
+	return session.ResumeContext{
+		OriginalTask:      originalTask,
+		PendingTool:       call.Name,
+		PendingArgs:       redactedMap(call.Args),
+		PolicyClass:       strings.TrimSpace(class),
+		Reason:            strings.TrimSpace(reason),
+		ActionSummary:     action,
+		AfterSuccess:      confirmedToolSuccessContinueText(originalTask, call),
+		AfterFailure:      "Continue the original task without asking for the same confirmation again. Use a simpler allowed command or another available tool if needed.",
+		AuthorizationOnly: authorizationOnly,
+	}
+}
+
+func redactedMap(value map[string]any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	redacted, ok := redactSecrets(value).(map[string]any)
+	if !ok {
+		return map[string]any{"value": redactSecrets(value)}
+	}
+	return redacted
+}
+
 func compactApprovalValue(value any) string {
 	text := redactSecretString(fmt.Sprint(redactSecrets(value)))
 	text = strings.Join(strings.Fields(text), " ")
@@ -1380,6 +1470,8 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		}
 		if control == "cancel" || (!hasControl && rt.isCancel(msg, text)) {
 			_ = trace.write(map[string]any{"type": "approval_denied", "task_id": state.Pending.TaskID, "tool": state.Pending.ToolCall.Name})
+			state.AddExecutionEvent(state.Pending.TaskID, session.ExecutionEvent{Type: "confirmation_cancelled", Status: "cancelled", Tool: state.Pending.ToolCall.Name, Summary: "user cancelled pending confirmation"})
+			state.SetExecutionStatus(state.Pending.TaskID, "cancelled")
 			state.Pending = nil
 			state.BlockActiveTask("cancelled")
 			if err := rt.saveState(state, trace); err != nil {
@@ -1393,12 +1485,20 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		pending := *state.Pending
 		pendingTaskID := pending.TaskID
 		call := pending.ToolCall
+		resume := pending.ResumeContext
 		state.Pending = nil
 		taskID := strings.TrimSpace(pendingTaskID)
 		if taskID == "" {
 			taskID = state.ActiveTask
 		}
-		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
+		if strings.TrimSpace(resume.OriginalTask) == "" {
+			if task := state.TaskByID(taskID); task != nil {
+				resume = task.Execution.ResumeContext
+			}
+		}
+		state.SetExecutionStatus(taskID, "resuming")
+		state.AddExecutionEvent(taskID, session.ExecutionEvent{Type: "confirmation_approved", Status: "resuming", Tool: call.Name, Summary: resume.ActionSummary})
+		_ = trace.write(map[string]any{"type": "pending_confirmed", "task_id": taskID, "frame_id": pending.FrameID, "tool_call": call, "resume_context": resume})
 		approvalKey, approvalClass := taskApprovalKey(call, nil, rt.Config)
 		if taskApprovalCanReuse(call, rt.Config) {
 			state.AddSessionApproval(session.TaskApproval{Key: approvalKey, Tool: call.Name, Class: approvalClass})
@@ -1415,7 +1515,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if task == nil {
 				task = state.EnsureTask("authorized script")
 			}
-			userText := mergeTaskAndInstruction(task.Goal, firstNonEmpty(pending.ResumeText, text))
+			userText := firstNonEmpty(resume.AfterSuccess, mergeTaskAndInstruction(task.Goal, firstNonEmpty(pending.ResumeText, text)))
 			_ = trace.write(map[string]any{"type": "pending_authorization_only_continue", "task_id": task.ID, "tool_call": call})
 			resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
 			return resp, true, err
@@ -1436,6 +1536,14 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			state.AddStep(taskID, *observe.TaskStep)
 			status = observe.TaskStep.Status
 			evidence = observe.TaskStep.Evidence
+			state.AddExecutionEvent(taskID, session.ExecutionEvent{
+				Type:     "confirmed_tool_result",
+				Status:   status,
+				Tool:     call.Name,
+				StepID:   observe.TaskStep.ID,
+				Summary:  observe.TaskStep.Summary,
+				Evidence: redactedMap(evidence),
+			})
 		}
 		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": redactToolResult(result), "acceptance": status, "evidence": redactSecrets(evidence)})
 		state.Messages = append(state.Messages, agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content})
@@ -1457,7 +1565,8 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if task == nil {
 				task = state.EnsureTask("confirmed tool result")
 			}
-			continueText := pendingToolFailureContinueText(task.Goal, call, result)
+			state.SetExecutionStatus(task.ID, "resuming")
+			continueText := pendingToolFailureContinueText(task.Goal, call, result, resume)
 			_ = trace.write(map[string]any{
 				"type":          "pending_tool_failed_continue",
 				"task_id":       task.ID,
@@ -1472,6 +1581,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		if task == nil {
 			task = state.EnsureTask("confirmed tool result")
 		}
+		state.SetExecutionStatus(task.ID, "resuming")
 		if call.Name == "schedule.create" && scheduleCreateRequiresTest(call) {
 			scheduleID := scheduleIDFromToolResult(result)
 			if scheduleID != "" {
@@ -1483,6 +1593,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 					Question:   question,
 				}
 				state.BlockActiveTask("await_schedule_test")
+				state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_schedule_review", Status: "awaiting_user_input", Tool: call.Name, Summary: "schedule review pending", Evidence: map[string]any{"schedule_id": scheduleID}})
 				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, true, err
 				}
@@ -1492,6 +1603,7 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		}
 		replyText := rt.summarizeConfirmedToolResult(ctx, msg, *task, call, result, trace)
 		state.CompleteActiveTaskWithSummary(summarize(replyText), trace.id, trace.path)
+		state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed_after_confirmed_tool", Status: "completed", Tool: call.Name, Summary: summarize(replyText)})
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, true, err
 		}
@@ -1820,7 +1932,40 @@ func (rt Runtime) summarizeConfirmedToolResult(ctx context.Context, msg channel.
 	return text
 }
 
-func pendingToolFailureContinueText(goal string, call agentcore.ToolCall, result agentcore.ToolResult) string {
+func confirmedToolSuccessContinueText(goal string, call agentcore.ToolCall) string {
+	var b strings.Builder
+	b.WriteString("The previously pending confirmation was approved and the tool call completed. Continue the original task to completion using this completed action as evidence.")
+	b.WriteString("\n\nCompleted tool: ")
+	b.WriteString(call.Name)
+	if command := strings.TrimSpace(fmt.Sprint(call.Args["command"])); command != "" && command != "<nil>" {
+		b.WriteString("\nCommand: ")
+		b.WriteString(command)
+	} else if len(call.Args) > 0 {
+		b.WriteString("\nArgs: ")
+		b.WriteString(compactApprovalValue(call.Args))
+	}
+	return mergeTaskAndInstruction(goal, b.String())
+}
+
+func pendingToolFailureContinueText(goal string, call agentcore.ToolCall, result agentcore.ToolResult, resume session.ResumeContext) string {
+	if text := strings.TrimSpace(resume.AfterFailure); text != "" {
+		var b strings.Builder
+		b.WriteString(text)
+		b.WriteString("\n\nFailed tool: ")
+		b.WriteString(call.Name)
+		if command := strings.TrimSpace(fmt.Sprint(call.Args["command"])); command != "" && command != "<nil>" {
+			b.WriteString("\nCommand: ")
+			b.WriteString(command)
+		} else if len(call.Args) > 0 {
+			b.WriteString("\nArgs: ")
+			b.WriteString(compactApprovalValue(call.Args))
+		}
+		if reason := strings.TrimSpace(result.Content); reason != "" {
+			b.WriteString("\nFailure: ")
+			b.WriteString(reason)
+		}
+		return mergeTaskAndInstruction(firstNonEmpty(resume.OriginalTask, goal), b.String())
+	}
 	var b strings.Builder
 	b.WriteString("The previously confirmed tool call failed. Continue the original task without asking for the same confirmation again. Use a simpler allowed command or another available tool if needed.")
 	b.WriteString("\n\nFailed tool: ")
