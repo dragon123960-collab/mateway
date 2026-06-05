@@ -148,6 +148,35 @@ func TestTerminalPolicyAllowsDevelopmentCheckCommands(t *testing.T) {
 	}
 }
 
+func TestTerminalPolicyAllowsUnknownCLIReadOnlyProbes(t *testing.T) {
+	for _, command := range []string{
+		"lark-cli --version",
+		"lark-cli --help",
+		"uvx help",
+		"command -v lark-cli",
+		"which lark-cli",
+		"type lark-cli",
+	} {
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow || decision.Class != "probe_read_only" {
+			t.Fatalf("expected read-only probe allow for %q, got %#v", command, decision)
+		}
+	}
+}
+
+func TestTerminalPolicyDoesNotTreatUnknownCLIExecutionAsProbe(t *testing.T) {
+	for _, command := range []string{
+		"lark-cli docs +create --title x",
+		"brew install lark-cli",
+		"npm install -g @larksuite/cli",
+		"unknown-cli run task",
+		"python3 -c 'print(1)'",
+	} {
+		if decision := CheckTerminalCommand(command, nil); decision.Allow {
+			t.Fatalf("expected non-probe command blocked or guarded for %q, got %#v", command, decision)
+		}
+	}
+}
+
 func TestTerminalPolicyRejectsUnsafeProjectInternalShape(t *testing.T) {
 	root := testRepoRoot(t)
 	cases := []string{

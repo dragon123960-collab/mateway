@@ -628,6 +628,34 @@ func TestRuntimeAcceptedInformationalEvidenceSkipsLLMReviewVeto(t *testing.T) {
 	}
 }
 
+func TestRuntimePureInformationalReplySkipsLLMReview(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	review := &testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: false, Reason: "review should not run"}}}
+	rt.Hooks.Providers = append([]HookProvider{review}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "脚本名：`feishu.docs.create`\n参数形式：`args=[\"--title\",\"<title>\",\"--markdown-file\",\"<absolute markdown path>\"]`。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "创建飞书云文档需要用哪个脚本？只回答脚本名和参数形式，不要执行。"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == "partial" {
+		t.Fatalf("expected deterministic informational completion, got %#v", resp)
+	}
+	if review.index != 0 {
+		t.Fatalf("expected LLM review skipped, got %d calls", review.index)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), "informational_reply_no_execution_required") || contains(string(data), `"type":"completion_review"`) {
+		t.Fatalf("expected deterministic completion without review loop:\n%s", data)
+	}
+}
+
 func TestRuntimeStandaloneTaskBypassesStaleUserInputPending(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}

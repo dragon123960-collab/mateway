@@ -67,6 +67,9 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 	if isAllowlistedLocalCommand(fields) {
 		return TerminalDecision{Allow: true, Class: "local_read_only"}
 	}
+	if isReadOnlyProbeCommand(fields) {
+		return TerminalDecision{Allow: true, Class: "probe_read_only"}
+	}
 	if isGuardedMutationCommand(fields) {
 		return TerminalDecision{Class: "guarded_mutation", Reason: "terminal command may mutate local state and requires confirmation"}
 	}
@@ -313,6 +316,42 @@ func isAllowlistedLocalCommand(fields []string) bool {
 	default:
 		return false
 	}
+}
+
+func isReadOnlyProbeCommand(fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := filepath.Base(fields[0])
+	switch cmd {
+	case "command":
+		return len(fields) == 3 && fields[1] == "-v" && isPlainCommandName(fields[2])
+	case "which", "type":
+		return len(fields) == 2 && isPlainCommandName(fields[1])
+	}
+	if looksLikeNetworkCommand(fields[0]) || isGuardedMutationCommand(fields) {
+		return false
+	}
+	if len(fields) == 1 {
+		return false
+	}
+	for _, arg := range fields[1:] {
+		switch arg {
+		case "--help", "-h", "help", "--version", "-v", "version":
+			continue
+		default:
+			return false
+		}
+	}
+	return isPlainCommandName(cmd)
+}
+
+func isPlainCommandName(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || looksLikePathArg(value) {
+		return false
+	}
+	return !strings.ContainsAny(value, ";&|`$<>")
 }
 
 func isReadOnlySed(fields []string) bool {

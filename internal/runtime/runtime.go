@@ -1058,6 +1058,9 @@ func looksLikeActionTask(text string) bool {
 	if lower == "" {
 		return false
 	}
+	if looksLikeInformationalMetaQuestion(lower) {
+		return false
+	}
 	if strings.HasPrefix(lower, "/read") || strings.HasPrefix(lower, "/search") {
 		return false
 	}
@@ -1076,6 +1079,16 @@ func looksLikeActionTask(text string) bool {
 			if strings.Contains(lower, artifact) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func looksLikeInformationalMetaQuestion(lower string) bool {
+	infoCues := []string{"只回答", "不要执行", "不执行", "不用执行", "脚本名", "参数形式", "which script", "do not execute", "don't execute", "without executing"}
+	for _, cue := range infoCues {
+		if strings.Contains(lower, cue) {
+			return true
 		}
 	}
 	return false
@@ -1135,7 +1148,38 @@ func deterministicCompletionDecision(task session.TaskNode, finalText string) de
 			Evidence:  completionEvidenceSummary(task),
 		}
 	}
+	if contract.TaskType == "informational" && canCompleteInformationalReplyWithoutReview(task) {
+		return deterministicCompletionResult{
+			Completed: true,
+			Reason:    "informational_reply_no_execution_required",
+			Evidence:  completionEvidenceSummary(task),
+		}
+	}
 	return deterministicCompletionResult{}
+}
+
+func canCompleteInformationalReplyWithoutReview(task session.TaskNode) bool {
+	if len(task.Steps) > 0 || hasAcceptedEvidenceStep(task) {
+		return false
+	}
+	if !looksLikeInformationalMetaQuestion(strings.ToLower(task.Goal)) {
+		return false
+	}
+	frame := task.Execution
+	if frame.Status == "await_confirm" || frame.Status == "await_user_input" || frame.Status == "failed" || frame.Status == "cancelled" {
+		return false
+	}
+	for _, event := range frame.Events {
+		switch event.Status {
+		case "pending", "failed", "blocked", "cancelled":
+			return false
+		}
+		switch event.Type {
+		case "tool_call", "tool_result", "confirmation_requested", "await_confirm", "await_user_input":
+			return false
+		}
+	}
+	return true
 }
 
 func completionEvidenceSummary(task session.TaskNode) map[string]any {
@@ -1335,7 +1379,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				lastCompletionReview = CompletionReviewResult{
 					Completed:         true,
 					Reason:            decision.Reason,
-					MissingItems:       nil,
+					MissingItems:      nil,
 					SuggestedFollowUp: "",
 				}
 				_ = trace.write(map[string]any{

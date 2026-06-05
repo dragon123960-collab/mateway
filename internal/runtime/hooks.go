@@ -829,7 +829,7 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 		decision := tool.CheckTerminalCommand(fmt.Sprint(input.ToolCall.Args["command"]), input.Config)
 		if decision.Allow {
 			switch decision.Class {
-			case "local_read_only", "read_only_pipeline", "read_only_chain", "project_internal":
+			case "local_read_only", "probe_read_only", "read_only_pipeline", "read_only_chain", "project_internal":
 				return ToolPolicyHookResult{}, nil
 			case "remote":
 				if !decision.RequireConfirm {
