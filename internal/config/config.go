@@ -79,7 +79,7 @@ func DefaultRoot() Root {
 		},
 		Security: SecurityConfig{
 			EnforceWorkspacePaths:       true,
-			RequireApprovalForRiskyTool: true,
+			RequireApprovalForRiskyTool: false,
 			AccessiblePaths:             []string{},
 			TerminalSandbox: TerminalSandboxConfig{
 				Enabled:        false,

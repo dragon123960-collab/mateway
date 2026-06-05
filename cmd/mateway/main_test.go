@@ -27,13 +27,13 @@ func TestTestCaseMessage(t *testing.T) {
 	}
 }
 
-func TestTestCaseApprovalWriteUsesConfiguredHome(t *testing.T) {
+func TestTestCaseWriteFileUsesConfiguredHome(t *testing.T) {
 	home := t.TempDir()
-	msg, err := testCaseMessage("approval-write", &config.Root{App: config.AppConfig{Home: home}})
+	msg, err := testCaseMessage("write-file", &config.Root{App: config.AppConfig{Home: home}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(msg, "/write ") || !strings.Contains(msg, filepath.Join(home, "tmp", "mateway-test-approval.txt")) {
+	if !strings.HasPrefix(msg, "/write ") || !strings.Contains(msg, filepath.Join(home, "tmp", "mateway-test-write.txt")) {
 		t.Fatalf("message = %q", msg)
 	}
 }

@@ -2047,7 +2047,7 @@ func buildHomeReport(home string) (homeReport, error) {
 
 func runTest(args []string) error {
 	fs := flag.NewFlagSet("mateway test", flag.ContinueOnError)
-	caseName := fs.String("case", "read-readme", "test case: read-readme, project-index, web-search, or custom")
+	caseName := fs.String("case", "read-readme", "test case: read-readme, project-index, web-search, write-file, or custom")
 	message := fs.String("message", "", "custom task message")
 	sessionKey := fs.String("session-key", "", "session key to reuse")
 	home := fs.String("home", "", "override MATEWAY_HOME for this run")
@@ -2249,12 +2249,12 @@ func testCaseMessage(name string, cfg ...*config.Root) (string, error) {
 		return "请查看 " + cwd + " 的项目结构，并说明最重要的目录各自负责什么。", nil
 	case "web-search":
 		return "请搜索今天 OpenAI API 的最新公开信息，并用两句话总结来源。", nil
-	case "approval-write":
+	case "write-file", "approval-write":
 		home := config.DefaultHome()
 		if len(cfg) > 0 && cfg[0] != nil && strings.TrimSpace(cfg[0].App.Home) != "" {
 			home = cfg[0].App.Home
 		}
-		return "/write " + filepath.Join(home, "tmp", "mateway-test-approval.txt") + " hello approval", nil
+		return "/write " + filepath.Join(home, "tmp", "mateway-test-write.txt") + " hello write", nil
 	case "custom":
 		return "", fmt.Errorf("custom case requires --message")
 	default:
@@ -2294,7 +2294,7 @@ func printHelp() {
 Usage:
   mateway init
   mateway ask <message>
-  mateway test [--case read-readme|project-index|web-search|approval-write] [--message <task>] [--confirm|--approval confirm|cancel] [--record=false]
+  mateway test [--case read-readme|project-index|web-search|write-file] [--message <task>] [--confirm|--approval confirm|cancel] [--record=false]
   mateway trace <trace-jsonl-path>
   mateway workspace report
   mateway session list

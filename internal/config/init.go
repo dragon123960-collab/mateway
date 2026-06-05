@@ -298,7 +298,7 @@ agents:
 
 security:
   enforce_workspace_paths: true
-  require_approval_for_risky_tools: true
+  require_approval_for_risky_tools: false
   accessible_paths: []
   terminal_sandbox:
     enabled: false
@@ -689,7 +689,7 @@ Workflow:
    - executable_name
    - why this method fits the current machine
 
-5. If the command is risky or mutates the machine, wait for confirmation through Mateway's guarded tool flow.
+5. Mutating commands may run directly. Avoid destructive commands such as rm/rmdir/shred/git reset/git clean unless the user explicitly asked; Mateway blocks those terminal commands by policy.
 
 6. Verify after installation.
    Prefer command -v, --version, --help, or a documented quick-start command.
@@ -784,7 +784,7 @@ when_to_use: creating Mateway skills, updating Mateway skills, adding scripts to
 
 Use this skill before creating or updating any Mateway skill.
 
-Default behavior: create or update the requested skill files, make scripts executable, then verify discovery and at least one safe execution path. Do not stop after a plan unless required information is missing or a guarded tool requests confirmation.
+Default behavior: create or update the requested skill files, make scripts executable, then verify discovery and at least one safe execution path. Do not stop after a plan unless required information is missing or a destructive command is blocked.
 
 ## Directory rules
 

@@ -75,7 +75,7 @@ The core loop stays small. Extension points are explicit:
 |---|---|
 | `followup_hook` | Bind "continue", "retry", "what about Tianjin?" to the right task, or ask for clarification |
 | `context_hook` | Inject runtime context, workspace profile, discovered skills, and relevant memory snippets |
-| `tool_policy_hook` | Enforce tool risk, confirmation boundaries, and dangerous command checks |
+| `tool_policy_hook` | Block destructive terminal commands while allowing normal tool execution |
 | `observe_hook` | Record accepted tool steps, task evidence, diary entries, and memory proposals |
 | `response_hook` | Sanitize final replies and add memory review prompts |
 
@@ -124,7 +124,7 @@ Mateway keeps internal machine interfaces in English: config keys, trace keys, a
 
 Default config uses `app.locale: auto`: Chinese user text receives Chinese prompts; other text receives English prompts. You can force a language with `app.locale: en-US` or `app.locale: zh-CN`. Additional locales can be added through `app.message_catalog_dir` by placing files such as `de-DE.yaml` or `fr-FR.yaml` with stable message keys and `aliases.<action>` entries.
 
-Review aliases are locale-independent. For example, tool approval accepts `confirm` / `cancel` and `确认` / `取消`; memory review accepts `save` / `ignore` and `保存` / `忽略`; schedule review accepts `run` / `cancel` and `执行` / `取消`. Tool approvals are remembered for the current session by guarded tool type, so a confirmed `file.write` or non-destructive `terminal.run` boundary does not repeatedly interrupt the same session; destructive terminal commands are never reused.
+Review aliases are locale-independent. Memory review accepts `save` / `ignore` and `保存` / `忽略`; schedule review accepts `run` / `cancel` and `执行` / `取消`. Tool execution no longer asks for approval by default; destructive terminal commands are blocked instead of confirmed.
 
 Example catalog fragment:
 
@@ -150,7 +150,7 @@ Mateway currently supports:
 - trace review: `mateway trace`
 - session inspect/archive commands: `mateway session list`, `mateway session show`, `mateway session archive list/show`
 - task tree and follow-up binding
-- session-scoped pending confirmation for risky tools
+- direct tool execution by default, with destructive terminal commands blocked
 - safe built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`
 - native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
 - parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
@@ -169,7 +169,7 @@ Mateway currently supports:
 - secret redaction in persistent runtime records
 - multi-agent profile foundations: `config.agents.profiles[]`, channel bindings, agent-specific skills, and agent-scoped memory directories
 
-`terminal.run` uses a three-tier boundary: read-only inspection and verification commands run without approval, write/unknown commands require review, and destructive commands such as `rm`, `shred`, `git reset`, `git clean`, or pipe-to-shell forms are blocked.
+`terminal.run` now defaults to execution without approval. Destructive commands such as `rm`, `rmdir`, `shred`, `git reset`, and `git clean` are blocked; future isolation is expected to move into a Docker sandbox.
 
 ## Quick Start
 
@@ -228,7 +228,7 @@ Validate configuration:
 ./build/mateway test --case read-readme
 ./build/mateway test --case project-index
 ./build/mateway test --case web-search
-./build/mateway test --case approval-write --confirm
+./build/mateway test --case write-file
 ```
 
 Custom task:
@@ -550,7 +550,7 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 - Multi-agent profile and binding foundation
 - CLI / test / Feishu / Weixin entrypoints
 - Hook pipeline
-- Tool policy and confirmation boundaries
+- Tool policy with destructive command blocking
 - JSONL traces
 - Skill discovery and context injection
 - Local secret store and skill secret scanning

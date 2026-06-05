@@ -12,8 +12,6 @@ import (
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
-	"github.com/dongping/mateway/internal/script"
-	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
@@ -817,87 +815,11 @@ type defaultToolPolicyHookProvider struct{}
 func (defaultToolPolicyHookProvider) Name() string { return "default_tool_policy" }
 
 func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input ToolPolicyHookInput) (ToolPolicyHookResult, error) {
-	catalog := i18n.New(i18n.Config{})
-	locale := strings.TrimSpace(input.Locale)
-	if input.Config != nil {
-		if locale == "" {
-			locale = input.Config.App.Locale
-		}
-		catalog = i18n.New(i18n.Config{CatalogDir: input.Config.App.MessageCatalogDir})
-	}
 	if input.ToolCall.Name == "terminal.run" {
 		decision := tool.CheckTerminalCommand(fmt.Sprint(input.ToolCall.Args["command"]), input.Config)
-		if decision.Allow {
-			switch decision.Class {
-			case "local_read_only", "probe_read_only", "read_only_pipeline", "read_only_chain", "project_internal":
-				return ToolPolicyHookResult{}, nil
-			case "remote":
-				if !decision.RequireConfirm {
-					return ToolPolicyHookResult{}, nil
-				}
-			}
-		}
-		if decision.Class == "destructive" || decision.Class == "path_escape" {
+		if decision.Class == "destructive" {
 			return ToolPolicyHookResult{}, nil
 		}
-		if decision.Class == "guarded_mutation" || decision.Class == "unknown" || decision.Class == "network" {
-			return ToolPolicyHookResult{
-				Block:      true,
-				Reason:     decision.Reason,
-				ResumeText: catalog.T(locale, "approval.confirm.resume_tool", map[string]string{"tool": input.ToolCall.Name}),
-			}, nil
-		}
-	}
-	if input.ToolCall.Name == "script.run" {
-		name := strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["name"]))
-		scripts, err := script.List(input.Config)
-		if err == nil {
-			for _, candidate := range scripts {
-				if candidate.Name != name {
-					continue
-				}
-				if candidate.Source == "external_skill" {
-					if !candidate.Authorized {
-						return ToolPolicyHookResult{
-							Block:             true,
-							Reason:            catalog.T(locale, "approval.confirm.external_script", map[string]string{"script": name}),
-							ResumeText:        catalog.T(locale, "approval.confirm.resume_script", nil),
-							AuthorizationOnly: true,
-						}, nil
-					}
-					return ToolPolicyHookResult{}, nil
-				}
-				break
-			}
-		}
-	}
-	if input.ToolCall.Name == "secret.set" {
-		id := strings.ToLower(strings.TrimSpace(fmt.Sprint(input.ToolCall.Args["id"])))
-		if !secret.ValidID(id) {
-			return ToolPolicyHookResult{}, nil
-		}
-		if boolArg(input.ToolCall.Args["overwrite"]) {
-			if entry, ok, err := (secret.Store{Home: configHome(input.Config)}).Get(id); err == nil && ok && entry.ID != "" {
-				return ToolPolicyHookResult{
-					Block:      true,
-					Reason:     "Overwriting existing secret " + id + " requires confirmation.",
-					ResumeText: "Continue after confirming secret overwrite",
-				}, nil
-			}
-		}
-	}
-	if input.Tool == nil {
-		return ToolPolicyHookResult{}, nil
-	}
-	if input.Tool.Risk() == agentcore.RiskGuardedMutation || input.Tool.Risk() == agentcore.RiskDangerous {
-		if input.Config != nil && !input.Config.Security.RequireApprovalForRiskyTool {
-			return ToolPolicyHookResult{}, nil
-		}
-		return ToolPolicyHookResult{
-			Block:      true,
-			Reason:     catalog.T(locale, "approval.confirm.generic", nil),
-			ResumeText: catalog.T(locale, "approval.confirm.resume_tool", map[string]string{"tool": input.Tool.Name()}),
-		}, nil
 	}
 	return ToolPolicyHookResult{}, nil
 }

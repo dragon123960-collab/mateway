@@ -71,7 +71,7 @@ mateway memory proposal reject <proposal_id>
 
 在聊天入口里，用户也可以直接回复 `保存` 或 `忽略`。Mateway 会把它存成 `memory_proposal_review` pending，所以这种短回复由运行时状态解释，而不是让模型猜。
 
-英文别名同样可用：memory review 可以回复 `save` / `ignore`，工具确认可以回复 `confirm` / `cancel`，定时任务试运行可以回复 `run` / `cancel`。这些别名不依赖当前界面语言。工具确认会按当前 session 和 guarded tool type 记住，所以确认过 `file.write` 或非破坏性的 `terminal.run` 边界后，同一 session 不会反复打断；破坏性 terminal 命令不会复用确认。
+英文别名同样可用：memory review 可以回复 `save` / `ignore`，定时任务试运行可以回复 `run` / `cancel`。这些别名不依赖当前界面语言。工具默认不再要求确认；破坏性 terminal 命令会直接阻拦，而不是进入确认流程。
 
 ### 3. Hook-first Runtime
 
@@ -81,7 +81,7 @@ mateway memory proposal reject <proposal_id>
 |---|---|
 | `followup_hook` | 把“继续”“重试”“天津呢？”绑定到正确任务，或要求澄清 |
 | `context_hook` | 注入 runtime context、workspace profile、已发现 skills 和相关 memory snippets |
-| `tool_policy_hook` | 执行工具风险、确认边界和危险命令检查 |
+| `tool_policy_hook` | 执行危险命令检查，默认放行非删除类工具调用 |
 | `observe_hook` | 记录已接受工具步骤、任务证据、diary 和 memory proposals |
 | `response_hook` | 清理最终回复，并附加 memory review 提示 |
 
@@ -94,7 +94,7 @@ mateway memory proposal reject <proposal_id>
 - provider 返回时的模型请求数和 token usage
 - tool calls 和 tool results
 - hook events
-- pending confirmations
+- schedule/memory 等用户决策 pending
 - final reply
 - runtime timings
 
@@ -141,7 +141,7 @@ Mateway 目前支持：
 - trace 回看：`mateway trace`
 - session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
 - task tree 和 follow-up 绑定
-- 风险工具 session 级 pending confirmation
+- 工具默认直接执行，删除/破坏类 terminal 命令硬阻拦
 - 安全内置工具：`file.read`、`file.write`、`project.index`、`terminal.run`、`web.search`、`web.fetch`
 - Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
 - 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
@@ -224,7 +224,7 @@ vim ~/.mateway/config/config.yaml
 ./build/mateway test --case read-readme
 ./build/mateway test --case project-index
 ./build/mateway test --case web-search
-./build/mateway test --case approval-write --confirm
+./build/mateway test --case write-file
 ```
 
 自定义任务：
@@ -548,7 +548,7 @@ Mateway 不会把这些能力伪装成已经完成：
 - 多 agent profile 和 binding 基础
 - CLI / test / Feishu / Weixin entrypoints
 - Hook pipeline
-- Tool policy 和 confirmation boundaries
+- Tool policy 和破坏性命令阻拦
 - JSONL traces
 - Skill discovery 和 context injection
 - 本地 secret store 和 skill secret 扫描

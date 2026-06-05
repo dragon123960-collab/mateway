@@ -205,7 +205,7 @@ func TestRuntimeRecordsTaskTreeForToolExecution(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
+func TestRuntimeWriteExecutesWithoutApproval(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: home},
@@ -218,22 +218,8 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "confirm") {
-		t.Fatalf("expected confirmation response, got %#v", resp.Reply)
-	}
-	state, err := rt.Store.Load("cli:test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Pending == nil || state.Pending.Kind != "confirm_tool" {
-		t.Fatalf("expected pending confirm tool, got %#v", state.Pending)
-	}
-	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Failed || resp.Reply.Style == "partial" {
-		t.Fatalf("expected continuation after confirmed write, got %#v", resp)
+	if resp.Reply.Style == "approval_pending" || resp.Failed {
+		t.Fatalf("expected direct write without confirmation, got %#v", resp)
 	}
 	data, err := os.ReadFile(target)
 	if err != nil {
@@ -246,8 +232,8 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(traceData), `"type":"pending_tool_success_continue"`) {
-		t.Fatalf("expected confirmed tool success continuation trace:\n%s", traceData)
+	if contains(string(traceData), `"type":"approval_required"`) || contains(string(traceData), `"type":"approval_pending"`) {
+		t.Fatalf("write should not require approval:\n%s", traceData)
 	}
 }
 
@@ -413,7 +399,7 @@ func TestRuntimeSessionScopedApprovalReusedByLaterTask(t *testing.T) {
 	}
 }
 
-func TestRuntimeApprovalPendingUsesInferredLocale(t *testing.T) {
+func TestRuntimeWriteWithInferredLocaleSkipsApproval(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: home, Locale: "auto"},
@@ -426,15 +412,19 @@ func TestRuntimeApprovalPendingUsesInferredLocale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
+	if resp.Reply.Style == "approval_pending" || resp.Failed {
+		t.Fatalf("expected direct write without approval, got %#v", resp)
 	}
-	if !contains(resp.Reply.Text, "继续之前需要确认") || contains(resp.Reply.Text, "Confirmation is required") {
-		t.Fatalf("expected zh approval text from inferred locale, got %#v", resp.Reply)
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "你好" {
+		t.Fatalf("written content = %q", string(data))
 	}
 }
 
-func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
+func TestRuntimeTerminalMutationExecutesWithoutApproval(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: home, Locale: "zh-CN"},
@@ -442,6 +432,9 @@ func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
 		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
 	}
 	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "terminal mutation executed"}}},
+	}, rt.Hooks.Providers...)
 	command := "touch " + filepath.Join(home, "out.txt")
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{{
 		Role: agentcore.RoleAssistant,
@@ -450,22 +443,23 @@ func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
 			Name: "terminal.run",
 			Args: map[string]any{"command": command},
 		}},
+	}, {
+		Role:    agentcore.RoleAssistant,
+		Content: "文件已经创建完成：" + filepath.Join(home, "out.txt"),
 	}}}, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "修复脚本"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
+	if resp.Reply.Style == "approval_pending" || resp.Failed {
+		t.Fatalf("expected terminal mutation without approval, got %#v", resp.Reply)
 	}
-	for _, want := range []string{"工具：terminal.run", "风险：terminal_guarded", "command: touch", "沉淀为 skill script", "script.run", "回复“确认”或 confirm", "回复“取消”或 cancel"} {
-		if !contains(resp.Reply.Text, want) {
-			t.Fatalf("expected approval text to contain %q, got %q", want, resp.Reply.Text)
-		}
+	if _, err := os.Stat(filepath.Join(home, "out.txt")); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestRuntimeConfirmationResumesOriginalTask(t *testing.T) {
+func TestRuntimeMutationExecutesOriginalTaskWithoutConfirmation(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: home},
@@ -479,15 +473,8 @@ func TestRuntimeConfirmationResumesOriginalTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected confirmation response, got %#v", resp.Reply)
-	}
-	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if resp.Reply.Text != "原任务已继续完成" {
-		t.Fatalf("expected resumed task summary, got %#v", resp.Reply)
+		t.Fatalf("expected task summary, got %#v", resp.Reply)
 	}
 }
 
@@ -1389,7 +1376,7 @@ func TestRuntimeScheduleCreateAsksForTestAndActivatesAfterExecute(t *testing.T) 
 	}
 }
 
-func TestRuntimeConfirmedScheduleCreateStillAsksForTest(t *testing.T) {
+func TestRuntimeScheduleCreateSkipsApprovalButStillAsksForTest(t *testing.T) {
 	home := t.TempDir()
 	if err := config.EnsureDefaultConfigFiles(home); err != nil {
 		t.Fatal(err)
@@ -1408,20 +1395,16 @@ func TestRuntimeConfirmedScheduleCreateStillAsksForTest(t *testing.T) {
 			Name: "schedule.create",
 			Args: map[string]any{"run_at": runAt, "text": "/read workspace/memory/README.md"},
 		}},
+	}, {
+		Role:    agentcore.RoleAssistant,
+		Content: "定时任务已创建，等待测试确认。",
 	}}}, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "feishu", SessionKey: "feishu:test-schedule-confirm", Text: "明天执行这个任务"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected schedule.create approval pending, got %#v", resp.Reply)
-	}
-	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "feishu", SessionKey: "feishu:test-schedule-confirm", Text: "确认"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if resp.Reply.Style != "schedule_review_pending" {
-		t.Fatalf("expected schedule review pending after confirmed create, got %#v", resp.Reply)
+		t.Fatalf("expected schedule review pending after direct create, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("feishu:test-schedule-confirm")
 	if err != nil {
@@ -1683,7 +1666,7 @@ func TestRuntimeSkillWriteDoesNotCreateAgentProfilePending(t *testing.T) {
 	}
 }
 
-func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
+func TestRuntimeAgentProfileProposalPendingWithoutToolConfirmation(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	target := filepath.Join(workspace, "agents", "main", "agent.md")
@@ -1704,13 +1687,6 @@ func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected tool confirmation first, got %#v", resp.Reply)
-	}
-	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if !contains(resp.Reply.Text, "profile proposal") {
 		t.Fatalf("expected proposal creation reply, got %#v", resp.Reply)
 	}
@@ -1719,7 +1695,7 @@ func TestRuntimeAgentProfileProposalPendingAfterToolConfirmation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if state.Pending == nil || state.Pending.Kind != "agent_profile_proposal_review" || state.Pending.ProposalID == "" {
-		t.Fatalf("expected profile proposal pending after tool confirmation, got %#v", state.Pending)
+		t.Fatalf("expected profile proposal pending after direct write, got %#v", state.Pending)
 	}
 	if !contains(state.Pending.Question, target) || !contains(state.Pending.Question, "+new agent") {
 		t.Fatalf("expected profile pending summary after confirmation, got %q", state.Pending.Question)
@@ -2531,15 +2507,14 @@ func TestRuntimeAllowsProjectInternalTerminalWithoutGenericConfirmation(t *testi
 	}
 }
 
-func TestRuntimeTerminalRemoteProfileConfirmationFollowsProfile(t *testing.T) {
+func TestRuntimeTerminalRemoteProfileConfirmationIgnored(t *testing.T) {
 	provider := defaultToolPolicyHookProvider{}
 	for _, tc := range []struct {
 		name           string
 		requireConfirm bool
-		wantBlock      bool
 	}{
-		{name: "profile requires confirm", requireConfirm: true, wantBlock: true},
-		{name: "profile skips confirm", requireConfirm: false, wantBlock: false},
+		{name: "profile requires confirm", requireConfirm: true},
+		{name: "profile skips confirm", requireConfirm: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Root{
@@ -2559,14 +2534,14 @@ func TestRuntimeTerminalRemoteProfileConfirmationFollowsProfile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if result.Block != tc.wantBlock {
-				t.Fatalf("block = %v want %v, result=%#v", result.Block, tc.wantBlock, result)
+			if result.Block {
+				t.Fatalf("remote profile confirmation should be ignored, got %#v", result)
 			}
 		})
 	}
 }
 
-func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *testing.T) {
+func TestRuntimeRunsTerminalMutationDuringAgentLoopWithoutApproval(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: home},
@@ -2574,6 +2549,9 @@ func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *tes
 		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
 	}
 	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "terminal mutation executed"}}},
+	}, rt.Hooks.Providers...)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{{
 		Role:    agentcore.RoleAssistant,
 		Content: "等等，改用 sed 修这一行。",
@@ -2582,36 +2560,26 @@ func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *tes
 			Name: "terminal.run",
 			Args: map[string]any{"command": "touch " + filepath.Join(home, "out.txt")},
 		}},
+	}, {
+		Role:    agentcore.RoleAssistant,
+		Content: "文件已经创建完成：" + filepath.Join(home, "out.txt"),
 	}}}, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "修复脚本"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
+	if resp.Reply.Style == "approval_pending" || resp.Failed {
+		t.Fatalf("expected direct terminal execution, got %#v", resp.Reply)
 	}
 	state, err := rt.Store.Load("cli:test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Pending == nil || state.Pending.Kind != "confirm_tool" {
-		t.Fatalf("expected confirm pending state, got %#v", state.Pending)
+	if state.Pending != nil {
+		t.Fatalf("expected no confirm pending state, got %#v", state.Pending)
 	}
-	if len(state.Tasks) != 1 || state.Tasks[0].Status != "await_confirm" {
-		t.Fatalf("expected task await_confirm, got %#v", state.Tasks)
-	}
-	frame := state.Tasks[0].Execution
-	if frame.Mode != "agent_loop" || frame.Status != "awaiting_confirmation" || frame.OriginalTask != "修复脚本" {
-		t.Fatalf("expected awaiting confirmation frame, got %#v", frame)
-	}
-	if state.Pending.FrameID == "" || state.Pending.ResumeContext.PendingTool != "terminal.run" || !contains(state.Pending.ResumeContext.ActionSummary, "touch") {
-		t.Fatalf("expected pending checkpoint with terminal command, got %#v", state.Pending)
-	}
-	if state.Pending.ResumeContext.AfterSuccess == "" || state.Pending.ResumeContext.AfterFailure == "" {
-		t.Fatalf("expected resume context instructions, got %#v", state.Pending.ResumeContext)
-	}
-	if !executionEventsContain(frame.Events, "await_confirmation") {
-		t.Fatalf("expected await_confirmation event, got %#v", frame.Events)
+	if len(state.Tasks) != 1 || len(state.Tasks[0].Steps) != 1 || state.Tasks[0].Steps[0].Tool != "terminal.run" {
+		t.Fatalf("expected terminal step, got %#v", state.Tasks)
 	}
 }
 
@@ -2715,7 +2683,7 @@ func TestRuntimeTerminalSessionApprovalDoesNotReuseForDestructiveCommand(t *test
 	}
 }
 
-func TestRuntimeExternalScriptAuthorizationReasonUsesLocale(t *testing.T) {
+func TestRuntimeExternalScriptAuthorizationSkipped(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	writeTestExternalScript(t, workspace)
@@ -2729,8 +2697,8 @@ func TestRuntimeExternalScriptAuthorizationReasonUsesLocale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !zh.Block || !zh.AuthorizationOnly || !contains(zh.Reason, "首次执行前需要一次性授权") || contains(zh.Reason, "External skill script") {
-		t.Fatalf("expected localized zh authorization reason, got %#v", zh)
+	if zh.Block || zh.AuthorizationOnly {
+		t.Fatalf("external scripts should not require authorization, got %#v", zh)
 	}
 
 	en, err := provider.ToolPolicyHook(context.Background(), ToolPolicyHookInput{
@@ -2740,8 +2708,8 @@ func TestRuntimeExternalScriptAuthorizationReasonUsesLocale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !en.Block || !contains(en.Reason, "External skill script agnes.image.generate requires one-time authorization") {
-		t.Fatalf("expected localized en authorization reason, got %#v", en)
+	if en.Block || en.AuthorizationOnly {
+		t.Fatalf("external scripts should not require authorization, got %#v", en)
 	}
 }
 
@@ -2776,7 +2744,7 @@ func TestRuntimeAuthorizedExternalScriptSkipsGenericConfirmation(t *testing.T) {
 	}
 }
 
-func TestRuntimeExternalScriptAuthorizationReplansInsteadOfRunningProbe(t *testing.T) {
+func TestRuntimeExternalScriptRunsWithoutAuthorization(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	writeTestExternalScript(t, workspace)
@@ -2807,31 +2775,18 @@ func TestRuntimeExternalScriptAuthorizationReplansInsteadOfRunningProbe(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" {
-		t.Fatalf("expected script authorization pending, got %#v", resp.Reply)
-	}
-	resp, err = rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if resp.Reply.Style == "partial" || resp.Failed {
-		t.Fatalf("expected generation continuation after authorization, got %#v", resp)
+		t.Fatalf("expected generation without authorization, got %#v", resp)
 	}
 	if contains(resp.Reply.Text, "usage:") {
-		t.Fatalf("authorization confirmation should not run --help as task output, got %#v", resp.Reply)
+		t.Fatalf("probe output should not become final task output, got %#v", resp.Reply)
 	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), `"type":"pending_authorization_only_continue"`) {
-		t.Fatalf("expected authorization-only continuation trace:\n%s", data)
-	}
 	if !contains(string(data), `"call_generate"`) || !contains(string(data), "AI course poster") {
 		t.Fatalf("expected replanned generation tool call:\n%s", data)
-	}
-	if contains(string(data), `"type":"tool_execution_end"`) && contains(string(data), `"call_probe"`) && contains(string(data), "usage: agnes.image.generate") {
-		t.Fatalf("probe call should not execute after authorization:\n%s", data)
 	}
 }
 
@@ -3038,7 +2993,16 @@ func TestRuntimePendingConfirmationWritesTrace(t *testing.T) {
 	}
 	rt := New(cfg)
 	target := filepath.Join(home, "out.txt")
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/write " + target + " hi"}); err != nil {
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("write file")
+	state.Pending = &session.PendingAction{
+		Kind:     "confirm_tool",
+		TaskID:   task.ID,
+		ToolCall: agentcore.ToolCall{ID: "call_1", Name: "file.write", Args: map[string]any{"path": target, "content": "hi"}},
+		Question: "确认执行？",
+	}
+	state.BlockActiveTask("await_confirm")
+	if err := rt.Store.Save(state); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
@@ -3458,8 +3422,8 @@ func TestRuntimeToolPolicyHookFailureFallsBackToLaterProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" && !contains(resp.Reply.Text, "confirm") {
-		t.Fatalf("expected later policy provider to require confirmation, got %#v", resp.Reply)
+	if resp.Reply.Style == "approval_pending" || resp.Failed {
+		t.Fatalf("expected later policy provider to allow direct execution, got %#v", resp.Reply)
 	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {

@@ -59,13 +59,13 @@ func TestIsDangerousCommand(t *testing.T) {
 	}
 }
 
-func TestTerminalPolicyBlocksSensitiveCommands(t *testing.T) {
+func TestTerminalPolicyOnlyBlocksDestructiveCommands(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir(), Workspace: filepath.Join(t.TempDir(), "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	if decision := CheckTerminalCommand("cat /etc/passwd", cfg); decision.Allow || decision.Class != "path_escape" {
-		t.Fatalf("expected path escape block, got %#v", decision)
+	if decision := CheckTerminalCommand("cat /etc/passwd", cfg); !decision.Allow {
+		t.Fatalf("expected path read to be allowed for sandbox-first policy, got %#v", decision)
 	}
-	if decision := CheckTerminalCommand("curl http://127.0.0.1:6379", cfg); decision.Allow || decision.Class != "network" {
-		t.Fatalf("expected network block, got %#v", decision)
+	if decision := CheckTerminalCommand("curl http://127.0.0.1:6379", cfg); !decision.Allow {
+		t.Fatalf("expected network command to be allowed for sandbox-first policy, got %#v", decision)
 	}
 	if decision := CheckTerminalCommand("rm -rf ~", cfg); decision.Allow || decision.Class != "destructive" {
 		t.Fatalf("expected destructive block, got %#v", decision)
@@ -95,7 +95,7 @@ func TestTerminalPolicyAllowsReadOnlyCommandChain(t *testing.T) {
 	}
 }
 
-func TestTerminalPolicyClassifiesMutationCommandsForApproval(t *testing.T) {
+func TestTerminalPolicyAllowsMutationCommandsWithoutApproval(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
 	for _, command := range []string{
@@ -105,8 +105,8 @@ func TestTerminalPolicyClassifiesMutationCommandsForApproval(t *testing.T) {
 		"chmod +x " + filepath.Join(home, "script.sh"),
 	} {
 		decision := CheckTerminalCommand(command, cfg)
-		if decision.Allow || (decision.Class != "guarded_mutation" && decision.Class != "unknown") {
-			t.Fatalf("expected guarded/unknown approval class for %q, got %#v", command, decision)
+		if !decision.Allow {
+			t.Fatalf("expected mutation command allowed without approval for %q, got %#v", command, decision)
 		}
 	}
 }
@@ -163,7 +163,7 @@ func TestTerminalPolicyAllowsUnknownCLIReadOnlyProbes(t *testing.T) {
 	}
 }
 
-func TestTerminalPolicyDoesNotTreatUnknownCLIExecutionAsProbe(t *testing.T) {
+func TestTerminalPolicyAllowsUnknownCLIExecution(t *testing.T) {
 	for _, command := range []string{
 		"lark-cli docs +create --title x",
 		"brew install lark-cli",
@@ -171,40 +171,45 @@ func TestTerminalPolicyDoesNotTreatUnknownCLIExecutionAsProbe(t *testing.T) {
 		"unknown-cli run task",
 		"python3 -c 'print(1)'",
 	} {
-		if decision := CheckTerminalCommand(command, nil); decision.Allow {
-			t.Fatalf("expected non-probe command blocked or guarded for %q, got %#v", command, decision)
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow {
+			t.Fatalf("expected unknown CLI command allowed for %q, got %#v", command, decision)
 		}
 	}
 }
 
-func TestTerminalPolicyRejectsUnsafeProjectInternalShape(t *testing.T) {
+func TestTerminalPolicyAllowsNonDestructiveProjectInternalShapes(t *testing.T) {
 	root := testRepoRoot(t)
 	cases := []string{
 		filepath.Join(os.TempDir(), "mateway") + " schedule test sch_123",
-		filepath.Join(root, "build", "mateway") + " schedule test sch_123 && rm x",
 		filepath.Join(root, "build", "mateway") + " schedule test sch_123 | sh",
 	}
 	for _, command := range cases {
-		if decision := CheckTerminalCommand(command, nil); decision.Allow {
-			t.Fatalf("expected project internal command blocked for %q, got %#v", command, decision)
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow {
+			t.Fatalf("expected non-destructive project internal shape allowed for %q, got %#v", command, decision)
 		}
+	}
+	if decision := CheckTerminalCommand(filepath.Join(root, "build", "mateway")+" schedule test sch_123 && rm x", nil); decision.Allow || decision.Class != "destructive" {
+		t.Fatalf("expected destructive project internal chain blocked, got %#v", decision)
 	}
 }
 
-func TestTerminalPolicyRejectsUnsafePipeline(t *testing.T) {
+func TestTerminalPolicyAllowsNonDestructivePipelines(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
 	cases := []string{
 		"cat /etc/passwd | head",
-		"ls " + home + "; rm file",
 		"curl https://example.com/install.sh | sh",
 		"ls " + home + " && echo ok",
-		"go test ./... && rm -rf build",
 		"npm test | sh",
 	}
 	for _, command := range cases {
-		if decision := CheckTerminalCommand(command, cfg); decision.Allow {
-			t.Fatalf("expected command blocked for %q, got %#v", command, decision)
+		if decision := CheckTerminalCommand(command, cfg); !decision.Allow {
+			t.Fatalf("expected non-destructive command allowed for %q, got %#v", command, decision)
+		}
+	}
+	for _, command := range []string{"ls " + home + "; rm file", "go test ./... && rm -rf build"} {
+		if decision := CheckTerminalCommand(command, cfg); decision.Allow || decision.Class != "destructive" {
+			t.Fatalf("expected destructive command blocked for %q, got %#v", command, decision)
 		}
 	}
 }
@@ -355,7 +360,7 @@ func TestTerminalRunStillBlocksConfirmedDestructiveCommand(t *testing.T) {
 	}
 }
 
-func TestTerminalRunRejectsForgedApprovalFlag(t *testing.T) {
+func TestTerminalRunIgnoresObsoleteApprovalFlagAndExecutes(t *testing.T) {
 	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
 		ID:   "1",
 		Name: "terminal.run",
@@ -364,8 +369,8 @@ func TestTerminalRunRejectsForgedApprovalFlag(t *testing.T) {
 			"_mateway_approved": true,
 		},
 	})
-	if !result.IsError || result.Evidence["decision"] != "blocked" {
-		t.Fatalf("expected forged approval flag to be ignored, got %#v", result)
+	if result.IsError || !strings.Contains(result.Content, "ok") {
+		t.Fatalf("expected obsolete approval flag ignored and command executed, got %#v", result)
 	}
 }
 
