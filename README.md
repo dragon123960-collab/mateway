@@ -169,6 +169,8 @@ Mateway currently supports:
 - secret redaction in persistent runtime records
 - multi-agent profile foundations: `config.agents.profiles[]`, channel bindings, agent-specific skills, and agent-scoped memory directories
 
+`terminal.run` uses a three-tier boundary: read-only inspection and verification commands run without approval, write/unknown commands require review, and destructive commands such as `rm`, `shred`, `git reset`, `git clean`, or pipe-to-shell forms are blocked.
+
 ## Quick Start
 
 ### Build

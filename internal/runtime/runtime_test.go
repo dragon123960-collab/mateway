@@ -386,18 +386,20 @@ func TestRuntimeApprovalPendingUsesInferredLocale(t *testing.T) {
 }
 
 func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
+	home := t.TempDir()
 	cfg := &config.Root{
-		App:      config.AppConfig{Home: t.TempDir(), Locale: "zh-CN"},
+		App:      config.AppConfig{Home: home, Locale: "zh-CN"},
 		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
 		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
 	}
 	rt := New(cfg)
+	command := "touch " + filepath.Join(home, "out.txt")
 	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{{
 		Role: agentcore.RoleAssistant,
 		ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
 			Name: "terminal.run",
-			Args: map[string]any{"command": "sed -i.bak 's/a/b/' file && rm file.bak"},
+			Args: map[string]any{"command": command},
 		}},
 	}}}, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "修复脚本"})
@@ -407,7 +409,7 @@ func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
 	if resp.Reply.Style != "approval_pending" {
 		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
 	}
-	for _, want := range []string{"工具：terminal.run", "风险：terminal_guarded", "command: sed -i.bak", "回复“确认”或 confirm", "回复“取消”或 cancel"} {
+	for _, want := range []string{"工具：terminal.run", "风险：terminal_guarded", "command: touch", "回复“确认”或 confirm", "回复“取消”或 cancel"} {
 		if !contains(resp.Reply.Text, want) {
 			t.Fatalf("expected approval text to contain %q, got %q", want, resp.Reply.Text)
 		}
@@ -2099,7 +2101,7 @@ func TestCompletionHeuristicFlagsColonEndedPlan(t *testing.T) {
 	}
 }
 
-func TestRuntimeDangerousTerminalCommandRequiresConfirmationEvenWhenRiskyAllowed(t *testing.T) {
+func TestRuntimeDangerousTerminalCommandRejectedEvenWhenRiskyAllowed(t *testing.T) {
 	cfg := &config.Root{
 		App:      config.AppConfig{Home: t.TempDir()},
 		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
@@ -2110,8 +2112,8 @@ func TestRuntimeDangerousTerminalCommandRequiresConfirmationEvenWhenRiskyAllowed
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "destructive") {
-		t.Fatalf("expected dangerous command confirmation, got %#v", resp.Reply)
+	if resp.Reply.Style == "approval_pending" || !contains(resp.Reply.Text, "destructive") {
+		t.Fatalf("expected dangerous command rejection without confirmation, got %#v", resp.Reply)
 	}
 }
 
@@ -2176,8 +2178,9 @@ func TestRuntimeTerminalRemoteProfileConfirmationFollowsProfile(t *testing.T) {
 }
 
 func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *testing.T) {
+	home := t.TempDir()
 	cfg := &config.Root{
-		App:      config.AppConfig{Home: t.TempDir()},
+		App:      config.AppConfig{Home: home},
 		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
 		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
 	}
@@ -2188,7 +2191,7 @@ func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *tes
 		ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
 			Name: "terminal.run",
-			Args: map[string]any{"command": "sed -i.bak 's/a/b/' file && rm file.bak"},
+			Args: map[string]any{"command": "touch " + filepath.Join(home, "out.txt")},
 		}},
 	}}}, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "修复脚本"})
@@ -2207,6 +2210,42 @@ func TestRuntimeReturnsApprovalPendingWhenToolPolicyBlocksDuringAgentLoop(t *tes
 	}
 	if len(state.Tasks) != 1 || state.Tasks[0].Status != "await_confirm" {
 		t.Fatalf("expected task await_confirm, got %#v", state.Tasks)
+	}
+}
+
+func TestRuntimeAllowsReadOnlyTerminalChainWithoutApproval(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "workspace", "ai-magician-templates.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("# Template\n\nhello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: true, EnforceWorkspacePaths: true},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	command := "ls -la " + target + " && file " + target + " && wc -l " + target + " && head -c 200 " + target + " | xxd | head -20"
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": command}}}},
+		{Role: agentcore.RoleAssistant, Content: "read-only inspection done"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "检查模板文件"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "approval_pending" {
+		t.Fatalf("read-only chain should not require approval, got %#v", resp.Reply)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"type":"approval_required"`) || !strings.Contains(string(data), `"policy_classification":"read_only_chain"`) {
+		t.Fatalf("expected read-only chain execution without approval:\n%s", data)
 	}
 }
 
@@ -2262,8 +2301,15 @@ func TestRuntimeTerminalSessionApprovalDoesNotReuseForDestructiveCommand(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "approval_pending" || !contains(resp.Reply.Text, "rm -rf /tmp/mateway-danger-test") {
-		t.Fatalf("expected destructive command confirmation with concrete command, got %#v", resp.Reply)
+	if resp.Reply.Style == "approval_pending" {
+		t.Fatalf("destructive command should be rejected without approval, got %#v", resp.Reply)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(data), `"policy_classification":"destructive"`) {
+		t.Fatalf("expected destructive command blocked by tool policy:\n%s", data)
 	}
 }
 
@@ -2409,7 +2455,7 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 		ToolCall: agentcore.ToolCall{
 			ID:   "call_1",
 			Name: "terminal.run",
-			Args: map[string]any{"command": "ls " + scriptsDir + " && echo ok"},
+			Args: map[string]any{"command": "rm -rf /tmp/mateway-blocked-test"},
 		},
 		Question: "确认执行？",
 	}
@@ -2450,8 +2496,8 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), "compound shell syntax is blocked") {
-		t.Fatalf("expected blocked compound command trace:\n%s", data)
+	if !contains(string(data), "destructive terminal command is blocked") || !contains(string(data), `"command":"rm -rf /tmp/mateway-blocked-test"`) {
+		t.Fatalf("expected blocked destructive trace:\n%s", data)
 	}
 	if !contains(string(data), `"command":"ls `+scriptsDir) {
 		t.Fatalf("expected simple retry command trace:\n%s", data)
@@ -2479,7 +2525,7 @@ func TestRuntimeContinuesAfterBlockedToolResultDuringAgentLoop(t *testing.T) {
 			ToolCalls: []agentcore.ToolCall{{
 				ID:   "call_1",
 				Name: "terminal.run",
-				Args: map[string]any{"command": "ls " + scriptsDir + " && echo ok"},
+				Args: map[string]any{"command": "rm -rf /tmp/mateway-blocked-test"},
 			}},
 		},
 		{Role: agentcore.RoleAssistant, Content: "复合 shell 被拦截，改用简单 ls。", ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "terminal.run", Args: map[string]any{"command": "ls " + scriptsDir}}}},
@@ -2506,8 +2552,8 @@ func TestRuntimeContinuesAfterBlockedToolResultDuringAgentLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(string(data), "compound shell syntax is blocked") {
-		t.Fatalf("expected blocked compound command trace:\n%s", data)
+	if !contains(string(data), "destructive terminal command is blocked") || !contains(string(data), `"command":"rm -rf /tmp/mateway-blocked-test"`) {
+		t.Fatalf("expected blocked destructive trace:\n%s", data)
 	}
 	if !contains(string(data), `"command":"ls `+scriptsDir) {
 		t.Fatalf("expected simple retry command trace:\n%s", data)
@@ -3400,7 +3446,7 @@ func (m *scriptedRuntimeModel) Next(_ context.Context, ctx agentcore.Context) (a
 func (m *retryAfterPendingToolFailureModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
 	if !m.used {
 		m.used = true
-		if !strings.Contains(fmt.Sprint(ctx.Messages), "compound shell syntax is blocked") {
+		if !strings.Contains(fmt.Sprint(ctx.Messages), "destructive terminal command is blocked") {
 			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "没有看到失败工具结果。"}, nil
 		}
 		return m.retry, nil

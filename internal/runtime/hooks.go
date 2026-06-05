@@ -825,24 +825,27 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 		}
 		catalog = i18n.New(i18n.Config{CatalogDir: input.Config.App.MessageCatalogDir})
 	}
-	if input.ToolCall.Name == "terminal.run" && tool.IsDangerousCommand(fmt.Sprint(input.ToolCall.Args["command"])) {
-		return ToolPolicyHookResult{
-			Block:      true,
-			Reason:     catalog.T(locale, "approval.confirm.reason", nil),
-			ResumeText: catalog.T(locale, "approval.confirm.resume_dangerous", nil),
-		}, nil
-	}
 	if input.ToolCall.Name == "terminal.run" {
 		decision := tool.CheckTerminalCommand(fmt.Sprint(input.ToolCall.Args["command"]), input.Config)
 		if decision.Allow {
 			switch decision.Class {
-			case "local_read_only", "read_only_pipeline", "project_internal":
+			case "local_read_only", "read_only_pipeline", "read_only_chain", "project_internal":
 				return ToolPolicyHookResult{}, nil
 			case "remote":
 				if !decision.RequireConfirm {
 					return ToolPolicyHookResult{}, nil
 				}
 			}
+		}
+		if decision.Class == "destructive" || decision.Class == "path_escape" {
+			return ToolPolicyHookResult{}, nil
+		}
+		if decision.Class == "guarded_mutation" || decision.Class == "unknown" || decision.Class == "network" {
+			return ToolPolicyHookResult{
+				Block:      true,
+				Reason:     decision.Reason,
+				ResumeText: catalog.T(locale, "approval.confirm.resume_tool", map[string]string{"tool": input.ToolCall.Name}),
+			}, nil
 		}
 	}
 	if input.ToolCall.Name == "script.run" {

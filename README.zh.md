@@ -160,6 +160,8 @@ Mateway 目前支持：
 - 持久化 runtime 记录中的 secret 脱敏
 - 多 agent profile 基础：`config.agents.profiles[]`、channel bindings、agent-specific skills 和 agent-scoped memory directories
 
+`terminal.run` 使用三档边界：只读检查和验证命令无需审核；写入类、未知类命令需要审核；`rm`、`shred`、`git reset`、`git clean` 或 pipe-to-shell 这类危险形态会直接拦截。
+
 ## 快速开始
 
 ### 构建
