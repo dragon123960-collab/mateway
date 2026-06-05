@@ -659,6 +659,43 @@ func TestRuntimeActionTaskReadOnlyEvidenceDoesNotComplete(t *testing.T) {
 	}
 }
 
+func TestRuntimeActionNoToolReplyInjectsForcedToolFollowUp(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	scriptDir := filepath.Join(workspace, "skills", "feishu-notify", "scripts")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scriptDir, "feishu.docs.create"), []byte("#!/bin/sh\n# mateway.name: feishu.docs.create\n# mateway.risk: guarded_mutation\necho ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{
+			{Completed: false, Reason: "only a plan", SuggestedFollowUp: "read the file and create the document"},
+			{Completed: false, Reason: "still no tool"},
+		}},
+	}, rt.Hooks.Providers...)
+	model := &captureSecondTurnModel{
+		first:  agentcore.Message{Role: agentcore.RoleAssistant, Content: "我先在本地看看有没有现成的飞书相关脚本或 skill。"},
+		second: agentcore.Message{Role: agentcore.RoleAssistant, Content: "还是没有执行。"},
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "/Users/dongping/.mateway/workspace/ai-magician-templates.md这个文档给我创一个飞书云文档"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed || resp.Reply.Style != "partial" {
+		t.Fatalf("expected no-progress partial after model still avoids tools, got %#v", resp)
+	}
+	for _, want := range []string{"MUST call an actual tool", "script.run", "feishu.docs.create", "--markdown-file"} {
+		if !strings.Contains(model.secondContext, want) {
+			t.Fatalf("expected forced follow-up to contain %q, got %s", want, model.secondContext)
+		}
+	}
+}
+
 func TestRuntimePureInformationalReplySkipsLLMReview(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
@@ -3511,6 +3548,13 @@ type retryAfterPendingToolFailureModel struct {
 	firstContext string
 }
 
+type captureSecondTurnModel struct {
+	first         agentcore.Message
+	second        agentcore.Message
+	calls         int
+	secondContext string
+}
+
 type blockingRuntimeModel struct{}
 
 type readRememberModel struct{}
@@ -3724,6 +3768,15 @@ func (m *retryAfterPendingToolFailureModel) Next(_ context.Context, ctx agentcor
 		return m.retry, nil
 	}
 	return m.done, nil
+}
+
+func (m *captureSecondTurnModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	m.calls++
+	if m.calls == 1 {
+		return m.first, nil
+	}
+	m.secondContext = fmt.Sprint(ctx.Messages)
+	return m.second, nil
 }
 
 func (blockingRuntimeModel) Next(ctx context.Context, _ agentcore.Context) (agentcore.Message, error) {

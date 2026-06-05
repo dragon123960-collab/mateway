@@ -1356,6 +1356,47 @@ func latestExecutionEvent(frame session.ExecutionFrame) session.ExecutionEvent {
 	return frame.Events[len(frame.Events)-1]
 }
 
+func forceToolExecutionFollowUp(task session.TaskNode, reviewFollowUp string, cfg *config.Root) string {
+	var b strings.Builder
+	b.WriteString("The previous assistant reply did not call any tool, so it made no executable progress on this action task.\n")
+	b.WriteString("In this next turn, you MUST call an actual tool. Do not answer with another plan or intention.\n")
+	if hint := availableActionToolHint(task.Goal, cfg); hint != "" {
+		b.WriteString(hint)
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(reviewFollowUp) != "" {
+		b.WriteString("Completion review says: ")
+		b.WriteString(strings.TrimSpace(reviewFollowUp))
+		b.WriteString("\n")
+	}
+	b.WriteString("If the tool cannot be called, state the concrete blocker and required user input instead of saying you will check later.")
+	return b.String()
+}
+
+func availableActionToolHint(goal string, cfg *config.Root) string {
+	lower := strings.ToLower(goal)
+	if !(strings.Contains(lower, "飞书") || strings.Contains(lower, "feishu") || strings.Contains(lower, "lark")) || !(strings.Contains(lower, "文档") || strings.Contains(lower, "document") || strings.Contains(lower, "doc")) {
+		return ""
+	}
+	if scriptAvailable(cfg, "feishu.docs.create") {
+		return "Available tool path: call script.run with name=feishu.docs.create and args=[\"--title\",\"<title>\",\"--markdown-file\",\"<absolute markdown path>\"]. For the current request, use the provided local markdown file path as --markdown-file."
+	}
+	return ""
+}
+
+func scriptAvailable(cfg *config.Root, name string) bool {
+	scripts, err := script.List(cfg)
+	if err != nil {
+		return false
+	}
+	for _, item := range scripts {
+		if item.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func looksLikeConcreteBlocker(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	if lower == "" {
@@ -1454,6 +1495,9 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				followUp := strings.TrimSpace(review.SuggestedFollowUp)
 				if followUp == "" {
 					followUp = "Continue now. Immediately execute the next required step with tools. If you cannot call a tool, state the concrete blocker and what user input or permission is needed. Do not only describe a plan."
+				}
+				if task.CompletionContract.RequiresMutation && len(turn.Message.ToolCalls) == 0 {
+					followUp = forceToolExecutionFollowUp(task, followUp, rt.Config)
 				}
 				followUps = append(followUps, agentcore.Message{Role: agentcore.RoleUser, Content: followUp})
 			} else {
