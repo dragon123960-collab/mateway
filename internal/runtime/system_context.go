@@ -113,6 +113,7 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	}
 	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
 	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
+	b.WriteString("- A message like \"I will check now\" or \"let me confirm\" is not a final answer. If you say you will check, confirm, create, update, or inspect something, call the required tool in the same turn.\n")
 	if prompt := strings.TrimSpace(systemPrompt); prompt != "" {
 		b.WriteString("\n")
 		b.WriteString(prompt)
@@ -120,8 +121,8 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	return strings.TrimSpace(b.String())
 }
 
-func appendRecentCompletedTaskContext(systemPrompt string, state session.State, currentTaskID string) string {
-	tasks := recentCompletedTasks(state, currentTaskID, 3)
+func appendPreviousTaskContext(systemPrompt string, state session.State, currentTaskID string) string {
+	tasks := recentPreviousTasks(state, currentTaskID, 3)
 	if len(tasks) == 0 {
 		return strings.TrimSpace(systemPrompt)
 	}
@@ -130,13 +131,16 @@ func appendRecentCompletedTaskContext(systemPrompt string, state session.State, 
 	if b.Len() > 0 {
 		b.WriteString("\n\n")
 	}
-	b.WriteString("Recent completed task context (weak reference only):\n")
-	b.WriteString("- These tasks are not active. Use them only when the new user message clearly refers back to them.\n")
-	b.WriteString("- Do not continue a completed task by default; start or continue the current task unless there is an explicit reference.\n")
+	b.WriteString("Continuity judgment:\n")
+	b.WriteString("- These are recent tasks from this session, not active instructions by themselves.\n")
+	b.WriteString("- Use them to decide whether the current user message is likely continuing prior work, especially when the message is short, has no clear standalone object, or appears to confirm a blocker from a prior task.\n")
+	b.WriteString("- If the current message is clearly a new task, ignore this context and work on the current task.\n")
+	b.WriteString("- If the user likely wants to continue a previous task, continue toward that previous task's original goal rather than treating the short message as the whole goal.\n")
 	for _, task := range tasks {
 		b.WriteString("- title: ")
 		b.WriteString(summarize(task.Goal))
-		b.WriteString("\n  status: completed")
+		b.WriteString("\n  status: ")
+		b.WriteString(defaultText(task.Status, "unknown"))
 		if strings.TrimSpace(task.Summary) != "" {
 			b.WriteString("\n  summary: ")
 			b.WriteString(summarize(task.Summary))
@@ -150,14 +154,14 @@ func appendRecentCompletedTaskContext(systemPrompt string, state session.State, 
 	return strings.TrimSpace(b.String())
 }
 
-func recentCompletedTasks(state session.State, currentTaskID string, limit int) []session.TaskNode {
+func recentPreviousTasks(state session.State, currentTaskID string, limit int) []session.TaskNode {
 	if limit <= 0 {
 		return nil
 	}
 	var out []session.TaskNode
 	for i := len(state.Tasks) - 1; i >= 0 && len(out) < limit; i-- {
 		task := state.Tasks[i]
-		if task.ID == currentTaskID || task.Status != "completed" {
+		if task.ID == currentTaskID {
 			continue
 		}
 		out = append(out, task)

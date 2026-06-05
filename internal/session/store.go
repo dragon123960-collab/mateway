@@ -308,6 +308,23 @@ func (s *State) CompleteActiveTaskWithSummary(summary, traceID, tracePath string
 	}
 }
 
+func (s *State) AwaitUserInputActiveTaskWithSummary(summary, traceID, tracePath string) {
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == s.ActiveTask {
+			s.Tasks[i].Status = "await_user_input"
+			s.Tasks[i].Summary = strings.TrimSpace(summary)
+			s.Tasks[i].TraceID = strings.TrimSpace(traceID)
+			s.Tasks[i].TracePath = strings.TrimSpace(tracePath)
+			now := time.Now()
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = executionStatusForTaskStatus("await_user_input")
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
 func (s *State) BlockActiveTask(kind string) {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {

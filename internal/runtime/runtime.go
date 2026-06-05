@@ -121,7 +121,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
-	systemPrompt = appendRecentCompletedTaskContext(systemPrompt, *state, task.ID)
+	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
 	agent.SystemPrompt = systemPrompt
 	agent.Messages = messages
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
@@ -174,11 +174,20 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	addUsage(&state.Usage, usage)
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
+	emptyActionPromise := looksLikeEmptyActionPromise(finalText)
 	if state.Pending == nil {
 		if result.StopReason != "" {
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
 			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
+		} else if looksLikeInputRequest(finalText) {
+			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
+			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
+		} else if emptyActionPromise {
+			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
+			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
@@ -242,7 +251,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	style := ""
-	failed := result.StopReason != ""
+	failed := result.StopReason != "" || emptyActionPromise
 	if failed && style == "" {
 		style = "partial"
 	}
@@ -882,6 +891,24 @@ func looksLikeInputRequest(text string) bool {
 	lower := strings.ToLower(trimmed)
 	return containsAny(lower, runtimeCueList(nil, "router.input_request.contains")) ||
 		containsAny(lower, runtimeCueList(nil, "router.input_request.question"))
+}
+
+func looksLikeEmptyActionPromise(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	if len([]rune(trimmed)) > 120 {
+		return false
+	}
+	if !strings.HasSuffix(trimmed, ":") && !strings.HasSuffix(trimmed, "：") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if containsAny(lower, []string{"i will", "i'll", "let me", "first", "then", "now i", "checking", "confirm"}) {
+		return true
+	}
+	return len([]rune(trimmed)) <= 40
 }
 
 func friendlyRuntimeError(cfg *config.Root, msg channel.InboundMessage, err error) string {

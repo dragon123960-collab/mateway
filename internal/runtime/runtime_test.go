@@ -396,6 +396,106 @@ func TestRuntimeFailedIterationLimitCanContinueActiveTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeInputRequestKeepsTaskActiveForUserContinuation(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "I need you to authorize Lark first. Please reply when authorization is complete."}, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "create a Lark document from /tmp/source.md")); err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 || state.ActiveTask != state.Tasks[0].ID || state.Tasks[0].Status != "await_user_input" {
+		t.Fatalf("expected input request to keep task active, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
+	}
+
+	model := &captureUserModel{text: "continuing"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "开通了")); err != nil {
+		t.Fatal(err)
+	}
+	state = loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 {
+		t.Fatalf("expected continuation to reuse original task, got %#v", state.Tasks)
+	}
+	if !strings.Contains(model.lastUser, "create a Lark document from /tmp/source.md") || !strings.Contains(model.lastUser, "开通了") {
+		t.Fatalf("expected user continuation to include original task and new input, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeEmptyActionPromiseDoesNotCompleteTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "好，我来把授权收尾确认："}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "开通了"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "partial" || !resp.Failed {
+		t.Fatalf("expected empty action promise to be partial, got resp=%#v", resp)
+	}
+	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 || state.ActiveTask != state.Tasks[0].ID || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected empty action promise to keep failed task active, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
+	}
+
+	model := &captureUserModel{text: "continuing"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "继续")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(model.lastUser, "开通了") || !strings.Contains(model.lastUser, "继续") {
+		t.Fatalf("expected continuation to steer into empty-promise task, got %q", model.lastUser)
+	}
+}
+
+func TestPreviousTaskContextSupportsContinuityJudgment(t *testing.T) {
+	state := session.State{Key: "cli:test"}
+	first := state.StartTask("create a Lark document from /tmp/source.md")
+	state.CompleteActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
+	second := state.StartTask("开通了")
+
+	prompt := appendPreviousTaskContext("Base prompt.", state, second.ID)
+	if !strings.Contains(prompt, "Continuity judgment:") {
+		t.Fatalf("expected previous task context, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "appears to confirm a blocker from a prior task") {
+		t.Fatalf("expected continuity guidance for blocker confirmation, got %q", prompt)
+	}
+	if !strings.Contains(prompt, first.Goal) || !strings.Contains(prompt, "Waiting for authorization.") {
+		t.Fatalf("expected previous task goal and summary, got %q", prompt)
+	}
+	if strings.Contains(prompt, second.Goal+"\n  status") {
+		t.Fatalf("current task should not be included as previous context, got %q", prompt)
+	}
+}
+
+func TestRuntimeNewTaskReceivesPreviousTaskContinuityContext(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	state.StartTask("create a Lark document from /tmp/source.md")
+	state.CompleteActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &capturePromptModel{text: "done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "ok")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(model.systemPrompt, "Continuity judgment:") {
+		t.Fatalf("expected continuity judgment in system prompt, got %q", model.systemPrompt)
+	}
+	if !strings.Contains(model.systemPrompt, "create a Lark document from /tmp/source.md") ||
+		!strings.Contains(model.systemPrompt, "Waiting for authorization.") {
+		t.Fatalf("expected previous task context in system prompt, got %q", model.systemPrompt)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "ok" {
+		t.Fatalf("expected soft continuation to create a new task, got %#v", updated.Tasks)
+	}
+}
+
 func TestCompactMessagesForStorageDropsSystemTruncatesToolAndKeepsRecent(t *testing.T) {
 	var messages []agentcore.Message
 	messages = append(messages, agentcore.Message{Role: agentcore.RoleSystem, Content: "system"})
@@ -470,6 +570,16 @@ func (m *captureUserModel) Next(_ context.Context, ctx agentcore.Context) (agent
 			break
 		}
 	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
+}
+
+type capturePromptModel struct {
+	text         string
+	systemPrompt string
+}
+
+func (m *capturePromptModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	m.systemPrompt = ctx.SystemPrompt
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
 }
 
