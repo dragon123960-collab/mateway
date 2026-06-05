@@ -232,8 +232,8 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(resp.Reply.Text, "wrote") {
-		t.Fatalf("expected write result, got %#v", resp.Reply)
+	if resp.Failed || resp.Reply.Style == "partial" {
+		t.Fatalf("expected continuation after confirmed write, got %#v", resp)
 	}
 	data, err := os.ReadFile(target)
 	if err != nil {
@@ -241,6 +241,13 @@ func TestRuntimeConfirmationFollowupExecutesPendingTool(t *testing.T) {
 	}
 	if string(data) != "hi" {
 		t.Fatalf("written content = %q", string(data))
+	}
+	traceData, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(traceData), `"type":"pending_tool_success_continue"`) {
+		t.Fatalf("expected confirmed tool success continuation trace:\n%s", traceData)
 	}
 }
 
@@ -481,6 +488,53 @@ func TestRuntimeConfirmationResumesOriginalTask(t *testing.T) {
 	}
 	if resp.Reply.Text != "原任务已继续完成" {
 		t.Fatalf("expected resumed task summary, got %#v", resp.Reply)
+	}
+}
+
+func TestRuntimeConfirmedToolSuccessDoesNotAskUserToContinue(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home},
+		Security: config.SecurityConfig{RequireApprovalForRiskyTool: false},
+		Agents:   config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
+	}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: false, Reason: "still incomplete", SuggestedFollowUp: "continue with tools"}}},
+	}, rt.Hooks.Providers...)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("/Users/dongping/.mateway/workspace/ai-magician-templates.md这个文档给我创一个飞书云文档")
+	state.Pending = &session.PendingAction{
+		Kind:   "confirm_tool",
+		TaskID: task.ID,
+		ToolCall: agentcore.ToolCall{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "echo feishu-notify"},
+		},
+		Question: "确认执行？",
+	}
+	state.BlockActiveTask("await_confirm")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "**已完成：**\n确认了 feishu-notify。\n\n**仍需完成：**\n尚未真正创建飞书云文档。\n\n**建议下一步：** 直接告诉我\"继续\"。"},
+		{Role: agentcore.RoleAssistant, Content: "仍未创建。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed || resp.Reply.Style != "partial" {
+		t.Fatalf("expected unfinished task to stay partial, got %#v", resp)
+	}
+	updated, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Tasks) != 1 || updated.Tasks[0].Status == "completed" {
+		t.Fatalf("task should not be completed after asking user to continue, got %#v", updated.Tasks)
 	}
 }
 
@@ -3799,7 +3853,7 @@ func (m *confirmResumeModel) Next(_ context.Context, ctx agentcore.Context) (age
 		}
 	}
 	for _, msg := range ctx.Messages {
-		if strings.TrimSpace(msg.Content) == "ok" {
+		if strings.TrimSpace(msg.Content) == "ok" || strings.HasPrefix(strings.TrimSpace(msg.Content), "wrote ") {
 			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "原任务已继续完成"}, nil
 		}
 	}

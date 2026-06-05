@@ -1890,13 +1890,15 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 				return rt.reply(msg, state.Pending.Question, "schedule_review_pending"), true, nil
 			}
 		}
-		replyText := rt.summarizeConfirmedToolResult(ctx, msg, *task, call, result, trace)
-		state.CompleteActiveTaskWithSummary(summarize(replyText), trace.id, trace.path)
-		state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed_after_confirmed_tool", Status: "completed", Tool: call.Name, Summary: summarize(replyText)})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return rt.reply(msg, replyText, "completed"), true, nil
+		continueText := confirmedToolSuccessContinueText(task.Goal, call)
+		_ = trace.write(map[string]any{
+			"type":          "pending_tool_success_continue",
+			"task_id":       task.ID,
+			"tool_call":     call,
+			"continue_text": continueText,
+		})
+		resp, err := rt.runTask(ctx, msg, state, task, continueText, trace)
+		return resp, true, err
 	case "memory_proposal_review":
 		control, hasControl := rt.pendingControl(msg, text)
 		if hasControl {
@@ -2187,38 +2189,6 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		state.Pending = nil
 		return Response{}, false, nil
 	}
-}
-
-func (rt Runtime) summarizeConfirmedToolResult(ctx context.Context, msg channel.InboundMessage, task session.TaskNode, call agentcore.ToolCall, result agentcore.ToolResult, trace *traceRecorder) string {
-	agent := rt.Pool.AgentForMessage(msg)
-	if agent == nil {
-		agent = agentcore.NewAgent(rt.Model, rt.Tools)
-	}
-	if agent.Model == nil {
-		return result.Content
-	}
-	modelCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	summary, err := agent.Model.Next(modelCtx, agentcore.Context{
-		SystemPrompt: "Summarize a confirmed tool execution for the original task. Do not call tools. Return a concise user-facing task-level update.",
-		Messages: []agentcore.Message{{
-			Role: agentcore.RoleUser,
-			Content: "Original task:\n" + task.Goal +
-				"\n\nConfirmed tool:\n" + call.Name +
-				"\n\nTool output:\n" + result.Content +
-				"\n\nExplain what was completed and what remains, if anything.",
-		}},
-		Tools: nil,
-	})
-	if err != nil {
-		_ = trace.write(map[string]any{"type": "pending_confirm_summary_error", "error": err.Error()})
-		return result.Content
-	}
-	text := strings.TrimSpace(summary.Content)
-	if text == "" {
-		return result.Content
-	}
-	return text
 }
 
 func confirmedToolSuccessContinueText(goal string, call agentcore.ToolCall) string {
