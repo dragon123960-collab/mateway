@@ -1604,9 +1604,9 @@ func renderToolApprovalQuestion(locale string, call agentcore.ToolCall, class, r
 		}
 	}
 	if strings.HasPrefix(locale, "zh") {
-		return strings.TrimSpace(fmt.Sprintf("继续之前需要确认。\n\n工具：%s\n风险：%s\n将执行：%s\n原因：%s\n\n回复“确认”或 confirm 继续；回复“取消”或 cancel 放弃。", call.Name, firstNonEmpty(class, "guarded_mutation"), action, reason))
+		return strings.TrimSpace(fmt.Sprintf("继续之前需要确认。\n\n工具：%s\n风险：%s\n将执行：%s\n原因：%s\n\n如果这是常用 CLI 或连接器流程，跑通后建议沉淀为 skill script，用 script.run 规范执行并留下稳定证据。\n\n回复“确认”或 confirm 继续；回复“取消”或 cancel 放弃。", call.Name, firstNonEmpty(class, "guarded_mutation"), action, reason))
 	}
-	return strings.TrimSpace(fmt.Sprintf("Confirmation is required before continuing.\n\nTool: %s\nRisk: %s\nAction: %s\nReason: %s\n\nReply \"confirm\" to continue, or \"cancel\" to stop.", call.Name, firstNonEmpty(class, "guarded_mutation"), action, reason))
+	return strings.TrimSpace(fmt.Sprintf("Confirmation is required before continuing.\n\nTool: %s\nRisk: %s\nAction: %s\nReason: %s\n\nIf this is a recurring CLI or connector workflow, consider turning the verified flow into a skill script and running it through script.run for stable evidence.\n\nReply \"confirm\" to continue, or \"cancel\" to stop.", call.Name, firstNonEmpty(class, "guarded_mutation"), action, reason))
 }
 
 func toolApprovalActionSummary(call agentcore.ToolCall) string {

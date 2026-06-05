@@ -451,7 +451,7 @@ func TestRuntimeApprovalPendingShowsConcreteToolCall(t *testing.T) {
 	if resp.Reply.Style != "approval_pending" {
 		t.Fatalf("expected approval pending response, got %#v", resp.Reply)
 	}
-	for _, want := range []string{"工具：terminal.run", "风险：terminal_guarded", "command: touch", "回复“确认”或 confirm", "回复“取消”或 cancel"} {
+	for _, want := range []string{"工具：terminal.run", "风险：terminal_guarded", "command: touch", "沉淀为 skill script", "script.run", "回复“确认”或 confirm", "回复“取消”或 cancel"} {
 		if !contains(resp.Reply.Text, want) {
 			t.Fatalf("expected approval text to contain %q, got %q", want, resp.Reply.Text)
 		}
