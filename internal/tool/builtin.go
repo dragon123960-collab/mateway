@@ -1298,5 +1298,5 @@ func isLikelyBinary(data []byte) bool {
 			return true
 		}
 	}
-	return !utf8.Valid(sample)
+	return !utf8.Valid(data)
 }

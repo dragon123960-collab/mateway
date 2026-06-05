@@ -1457,13 +1457,15 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 			if task == nil {
 				task = state.EnsureTask("confirmed tool result")
 			}
+			continueText := pendingToolFailureContinueText(task.Goal, call, result)
 			_ = trace.write(map[string]any{
-				"type":      "pending_tool_failed_continue",
-				"task_id":   task.ID,
-				"tool_call": call,
-				"reason":    result.Content,
+				"type":          "pending_tool_failed_continue",
+				"task_id":       task.ID,
+				"tool_call":     call,
+				"reason":        result.Content,
+				"continue_text": continueText,
 			})
-			resp, err := rt.runTask(ctx, msg, state, task, "", trace)
+			resp, err := rt.runTask(ctx, msg, state, task, continueText, trace)
 			return resp, true, err
 		}
 		task := state.ActivateTask(taskID)
@@ -1816,6 +1818,25 @@ func (rt Runtime) summarizeConfirmedToolResult(ctx context.Context, msg channel.
 		return result.Content
 	}
 	return text
+}
+
+func pendingToolFailureContinueText(goal string, call agentcore.ToolCall, result agentcore.ToolResult) string {
+	var b strings.Builder
+	b.WriteString("The previously confirmed tool call failed. Continue the original task without asking for the same confirmation again. Use a simpler allowed command or another available tool if needed.")
+	b.WriteString("\n\nFailed tool: ")
+	b.WriteString(call.Name)
+	if command := strings.TrimSpace(fmt.Sprint(call.Args["command"])); command != "" && command != "<nil>" {
+		b.WriteString("\nCommand: ")
+		b.WriteString(command)
+	} else if len(call.Args) > 0 {
+		b.WriteString("\nArgs: ")
+		b.WriteString(compactApprovalValue(call.Args))
+	}
+	if reason := strings.TrimSpace(result.Content); reason != "" {
+		b.WriteString("\nFailure: ")
+		b.WriteString(reason)
+	}
+	return mergeTaskAndInstruction(goal, b.String())
 }
 
 func (rt Runtime) parseMemoryProposalReviewAction(msg channel.InboundMessage, text string) (string, bool) {

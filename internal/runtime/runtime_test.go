@@ -2463,7 +2463,7 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	if err := rt.Store.Save(state); err != nil {
 		t.Fatal(err)
 	}
-	rt.Pool.agents["main"] = agentcore.NewAgent(&retryAfterPendingToolFailureModel{retry: agentcore.Message{
+	retryModel := &retryAfterPendingToolFailureModel{retry: agentcore.Message{
 		Role:    agentcore.RoleAssistant,
 		Content: "复合 shell 被拦截，改用简单 ls。",
 		ToolCalls: []agentcore.ToolCall{{
@@ -2474,7 +2474,8 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	}, done: agentcore.Message{
 		Role:    agentcore.RoleAssistant,
 		Content: "已改用简单命令继续检查。",
-	}}, rt.Tools)
+	}}
+	rt.Pool.agents["main"] = agentcore.NewAgent(retryModel, rt.Tools)
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "确认"})
 	if err != nil {
 		t.Fatal(err)
@@ -2498,6 +2499,11 @@ func TestRuntimeContinuesAfterConfirmedToolPolicyFailure(t *testing.T) {
 	}
 	if !contains(string(data), "destructive terminal command is blocked") || !contains(string(data), `"command":"rm -rf /tmp/mateway-blocked-test"`) {
 		t.Fatalf("expected blocked destructive trace:\n%s", data)
+	}
+	for _, want := range []string{"Continue the existing task:", "Original task: 检查生图脚本", "Failed tool: terminal.run", "Command: rm -rf /tmp/mateway-blocked-test", "Failure: destructive terminal command is blocked"} {
+		if !contains(retryModel.firstContext, want) {
+			t.Fatalf("expected retry context to contain %q, got %s", want, retryModel.firstContext)
+		}
 	}
 	if !contains(string(data), `"command":"ls `+scriptsDir) {
 		t.Fatalf("expected simple retry command trace:\n%s", data)
@@ -3235,9 +3241,10 @@ type scriptedRuntimeModel struct {
 }
 
 type retryAfterPendingToolFailureModel struct {
-	retry agentcore.Message
-	done  agentcore.Message
-	used  bool
+	retry        agentcore.Message
+	done         agentcore.Message
+	used         bool
+	firstContext string
 }
 
 type blockingRuntimeModel struct{}
@@ -3446,6 +3453,7 @@ func (m *scriptedRuntimeModel) Next(_ context.Context, ctx agentcore.Context) (a
 func (m *retryAfterPendingToolFailureModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
 	if !m.used {
 		m.used = true
+		m.firstContext = fmt.Sprint(ctx.Messages)
 		if !strings.Contains(fmt.Sprint(ctx.Messages), "destructive terminal command is blocked") {
 			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "没有看到失败工具结果。"}, nil
 		}

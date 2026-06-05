@@ -544,6 +544,20 @@ func TestFileReadRejectsLargeFile(t *testing.T) {
 	}
 }
 
+func TestFileReadAllowsUTF8MarkdownAcrossSampleBoundary(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "utf8.md")
+	content := strings.Repeat("a", 4095) + "魔法师\n\n中文 Markdown 内容"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if result.IsError || !strings.Contains(result.Content, "中文 Markdown 内容") {
+		t.Fatalf("expected utf-8 markdown content, got %#v", result)
+	}
+}
+
 func TestFileReadRejectsBinaryFile(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, "binary.bin")
