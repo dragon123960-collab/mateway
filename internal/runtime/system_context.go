@@ -120,6 +120,54 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	return strings.TrimSpace(b.String())
 }
 
+func appendRecentCompletedTaskContext(systemPrompt string, state session.State, currentTaskID string) string {
+	tasks := recentCompletedTasks(state, currentTaskID, 3)
+	if len(tasks) == 0 {
+		return strings.TrimSpace(systemPrompt)
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(systemPrompt))
+	if b.Len() > 0 {
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Recent completed task context (weak reference only):\n")
+	b.WriteString("- These tasks are not active. Use them only when the new user message clearly refers back to them.\n")
+	b.WriteString("- Do not continue a completed task by default; start or continue the current task unless there is an explicit reference.\n")
+	for _, task := range tasks {
+		b.WriteString("- title: ")
+		b.WriteString(summarize(task.Goal))
+		b.WriteString("\n  status: completed")
+		if strings.TrimSpace(task.Summary) != "" {
+			b.WriteString("\n  summary: ")
+			b.WriteString(summarize(task.Summary))
+		}
+		if strings.TrimSpace(task.TraceID) != "" {
+			b.WriteString("\n  trace_id: ")
+			b.WriteString(strings.TrimSpace(task.TraceID))
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func recentCompletedTasks(state session.State, currentTaskID string, limit int) []session.TaskNode {
+	if limit <= 0 {
+		return nil
+	}
+	var out []session.TaskNode
+	for i := len(state.Tasks) - 1; i >= 0 && len(out) < limit; i-- {
+		task := state.Tasks[i]
+		if task.ID == currentTaskID || task.Status != "completed" {
+			continue
+		}
+		out = append(out, task)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
 func splitMergedTaskInstruction(text string) (string, string, bool) {
 	const prefix = "Continue the existing task:\nOriginal task: "
 	if !strings.HasPrefix(text, prefix) {

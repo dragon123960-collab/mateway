@@ -884,6 +884,42 @@ func TestRuntimeStartsNewTaskAfterCompletedTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeInjectsCompletedTaskAsWeakContextForNewTask(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	state := session.State{Key: "cli:test"}
+	done := state.StartTask("创建飞书云文档")
+	done.Status = "completed"
+	done.Summary = "已创建飞书云文档并返回链接。"
+	done.TraceID = "trace-done"
+	state.ActiveTask = ""
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "context captured"}}},
+	}, rt.Hooks.Providers...)
+	model := &newTaskCaptureRuntimeContextModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	_, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "2", Channel: "cli", SessionKey: "cli:test", Text: "完全不同的新请求"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Tasks) != 2 {
+		t.Fatalf("expected new task plus completed context task, got %#v", updated.Tasks)
+	}
+	for _, want := range []string{"Recent completed task context", "weak reference only", "创建飞书云文档", "已创建飞书云文档并返回链接", "trace-done"} {
+		if !contains(model.systemPrompt, want) {
+			t.Fatalf("expected system prompt to contain %q, got %s", want, model.systemPrompt)
+		}
+	}
+}
+
 func TestRuntimeExplicitNewTaskCueUsesModelFollowup(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir()}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -3736,6 +3772,10 @@ type captureRuntimeContextModel struct {
 	systemPrompt   string
 }
 
+type newTaskCaptureRuntimeContextModel struct {
+	systemPrompt string
+}
+
 func contains(text, want string) bool {
 	return strings.Contains(text, want)
 }
@@ -3774,6 +3814,17 @@ func (newTaskFollowupModel) Next(_ context.Context, ctx agentcore.Context) (agen
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: lastUserContent(ctx.Messages)}, nil
+}
+
+func (m *newTaskCaptureRuntimeContextModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "route user messages") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"kind":"new_task","reason":"test semantic new task"}`}, nil
+	}
+	if strings.Contains(ctx.SystemPrompt, "review whether an agent task is actually complete") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"completed":true,"reason":"test complete","missing_items":[],"suggested_followup":""}`}, nil
+	}
+	m.systemPrompt = ctx.SystemPrompt
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "captured context"}, nil
 }
 
 func (pendingIntentActionAckModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {

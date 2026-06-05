@@ -171,7 +171,9 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	}
 	profile := rt.Pool.ProfileForMessage(msg)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	agent.SystemPrompt = prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
+	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
+	systemPrompt = appendRecentCompletedTaskContext(systemPrompt, *state, task.ID)
+	agent.SystemPrompt = systemPrompt
 	agent.Messages = messages
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	agent.MaxIterations = maxIterations(rt.Config)
