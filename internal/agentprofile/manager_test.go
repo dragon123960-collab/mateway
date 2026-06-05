@@ -39,6 +39,14 @@ func TestManagerCreateReportBindUnbind(t *testing.T) {
 			t.Fatalf("missing %s: %v", name, err)
 		}
 	}
+	memoryData, err := os.ReadFile(filepath.Join(workspace, "memory", "agents", "opsbot", "memory.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryText := string(memoryData)
+	if !strings.HasPrefix(memoryText, "---\n") || !strings.Contains(memoryText, "owner_agent: opsbot") {
+		t.Fatalf("memory entry missing frontmatter:\n%s", memoryText)
+	}
 	assertAgentFileContains(t, filepath.Join(workspace, "agents", "opsbot", "agent.md"), "Ops Bot", "agent \"opsbot\"", "## Operating Rules")
 	assertAgentFileContains(t, filepath.Join(workspace, "agents", "opsbot", "soul.md"), "You are Ops Bot", "## Principles", "## Boundaries")
 	assertAgentFileContains(t, filepath.Join(workspace, "agents", "opsbot", "user.md"), "No stable user preferences recorded yet.", "agent \"opsbot\"", "## Do Not Assume")

@@ -178,7 +178,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	reviewModel := rt.Pool.RoleModelForMessage(msg, "review", agent.Model)
 	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
 	defer stopActivityWatch()
-	agentHooks, runtimeStopReason := rt.hooksForState(state, task.ID, userText, runtimeLocale(rt.Config, msg), reviewModel, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+	agentHooks, runtimeStopReason, latestCompletionReview := rt.hooksForState(state, task.ID, userText, runtimeLocale(rt.Config, msg), reviewModel, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
@@ -250,11 +250,11 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
 			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
-		} else if looksLikeInputRequest(finalText) {
+		} else if !completionReviewAllowsFinalAnswer(activeTaskSnapshot(state, task.ID), latestCompletionReview()) && looksLikeInputRequest(finalText) {
 			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: finalText}
 			state.BlockActiveTask("await_user_input")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "awaiting_user_input", Summary: summarize(finalText)})
-		} else if warning := finalTextWarning(finalText); warning != "" {
+		} else if warning := finalTextWarning(finalText); warning != "" && !completionReviewAllowsFinalAnswer(activeTaskSnapshot(state, task.ID), latestCompletionReview()) {
 			blockedByFinalWarning = true
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "blocked", Status: "failed", Summary: warning, Evidence: map[string]any{"text": finalText}})
@@ -1137,6 +1137,24 @@ func hasAcceptedMutationStep(task session.TaskNode) bool {
 	return false
 }
 
+func completionReviewAllowsFinalAnswer(task session.TaskNode, review CompletionReviewResult) bool {
+	return review.Completed && hasAcceptedEvidenceStep(task)
+}
+
+func hasAcceptedEvidenceStep(task session.TaskNode) bool {
+	for _, step := range task.Steps {
+		if step.Accepted || step.Status == "accepted" {
+			return true
+		}
+	}
+	for _, event := range task.Execution.Events {
+		if event.Status == "accepted" {
+			return true
+		}
+	}
+	return false
+}
+
 func latestExecutionEvent(frame session.ExecutionFrame) session.ExecutionEvent {
 	if len(frame.Events) == 0 {
 		return session.ExecutionEvent{}
@@ -1157,7 +1175,7 @@ func looksLikeConcreteBlocker(text string) bool {
 	return false
 }
 
-func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) (agentcore.Hooks, func() string) {
+func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) (agentcore.Hooks, func() string, func() CompletionReviewResult) {
 	steeringSent := false
 	var followUps []agentcore.Message
 	noProgressTurns := 0
@@ -1166,8 +1184,12 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 	lastFailureSignature := ""
 	repeatedToolFailures := 0
 	stopReason := ""
+	var lastCompletionReview CompletionReviewResult
 	runtimeStopReason := func() string {
 		return stopReason
+	}
+	latestCompletionReview := func() CompletionReviewResult {
+		return lastCompletionReview
 	}
 	hooks := agentcore.Hooks{
 		Emit: trace.emit,
@@ -1190,6 +1212,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 				TranscriptMessages: turn.Messages,
 				Model:              model,
 			}, trace)
+			lastCompletionReview = review
 			_ = trace.write(map[string]any{
 				"type":               "completion_review",
 				"task_id":            taskID,
@@ -1334,7 +1357,7 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale s
 			return agentcore.AfterToolCallResult{}, nil
 		},
 	}
-	return hooks, runtimeStopReason
+	return hooks, runtimeStopReason, latestCompletionReview
 }
 
 func toolFailureSignature(call agentcore.ToolCall) string {

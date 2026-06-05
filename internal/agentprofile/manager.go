@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dongping/mateway/internal/agenttemplate"
 	"github.com/dongping/mateway/internal/config"
@@ -262,9 +263,43 @@ func ensureAgentFiles(workspace string, profile config.AgentProfileConfig) error
 	index := filepath.Join(memDir, "memory.md")
 	_, err := os.Stat(index)
 	if os.IsNotExist(err) {
-		return os.WriteFile(index, []byte("# "+profile.Name+" Memory\n\nLong-term memory index for this agent.\n"), 0o644)
+		return os.WriteFile(index, []byte(memoryEntryTemplate(profile)), 0o644)
 	}
 	return err
+}
+
+func memoryEntryTemplate(profile config.AgentProfileConfig) string {
+	id := strings.TrimSpace(profile.ID)
+	if id == "" {
+		id = "agent"
+	}
+	name := strings.TrimSpace(profile.Name)
+	if name == "" {
+		name = id
+	}
+	now := time.Now().UTC().Format("2006-01-02")
+	return fmt.Sprintf(`---
+type: wiki
+scope: agent
+owner_agent: %s
+project_id:
+visibility: private
+status: proposed
+tags: []
+aliases: []
+op_fingerprint:
+sources: []
+confidence: low
+created_at: %s
+updated_at: %s
+review_after:
+schema_version: 1
+---
+
+# %s Memory
+
+Long-term memory index for this agent.
+`, id, now, now, name)
 }
 
 func statFile(path string) FileStatus {

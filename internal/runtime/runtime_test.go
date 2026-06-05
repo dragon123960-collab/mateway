@@ -554,6 +554,40 @@ func TestRuntimeNeedMeQuestionWaitsForFollowup(t *testing.T) {
 	}
 }
 
+func TestRuntimeCompletedEvidenceAnswerDoesNotBecomeUserInputPending(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "README.md")
+	if err := os.WriteFile(target, []byte("# Mateway\n\nCurrent goal: small runtime.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Hooks.Providers = append([]HookProvider{
+		&testCompletionReviewProvider{results: []CompletionReviewResult{{Completed: true, Reason: "read and summarized"}}},
+	}, rt.Hooks.Providers...)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&scriptedRuntimeModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": target}}}},
+		{Role: agentcore.RoleAssistant, Content: "已总结项目当前目标。下一阶段包括运行更多检查和执行发布流程。需要验证任一点，告诉我读哪个文件。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "读取 README 并总结项目当前目标"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == "partial" || resp.Failed {
+		t.Fatalf("expected completed reply, got %#v", resp)
+	}
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending != nil {
+		t.Fatalf("expected no pending input, got %#v", state.Pending)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected completed task, got %#v", state.Tasks)
+	}
+}
+
 func TestRuntimeStandaloneTaskBypassesStaleUserInputPending(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
