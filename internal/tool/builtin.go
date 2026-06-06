@@ -337,17 +337,17 @@ func countDirectoryEntries(root string) (int, error) {
 }
 
 func (ProjectIndexTool) Name() string        { return "project.index" }
-func (ProjectIndexTool) Description() string { return "list files under a project directory" }
+func (ProjectIndexTool) Description() string { return "list files and directories under a path (non-recursive)" }
 func (ProjectIndexTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"path"}}
 }
 func (ProjectIndexTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Use before reading a project when you need an overview of files and directories.",
+		WhenToUse:            "Use before reading a project when you need an overview of the directory structure. Call with a specific subdirectory path to explore deeper levels.",
 		WhenNotToUse:         "Do not use as a replacement for reading a specific file whose path is already known.",
-		OutputContract:       "Return newline-delimited relative file paths, capped to the tool limit.",
-		Evidence:             "Return scanned root path and file count.",
-		Acceptance:           "Accepted when the directory scan succeeds and returns file count evidence.",
+		OutputContract:       "Return directory entries with DIR: and FILE: prefixes, sorted with directories first.",
+		Evidence:             "Return scanned root path and entry count.",
+		Acceptance:           "Accepted when the directory scan succeeds and returns entry count evidence.",
 		SoftFailureSignals:   []string{"path is not a directory", "permission denied", "outside allowed roots"},
 		ParallelMode:         "read_only_ok",
 		ReusePolicy:          "stable_read",
@@ -360,27 +360,25 @@ func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
 	}
-	limit := 120
-	var files []string
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || len(files) >= limit {
-			return err
-		}
-		name := d.Name()
-		if d.IsDir() && (name == ".git" || name == "node_modules" || name == "dist" || name == "build") {
-			return filepath.SkipDir
-		}
-		if !d.IsDir() {
-			rel, _ := filepath.Rel(root, path)
-			files = append(files, rel)
-		}
-		return nil
-	})
+	entries, err := os.ReadDir(root)
 	if err != nil {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": root}}
 	}
-	sort.Strings(files)
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(files, "\n"), Evidence: map[string]any{"path": root, "count": len(files)}}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir() != entries[j].IsDir() {
+			return entries[i].IsDir()
+		}
+		return entries[i].Name() < entries[j].Name()
+	})
+	var lines []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			lines = append(lines, "DIR:  "+entry.Name()+"/")
+		} else {
+			lines = append(lines, "FILE: "+entry.Name())
+		}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"path": root, "entries": len(entries)}}
 }
 
 type TerminalRunTool struct{ Config *config.Root }
@@ -468,7 +466,12 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		cmd.Dir = workdir
 	}
 	output, err := cmd.CombinedOutput()
-	result := strings.TrimSpace(string(output))
+	const maxTerminalOutput = 512 * 1024
+	raw := string(output)
+	if len(raw) > maxTerminalOutput {
+		raw = raw[:maxTerminalOutput] + "\n... (output truncated at 512KB)"
+	}
+	result := strings.TrimSpace(raw)
 	if err != nil {
 		if result == "" {
 			result = err.Error()
