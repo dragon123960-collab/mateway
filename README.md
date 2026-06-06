@@ -135,11 +135,12 @@ Mateway currently supports:
 - native Weixin iLink Bot channel: `mateway weixin login`, `mateway weixin enable`
 - channel discovery from runtime channel config files: `mateway channel list`
 - real runtime tests: `mateway test`
+- local diagnostics: `mateway doctor`
 - trace review: `mateway trace`
 - session inspect/archive commands: `mateway session list`, `mateway session show`, `mateway session archive list/show`
 - task tree with active-task steering
 - direct tool execution by default, with destructive terminal commands blocked
-- built-in tools: `file.read`, `file.write`, `project.index`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, schedule management tools, and `task.search` / `task.resume`
+- built-in tools: `file.read`, `file.write`, `file.delete`, `project.index`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, schedule management tools, and `task.search` / `task.resume`
 - native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
 - parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
 - local secret store: `mateway secret set/get/list/delete`

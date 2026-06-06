@@ -69,6 +69,13 @@ func TestInstallFromLocalSkillFile(t *testing.T) {
 	if !strings.Contains(string(data), "Demo") {
 		t.Fatalf("unexpected installed data: %s", data)
 	}
+	metadata, ok, err := ReadMetadata(filepath.Join(workspace, "skills", "demo-skill"))
+	if err != nil || !ok {
+		t.Fatalf("expected metadata, ok=%v err=%v", ok, err)
+	}
+	if metadata.ToolRuntime != "mateway" || !strings.Contains(metadata.Source, "SKILL.md") {
+		t.Fatalf("metadata = %#v", metadata)
+	}
 	if _, err := Install(InstallInput{Workspace: workspace, Source: source}); err == nil {
 		t.Fatal("expected duplicate install error")
 	}

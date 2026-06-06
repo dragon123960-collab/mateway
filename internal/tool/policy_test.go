@@ -595,6 +595,134 @@ func TestFileWriteAllowsAgentSkillProfilePath(t *testing.T) {
 	}
 }
 
+func TestFileDeleteDeletesFileInsideAllowedRoot(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "tmp", "smoke.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("smoke"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileDeleteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.delete",
+		Args: map[string]any{"path": target},
+	})
+	if result.IsError || result.Evidence["kind"] != "file" || result.Evidence["deleted"] != true {
+		t.Fatalf("expected file delete, got %#v", result)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected target deleted, err=%v", err)
+	}
+}
+
+func TestFileDeleteDeletesDirectoryOnlyWithRecursive(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "tmp", "smoke-dir")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	tool := FileDeleteTool{Config: cfg}
+	blocked := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_1", Name: "file.delete", Args: map[string]any{"path": target}})
+	if !blocked.IsError || !strings.Contains(blocked.Content, "recursive=true") {
+		t.Fatalf("expected recursive requirement, got %#v", blocked)
+	}
+	allowed := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_2", Name: "file.delete", Args: map[string]any{"path": target, "recursive": true}})
+	if allowed.IsError || allowed.Evidence["kind"] != "directory" || allowed.Evidence["entries"] != 1 {
+		t.Fatalf("expected directory delete, got %#v", allowed)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected directory deleted, err=%v", err)
+	}
+}
+
+func TestFileDeleteRejectsPathTraversalOutsideAllowedRoot(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileDeleteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.delete",
+		Args: map[string]any{"path": filepath.Join("..", "outside.txt")},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "outside allowed roots") {
+		t.Fatalf("expected traversal rejection, got %#v", result)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside file should remain, err=%v", err)
+	}
+}
+
+func TestFileDeleteRejectsAllowedRootAndProtectedStores(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	tool := FileDeleteTool{Config: cfg}
+	rootResult := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_1", Name: "file.delete", Args: map[string]any{"path": home, "recursive": true}})
+	if !rootResult.IsError || !strings.Contains(rootResult.Content, "allowed root") {
+		t.Fatalf("expected root delete rejection, got %#v", rootResult)
+	}
+	for _, rel := range []string{"config/config.yaml", "secrets/secrets.json", "trace/t.jsonl", "sessions/s.json"} {
+		target := filepath.Join(home, rel)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("state"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		result := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_2", Name: "file.delete", Args: map[string]any{"path": target}})
+		if !result.IsError || !strings.Contains(result.Content, "protected path") {
+			t.Fatalf("expected protected path rejection for %s, got %#v", rel, result)
+		}
+	}
+}
+
+func TestFileDeleteRejectsSymlinkToOutsideAllowedRoot(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(home, "tmp", "outside-link")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileDeleteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.delete",
+		Args: map[string]any{"path": link},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "outside allowed roots") {
+		t.Fatalf("expected symlink outside rejection, got %#v", result)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("symlink should remain, err=%v", err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside target should remain, err=%v", err)
+	}
+}
+
 func TestScheduleCreateToolWritesTask(t *testing.T) {
 	home := t.TempDir()
 	runAt := "2026-05-29T16:30:00+08:00"

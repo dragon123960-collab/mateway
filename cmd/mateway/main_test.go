@@ -608,6 +608,55 @@ func TestSandboxAndWorkspaceReports(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsConfigToolsAndSkills(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
+	for _, want := range []string{"OK\tconfig_load", "OK\ttools", "OK\tskills", "summary\t"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "script.run") {
+		t.Fatalf("doctor should not report stale script tooling for fresh init:\n%s", out)
+	}
+}
+
+func TestDoctorWarnsOnStaleSkillGuidance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "skills", "stale", "SKILL.md")
+	writeMainTestFile(t, path, "---\nname: stale\n---\n# Stale\n\nUse script.run for this task.\n")
+	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
+	if !strings.Contains(out, "WARN\tskill.stale_tooling") || !strings.Contains(out, path) {
+		t.Fatalf("doctor did not warn about stale skill:\n%s", out)
+	}
+}
+
+func TestDoctorAllowsExternalSkillWithMatewayMetadata(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "skills", "external", "SKILL.md")
+	writeMainTestFile(t, path, "---\nname: external\nallowed-tools: Bash(external:*)\n---\n# External\n")
+	writeMainTestFile(t, filepath.Join(home, "workspace", "skills", "external", ".mateway", "metadata.yaml"), "adapter_version: \"1\"\ntool_runtime: mateway\nsource: external\n")
+	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
+	if strings.Contains(out, "WARN\tskill.external_metadata_missing") {
+		t.Fatalf("doctor should accept external metadata:\n%s", out)
+	}
+	if !strings.Contains(out, "OK\tskill.metadata") {
+		t.Fatalf("doctor should report metadata:\n%s", out)
+	}
+}
+
 func TestAgentCommandsCreateBindReport(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

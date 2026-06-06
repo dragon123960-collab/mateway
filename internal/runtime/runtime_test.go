@@ -174,7 +174,7 @@ func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 func TestDefaultRegistryContainsPiStyleTools(t *testing.T) {
 	registry := tool.NewRegistry(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	for _, name := range []string{
-		"file.read", "file.write", "project.index", "terminal.run", "web.search", "web.fetch", "secret.set",
+		"file.read", "file.write", "file.delete", "project.index", "terminal.run", "web.search", "web.fetch", "secret.set",
 		"schedule.create", "schedule.list", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run_now",
 		"task.search", "task.resume",
 	} {

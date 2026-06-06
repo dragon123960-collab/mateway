@@ -38,6 +38,7 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry := agentcore.NewToolRegistry()
 	registry.Register(FileReadTool{Config: root})
 	registry.Register(FileWriteTool{Config: root})
+	registry.Register(FileDeleteTool{Config: root})
 	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
 	registry.Register(SecretSetTool{Config: root})
@@ -77,6 +78,7 @@ func (EchoTool) ToolContract() agentcore.ToolContract {
 
 type FileWriteTool struct{ Config *config.Root }
 type FileReadTool struct{ Config *config.Root }
+type FileDeleteTool struct{ Config *config.Root }
 type ProjectIndexTool struct{ Config *config.Root }
 
 func (FileWriteTool) Name() string        { return "file.write" }
@@ -127,6 +129,211 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: "wrote " + path, Evidence: map[string]any{"path": path, "bytes": len(content)}}
+}
+
+func (FileDeleteTool) Name() string { return "file.delete" }
+func (FileDeleteTool) Description() string {
+	return "delete a local file or directory inside allowed roots"
+}
+func (FileDeleteTool) Schema() agentcore.Schema {
+	return agentcore.Schema{
+		Required: []string{"path"},
+		Properties: map[string]any{
+			"path":      map[string]any{"type": "string"},
+			"recursive": map[string]any{"type": "boolean", "description": "Required to delete directories."},
+		},
+	}
+}
+func (FileDeleteTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use only when the task explicitly requires removing a local generated file or scratch directory.",
+		WhenNotToUse:         "Do not use for exploratory cleanup, project source removal, config/run/secret/trace stores, or paths outside allowed roots.",
+		OutputContract:       "Return a short delete confirmation with path, kind, recursive flag, and size/count evidence.",
+		Evidence:             "Return resolved path, kind, bytes for files, entry count for directories, and deleted=true.",
+		Acceptance:           "Accepted only when the target path is valid, inside allowed roots, not a protected root/store, and deletion succeeds.",
+		SoftFailureSignals:   []string{"outside allowed roots", "refusing to delete", "recursive=true is required", "no such file or directory"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "dangerous mutation; guarded by strict path policy and protected path checks, not chat approval.",
+	}
+}
+func (FileDeleteTool) Risk() agentcore.Risk { return agentcore.RiskDangerous }
+func (t FileDeleteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	rawPath := fmt.Sprint(call.Args["path"])
+	path, err := ResolveAllowedPath(rawPath, t.Config)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": rawPath}}
+	}
+	if err := ensureDeletePathInsideAllowedRoots(path, t.Config); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": rawPath}}
+	}
+	target, err := validateDeleteTarget(path, t.Config)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+	}
+	if target.Info.IsDir() && !boolArg(call.Args["recursive"]) {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "recursive=true is required to delete a directory", IsError: true, Evidence: map[string]any{"path": path, "kind": "directory"}}
+	}
+	evidence := map[string]any{
+		"path":      target.Path,
+		"kind":      target.Kind,
+		"recursive": boolArg(call.Args["recursive"]),
+		"deleted":   true,
+	}
+	if target.Info.IsDir() {
+		count, err := countDirectoryEntries(target.Path)
+		if err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": target.Path, "kind": "directory"}}
+		}
+		evidence["entries"] = count
+		if err := os.RemoveAll(target.Path); err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": target.Path, "kind": "directory"}}
+		}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "deleted directory " + target.Path, Evidence: evidence}
+	}
+	evidence["bytes"] = target.Info.Size()
+	if err := os.Remove(target.Path); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": target.Path, "kind": "file"}}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: "deleted file " + target.Path, Evidence: evidence}
+}
+
+type deleteTarget struct {
+	Path string
+	Info os.FileInfo
+	Kind string
+}
+
+func validateDeleteTarget(path string, cfg *config.Root) (deleteTarget, error) {
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return deleteTarget{}, err
+	}
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return deleteTarget{}, err
+	}
+	if err := rejectProtectedDeletePath(clean, cfg); err != nil {
+		return deleteTarget{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := filepath.EvalSymlinks(clean)
+		if err != nil {
+			return deleteTarget{}, err
+		}
+		if err := ensureDeletePathInsideAllowedRoots(target, cfg); err != nil {
+			return deleteTarget{}, fmt.Errorf("symlink target %s is outside allowed roots", target)
+		}
+		if err := rejectProtectedDeletePath(target, cfg); err != nil {
+			return deleteTarget{}, err
+		}
+		return deleteTarget{Path: clean, Info: info, Kind: "symlink"}, nil
+	}
+	real := clean
+	if info.IsDir() {
+		real, err = filepath.EvalSymlinks(clean)
+		if err != nil {
+			return deleteTarget{}, err
+		}
+		if err := ensureDeletePathInsideAllowedRoots(real, cfg); err != nil {
+			return deleteTarget{}, fmt.Errorf("directory target %s is outside allowed roots", real)
+		}
+		if err := rejectProtectedDeletePath(real, cfg); err != nil {
+			return deleteTarget{}, err
+		}
+		return deleteTarget{Path: real, Info: info, Kind: "directory"}, nil
+	}
+	return deleteTarget{Path: clean, Info: info, Kind: "file"}, nil
+}
+
+func ensureDeletePathInsideAllowedRoots(path string, cfg *config.Root) error {
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	roots := allowedRoots(cfg)
+	if len(roots) == 0 {
+		return fmt.Errorf("file.delete requires configured allowed roots")
+	}
+	realPath := clean
+	if evaluated, err := filepath.EvalSymlinks(clean); err == nil {
+		realPath = evaluated
+	}
+	for _, root := range allowedRoots(cfg) {
+		rootAbs, err := filepath.Abs(filepath.Clean(root))
+		if err != nil || rootAbs == "" {
+			continue
+		}
+		realRoot := rootAbs
+		if evaluated, err := filepath.EvalSymlinks(rootAbs); err == nil {
+			realRoot = evaluated
+		}
+		if realPath == realRoot || strings.HasPrefix(realPath, realRoot+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("path %s is outside allowed roots", clean)
+}
+
+func rejectProtectedDeletePath(path string, cfg *config.Root) error {
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	for _, root := range allowedRoots(cfg) {
+		rootAbs, err := filepath.Abs(filepath.Clean(root))
+		if err != nil || rootAbs == "" {
+			continue
+		}
+		if clean == rootAbs {
+			return fmt.Errorf("refusing to delete allowed root %s", clean)
+		}
+	}
+	home := configHome(cfg)
+	protected := []string{
+		filepath.Join(home, "config"),
+		filepath.Join(home, "run"),
+		filepath.Join(home, "secrets"),
+		filepath.Join(home, "trace"),
+		filepath.Join(home, "traces"),
+		filepath.Join(home, "sessions"),
+		filepath.Join(home, "schedules"),
+		filepath.Join(home, "indexes"),
+		filepath.Join(home, "logs"),
+		filepath.Join(home, "observe"),
+		filepath.Join(home, "memory"),
+		filepath.Join(home, ".git"),
+	}
+	for _, root := range protected {
+		rootAbs, err := filepath.Abs(filepath.Clean(root))
+		if err != nil || rootAbs == "" {
+			continue
+		}
+		if clean == rootAbs || strings.HasPrefix(clean, rootAbs+string(filepath.Separator)) {
+			return fmt.Errorf("refusing to delete protected path %s", clean)
+		}
+	}
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
+		switch part {
+		case ".git", ".hg", ".svn":
+			return fmt.Errorf("refusing to delete VCS path %s", clean)
+		}
+	}
+	return nil
+}
+
+func countDirectoryEntries(root string) (int, error) {
+	count := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != root {
+			count++
+		}
+		return nil
+	})
+	return count, err
 }
 
 func (ProjectIndexTool) Name() string        { return "project.index" }
@@ -206,8 +413,8 @@ func (TerminalRunTool) Schema() agentcore.Schema {
 }
 func (TerminalRunTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Use for local verification commands such as tests, builds, or simple shell inspection.",
-		WhenNotToUse:         "Do not use for destructive commands, secret exfiltration, or long-running services unless explicitly requested.",
+		WhenToUse:            "Use for local verification commands such as tests, builds, or simple shell inspection. If an external skill, README, or setup guide says to run Bash, shell, CLI, command-line, or terminal commands, execute those commands through terminal.run.",
+		WhenNotToUse:         "Do not invent Bash or shell tool names. Do not use for destructive commands, secret exfiltration, or long-running services unless explicitly requested.",
 		OutputContract:       "Return combined stdout/stderr, trimmed, with command evidence.",
 		Evidence:             "Return the command, combined output, and redacted env secret ids when injected.",
 		Acceptance:           "Accepted when the command exits successfully; failed when the command returns an error.",
@@ -544,6 +751,19 @@ func (ScheduleUpdateTool) Description() string { return "update a local schedule
 func (ScheduleUpdateTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"id"}}
 }
+func (ScheduleUpdateTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks to change an existing scheduled task's text, run time, interval, or status.",
+		WhenNotToUse:         "Do not use to create a new schedule or to run a task immediately.",
+		OutputContract:       "Return updated schedule id, status, run time, interval, and session key evidence.",
+		Evidence:             "Return id, status, run_at, interval, and session_key.",
+		Acceptance:           "Accepted when the schedule store updates the requested task.",
+		SoftFailureSignals:   []string{"schedule not found", "run_at must be RFC3339", "interval must be a Go duration"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; schedule changes are direct and do not create chat approval pending.",
+	}
+}
 func (ScheduleUpdateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t ScheduleUpdateTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	input := schedule.UpdateInput{ID: toolArgString(call.Args, "id")}
@@ -579,6 +799,19 @@ func (SchedulePauseTool) Description() string { return "pause a local scheduled 
 func (SchedulePauseTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"id"}}
 }
+func (SchedulePauseTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks to temporarily stop an existing scheduled task.",
+		WhenNotToUse:         "Do not use to permanently remove a schedule; use schedule.delete only when deletion is explicitly requested.",
+		OutputContract:       "Return paused schedule id, status, run time, interval, and session key evidence.",
+		Evidence:             "Return id, status, run_at, interval, and session_key.",
+		Acceptance:           "Accepted when the target schedule status becomes paused.",
+		SoftFailureSignals:   []string{"schedule not found"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; pause is reversible and does not create chat approval pending.",
+	}
+}
 func (SchedulePauseTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t SchedulePauseTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	task, err := scheduleStore(t.Config).Pause(toolArgString(call.Args, "id"))
@@ -593,6 +826,19 @@ func (ScheduleResumeTool) Description() string { return "resume a local schedule
 func (ScheduleResumeTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"id"}}
 }
+func (ScheduleResumeTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks to reactivate a paused or inactive scheduled task.",
+		WhenNotToUse:         "Do not use to create a new schedule or change its timing unless the user asked for that too.",
+		OutputContract:       "Return resumed schedule id, status, run time, interval, and session key evidence.",
+		Evidence:             "Return id, status, run_at, interval, and session_key.",
+		Acceptance:           "Accepted when the target schedule status becomes active.",
+		SoftFailureSignals:   []string{"schedule not found"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; resume is direct and does not create chat approval pending.",
+	}
+}
 func (ScheduleResumeTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t ScheduleResumeTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	task, err := scheduleStore(t.Config).Activate(toolArgString(call.Args, "id"))
@@ -606,6 +852,19 @@ func (ScheduleDeleteTool) Name() string        { return "schedule.delete" }
 func (ScheduleDeleteTool) Description() string { return "delete a local scheduled task" }
 func (ScheduleDeleteTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"id"}}
+}
+func (ScheduleDeleteTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use only when the user explicitly asks to delete an existing scheduled task.",
+		WhenNotToUse:         "Do not use for temporary stopping; use schedule.pause when the user asks to pause.",
+		OutputContract:       "Return deleted schedule id and deleted=true evidence.",
+		Evidence:             "Return id and deleted boolean.",
+		Acceptance:           "Accepted when the schedule store deletes the requested task.",
+		SoftFailureSignals:   []string{"schedule not found"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "dangerous mutation; deletion is handled by hard tool boundaries, not chat approval pending.",
+	}
 }
 func (ScheduleDeleteTool) Risk() agentcore.Risk { return agentcore.RiskDangerous }
 func (t ScheduleDeleteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
@@ -624,6 +883,19 @@ func (ScheduleRunNowTool) Name() string        { return "schedule.run_now" }
 func (ScheduleRunNowTool) Description() string { return "mark a local scheduled task due now" }
 func (ScheduleRunNowTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"id"}}
+}
+func (ScheduleRunNowTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks to trigger an existing scheduled task immediately.",
+		WhenNotToUse:         "Do not use for ordinary immediate tasks that should be handled directly in the current conversation.",
+		OutputContract:       "Return schedule id, active status, updated run time, interval, and session key evidence.",
+		Evidence:             "Return id, status, run_at, interval, and session_key.",
+		Acceptance:           "Accepted when the schedule is marked due now.",
+		SoftFailureSignals:   []string{"schedule not found"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; run-now only changes scheduler state and does not create chat approval pending.",
+	}
 }
 func (ScheduleRunNowTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t ScheduleRunNowTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
@@ -671,6 +943,19 @@ func (TaskSearchTool) Description() string { return "search current and archived
 func (TaskSearchTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"query"}}
 }
+func (TaskSearchTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when the user asks to find, recover, continue, or choose among previous tasks.",
+		WhenNotToUse:         "Do not use when the current active task is already open; continue that task directly.",
+		OutputContract:       "Return numbered candidate tasks with session, archive, task id, status, updated time, goal, and summary.",
+		Evidence:             "Return candidate count and structured candidate identifiers.",
+		Acceptance:           "Accepted when candidates are listed or count is zero.",
+		SoftFailureSignals:   []string{"session not found", "archive read error"},
+		ParallelMode:         "read_only_ok",
+		ReusePolicy:          "stable_read",
+		ConfirmationBoundary: "safe read; no confirmation.",
+	}
+}
 func (TaskSearchTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (t TaskSearchTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	query := strings.TrimSpace(toolArgString(call.Args, "query"))
@@ -698,6 +983,19 @@ func (TaskResumeTool) Name() string        { return "task.resume" }
 func (TaskResumeTool) Description() string { return "load historical task context for continuation" }
 func (TaskResumeTool) Schema() agentcore.Schema {
 	return agentcore.Schema{Required: []string{"task_id"}}
+}
+func (TaskResumeTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use after task.search when one historical task candidate is clearly selected for continuation.",
+		WhenNotToUse:         "Do not use to mutate historical archives or when the user has not identified which candidate to resume.",
+		OutputContract:       "Return historical task context including source, task id, goal, summary, trace path when available, and current request.",
+		Evidence:             "Return session_key, archive_id, task_id, status, goal, and summary identifiers.",
+		Acceptance:           "Accepted when the requested task context is loaded.",
+		SoftFailureSignals:   []string{"task_id is required", "task not found"},
+		ParallelMode:         "read_only_ok",
+		ReusePolicy:          "stable_read",
+		ConfirmationBoundary: "safe read; no confirmation and no archive mutation.",
+	}
 }
 func (TaskResumeTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (t TaskResumeTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {

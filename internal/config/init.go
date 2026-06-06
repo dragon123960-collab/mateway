@@ -672,7 +672,7 @@ Workflow:
    - executable_name
    - why this method fits the current machine
 
-5. Mutating commands may run directly. Avoid destructive commands such as rm/rmdir/shred/git reset/git clean unless the user explicitly asked; Mateway blocks those terminal commands by policy.
+5. Mutating commands may run directly when they are part of installation. Do not use terminal commands for destructive cleanup; use file.delete for generated files or scratch directories when cleanup is explicitly needed.
 
 6. Verify after installation.
    Prefer command -v, --version, --help, or a documented quick-start command.
@@ -818,7 +818,7 @@ Preferred layout:
 ` + "```" + `
 
 - Put skill-specific executable scripts in <skill_name>/scripts/.
-- Scripts are ordinary files. There is no Mateway script registry or script.run bridge.
+- Scripts are ordinary files. There is no Mateway script registry bridge.
 - Keep SKILL.md concise: trigger description, workflow, command templates, required inputs, safety boundaries, and verification steps.
 
 ## Secret rules
