@@ -84,11 +84,18 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 			if err != nil {
 				return Result{}, err
 			}
-			if !stop && len(followUps) > 0 {
-				transcript = append(transcript, followUps...)
-				continue
-			}
-			result := Result{
+		if !stop && len(followUps) > 0 {
+			transcript = append(transcript, followUps...)
+			continue
+		}
+		if iteration == 1 && cfg.Tools != nil {
+			transcript = append(transcript, Message{
+				Role:    RoleUser,
+				Content: "Are you sure this is complete? If the task requires tools, use them now.",
+			})
+			continue
+		}
+		result := Result{
 				Messages:   transcript,
 				FinalText:  strings.TrimSpace(assistant.Content),
 				Iterations: iteration,
