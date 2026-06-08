@@ -19,6 +19,7 @@ import (
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/util"
 )
 
 type Client struct {
@@ -375,8 +376,9 @@ func buildSystemPrompt(base string, tools []agentcore.Tool, includeTextProtocol 
 }
 
 func currentDatePrompt() string {
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
-	return fmt.Sprintf("Current date: %s. Current time: %s. Timezone: Asia/Shanghai. Treat any date before %s as historical, not current. For weather, news, prices, schedules, or other time-sensitive answers, use available tools and verify the result date matches today before presenting it as current.", now.Format("2006-01-02"), now.Format("15:04"), now.Format("2006-01-02"))
+	loc, timezone := config.TimezoneLocation("")
+	now := time.Now().In(loc)
+	return fmt.Sprintf("Current date: %s. Current time: %s. Timezone: %s. Treat any date before %s as historical, not current. For weather, news, prices, schedules, or other time-sensitive answers, use available tools and verify the result date matches today before presenting it as current.", now.Format("2006-01-02"), now.Format("15:04"), timezone, now.Format("2006-01-02"))
 }
 
 func writeContractLine(b *strings.Builder, label, value string) {
@@ -1194,14 +1196,7 @@ func usagePtr(usage agentcore.Usage) *agentcore.Usage {
 	return &usage
 }
 
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
+var firstNonEmptyString = util.FirstNonEmptyString
 
 func stripReasoning(text string) string {
 	for {

@@ -34,7 +34,9 @@ trace: /Users/dongping/.mateway/trace/...
 
 ## Slash Command
 
-P0 支持：
+Mateway 是通用 agent 网关，slash command 不应只围绕代码仓库，而应围绕 session、channel、agent、工具、模型、trace、memory 和本地控制。命令分组如下。
+
+P0 已支持或应优先支持：
 
 - `/help`：显示 CLI 内命令。
 - `/new`：重置当前 session，让下一条作为新任务。
@@ -48,6 +50,18 @@ P0 支持：
 - `/tools enable|disable <tool_name> [--agent <agent_id>]`：修改指定 agent profile 的工具启停配置。
 - `/model [--agent <agent_id>] [--verbose]`：查看当前 agent profile 的模型选择链路；`--verbose` 同时列出已加载模型端点。
 - `/exit`：退出。
+
+P1/P2 通用控制台命令：
+
+- `/agent [agent_id]`：查看或切换当前 agent profile。
+- `/channels`：查看已启用 channel、账号和绑定关系。
+- `/send --to <channel:target> <message>`：从 TUI 内直接向飞书/微信等 channel 发送消息。
+- `/fetch-history --from <channel:target> [--limit <n>]`：从远端 channel 主动拉历史并导入当前 session。
+- `/memory search <query>`：搜索当前 agent 可用记忆。
+- `/memory proposals`：查看待确认的记忆/经验沉淀。
+- `/approvals`：查看当前或最近的人工审批记录。
+- `/config`：查看当前配置摘要，不输出 secret。
+- `/workspace`：查看本地工作目录、可访问路径和 sandbox 状态。
 
 `/resume` 默认是 fork 模式：把源 session 的上下文复制到当前 CLI session，让本地继续任务但不污染原飞书/微信会话。显式加 `--attach` 时，CLI 直接切换到源 session key 上继续。
 
@@ -118,7 +132,35 @@ mateway tui --session cli:review
 - 审批时在底部输入 `y` 或 `n` 后回车。
 - 支持基础 slash command：`/help`、`/exit`、`/new`、`/session`、`/sessions`、`/resume`、`/show`、`/trace`、`/events`。
 
-当前版本优先验证布局和信息架构。后续如果要做可展开工具块、右侧 todo 实时高亮、命令面板和鼠标交互，可以在这个入口上继续演进，或切换到 Bubble Tea / tview 这类成熟 TUI 框架。
+当前 TUI 已采用 Bubble Tea / Bubbles / Lip Gloss 作为成熟 Go TUI 框架，不再扩展手写 ANSI/raw input 实现。界面参考 opencode 的 split-footer 思路：上方过程区追加 transcript / tool event，底部 footer 负责输入、状态和命令入口，宽屏时右侧常驻 Mateway 状态栏。Todo、工具详情、审批和问题不应照搬为编程任务侧栏，而应作为过程区的结构化 entry、右侧状态摘要或底部临时 panel 展示。
+
+opencode 的 TUI 使用 `@opentui/core`、`@opentui/solid` 和 `@opentui/keymap`，输入由 textarea 组件处理，宽度使用成熟 string-width 能力，scrollback 与 footer 分离。Mateway 对应采用 Bubbles `viewport` 承载过程区、`textarea` 承载底部输入、Lip Gloss 负责状态行和样式、`go-runewidth` 处理中文宽度。后续 TUI 改进必须优先落在这些组件之上，避免重新引入自维护终端渲染逻辑。
+
+继续调研 opencode 后的几个设计判断：
+
+- 鼠标滚动和右侧滚动条来自 renderer 的 mouse support 与独立 `scrollbox`，不是业务层判断鼠标在左侧还是右侧。
+- 光标闪烁由 textarea/cursor 组件负责；TUI 应使用终端真实 cursor，不要用文本字符模拟。
+- 底部状态应显示 Mateway 自己的状态，例如 `Idle`、`Thinking`、`Acting`、`Approval`，不要照搬 `Build` 等 opencode agent 标签。
+- 模型名称应来自 Mateway 配置里的实际 model，不附加模仿式 provider 文案。
+
+右侧常驻状态栏应优先展示 Mateway 的网关信息：
+
+- 当前 agent、session、model 和 channel。
+- 当前任务状态、过程事件数量、最新 trace。
+- 本地上下文，例如 cwd、workspace、可访问路径和 sandbox 状态。
+- channel bridge 状态，例如 CLI、飞书、微信账号是否启用。
+- 工具/审批状态，例如启用工具数量、是否等待确认。
+- 关键 slash 命令提示。
+
+## 差异化
+
+Mateway CLI 可以学习 opencode / Claude Code 的交互清晰度，但定位不同：
+
+- 编程 CLI 的中心是代码仓库、diff、LSP、测试和 Todo；Mateway 的中心是跨 channel session、agent profile、tool contract、trace、memory 和本地控制。
+- 编程 CLI 的右侧栏适合显示 Todo / LSP / cost；Mateway 的右侧栏应显示 gateway、channel、session、agent、model、tool 和 approval 状态。
+- 编程 CLI 的 `/init`、`/diff`、`/commit` 是高频；Mateway 的高频是 `/resume`、`/sessions`、`/trace`、`/events`、`/tools`、`/model`、`/send`、`/fetch-history`。
+- 编程 CLI 主要接管本地项目；Mateway 要能把飞书/微信里的任务拉回本地继续，也要能从本地把消息、结果、提醒发回远端 channel。
+- 编程 CLI 的可观测性服务于代码变更；Mateway 的可观测性服务于 agent 网关调试，必须能回答“哪个 agent、哪个 channel、哪个 session、调用了什么工具、成功还是失败、trace 在哪”。
 
 ## 审批
 

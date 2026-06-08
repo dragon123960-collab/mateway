@@ -157,6 +157,9 @@ func number(value any) float64 {
 	switch v := value.(type) {
 	case float64:
 		return v
+	case json.Number:
+		n, _ := v.Float64()
+		return n
 	case int64:
 		return float64(v)
 	case int:

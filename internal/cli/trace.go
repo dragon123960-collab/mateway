@@ -44,7 +44,7 @@ func printTraceSummary(out io.Writer, path string) error {
 		fmt.Fprintln(out, "task_id:", summary.TaskID)
 	}
 	fmt.Fprintln(out, "events:", summary.Events)
-	fmt.Printf("complete: %t\n", summary.RuntimeDone)
+	fmt.Fprintf(out, "complete: %t\n", summary.RuntimeDone)
 	fmt.Fprintln(out, "model_ms:", summary.ModelDurationMS)
 	fmt.Fprintln(out, "tool_ms:", summary.ToolDurationMS)
 	fmt.Fprintln(out, "runtime_ms:", summary.RuntimeDurationMS)

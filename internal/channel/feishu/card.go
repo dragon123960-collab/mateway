@@ -128,13 +128,13 @@ func escapeInlineCode(text string) string {
 	return strings.ReplaceAll(text, "`", "'")
 }
 
-func headerTemplateForStyle(style string) string {
-	switch strings.TrimSpace(style) {
-	case "partial":
+func headerTemplateForStyle(style channel.MessageStyle) string {
+	switch style {
+	case channel.StylePartial:
 		return "orange"
-	case "input_required", "processing":
+	case channel.StyleInputRequired, channel.StyleProcessing:
 		return "blue"
-	case "error":
+	case channel.StyleError:
 		return "red"
 	default:
 		return "green"
@@ -145,10 +145,10 @@ func feishuCardTitle(reply channel.OutboundMessage) string {
 	if title := strings.TrimSpace(reply.Title); title != "" {
 		return title
 	}
-	switch strings.TrimSpace(reply.Style) {
-	case "input_required":
+	switch reply.Style {
+	case channel.StyleInputRequired:
 		return "Mateway Needs More Information"
-	case "error":
+	case channel.StyleError:
 		return "Mateway Failed"
 	default:
 		return "Mateway"
@@ -156,15 +156,15 @@ func feishuCardTitle(reply channel.OutboundMessage) string {
 }
 
 func cardFooterNote(reply channel.OutboundMessage) string {
-	switch strings.TrimSpace(reply.Style) {
-	case "partial":
+	switch reply.Style {
+	case channel.StylePartial:
 		return "Status: partial"
-	case "input_required":
+	case channel.StyleInputRequired:
 		return "Please reply directly with the missing information."
-	case "error":
+	case channel.StyleError:
 		return "The task stopped at a safe point. You can add more information and retry."
 	default:
-		return "Status: " + firstNonEmpty(strings.TrimSpace(reply.Style), "completed")
+		return "Status: " + firstNonEmpty(strings.TrimSpace(string(reply.Style)), string(channel.StyleCompleted))
 	}
 }
 
@@ -227,10 +227,10 @@ func looksLikeToolCallDetailLine(lower, trimmed string) bool {
 }
 
 func fallbackFeishuText(reply channel.OutboundMessage) string {
-	switch strings.TrimSpace(reply.Style) {
-	case "input_required":
+	switch reply.Style {
+	case channel.StyleInputRequired:
 		return "I need one more piece of information before I can continue."
-	case "error":
+	case channel.StyleError:
 		return "The task failed and stopped at a safe point."
 	default:
 		return "Done."

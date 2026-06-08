@@ -35,7 +35,7 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 	now := time.Now().Format(time.RFC3339)
 	id := "diary_" + time.Now().Format("20060102_150405_000000")
 	diaryPath := filepath.Join(home, "observe", "diary", id+".md")
-	diary := renderDiary(event, now)
+	diary := cleanMemoryText(renderDiary(event, now))
 	if err := os.MkdirAll(filepath.Dir(diaryPath), 0o755); err != nil {
 		return LearningResult{}, err
 	}
@@ -50,7 +50,7 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 		if err := os.MkdirAll(filepath.Dir(reflectionPath), 0o755); err != nil {
 			return result, err
 		}
-		if err := os.WriteFile(reflectionPath, []byte(renderReflection(event, now)), 0o644); err != nil {
+		if err := os.WriteFile(reflectionPath, []byte(cleanMemoryText(renderReflection(event, now))), 0o644); err != nil {
 			return result, err
 		}
 		result.ReflectionPath = reflectionPath
@@ -60,7 +60,7 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 			Type:       "experience",
 			Scope:      "agent",
 			Title:      proposalTitle(event),
-			Body:       proposalBody(event),
+			Body:       cleanMemoryText(proposalBody(event)),
 			Sources:    learningSources(event),
 			Confidence: "low",
 		})
@@ -345,7 +345,11 @@ func proposalBody(event LearningEvent) string {
 		b.WriteString(text)
 		b.WriteString("\n")
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(cleanMemoryText(b.String()))
+}
+
+func cleanMemoryText(text string) string {
+	return strings.ToValidUTF8(text, "")
 }
 
 func learningSources(event LearningEvent) []string {

@@ -527,8 +527,9 @@ func hashText(text string) string {
 
 func truncateDistillText(text string, limit int) string {
 	text = strings.TrimSpace(text)
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text
 	}
-	return text[:limit] + fmt.Sprintf("\n... (%d chars)", len(text))
+	return string(runes[:limit]) + fmt.Sprintf("\n... (%d chars)", len(runes))
 }

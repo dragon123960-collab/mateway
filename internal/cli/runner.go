@@ -431,22 +431,6 @@ func (s *chatState) resume(args []string) error {
 	return nil
 }
 
-func printChatHelp(out io.Writer) {
-	fmt.Fprintln(out, "slash commands:")
-	fmt.Fprintln(out, "  /help")
-	fmt.Fprintln(out, "  /new")
-	fmt.Fprintln(out, "  /sessions")
-	fmt.Fprintln(out, "  /session <session_key>")
-	fmt.Fprintln(out, "  /resume [--attach] <session_key>")
-	fmt.Fprintln(out, "  /show [session_key]")
-	fmt.Fprintln(out, "  /trace [trace_path|session_key]")
-	fmt.Fprintln(out, "  /events [trace_path|session_key]")
-	fmt.Fprintln(out, "  /tools [--agent <agent_id>] [--verbose]")
-	fmt.Fprintln(out, "  /tools enable|disable <tool_name> [--agent <agent_id>]")
-	fmt.Fprintln(out, "  /model [--agent <agent_id>] [--verbose]")
-	fmt.Fprintln(out, "  /exit")
-}
-
 func parseModelSlashArgs(args []string) (bool, string, error) {
 	verbose := false
 	agentID := ""

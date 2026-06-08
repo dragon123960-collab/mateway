@@ -111,7 +111,7 @@ func feishuChannelSpec(name string, channelCfg config.FeishuConfig) channelSpec 
 				downloaded, err := sender.DownloadMessageImages(eventCtx, msg, rt.Home)
 				if err != nil {
 					log.Printf("mateway gateway feishu media download error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Runtime.Config, msg, "gateway.media_download_failed", map[string]string{"error": err.Error()}), Style: "error"})
+					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Runtime.Config, msg, "gateway.media_download_failed", map[string]string{"error": err.Error()}), Style: channel.StyleError})
 					return nil
 				}
 				msg = downloaded
@@ -337,7 +337,7 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 		if !cardAction {
 			react(runCtx, sender, msg.ID, "CROSS_MARK")
 		}
-		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: "error"})
+		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: channel.StyleError})
 		return
 	}
 	replyStart := time.Now()
@@ -534,10 +534,10 @@ func isCardAction(msg channel.InboundMessage) bool {
 }
 
 func reactionForReply(reply channel.OutboundMessage) string {
-	switch strings.TrimSpace(reply.Style) {
-	case "input_required", "clarify", "partial":
+	switch strings.TrimSpace(string(reply.Style)) {
+	case string(channel.StyleInputRequired), "clarify", string(channel.StylePartial):
 		return "EYES"
-	case "error", "cancelled":
+	case string(channel.StyleError), "cancelled":
 		return "CROSS_MARK"
 	default:
 		return "DONE"
@@ -613,7 +613,7 @@ func gatewayText(cfg *config.Root, msg channel.InboundMessage, key string, value
 }
 
 var gatewayTexts = map[string]string{
-	"gateway.processing_ack":          "Processing...",
-	"gateway.processing_failed":       "The request failed while processing: {error}",
-	"gateway.media_download_failed":   "Failed to download message media: {error}",
+	"gateway.processing_ack":        "Processing...",
+	"gateway.processing_failed":     "The request failed while processing: {error}",
+	"gateway.media_download_failed": "Failed to download message media: {error}",
 }

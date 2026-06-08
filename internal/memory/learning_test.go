@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/dongping/mateway/internal/session"
 )
@@ -125,6 +126,42 @@ func TestRecordTaskCompletionCreatesProposalForExplicitMemoryCue(t *testing.T) {
 	text := string(data)
 	if !strings.Contains(text, "Accepted tool step: file.read") || !strings.Contains(text, "trace:trace-2") || !strings.Contains(text, "task:task-2") {
 		t.Fatalf("unexpected proposal:\n%s", text)
+	}
+}
+
+func TestRecordTaskCompletionProposalDropsInvalidUTF8(t *testing.T) {
+	home := t.TempDir()
+	result, err := RecordTaskCompletion(LearningEvent{
+		Home:       home,
+		SessionKey: "cli:test",
+		Task: session.TaskNode{
+			ID:     "task-utf8",
+			Goal:   "记住 UTF-8 清理流程",
+			Status: "completed",
+			Steps: []session.TaskStep{{
+				Tool:    "file.read",
+				Status:  "accepted",
+				Summary: "read " + string([]byte{0xe8, 0xae}),
+			}},
+		},
+		FinalText: "完成" + string([]byte{0xe8}),
+		TraceID:   "trace-utf8",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Proposal == nil {
+		t.Fatalf("expected proposal: %#v", result)
+	}
+	data, err := os.ReadFile(result.Proposal.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.Valid(data) {
+		t.Fatalf("proposal contains invalid UTF-8: %q", data)
+	}
+	if strings.Contains(string(data), "\ufffd") {
+		t.Fatalf("proposal should drop invalid bytes instead of writing replacement characters:\n%s", data)
 	}
 }
 

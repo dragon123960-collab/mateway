@@ -20,6 +20,16 @@ func TestSessionKeyUsesChannelNamespace(t *testing.T) {
 	}
 }
 
+func TestGatewayTextUsesCatalogAndValues(t *testing.T) {
+	got := gatewayText(nil, channel.InboundMessage{}, "gateway.processing_failed", map[string]string{"error": "boom"})
+	if strings.Contains(got, "gateway.processing_failed") || !strings.Contains(got, "boom") {
+		t.Fatalf("gateway text did not render template values: %q", got)
+	}
+	if got := gatewayText(nil, channel.InboundMessage{}, "gateway.unknown", nil); got != "gateway.unknown" {
+		t.Fatalf("unknown gateway text = %q", got)
+	}
+}
+
 func TestInstanceLockRejectsSecondHolder(t *testing.T) {
 	home := t.TempDir()
 	lock, err := AcquireInstanceLock(home)
@@ -100,7 +110,7 @@ func TestReactionForReply(t *testing.T) {
 		"":               "DONE",
 	}
 	for style, want := range cases {
-		if got := reactionForReply(channel.OutboundMessage{Style: style}); got != want {
+		if got := reactionForReply(channel.OutboundMessage{Style: channel.MessageStyle(style)}); got != want {
 			t.Fatalf("style %q reaction = %q want %q", style, got, want)
 		}
 	}

@@ -6,17 +6,25 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/tool"
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
+
+const maxTUIEventLines = 2500
 
 type TUIOptions struct {
 	Config     *config.Root
@@ -42,32 +50,58 @@ func RunTUI(ctx context.Context, opts TUIOptions) error {
 	if !ok || !outOK || !CanRunTUI(inFile, outFile) {
 		return fmt.Errorf("tui requires an interactive terminal")
 	}
-	oldState, err := term.MakeRaw(int(inFile.Fd()))
-	if err != nil {
-		return err
-	}
-	defer term.Restore(int(inFile.Fd()), oldState)
-	app := newTUIApp(opts.Config, ResolveSessionKey(opts.SessionKey), inFile, outFile)
-	return app.run(ctx)
+	model := newTUIModel(ctx, opts.Config, ResolveSessionKey(opts.SessionKey))
+	program := tea.NewProgram(
+		model,
+		tea.WithInput(inFile),
+		tea.WithOutput(outFile),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+	model.program = program
+	_, err := program.Run()
+	return err
 }
 
 func CanRunTUI(in, out *os.File) bool {
 	return in != nil && out != nil && term.IsTerminal(int(in.Fd())) && term.IsTerminal(int(out.Fd()))
 }
 
-type tuiApp struct {
+type tuiModel struct {
+	ctx        context.Context
 	cfg        *config.Root
 	sessionKey string
-	in         *os.File
-	out        *os.File
+	agent      config.AgentProfileConfig
+	model      tuiModelInfo
+	program    *tea.Program
 
-	mu       sync.Mutex
-	input    string
-	events   []string
-	scroll   int
-	running  bool
-	approval *tuiApproval
-	errText  string
+	viewport      viewport.Model
+	input         textarea.Model
+	events        []string
+	width         int
+	height        int
+	sidebar       int
+	sidebarScroll int
+
+	running       bool
+	status        string
+	progress      int
+	toolEvents    int
+	lastTool      string
+	lastToolState string
+	currentTask   string
+	liveSteps     []session.TaskStep
+	approval      *tuiApproval
+	pendingAnswer chan runtime.ApprovalDecision
+	errText       string
+
+	commandPanel bool
+	commandIndex int
+	picker       *tuiPicker
+	history      []string
+	historyIndex int
+	autoFollow   bool
+	newEvents    int
 }
 
 type tuiApproval struct {
@@ -75,297 +109,1755 @@ type tuiApproval struct {
 	reply   chan runtime.ApprovalDecision
 }
 
-func newTUIApp(cfg *config.Root, sessionKey string, in, out *os.File) *tuiApp {
-	return &tuiApp{cfg: cfg, sessionKey: sessionKey, in: in, out: out}
+type tuiPicker struct {
+	Kind   string
+	Title  string
+	Search string
+	Index  int
+	Items  []tuiPickerItem
 }
 
-func (a *tuiApp) run(ctx context.Context) error {
-	a.enterScreen()
-	defer a.leaveScreen()
-	a.addEvent(colorize("New session - "+time.Now().Format("2006-01-02 15:04:05"), ansiDim, true))
-	a.render()
-	buf := make([]byte, 1)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+type tuiPickerItem struct {
+	Label    string
+	Detail   string
+	Value    string
+	Status   string
+	Shortcut string
+}
+
+type tuiProgressMsg struct {
+	line      string
+	status    string
+	tool      string
+	toolState string
+	summary   string
+	duration  int64
+}
+
+type tuiResultMsg struct {
+	reply     channel.OutboundMessage
+	followUps []channel.OutboundMessage
+	tracePath string
+	err       error
+}
+
+type tuiApprovalMsg struct {
+	approval *tuiApproval
+}
+
+type tuiApprovalDoneMsg struct{}
+
+func newTUIModel(ctx context.Context, cfg *config.Root, sessionKey string) *tuiModel {
+	agent := cfg.DefaultAgent()
+	input := textarea.New()
+	input.Placeholder = `Ask anything...`
+	input.Prompt = ""
+	input.SetPromptFunc(0, func(int) string { return "" })
+	input.ShowLineNumbers = false
+	input.EndOfBufferCharacter = 0
+	input.MaxHeight = 4
+	input.SetHeight(3)
+	input.CharLimit = 0
+	input.FocusedStyle.Base = lipgloss.NewStyle()
+	input.BlurredStyle.Base = lipgloss.NewStyle()
+	input.Focus()
+	vp := viewport.New(80, 20)
+	model := &tuiModel{
+		ctx:          ctx,
+		cfg:          cfg,
+		sessionKey:   sessionKey,
+		agent:        agent,
+		model:        currentTUIModel(cfg, agent),
+		viewport:     vp,
+		input:        input,
+		status:       "Idle",
+		historyIndex: -1,
+		autoFollow:   true,
+	}
+	model.addSessionBanner()
+	return model
+}
+
+func (m *tuiModel) Init() tea.Cmd {
+	return textarea.Blink
+}
+
+func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.resize()
+	case tea.KeyMsg:
+		if m.picker != nil {
+			return m.updatePicker(msg)
 		}
-		n, err := a.in.Read(buf)
-		if err != nil {
-			return err
+		if m.commandPanel {
+			return m.updateCommandPanel(msg)
 		}
-		if n == 0 {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.commandPanel = false
+			return m, nil
+		case "enter":
+			return m, m.submit()
+		case "/":
+			if strings.TrimSpace(m.input.Value()) == "" {
+				m.commandPanel = true
+				m.commandIndex = 0
+				m.input.SetValue("/")
+				return m, nil
+			}
+		case "up":
+			if (strings.TrimSpace(m.input.Value()) == "" || m.historyIndex >= 0) && len(m.history) > 0 {
+				m.historyUp()
+				return m, nil
+			}
+			m.viewport.LineUp(1)
+			m.autoFollow = false
+			return m, nil
+		case "down":
+			if (strings.TrimSpace(m.input.Value()) == "" || m.historyIndex >= 0) && len(m.history) > 0 {
+				m.historyDown()
+				return m, nil
+			}
+			m.viewport.LineDown(1)
+			if m.viewport.AtBottom() {
+				m.autoFollow = true
+				m.newEvents = 0
+			}
+			return m, nil
+		case "pgup":
+			m.viewport.ViewUp()
+			m.autoFollow = false
+			return m, nil
+		case "pgdown":
+			m.viewport.ViewDown()
+			if m.viewport.AtBottom() {
+				m.autoFollow = true
+				m.newEvents = 0
+			}
+			return m, nil
+		case "end":
+			m.viewport.GotoBottom()
+			m.autoFollow = true
+			m.newEvents = 0
+			return m, nil
+		}
+	case tea.MouseMsg:
+		sidebarWidth := m.sidebarWidth()
+		if sidebarWidth > 0 && msg.X >= m.contentWidth() {
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				m.sidebarScroll = maxInt(0, m.sidebarScroll-3)
+			case tea.MouseWheelDown:
+				m.sidebarScroll += 3
+			}
+			return m, nil
+		}
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			m.autoFollow = false
+		case tea.MouseWheelDown:
+			if m.viewport.AtBottom() {
+				m.autoFollow = true
+				m.newEvents = 0
+			}
+		}
+	case tuiProgressMsg:
+		m.status = msg.status
+		m.progress++
+		if strings.TrimSpace(msg.tool) != "" {
+			m.toolEvents++
+			m.lastTool = msg.tool
+			m.lastToolState = msg.toolState
+			m.recordLiveStep(msg)
+		}
+		if strings.TrimSpace(msg.line) != "" {
+			m.addEvent(msg.line)
+		}
+		return m, nil
+	case tuiApprovalMsg:
+		m.approval = msg.approval
+		m.pendingAnswer = msg.approval.reply
+		m.status = "Approval"
+		m.addEvent("")
+		m.addEvent(colorize("! Approval required", ansiYellow, true))
+		m.addEvent("  tool:   " + friendlyToolName(msg.approval.request.ToolCall.Name))
+		m.addEvent("  detail: " + approvalDetail(msg.approval.request.ToolCall))
+		m.addEvent("  enter y or n")
+		return m, nil
+	case tuiApprovalDoneMsg:
+		m.approval = nil
+		m.pendingAnswer = nil
+		return m, nil
+	case tuiResultMsg:
+		m.running = false
+		m.status = "Idle"
+		m.currentTask = ""
+		m.liveSteps = nil
+		if msg.err != nil {
+			m.errText = msg.err.Error()
+			m.addEvent("")
+			m.addEvent(colorize("Error", ansiRed, true))
+			m.addEvent(compactBlock(msg.err.Error(), 600))
+			return m, nil
+		}
+		m.addEvent("")
+		m.addEvent(colorize("Assistant", ansiGreen, true))
+		for _, out := range (channel.OutboundBatch{Reply: msg.reply, FollowUps: msg.followUps}).Messages() {
+			rendered := renderMarkdownForTUI(out.Text, maxInt(40, m.contentWidth()-4))
+			for _, line := range wrapLines(rendered, maxInt(40, m.contentWidth()-4)) {
+				m.addEvent(line)
+			}
+			m.addEvent("")
+		}
+		if strings.TrimSpace(msg.tracePath) != "" {
+			m.addEvent(colorize("trace: "+msg.tracePath, ansiDim, true))
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.viewport, cmd = m.viewport.Update(msg)
+	if m.approval == nil || m.pendingAnswer != nil {
+		var inputCmd tea.Cmd
+		m.input, inputCmd = m.input.Update(msg)
+		cmd = tea.Batch(cmd, inputCmd)
+		if m.commandPanel && !strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/") {
+			m.commandPanel = false
+		}
+	}
+	return m, cmd
+}
+
+func (m *tuiModel) View() string {
+	if m.width <= 0 || m.height <= 0 {
+		return ""
+	}
+	footer := m.footerView()
+	available := maxInt(1, m.height-lipgloss.Height(footer))
+	contentWidth := m.contentWidth()
+	m.viewport.Width = contentWidth
+	m.viewport.Height = available
+	content := lipgloss.NewStyle().
+		Width(contentWidth).
+		Height(available).
+		Render(m.viewport.View())
+	main := fitRenderedHeight(lipgloss.JoinVertical(lipgloss.Left, content, footer), m.height)
+	if m.sidebarWidth() == 0 {
+		if m.picker != nil {
+			return centerModal(m.width, m.height, m.pickerView(minInt(m.width-8, 88)))
+		}
+		if m.commandPanel {
+			return centerModal(m.width, m.height, m.commandPanelView(minInt(m.width-8, 84)))
+		}
+		return main
+	}
+	sidebar := fitRenderedHeight(m.sidebarView(m.height), m.height)
+	view := lipgloss.JoinHorizontal(lipgloss.Top, main, sidebar)
+	if m.picker != nil {
+		return centerModal(m.width, m.height, m.pickerView(minInt(m.width-8, 88)))
+	}
+	if m.commandPanel {
+		return centerModal(m.width, m.height, m.commandPanelView(minInt(m.width-8, 84)))
+	}
+	return view
+}
+
+func fitRenderedHeight(view string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(view, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *tuiModel) resize() {
+	footer := m.footerView()
+	m.sidebar = m.sidebarWidth()
+	m.viewport.Width = m.contentWidth()
+	m.viewport.Height = maxInt(1, m.height-lipgloss.Height(footer))
+	m.input.SetWidth(maxInt(8, m.contentWidth()-4))
+	m.input.SetHeight(m.inputHeight())
+	m.refreshViewport()
+}
+
+func (m *tuiModel) footerView() string {
+	width := m.contentWidth()
+	var parts []string
+	if m.approval != nil {
+		parts = append(parts, m.approvalPanelView(width))
+	}
+	m.input.SetHeight(m.inputHeight())
+	input := tuiInputStyle(width).Render(m.input.View())
+	status := m.statusLine(width)
+	parts = append(parts, input, status)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+func (m *tuiModel) statusLine(width int) string {
+	mode := colorize(firstNonEmpty(m.status, "Idle"), ansiBlue, true)
+	if m.approval != nil {
+		mode = colorize("Approval", ansiYellow, true)
+	}
+	parts := []string{mode, colorize(m.model.Display(), ansiDim, true)}
+	if m.running {
+		parts = append(parts, colorize(m.progressSummary(), ansiDim, true))
+	}
+	if m.newEvents > 0 {
+		parts = append(parts, colorize(fmt.Sprintf("%d new events", m.newEvents), ansiYellow, true))
+	}
+	right := statusRight(width, []string{
+		"agent:" + firstNonEmpty(m.agent.ID, "main"),
+		"session:" + strings.TrimPrefix(m.sessionKey, "cli:"),
+		"ctrl+c exit",
+		"/ commands",
+	})
+	left := strings.Join(parts, " · ")
+	gap := width - visibleLen(left) - visibleLen(right)
+	if gap < 1 {
+		return truncateANSI(left+" · "+right, width)
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func (m *tuiModel) inputHeight() int {
+	value := m.input.Value()
+	lines := 3
+	if strings.TrimSpace(value) != "" {
+		lines = maxInt(3, strings.Count(value, "\n")+1)
+	}
+	if lines > 4 {
+		return 4
+	}
+	return lines
+}
+
+func (m *tuiModel) progressSummary() string {
+	if m.toolEvents > 0 {
+		return fmt.Sprintf("%d tool updates", m.toolEvents)
+	}
+	if m.progress > 0 {
+		return "working"
+	}
+	return "waiting"
+}
+
+func (m *tuiModel) commandPanelView(width int) string {
+	items := m.filteredCommandItems()
+	if len(items) == 0 {
+		items = []commandPanelItem{{
+			Section: "Search",
+			Label:   "No matching commands",
+			What:    "try another search",
+		}}
+	}
+	if m.commandIndex >= len(items) {
+		m.commandIndex = len(items) - 1
+	}
+	if m.commandIndex < 0 {
+		m.commandIndex = 0
+	}
+	lines := []string{
+		paletteHeaderLine(width),
+		paletteSearchLine(m.commandSearch(), width),
+		"",
+	}
+	lastSection := ""
+	shown := 0
+	for i, item := range visiblePaletteItems(items, m.commandIndex, 14) {
+		absolute := i
+		if len(items) > 14 {
+			absolute = paletteVisibleStart(len(items), m.commandIndex, 14) + i
+		}
+		if item.Section != lastSection {
+			if lastSection != "" {
+				lines = append(lines, "")
+			}
+			lines = append(lines, colorize(item.Section, ansiBlue, true))
+			lastSection = item.Section
+		}
+		selected := absolute == m.commandIndex
+		lines = append(lines, paletteItemLine(item, selected, width))
+		shown++
+	}
+	if shown == 0 {
+		lines = append(lines, colorize("No matching commands", ansiDim, true))
+	}
+	lines = append(lines, "", colorize("Esc close · Enter run/fill · ↑/↓ select", ansiDim, true))
+	return paletteStyle(width).Render(strings.Join(lines, "\n"))
+}
+
+func paletteHeaderLine(width int) string {
+	left := colorize("Commands", ansiGreen, true)
+	right := colorize("esc", ansiDim, true)
+	gap := maxInt(1, width-6-visibleLen(left)-visibleLen(right))
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func paletteSearchLine(search string, width int) string {
+	if strings.TrimSpace(search) == "" {
+		search = "Search"
+	}
+	return truncateANSI(colorize("Search ", ansiDim, true)+search, maxInt(10, width-6))
+}
+
+func paletteItemLine(item commandPanelItem, selected bool, width int) string {
+	label := firstNonEmpty(item.Label, item.Command)
+	shortcut := colorize(item.Shortcut, ansiDim, true)
+	detail := colorize(item.What, ansiDim, true)
+	left := label
+	if strings.TrimSpace(detail) != "" && !selected {
+		left += " " + detail
+	}
+	if strings.TrimSpace(shortcut) == "" {
+		if selected {
+			return selectedPaletteLine(truncateANSI(left, width-6), width)
+		}
+		return truncateANSI("  "+left, width-6)
+	}
+	gap := maxInt(1, width-8-visibleLen(left)-visibleLen(shortcut))
+	line := left + strings.Repeat(" ", gap) + shortcut
+	if selected {
+		return selectedPaletteLine(truncateANSI(line, width-6), width)
+	}
+	return truncateANSI("  "+line, width-6)
+}
+
+func selectedPaletteLine(text string, width int) string {
+	innerWidth := maxInt(8, width-6)
+	padded := padRightVisible("  "+text, innerWidth)
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("255")).
+		Background(lipgloss.Color("238")).
+		Bold(true).
+		Render(padded)
+}
+
+func visiblePaletteItems(items []commandPanelItem, selected, limit int) []commandPanelItem {
+	if len(items) <= limit {
+		return items
+	}
+	start := paletteVisibleStart(len(items), selected, limit)
+	return items[start:minInt(len(items), start+limit)]
+}
+
+func paletteVisibleStart(total, selected, limit int) int {
+	if total <= limit {
+		return 0
+	}
+	start := selected - limit/2
+	if start < 0 {
+		return 0
+	}
+	if start+limit > total {
+		return total - limit
+	}
+	return start
+}
+
+func paletteStyle(width int) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("238")).
+		Background(lipgloss.Color("235")).
+		Padding(1, 2).
+		Width(maxInt(40, width))
+}
+
+func (m *tuiModel) pickerView(width int) string {
+	if m.picker == nil {
+		return ""
+	}
+	items := m.filteredPickerItems()
+	if len(items) == 0 {
+		items = []tuiPickerItem{{Label: "No matches", Detail: "try another search"}}
+	}
+	if m.picker.Index >= len(items) {
+		m.picker.Index = len(items) - 1
+	}
+	if m.picker.Index < 0 {
+		m.picker.Index = 0
+	}
+	lines := []string{
+		pickerHeaderLine(m.picker.Title, width),
+		paletteSearchLine(m.picker.Search, width),
+		"",
+	}
+	for i, item := range visiblePickerItems(items, m.picker.Index, 12) {
+		absolute := i
+		if len(items) > 12 {
+			absolute = paletteVisibleStart(len(items), m.picker.Index, 12) + i
+		}
+		lines = append(lines, pickerItemLine(item, absolute == m.picker.Index, width))
+	}
+	lines = append(lines, "", colorize("Esc back · Enter select · ↑/↓ move · type to filter", ansiDim, true))
+	return paletteStyle(width).Render(strings.Join(lines, "\n"))
+}
+
+func pickerHeaderLine(title string, width int) string {
+	left := colorize(firstNonEmpty(title, "Select"), ansiGreen, true)
+	right := colorize("esc", ansiDim, true)
+	gap := maxInt(1, width-6-visibleLen(left)-visibleLen(right))
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func pickerItemLine(item tuiPickerItem, selected bool, width int) string {
+	label := item.Label
+	status := colorize(item.Status, ansiDim, true)
+	detail := colorize(item.Detail, ansiDim, true)
+	left := label
+	if strings.TrimSpace(detail) != "" && !selected {
+		left += " " + detail
+	}
+	if strings.TrimSpace(status) != "" {
+		gap := maxInt(1, width-8-visibleLen(left)-visibleLen(status))
+		left = left + strings.Repeat(" ", gap) + status
+	}
+	if selected {
+		return selectedPaletteLine(truncateANSI(left, width-6), width)
+	}
+	return truncateANSI("  "+left, width-6)
+}
+
+func visiblePickerItems(items []tuiPickerItem, selected, limit int) []tuiPickerItem {
+	if len(items) <= limit {
+		return items
+	}
+	start := paletteVisibleStart(len(items), selected, limit)
+	return items[start:minInt(len(items), start+limit)]
+}
+
+func (m *tuiModel) filteredPickerItems() []tuiPickerItem {
+	if m.picker == nil {
+		return nil
+	}
+	filter := strings.ToLower(strings.TrimSpace(m.picker.Search))
+	if filter == "" {
+		return m.picker.Items
+	}
+	var out []tuiPickerItem
+	for _, item := range m.picker.Items {
+		haystack := strings.ToLower(strings.Join([]string{item.Label, item.Detail, item.Value, item.Status}, " "))
+		if strings.Contains(haystack, filter) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (m *tuiModel) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.picker = nil
+		return m, nil
+	case "backspace":
+		if m.picker.Search != "" {
+			rs := []rune(m.picker.Search)
+			m.picker.Search = string(rs[:len(rs)-1])
+			m.picker.Index = 0
+		}
+		return m, nil
+	case "up":
+		m.picker.Index--
+		if m.picker.Index < 0 {
+			m.picker.Index = len(m.filteredPickerItems()) - 1
+		}
+		return m, nil
+	case "down":
+		m.picker.Index++
+		items := m.filteredPickerItems()
+		if len(items) == 0 || m.picker.Index >= len(items) {
+			m.picker.Index = 0
+		}
+		return m, nil
+	case "enter":
+		return m, m.acceptPicker()
+	}
+	if len(msg.Runes) > 0 {
+		m.picker.Search += string(msg.Runes)
+		m.picker.Index = 0
+	}
+	return m, nil
+}
+
+func (m *tuiModel) acceptPicker() tea.Cmd {
+	if m.picker == nil {
+		return nil
+	}
+	items := m.filteredPickerItems()
+	if len(items) == 0 {
+		return nil
+	}
+	if m.picker.Index < 0 || m.picker.Index >= len(items) {
+		m.picker.Index = 0
+	}
+	item := items[m.picker.Index]
+	kind := m.picker.Kind
+	m.picker = nil
+	switch kind {
+	case "sessions":
+		m.sessionKey = item.Value
+		m.addEvent("session: " + item.Value)
+	case "models":
+		m.switchTUIModel(item.Value)
+	case "tools":
+		m.toggleTool(item.Value, item.Status)
+	}
+	return nil
+}
+
+func (m *tuiModel) switchTUIModel(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	m.cfg.Model.Default = name
+	m.agent.Model.Default = name
+	m.model = currentTUIModel(m.cfg, m.agent)
+	m.addEvent("model: " + m.model.Display())
+}
+
+func (m *tuiModel) toggleTool(name, status string) {
+	var (
+		change ToolAccessChange
+		err    error
+	)
+	if strings.EqualFold(status, "disabled") {
+		change, err = EnableTool(m.cfg, m.agent.ID, name)
+	} else {
+		change, err = DisableTool(m.cfg, m.agent.ID, name)
+	}
+	if err != nil {
+		m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+		return
+	}
+	var out bytes.Buffer
+	PrintToolAccessChange(&out, change)
+	m.addOutput(out.String())
+	m.agent = m.cfg.DefaultAgent()
+}
+
+func centerModal(width, height int, panel string) string {
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+func padRightVisible(text string, width int) string {
+	n := visibleLen(text)
+	if n >= width {
+		return text
+	}
+	return text + strings.Repeat(" ", width-n)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (m *tuiModel) approvalPanelView(width int) string {
+	req := m.approval.request
+	lines := []string{
+		colorize("Approval required", ansiYellow, true),
+		"tool:   " + friendlyToolName(req.ToolCall.Name),
+		"detail: " + approvalDetail(req.ToolCall),
+		"reason: " + firstNonEmpty(req.Reason, "requires confirmation"),
+		colorize("reply y or n", ansiDim, true),
+	}
+	return panelStyle(width, "214").Render(strings.Join(lines, "\n"))
+}
+
+func panelStyle(width int, color string) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(color)).
+		Padding(0, 1).
+		Width(maxInt(8, width-2))
+}
+
+func tuiInputStyle(width int) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("63")).
+		Padding(0, 1).
+		Width(maxInt(8, width-2))
+}
+
+func (m *tuiModel) contentWidth() int {
+	if m.sidebar > 0 {
+		return maxInt(40, m.width-m.sidebar)
+	}
+	return m.width
+}
+
+func (m *tuiModel) sidebarWidth() int {
+	if m.width < 120 {
+		return 0
+	}
+	width := m.width / 4
+	if width < 28 {
+		return 28
+	}
+	if width > 38 {
+		return 38
+	}
+	return width
+}
+
+func (m *tuiModel) sidebarView(height int) string {
+	width := m.sidebarWidth()
+	if width == 0 {
+		return ""
+	}
+	state, _ := session.NewStore(m.cfg.App.Home).Load(m.sessionKey)
+	summary := m.sidebarSummary(state)
+	lines := []string{colorize("Mateway", ansiGreen, true), ""}
+	lines = appendSidebarSection(lines, "State",
+		firstNonEmpty(m.status, "Idle"),
+		fmt.Sprintf("%d process events", m.progress),
+	)
+	lines = appendSidebarSection(lines, "Session",
+		summary.SessionName,
+		fmt.Sprintf("%d messages", len(state.Messages)),
+		fmt.Sprintf("%d tasks", len(state.Tasks)),
+	)
+	lines = appendSidebarSection(lines, "Agent",
+		firstNonEmpty(m.agent.Name, m.agent.ID, "main"),
+		m.model.Display(),
+		"local cli",
+	)
+	lines = appendSidebarSection(lines, "Usage", summary.UsageLines...)
+	lines = appendSidebarSection(lines, "Trace", summary.TraceLines...)
+	lines = appendSidebarSection(lines, "Task", summary.TaskLines...)
+	lines = appendSidebarSection(lines, "Tools", summary.ToolLines...)
+	lines = m.fitSidebarLines(lines, maxInt(1, height-2), maxInt(8, width-5))
+	return sidebarStyle(width, height).Render(strings.Join(lines, "\n"))
+}
+
+type tuiSidebarSummary struct {
+	SessionName string
+	UsageLines  []string
+	TraceLines  []string
+	TaskLines   []string
+	ToolLines   []string
+}
+
+func (m *tuiModel) sidebarSummary(state session.State) tuiSidebarSummary {
+	out := tuiSidebarSummary{SessionName: m.sessionDisplayName(state)}
+	usage := state.Usage
+	tracePath := latestTracePath(state)
+	if tracePath != "" {
+		if summary, err := runtime.SummarizeTrace(tracePath); err == nil {
+			out.TraceLines = traceSummaryLines(summary)
+			if usage.Requests == 0 && summary.ModelRequests > 0 {
+				usage.Requests = summary.ModelRequests
+				usage.InputTokens = summary.InputTokens
+				usage.OutputTokens = summary.OutputTokens
+				usage.TotalTokens = summary.TotalTokens
+			}
+		} else {
+			out.TraceLines = []string{filepath.Base(tracePath), "unreadable"}
+		}
+	}
+	if len(out.TraceLines) == 0 {
+		out.TraceLines = []string{"none"}
+	}
+	out.UsageLines = usageLines(usage)
+	if m.running {
+		out.TaskLines = m.liveTaskLines()
+	} else {
+		out.TaskLines = taskLines(state)
+	}
+	out.ToolLines = m.toolLines()
+	return out
+}
+
+func (m *tuiModel) liveTaskLines() []string {
+	lines := []string{"Status: " + firstNonEmpty(m.status, "running")}
+	if strings.TrimSpace(m.currentTask) != "" {
+		lines = append(lines, "Goal: "+compactInline(m.currentTask, 84))
+	}
+	if len(m.liveSteps) > 0 {
+		lines = append(lines, recentStepLines(m.liveSteps, 4)...)
+	} else {
+		lines = append(lines, "Waiting for first tool/event")
+	}
+	return lines
+}
+
+func (m *tuiModel) sessionDisplayName(state session.State) string {
+	key := firstNonEmpty(state.Key, m.sessionKey)
+	if strings.HasPrefix(key, "cli:") {
+		return strings.TrimPrefix(key, "cli:")
+	}
+	return key
+}
+
+func appendSidebarSection(lines []string, title string, values ...string) []string {
+	var clean []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			clean = append(clean, value)
+		}
+	}
+	if len(clean) == 0 {
+		return lines
+	}
+	if len(lines) > 0 && lines[len(lines)-1] != "" {
+		lines = append(lines, "")
+	}
+	lines = append(lines, sidebarSectionTitle(title))
+	return append(lines, clean...)
+}
+
+func sidebarSectionTitle(title string) string {
+	return colorize(strings.ToUpper(title), ansiBlue, true)
+}
+
+func usageLines(usage session.Usage) []string {
+	if usage.Requests == 0 && usage.TotalTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.Cost == 0 {
+		return []string{"none"}
+	}
+	lines := []string{
+		fmt.Sprintf("%d requests", usage.Requests),
+		fmt.Sprintf("%d tokens", usage.TotalTokens),
+		fmt.Sprintf("in %d / out %d", usage.InputTokens, usage.OutputTokens),
+	}
+	if usage.Cost > 0 {
+		lines = append(lines, fmt.Sprintf("$%.4f", usage.Cost))
+	}
+	return lines
+}
+
+func traceSummaryLines(summary runtime.TraceSummary) []string {
+	name := firstNonEmpty(summary.TraceID, filepath.Base(summary.Path))
+	lines := []string{name}
+	lines = append(lines, fmt.Sprintf("%d events", summary.Events))
+	if summary.ModelRequests > 0 {
+		lines = append(lines, fmt.Sprintf("%d model calls", summary.ModelRequests))
+	}
+	if summary.ModelDurationMS > 0 || summary.ToolDurationMS > 0 || summary.RuntimeDurationMS > 0 {
+		lines = append(lines, fmt.Sprintf("model %s", durationText(summary.ModelDurationMS)))
+		lines = append(lines, fmt.Sprintf("tools %s", durationText(summary.ToolDurationMS)))
+		lines = append(lines, fmt.Sprintf("runtime %s", durationText(summary.RuntimeDurationMS)))
+	}
+	return lines
+}
+
+func taskLines(state session.State) []string {
+	task, ok := selectedTask(state)
+	if !ok {
+		if strings.TrimSpace(state.ActiveTask) != "" {
+			return []string{"active " + state.ActiveTask}
+		}
+		return []string{"none"}
+	}
+	return taskSidebarLines(task)
+}
+
+func selectedTask(state session.State) (session.TaskNode, bool) {
+	if strings.TrimSpace(state.ActiveTask) != "" {
+		for _, task := range state.Tasks {
+			if task.ID == state.ActiveTask {
+				return task, true
+			}
+		}
+		return session.TaskNode{}, false
+	}
+	if len(state.Tasks) == 0 {
+		return session.TaskNode{}, false
+	}
+	return state.Tasks[len(state.Tasks)-1], true
+}
+
+func taskSidebarLines(task session.TaskNode) []string {
+	status := firstNonEmpty(task.Status, task.Execution.Status, "latest")
+	lines := []string{contractListTitle(status)}
+	contract := task.Execution.Contract
+	if contract == nil {
+		return append(lines, "Goal: "+compactInline(firstNonEmpty(task.Summary, task.Goal, task.ID), 72))
+	}
+	goal := firstNonEmpty(contract.Summary, task.Summary, task.Goal)
+	if goal != "" {
+		lines = append(lines, contractChecklistLine("done", compactInline(goal, 84), "goal"))
+	}
+	if usefulContractText(contract.ExpectedOutcome) {
+		lines = append(lines, contractChecklistLine("pending", compactInline(contract.ExpectedOutcome, 84), "outcome"))
+	}
+	if usefulContractText(contract.CompletionPolicy) {
+		lines = append(lines, contractChecklistLine("pending", compactInline(contract.CompletionPolicy, 84), "done when"))
+	}
+	lines = append(lines, requirementLines(contract, task.Steps)...)
+	return lines
+}
+
+func contractListTitle(status string) string {
+	status = firstNonEmpty(status, "latest")
+	return "▾ Contract " + status
+}
+
+func contractChecklistLine(state, text, suffix string) string {
+	mark := "[ ]"
+	color := ""
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "done", "accepted", "completed", "success":
+		mark = "[✓]"
+		color = ansiDim
+	case "running", "active":
+		mark = "[•]"
+		color = ansiYellow
+	case "failed", "blocked", "error":
+		mark = "[!]"
+		color = ansiRed
+	}
+	line := mark + " " + text
+	if strings.TrimSpace(suffix) != "" {
+		line += " — " + suffix
+	}
+	if color == "" {
+		return line
+	}
+	return colorize(line, color, true)
+}
+
+func (m *tuiModel) fitSidebarLines(lines []string, maxLines, width int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	var wrapped []string
+	for _, line := range lines {
+		wrapped = append(wrapped, wrapLines(line, width)...)
+	}
+	if len(wrapped) <= maxLines {
+		m.sidebarScroll = 0
+		return wrapped
+	}
+	maxScroll := len(wrapped) - maxLines
+	if m.sidebarScroll > maxScroll {
+		m.sidebarScroll = maxScroll
+	}
+	if m.sidebarScroll < 0 {
+		m.sidebarScroll = 0
+	}
+	out := append([]string{}, wrapped[m.sidebarScroll:m.sidebarScroll+maxLines]...)
+	if m.sidebarScroll > 0 && len(out) > 0 {
+		out[0] = colorize("... scroll up", ansiDim, true)
+	}
+	if m.sidebarScroll < maxScroll && len(out) > 0 {
+		out[len(out)-1] = colorize("... scroll down", ansiDim, true)
+	}
+	return out
+}
+
+func appendSidebarOverflowHint(lines []string, maxLines int) []string {
+	hint := colorize("... more in /events", ansiDim, true)
+	if maxLines <= 1 {
+		return []string{hint}
+	}
+	out := append([]string{}, lines[:maxLines-1]...)
+	return append(out, hint)
+}
+
+func usefulContractText(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return false
+	}
+	generic := []string{
+		"answer the user task",
+		"final answer",
+		"available context",
+		"ask for required input",
+		"cite the located previous task identifiers",
+	}
+	for _, marker := range generic {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+func requirementLines(contract *session.TaskContract, steps []session.TaskStep) []string {
+	if contract == nil {
+		return nil
+	}
+	stats := contractToolStats(steps)
+	var lines []string
+	for _, tool := range contract.RequiredTools {
+		tool = strings.TrimSpace(tool)
+		if tool == "" {
 			continue
 		}
-		b := buf[0]
-		switch b {
-		case 3:
-			return nil
-		case 27:
-			a.readEscape()
-		case '\r', '\n':
-			if a.submit(ctx) {
-				return nil
-			}
-		case 127, 8:
-			a.backspace()
-		default:
-			if b >= 32 && b != 127 {
-				a.appendInput(string(b))
-			}
+		stat := stats[tool]
+		lines = append(lines, contractChecklistLine(stat.State(), friendlyToolName(tool), stat.Suffix()))
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		label := firstNonEmpty(evidence.Description, evidence.Tool, evidence.Kind)
+		if label == "" {
+			continue
 		}
-		a.render()
+		stat := contractItemStat{}
+		if strings.TrimSpace(evidence.Tool) != "" {
+			stat = stats[evidence.Tool]
+		}
+		lines = append(lines, contractChecklistLine(stat.State(), compactInline(label, 52), "evidence"))
+	}
+	return lines
+}
+
+type contractItemStat struct {
+	Accepted bool
+	Running  bool
+	Failed   int
+	Blocked  int
+}
+
+func (s contractItemStat) State() string {
+	if s.Accepted {
+		return "done"
+	}
+	if s.Running {
+		return "running"
+	}
+	if s.Failed > 0 || s.Blocked > 0 {
+		return "failed"
+	}
+	return "pending"
+}
+
+func (s contractItemStat) Suffix() string {
+	failures := s.Failed + s.Blocked
+	if s.Accepted && failures > 0 {
+		if failures == 1 {
+			return "after 1 retry"
+		}
+		return fmt.Sprintf("after %d retries", failures)
+	}
+	if !s.Accepted && failures > 0 {
+		if failures == 1 {
+			return "1 failed attempt"
+		}
+		return fmt.Sprintf("%d failed attempts", failures)
+	}
+	if s.Running {
+		return "running"
+	}
+	return ""
+}
+
+func contractToolStats(steps []session.TaskStep) map[string]contractItemStat {
+	out := map[string]contractItemStat{}
+	for _, step := range steps {
+		if strings.TrimSpace(step.Tool) == "" {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(step.Status))
+		stat := out[step.Tool]
+		if step.Accepted || status == "accepted" || status == "completed" || status == "success" {
+			stat.Accepted = true
+		}
+		if status == "running" {
+			stat.Running = true
+		}
+		if status == "failed" || status == "error" {
+			stat.Failed++
+		}
+		if status == "blocked" {
+			stat.Blocked++
+		}
+		out[step.Tool] = stat
+	}
+	return out
+}
+
+func recentStepLines(steps []session.TaskStep, limit int) []string {
+	if limit <= 0 || len(steps) == 0 {
+		return nil
+	}
+	start := len(steps) - limit
+	if start < 0 {
+		start = 0
+	}
+	lines := []string{"Recent steps:"}
+	for _, step := range steps[start:] {
+		mark := "•"
+		if step.Accepted || strings.EqualFold(step.Status, "accepted") || strings.EqualFold(step.Status, "completed") {
+			mark = "✓"
+		}
+		if strings.EqualFold(step.Status, "blocked") || strings.EqualFold(step.Status, "failed") {
+			mark = "!"
+		}
+		line := fmt.Sprintf("%s %s", mark, friendlyToolName(step.Tool))
+		if strings.TrimSpace(step.Summary) != "" {
+			line += " " + compactInline(step.Summary, 44)
+		} else if strings.TrimSpace(step.Status) != "" {
+			line += " " + strings.TrimSpace(step.Status)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func (m *tuiModel) toolLines() []string {
+	if m.approval != nil {
+		return []string{"approval required", friendlyToolName(m.approval.request.ToolCall.Name)}
+	}
+	if strings.TrimSpace(m.lastTool) == "" {
+		return []string{"none"}
+	}
+	return []string{friendlyToolName(m.lastTool), firstNonEmpty(m.lastToolState, "running")}
+}
+
+type commandPanelItem struct {
+	Section  string
+	Label    string
+	Command  string
+	What     string
+	Example  string
+	Shortcut string
+	Direct   bool
+}
+
+func allCommandPanelItems() []commandPanelItem {
+	return []commandPanelItem{
+		{Section: "Suggested", Label: "New session", Command: "/new", What: "start a fresh task", Example: "/new", Shortcut: "ctrl+x n", Direct: true},
+		{Section: "Suggested", Label: "Show trace", Command: "/trace", What: "summarize latest trace", Example: "/trace", Direct: true},
+		{Section: "Suggested", Label: "Show events", Command: "/events", What: "render process events", Example: "/events", Direct: true},
+		{Section: "Suggested", Label: "Switch model", Command: "/model", What: "open model selector", Example: "/model", Shortcut: "ctrl+x m", Direct: true},
+		{Section: "Suggested", Label: "Manage tools", Command: "/tools", What: "open tool selector", Example: "/tools", Direct: true},
+
+		{Section: "Session", Label: "List sessions", Command: "/sessions", What: "open session selector", Example: "/sessions", Direct: true},
+		{Section: "Session", Label: "Switch session", Command: "/session <key>", What: "attach this TUI to a session", Example: "/session feishu:oc_xxx"},
+		{Section: "Session", Label: "Resume session", Command: "/resume <key>", What: "copy another channel session here", Example: "/resume feishu:oc_xxx"},
+		{Section: "Session", Label: "Attach session", Command: "/resume --attach <key>", What: "continue another session directly", Example: "/resume --attach feishu:oc_xxx"},
+		{Section: "Session", Label: "Show session", Command: "/show", What: "show messages, tasks, and active task", Example: "/show", Direct: true},
+		{Section: "Session", Label: "Fork session", Command: "/resume <key>", What: "fork remote/local context into this session", Example: "/resume weixin:user_xxx"},
+
+		{Section: "Observe", Label: "Trace summary", Command: "/trace [path|key]", What: "summarize trace or session", Example: "/trace"},
+		{Section: "Observe", Label: "Process events", Command: "/events [path|key]", What: "show model/tool/final events", Example: "/events"},
+		{Section: "Observe", Label: "Raw events JSON", Command: "/events --json", What: "show trace events as JSON", Example: "/events --json", Direct: true},
+
+		{Section: "Agent / Model", Label: "Switch model", Command: "/model", What: "open model selector", Example: "/model", Direct: true},
+		{Section: "Agent / Model", Label: "Model details", Command: "/model --verbose", What: "show selection chain and endpoints", Example: "/model --verbose", Direct: true},
+
+		{Section: "Tools", Label: "Manage tools", Command: "/tools", What: "open tool enable/disable selector", Example: "/tools", Direct: true},
+		{Section: "Tools", Label: "Tool details", Command: "/tools --verbose", What: "show arguments and boundaries", Example: "/tools --verbose", Direct: true},
+		{Section: "Tools", Label: "Enable tool", Command: "/tools enable <tool>", What: "enable one tool", Example: "/tools enable project.index"},
+		{Section: "Tools", Label: "Disable tool", Command: "/tools disable <tool>", What: "disable one tool", Example: "/tools disable terminal.run"},
+
+		{Section: "Channel", Label: "Send to channel", Command: "mateway send --to <target>", What: "send a message to Feishu or Weixin", Example: "mateway send --to feishu:oc_xxx done"},
+		{Section: "Channel", Label: "Fetch history", Command: "mateway fetch-history --from <target>", What: "pull remote channel history", Example: "mateway fetch-history --from feishu:oc_xxx"},
+
+		{Section: "Memory", Label: "Search memory", Command: "mateway memory search <query>", What: "search local agent memory", Example: "mateway memory search deployment"},
+		{Section: "Memory", Label: "Memory proposals", Command: "mateway memory proposal list", What: "review pending memory changes", Example: "mateway memory proposal list"},
+
+		{Section: "Local", Label: "Workspace report", Command: "mateway workspace report", What: "inspect runtime home and workspace", Example: "mateway workspace report"},
+		{Section: "Local", Label: "Gateway status", Command: "mateway gateway status", What: "check local gateway state", Example: "mateway gateway status"},
+		{Section: "Local", Label: "Help", Command: "/help", What: "show full command guide", Example: "/help", Direct: true},
+		{Section: "Local", Label: "Exit", Command: "/exit", What: "leave the TUI", Example: "/exit", Direct: true},
 	}
 }
 
-func (a *tuiApp) submit(ctx context.Context) bool {
-	a.mu.Lock()
-	text := strings.TrimSpace(a.input)
-	approval := a.approval
-	if approval != nil {
-		a.input = ""
-		a.mu.Unlock()
+func (m *tuiModel) filteredCommandItems() []commandPanelItem {
+	items := allCommandPanelItems()
+	filter := strings.ToLower(m.commandSearch())
+	if filter == "" || filter == "/" {
+		return items
+	}
+	var out []commandPanelItem
+	for _, item := range items {
+		haystack := strings.ToLower(strings.Join([]string{item.Section, item.Label, item.Command, item.What, item.Example}, " "))
+		if strings.Contains(haystack, filter) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (m *tuiModel) commandSearch() string {
+	value := strings.TrimSpace(m.input.Value())
+	value = strings.TrimPrefix(value, "/")
+	return strings.TrimSpace(value)
+}
+
+func (m *tuiModel) updateCommandPanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.commandPanel = false
+		if strings.TrimSpace(m.input.Value()) == "/" {
+			m.input.SetValue("")
+		}
+		return m, nil
+	case "up":
+		m.commandIndex--
+		if m.commandIndex < 0 {
+			m.commandIndex = len(m.filteredCommandItems()) - 1
+		}
+		return m, nil
+	case "down":
+		m.commandIndex++
+		items := m.filteredCommandItems()
+		if len(items) == 0 || m.commandIndex >= len(items) {
+			m.commandIndex = 0
+		}
+		return m, nil
+	case "enter":
+		items := m.filteredCommandItems()
+		if len(items) == 0 {
+			m.commandPanel = false
+			return m, nil
+		}
+		if m.commandIndex < 0 || m.commandIndex >= len(items) {
+			m.commandIndex = 0
+		}
+		item := items[m.commandIndex]
+		value := commandFillValue(item)
+		m.commandPanel = false
+		m.input.SetValue(value)
+		if item.Direct && strings.HasPrefix(value, "/") {
+			return m, m.submit()
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	if !strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/") {
+		m.commandPanel = false
+	}
+	m.commandIndex = 0
+	return m, cmd
+}
+
+func commandFillValue(item commandPanelItem) string {
+	if strings.TrimSpace(item.Example) != "" && strings.HasPrefix(strings.TrimSpace(item.Example), "/") {
+		return strings.TrimSpace(item.Example)
+	}
+	if strings.TrimSpace(item.Example) != "" && !strings.Contains(item.Example, "<") {
+		return strings.TrimSpace(item.Example)
+	}
+	if strings.Contains(item.Command, "<") || strings.Contains(item.Command, "[") {
+		return item.Command
+	}
+	fields := strings.Fields(item.Command)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func (m *tuiModel) recordHistory(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if len(m.history) == 0 || m.history[len(m.history)-1] != text {
+		m.history = append(m.history, text)
+	}
+	m.historyIndex = -1
+}
+
+func (m *tuiModel) historyUp() {
+	if len(m.history) == 0 {
+		return
+	}
+	if m.historyIndex < 0 {
+		m.historyIndex = len(m.history) - 1
+	} else if m.historyIndex > 0 {
+		m.historyIndex--
+	}
+	m.input.SetValue(m.history[m.historyIndex])
+}
+
+func (m *tuiModel) historyDown() {
+	if len(m.history) == 0 || m.historyIndex < 0 {
+		return
+	}
+	if m.historyIndex >= len(m.history)-1 {
+		m.historyIndex = -1
+		m.input.SetValue("")
+		return
+	}
+	m.historyIndex++
+	m.input.SetValue(m.history[m.historyIndex])
+}
+
+func durationText(ms int64) string {
+	if ms <= 0 {
+		return "0ms"
+	}
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
+}
+
+func sidebarStyle(width, height int) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), false, false, false, true).
+		BorderForeground(lipgloss.Color("238")).
+		Padding(1, 2).
+		Width(width).
+		Height(maxInt(1, height))
+}
+
+func (m *tuiModel) submit() tea.Cmd {
+	text := strings.TrimSpace(m.input.Value())
+	if text == "" {
+		return nil
+	}
+	m.commandPanel = false
+	if m.approval != nil && m.pendingAnswer != nil {
+		m.input.SetValue("")
+		m.recordHistory(text)
 		answer := strings.ToLower(text)
-		approval.reply <- runtime.ApprovalDecision{Approved: answer == "y" || answer == "yes"}
-		return false
+		m.pendingAnswer <- runtime.ApprovalDecision{Approved: answer == "y" || answer == "yes"}
+		return nil
 	}
-	if text == "" || a.running {
-		a.mu.Unlock()
-		return false
+	if m.running {
+		m.addEvent(colorize("task is still running; draft kept in input", ansiYellow, true))
+		return nil
 	}
-	a.input = ""
+	m.input.SetValue("")
+	m.recordHistory(text)
 	if cmd, ok := ParseSlash(text); ok {
-		a.mu.Unlock()
-		return a.handleSlash(ctx, cmd)
+		if m.handleSlash(cmd) {
+			return tea.Quit
+		}
+		return nil
 	}
-	a.running = true
-	a.events = append(a.events, colorize("User", ansiCyan, true), "│ "+compactBlock(text, 600), "")
-	a.scroll = 0
-	a.mu.Unlock()
-	go a.runTask(ctx, text)
-	return false
+	m.running = true
+	m.status = "Thinking"
+	m.progress = 0
+	m.toolEvents = 0
+	m.currentTask = text
+	m.liveSteps = nil
+	m.addEvent(colorize("User", ansiCyan, true))
+	m.addEvent("│ " + compactBlock(text, 600))
+	m.addEvent("")
+	m.addEvent(colorize("• Thinking", ansiDim, true))
+	return m.runTaskCmd(text)
 }
 
-func (a *tuiApp) runTask(ctx context.Context, text string) {
-	rt := runtime.New(a.cfg)
+func (m *tuiModel) runTaskCmd(text string) tea.Cmd {
+	return func() tea.Msg {
+		go m.runTask(text)
+		return nil
+	}
+}
+
+func (m *tuiModel) runTask(text string) {
+	rt := runtime.New(m.cfg)
 	rt.ProgressSink = func(msg channel.OutboundMessage) {
-		if len(msg.Progress) == 0 {
+		if len(msg.Progress) == 0 || m.program == nil {
 			return
 		}
-		line := renderProgressLine(msg.Progress[len(msg.Progress)-1], true)
-		if strings.TrimSpace(line) == "" {
-			return
-		}
-		a.addEvent(line)
-		a.render()
+		step := msg.Progress[len(msg.Progress)-1]
+		m.program.Send(tuiProgressMsg{
+			line:      renderTUIProgressBlock(step),
+			status:    progressStatus(step),
+			tool:      step.Tool,
+			toolState: step.Status,
+			summary:   step.Summary,
+			duration:  step.DurationMS,
+		})
 	}
 	rt.Hooks.ApproveToolCall = func(_ context.Context, req runtime.ApprovalRequest) (runtime.ApprovalDecision, error) {
 		approval := &tuiApproval{request: req, reply: make(chan runtime.ApprovalDecision, 1)}
-		a.mu.Lock()
-		a.approval = approval
-		a.events = append(a.events, "", colorize("! Approval required", ansiYellow, true), "  tool:   "+friendlyToolName(req.ToolCall.Name), "  detail: "+approvalDetail(req.ToolCall), "  enter y or n")
-		a.mu.Unlock()
-		a.render()
+		if m.program != nil {
+			m.program.Send(tuiApprovalMsg{approval: approval})
+		}
 		decision := <-approval.reply
-		a.mu.Lock()
-		a.approval = nil
-		a.mu.Unlock()
-		a.render()
+		if m.program != nil {
+			m.program.Send(tuiApprovalDoneMsg{})
+		}
 		return decision, nil
 	}
-	resp, err := rt.Handle(ctx, inbound(text, a.sessionKey))
-	a.mu.Lock()
-	a.running = false
-	if err != nil {
-		a.errText = err.Error()
-		a.events = append(a.events, "", colorize("Error", ansiRed, true), compactBlock(err.Error(), 600))
-		a.mu.Unlock()
-		a.render()
+	resp, err := rt.Handle(m.ctx, inbound(text, m.sessionKey))
+	if m.program != nil {
+		m.program.Send(tuiResultMsg{reply: resp.Reply, followUps: resp.FollowUps, tracePath: resp.TracePath, err: err})
+	}
+}
+
+func (m *tuiModel) recordLiveStep(msg tuiProgressMsg) {
+	toolName := strings.TrimSpace(msg.tool)
+	if toolName == "" {
 		return
 	}
-	a.events = append(a.events, "", colorize("Assistant", ansiGreen, true))
-	for _, msg := range (channel.OutboundBatch{Reply: resp.Reply, FollowUps: resp.FollowUps}).Messages() {
-		a.events = append(a.events, wrapLines(msg.Text, 120)...)
-		a.events = append(a.events, "")
+	status := firstNonEmpty(msg.toolState, "running")
+	summary := strings.TrimSpace(msg.summary)
+	if summary == "" && msg.duration > 0 {
+		summary = durationText(msg.duration)
 	}
-	if strings.TrimSpace(resp.TracePath) != "" {
-		a.events = append(a.events, colorize("trace: "+resp.TracePath, ansiDim, true))
+	step := session.TaskStep{
+		Tool:     toolName,
+		Status:   status,
+		Summary:  summary,
+		Accepted: strings.EqualFold(status, "accepted") || strings.EqualFold(status, "completed") || strings.EqualFold(status, "success"),
 	}
-	a.mu.Unlock()
-	a.render()
-}
-
-func (a *tuiApp) appendInput(value string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.input += value
-}
-
-func (a *tuiApp) backspace() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.input) > 0 {
-		a.input = a.input[:len(a.input)-1]
+	if len(m.liveSteps) > 0 {
+		last := &m.liveSteps[len(m.liveSteps)-1]
+		if last.Tool == step.Tool && (last.Status == "running" || last.Summary == step.Summary || step.Accepted) {
+			*last = step
+			return
+		}
+	}
+	m.liveSteps = append(m.liveSteps, step)
+	if len(m.liveSteps) > 12 {
+		m.liveSteps = m.liveSteps[len(m.liveSteps)-12:]
 	}
 }
 
-func (a *tuiApp) readEscape() {
-	buf := make([]byte, 2)
-	n, _ := a.in.Read(buf)
-	if n < 2 || buf[0] != '[' {
+func (m *tuiModel) addEvent(line string) {
+	if len(m.events) > 0 && m.events[len(m.events)-1] == line {
 		return
 	}
-	switch buf[1] {
-	case 'A':
-		a.scrollBy(1)
-	case 'B':
-		a.scrollBy(-1)
-	case '5':
-		_, _ = a.in.Read(buf[:1])
-		a.scrollBy(10)
-	case '6':
-		_, _ = a.in.Read(buf[:1])
-		a.scrollBy(-10)
+	m.events = append(m.events, line)
+	if len(m.events) > maxTUIEventLines {
+		drop := len(m.events) - maxTUIEventLines + 1
+		m.events = append([]string{colorize(fmt.Sprintf("... trimmed %d older TUI lines; use /events or /trace for full history", drop), ansiDim, true)}, m.events[drop:]...)
+	}
+	if !m.autoFollow {
+		m.newEvents++
+	}
+	m.refreshViewport()
+}
+
+func (m *tuiModel) addOutput(text string) {
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		m.addEvent(line)
 	}
 }
 
-func (a *tuiApp) scrollBy(delta int) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.scroll += delta
-	if a.scroll < 0 {
-		a.scroll = 0
-	}
-	if a.scroll > len(a.events) {
-		a.scroll = len(a.events)
+func (m *tuiModel) refreshViewport() {
+	m.viewport.SetContent(strings.Join(m.events, "\n"))
+	if m.autoFollow {
+		m.viewport.GotoBottom()
+		m.newEvents = 0
 	}
 }
 
-func (a *tuiApp) addEvent(line string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.events) > 0 && a.events[len(a.events)-1] == line {
+func (m *tuiModel) addSessionBanner() {
+	state, err := session.NewStore(m.cfg.App.Home).Load(m.sessionKey)
+	label := m.sessionDisplayName(state)
+	if err == nil && (len(state.Messages) > 0 || len(state.Tasks) > 0) {
+		m.addEvent(colorize(fmt.Sprintf("Session resumed - %s (%d messages, %d tasks)", label, len(state.Messages), len(state.Tasks)), ansiDim, true))
+		if last := lastDisplayMessage(state); last != "" {
+			m.addEvent(colorize("Last message", ansiDim, true))
+			m.addEvent("│ " + compactBlock(last, 220))
+		}
 		return
 	}
-	a.events = append(a.events, line)
-	a.scroll = 0
+	m.addEvent(colorize("Session ready - "+label+" - "+time.Now().Format("2006-01-02 15:04:05"), ansiDim, true))
 }
 
-func (a *tuiApp) handleSlash(ctx context.Context, cmd SlashCommand) bool {
+func lastDisplayMessage(state session.State) string {
+	for i := len(state.Messages) - 1; i >= 0; i-- {
+		msg := state.Messages[i]
+		if strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		switch string(msg.Role) {
+		case "user":
+			return "User: " + msg.Content
+		case "assistant":
+			return "Assistant: " + msg.Content
+		}
+	}
+	return ""
+}
+
+func (m *tuiModel) handleSlash(cmd SlashCommand) bool {
 	switch cmd.Name {
 	case "exit", "quit", "q":
 		return true
 	case "help", "?":
-		a.addEvent(colorize("Commands", ansiGreen, true))
-		a.addEvent("/help  /exit  /new  /session <key>  /sessions  /resume [--attach] <key>")
-		a.addEvent("/show [key]  /trace [path|key]  /events [path|key]")
+		var out bytes.Buffer
+		printChatHelp(&out)
+		m.addOutput(out.String())
 	case "new":
-		a.mu.Lock()
-		if a.running {
-			a.mu.Unlock()
-			a.addEvent(colorize("task is already running", ansiYellow, true))
-			return false
-		}
-		a.running = true
-		a.events = append(a.events, colorize("User", ansiCyan, true), "│ /new", "")
-		a.scroll = 0
-		a.mu.Unlock()
-		go a.runTask(ctx, "/new")
+		m.running = true
+		m.status = "Thinking"
+		m.progress = 0
+		m.toolEvents = 0
+		m.currentTask = "/new"
+		m.liveSteps = nil
+		m.addEvent(colorize("User", ansiCyan, true))
+		m.addEvent("│ /new")
+		m.addEvent("")
+		m.addEvent(colorize("• Thinking", ansiDim, true))
+		go m.runTask("/new")
 	case "session":
 		if len(cmd.Args) != 1 {
-			a.addEvent(colorize("usage: /session <session_key>", ansiYellow, true))
+			m.addEvent(colorize("usage: /session <session_key>", ansiYellow, true))
 			return false
 		}
 		next := ResolveSessionKey(cmd.Args[0])
-		a.setSessionKey(next)
-		a.addEvent("session: " + next)
+		m.sessionKey = next
+		m.addEvent("session: " + next)
 	case "sessions":
-		keys, err := session.NewStore(a.cfg.App.Home).List()
+		if len(cmd.Args) == 0 {
+			if err := m.openSessionsPicker(); err != nil {
+				m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			}
+			return false
+		}
+		keys, err := session.NewStore(m.cfg.App.Home).List()
 		if err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 			return false
 		}
 		sort.Strings(keys)
-		a.addEvent(colorize("Sessions", ansiGreen, true))
+		m.addEvent(colorize("Sessions", ansiGreen, true))
 		for _, key := range keys {
 			prefix := "  "
-			if key == a.currentSessionKey() {
+			if key == m.sessionKey {
 				prefix = "* "
 			}
-			a.addEvent(prefix + key)
+			m.addEvent(prefix + key)
 		}
 	case "show":
-		key := a.currentSessionKey()
+		key := m.sessionKey
 		if len(cmd.Args) > 0 {
 			key = ResolveSessionKey(cmd.Args[0])
 		}
-		state, err := session.NewStore(a.cfg.App.Home).Load(key)
+		state, err := session.NewStore(m.cfg.App.Home).Load(key)
 		if err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 			return false
 		}
-		a.addEvent(colorize("Session", ansiGreen, true))
-		a.addEvent(fmt.Sprintf("key=%s messages=%d tasks=%d active=%s", state.Key, len(state.Messages), len(state.Tasks), state.ActiveTask))
+		m.addEvent(colorize("Session", ansiGreen, true))
+		m.addEvent(fmt.Sprintf("key=%s messages=%d tasks=%d active=%s", state.Key, len(state.Messages), len(state.Tasks), state.ActiveTask))
 	case "trace":
-		path, err := a.resolveTracePath(cmd.Args)
+		path, err := m.resolveTracePath(cmd.Args)
 		if err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 			return false
 		}
 		var out bytes.Buffer
 		if err := printTraceSummary(&out, path); err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 			return false
 		}
-		a.addOutput(out.String())
+		m.addOutput(out.String())
 	case "events":
-		path, err := a.resolveTracePath(cmd.Args)
+		opts := TraceEventsOptions{}
+		var filtered []string
+		for _, arg := range cmd.Args {
+			if arg == "--json" {
+				opts.JSON = true
+				continue
+			}
+			filtered = append(filtered, arg)
+		}
+		path, err := m.resolveTracePath(filtered)
 		if err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 			return false
 		}
 		var out bytes.Buffer
 		fmt.Fprintln(&out, "trace:", path)
-		if err := PrintTraceEventsWithOptions(&out, path, TraceEventsOptions{}); err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+		if err := PrintTraceEventsWithOptions(&out, path, opts); err != nil {
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 			return false
 		}
-		a.addOutput(out.String())
+		m.addOutput(out.String())
+	case "tools":
+		if len(cmd.Args) == 0 {
+			m.openToolsPicker()
+			return false
+		}
+		var out bytes.Buffer
+		if err := m.handleToolsSlash(&out, cmd.Args); err != nil {
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			return false
+		}
+		m.addOutput(out.String())
+	case "model":
+		if len(cmd.Args) == 0 {
+			m.openModelsPicker()
+			return false
+		}
+		verbose, agentID, err := parseModelSlashArgs(cmd.Args)
+		if err != nil {
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			return false
+		}
+		var out bytes.Buffer
+		if err := PrintModel(&out, m.cfg, agentID, verbose); err != nil {
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			return false
+		}
+		m.addOutput(out.String())
 	case "resume":
-		if err := a.resume(cmd.Args); err != nil {
-			a.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+		if err := m.resume(cmd.Args); err != nil {
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 		}
 	default:
-		a.addEvent(colorize("unknown command: /"+cmd.Name, ansiYellow, true))
+		m.addEvent(colorize("unknown command: /"+cmd.Name, ansiYellow, true))
 	}
 	return false
 }
 
-func (a *tuiApp) currentSessionKey() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.sessionKey
-}
-
-func (a *tuiApp) setSessionKey(key string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.sessionKey = key
-	a.scroll = 0
-}
-
-func (a *tuiApp) addOutput(text string) {
-	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
-		a.addEvent(line)
+func (m *tuiModel) openSessionsPicker() error {
+	store := session.NewStore(m.cfg.App.Home)
+	keys, err := store.List()
+	if err != nil {
+		return err
 	}
+	sort.Strings(keys)
+	items := make([]tuiPickerItem, 0, len(keys))
+	for _, key := range keys {
+		state, _ := store.Load(key)
+		status := ""
+		if key == m.sessionKey {
+			status = "current"
+		}
+		detail := fmt.Sprintf("%d messages · %d tasks", len(state.Messages), len(state.Tasks))
+		if !state.UpdatedAt.IsZero() {
+			detail += " · " + state.UpdatedAt.Format("01-02 15:04")
+		}
+		items = append(items, tuiPickerItem{
+			Label:  key,
+			Detail: detail,
+			Value:  key,
+			Status: status,
+		})
+	}
+	if len(items) == 0 {
+		items = []tuiPickerItem{{Label: m.sessionKey, Detail: "current session", Value: m.sessionKey, Status: "current"}}
+	}
+	m.picker = &tuiPicker{Kind: "sessions", Title: "Sessions", Items: items}
+	return nil
 }
 
-func (a *tuiApp) resolveTracePath(args []string) (string, error) {
+func (m *tuiModel) openModelsPicker() {
+	var items []tuiPickerItem
+	current := strings.TrimSpace(m.model.Name)
+	for _, model := range m.cfg.Models {
+		if !model.Enabled {
+			continue
+		}
+		status := ""
+		if strings.EqualFold(model.Name, current) || strings.EqualFold(model.Model, m.model.Model) {
+			status = "current"
+		}
+		detail := firstNonEmpty(model.Model, model.Provider)
+		if model.Provider != "" && model.Model != "" {
+			detail = model.Provider + " · " + model.Model
+		}
+		if model.ContextWindow > 0 {
+			detail += fmt.Sprintf(" · %d ctx", model.ContextWindow)
+		}
+		items = append(items, tuiPickerItem{
+			Label:  model.Name,
+			Detail: detail,
+			Value:  model.Name,
+			Status: status,
+		})
+	}
+	if len(items) == 0 {
+		items = []tuiPickerItem{{Label: m.model.Display(), Detail: "configured fallback", Value: m.model.Name, Status: "current"}}
+	}
+	m.picker = &tuiPicker{Kind: "models", Title: "Models", Items: items}
+}
+
+func (m *tuiModel) openToolsPicker() {
+	all := tool.NewRegistry(m.cfg).List()
+	enabled := map[string]bool{}
+	profile, hasProfile := findAgentProfile(m.cfg, firstNonEmpty(m.agent.ID, m.cfg.Agents.Default))
+	if hasProfile {
+		for _, item := range tool.NewRegistryForProfile(m.cfg, profile).List() {
+			enabled[item.Name()] = true
+		}
+	} else {
+		for _, item := range all {
+			enabled[item.Name()] = true
+		}
+	}
+	items := make([]tuiPickerItem, 0, len(all))
+	for _, item := range all {
+		status := "enabled"
+		if !enabled[item.Name()] {
+			status = "disabled"
+		}
+		required := strings.Join(item.Schema().Required, ",")
+		if required == "" {
+			required = "no required args"
+		}
+		items = append(items, tuiPickerItem{
+			Label:  item.Name(),
+			Detail: fmt.Sprintf("%s · %s", item.Risk(), required),
+			Value:  item.Name(),
+			Status: status,
+		})
+	}
+	m.picker = &tuiPicker{Kind: "tools", Title: "Tools", Items: items}
+}
+
+func (m *tuiModel) handleToolsSlash(out io.Writer, args []string) error {
+	verbose := false
+	agentID := ""
+	var values []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--verbose":
+			verbose = true
+		case "--agent":
+			if i+1 >= len(args) {
+				return fmt.Errorf("usage: /tools [--agent <agent_id>] [--verbose]")
+			}
+			i++
+			agentID = args[i]
+		default:
+			values = append(values, args[i])
+		}
+	}
+	if len(values) == 0 {
+		return PrintTools(out, m.cfg, agentID, verbose)
+	}
+	if len(values) != 2 {
+		return fmt.Errorf("usage: /tools [enable|disable] <tool_name> [--agent <agent_id>]")
+	}
+	var (
+		change ToolAccessChange
+		err    error
+	)
+	switch values[0] {
+	case "enable":
+		change, err = EnableTool(m.cfg, agentID, values[1])
+	case "disable":
+		change, err = DisableTool(m.cfg, agentID, values[1])
+	default:
+		return fmt.Errorf("usage: /tools [enable|disable] <tool_name> [--agent <agent_id>]")
+	}
+	if err != nil {
+		return err
+	}
+	PrintToolAccessChange(out, change)
+	return nil
+}
+
+func (m *tuiModel) resolveTracePath(args []string) (string, error) {
 	if len(args) > 1 {
 		return "", fmt.Errorf("usage: /trace [trace_path|session_key]")
 	}
-	store := session.NewStore(a.cfg.App.Home)
+	store := session.NewStore(m.cfg.App.Home)
 	if len(args) == 1 {
 		value := strings.TrimSpace(args[0])
 		if strings.Contains(value, "/") || strings.HasSuffix(value, ".jsonl") {
@@ -381,18 +1873,17 @@ func (a *tuiApp) resolveTracePath(args []string) (string, error) {
 		}
 		return "", fmt.Errorf("session %q has no trace", key)
 	}
-	key := a.currentSessionKey()
-	state, err := store.Load(key)
+	state, err := store.Load(m.sessionKey)
 	if err != nil {
 		return "", err
 	}
 	if path := latestTracePath(state); path != "" {
 		return path, nil
 	}
-	return "", fmt.Errorf("session %q has no trace", key)
+	return "", fmt.Errorf("session %q has no trace", m.sessionKey)
 }
 
-func (a *tuiApp) resume(args []string) error {
+func (m *tuiModel) resume(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: /resume [--attach] <session_key>")
 	}
@@ -411,126 +1902,123 @@ func (a *tuiApp) resume(args []string) error {
 	}
 	source := ResolveSessionKey(values[0])
 	if attach {
-		a.setSessionKey(source)
-		a.addEvent("attached: " + source)
+		m.sessionKey = source
+		m.addEvent("attached: " + source)
 		return nil
 	}
-	target := a.currentSessionKey()
-	if err := ForkSession(session.NewStore(a.cfg.App.Home), source, target); err != nil {
+	target := m.sessionKey
+	if err := ForkSession(session.NewStore(m.cfg.App.Home), source, target); err != nil {
 		return err
 	}
-	a.addEvent(fmt.Sprintf("resumed %s into %s", source, target))
+	m.addEvent(fmt.Sprintf("resumed %s into %s", source, target))
 	return nil
 }
 
-func (a *tuiApp) render() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	width, height, err := term.GetSize(int(a.out.Fd()))
-	if err != nil || width <= 0 || height <= 0 {
-		width, height = 120, 40
-	}
-	sidebar := 28
-	if width < 100 {
-		sidebar = 0
-	}
-	mainWidth := width - sidebar - 2
-	if mainWidth < 40 {
-		mainWidth = width
-	}
-	state, _ := session.NewStore(a.cfg.App.Home).Load(a.sessionKey)
-	var b strings.Builder
-	b.WriteString("\x1b[H\x1b[2J")
-	contentHeight := height - 4
-	lines := visibleWindow(a.events, contentHeight, a.scroll)
-	for row := 0; row < contentHeight; row++ {
-		left := ""
-		if row < len(lines) {
-			left = truncateANSI(lines[row], mainWidth)
+func progressStatus(step channel.ProgressStep) string {
+	if strings.TrimSpace(step.Tool) != "" {
+		switch strings.TrimSpace(step.Status) {
+		case "completed", "success", "accepted", "done":
+			return "Done"
+		case "blocked", "failed", "error":
+			return "Blocked"
+		default:
+			return "Acting: " + friendlyToolName(step.Tool)
 		}
-		b.WriteString(padVisible(left, mainWidth))
-		if sidebar > 0 {
-			b.WriteString("  ")
-			b.WriteString(a.sidebarLine(row, sidebar, state))
+	}
+	if strings.EqualFold(step.Status, "thinking") {
+		return "Thinking"
+	}
+	return firstNonEmpty(step.Status, "Acting")
+}
+
+func renderTUIProgressBlock(step channel.ProgressStep) string {
+	event := eventFromProgressStep(step)
+	label, detail := processEventLabelAndDetail(event)
+	if strings.TrimSpace(label) == "" {
+		return ""
+	}
+	if event.Type != "tool.started" && event.Type != "tool.completed" && event.Type != "tool.blocked" && event.Type != "tool.progress" {
+		return renderProcessEvent(event, true)
+	}
+	color := processEventColor(event)
+	title := friendlyToolName(firstNonEmpty(event.Tool, event.Title))
+	status := firstNonEmpty(event.Status, strings.TrimSpace(label))
+	lines := []string{colorize("┌ Tool "+title, color, true)}
+	if strings.TrimSpace(event.Args) != "" {
+		lines = append(lines, "│ args: "+compactInline(event.Args, 96))
+	}
+	if strings.TrimSpace(event.Summary) != "" {
+		lines = append(lines, "│ summary: "+compactInline(event.Summary, 120))
+	}
+	if event.DurationMS > 0 {
+		lines = append(lines, "│ duration: "+durationText(event.DurationMS))
+	}
+	if strings.TrimSpace(detail) != "" && event.Args == "" && event.Summary == "" {
+		lines = append(lines, "│ "+compactInline(detail, 120))
+	}
+	if event.TimedOut {
+		lines = append(lines, "│ timed out")
+	}
+	lines = append(lines, colorize("└ "+status, color, true))
+	return strings.Join(lines, "\n")
+}
+
+func statusRight(width int, parts []string) string {
+	visible := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			visible = append(visible, colorize(part, ansiDim, true))
 		}
-		b.WriteString("\r\n")
 	}
-	b.WriteString(strings.Repeat("─", maxInt(0, width)) + "\r\n")
-	prompt := colorize("Build", ansiBlue, true) + " · " + colorize("MiniMax-M3", ansiDim, true)
-	if a.approval != nil {
-		prompt = colorize("Approval", ansiYellow, true) + " · enter y or n"
+	if width < 80 && len(visible) > 2 {
+		visible = visible[len(visible)-2:]
 	}
-	if a.running {
-		prompt += colorize(" · running", ansiDim, true)
+	if width < 120 && len(visible) > 3 {
+		visible = visible[len(visible)-3:]
 	}
-	b.WriteString(truncateANSI(prompt, width) + "\r\n")
-	b.WriteString(truncateANSI("  "+a.input, width) + "\r\n")
-	_, _ = a.out.WriteString(b.String())
+	return strings.Join(visible, "  ")
 }
 
-func (a *tuiApp) sidebarLine(row, width int, state session.State) string {
-	lines := []string{
-		colorize("Session", ansiGreen, true),
-		a.sessionKey,
-		"",
-		colorize("Context", ansiGreen, true),
-		fmt.Sprintf("%d messages", len(state.Messages)),
-		fmt.Sprintf("%d tasks", len(state.Tasks)),
-		"",
-		colorize("Todo", ansiGreen, true),
+type tuiModelInfo struct {
+	Name     string
+	Provider string
+	Model    string
+}
+
+func (m tuiModelInfo) Display() string {
+	return firstNonEmpty(m.Model, m.Name, "model:unknown")
+}
+
+func currentTUIModel(cfg *config.Root, agent config.AgentProfileConfig) tuiModelInfo {
+	if cfg == nil {
+		return tuiModelInfo{}
 	}
-	for _, task := range state.Tasks {
-		status := "[ ]"
-		if !session.IsOpenTaskStatus(task.Status) {
-			status = "[x]"
+	for _, name := range modelChain(agent.Model, cfg.Model) {
+		for _, model := range cfg.Models {
+			if !model.Enabled {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(model.Name), strings.TrimSpace(name)) {
+				return tuiModelInfo{Name: model.Name, Provider: model.Provider, Model: model.Model}
+			}
 		}
-		lines = append(lines, status+" "+compactInline(task.Goal, width-4))
 	}
-	if len(state.Tasks) == 0 {
-		lines = append(lines, colorize("No tasks yet", ansiDim, true))
-	}
-	if row >= len(lines) {
-		return strings.Repeat(" ", width)
-	}
-	return padVisible(truncateANSI(lines[row], width), width)
-}
-
-func (a *tuiApp) enterScreen() {
-	_, _ = a.out.WriteString("\x1b[?1049h\x1b[?25l")
-}
-
-func (a *tuiApp) leaveScreen() {
-	_, _ = a.out.WriteString("\x1b[?25h\x1b[?1049l")
-}
-
-func tailLines(lines []string, limit int) []string {
-	if limit <= 0 || len(lines) <= limit {
-		return lines
-	}
-	return lines[len(lines)-limit:]
-}
-
-func visibleWindow(lines []string, limit, scroll int) []string {
-	if limit <= 0 || len(lines) <= limit {
-		return lines
-	}
-	end := len(lines) - scroll
-	if end < limit {
-		end = limit
-	}
-	if end > len(lines) {
-		end = len(lines)
-	}
-	return lines[end-limit : end]
+	name := firstNonEmpty(agent.Model.Default, cfg.Model.Default)
+	return tuiModelInfo{Name: name, Model: name}
 }
 
 func wrapLines(text string, width int) []string {
 	var out []string
 	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
 		line = strings.TrimRight(line, "\r")
-		for len(line) > width && width > 0 {
-			out = append(out, line[:width])
-			line = line[width:]
+		if strings.Contains(line, "\x1b[") {
+			out = append(out, truncateANSI(line, width))
+			continue
+		}
+		for visibleLen(line) > width && width > 0 {
+			head := truncateANSI(line, width)
+			out = append(out, head)
+			line = strings.TrimPrefix(line, head)
 		}
 		out = append(out, line)
 	}
@@ -541,45 +2029,56 @@ func truncateANSI(text string, width int) string {
 	if width <= 0 || visibleLen(text) <= width {
 		return text
 	}
-	return text[:minInt(len(text), width)]
-}
-
-func padVisible(text string, width int) string {
-	n := visibleLen(text)
-	if n >= width {
-		return text
+	var b strings.Builder
+	visible := 0
+	inEscape := false
+	for _, r := range text {
+		if r == '\x1b' {
+			inEscape = true
+			b.WriteRune(r)
+			continue
+		}
+		if inEscape {
+			b.WriteRune(r)
+			if r == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		w := runewidth.RuneWidth(r)
+		if visible+w > width {
+			break
+		}
+		b.WriteRune(r)
+		visible += w
 	}
-	return text + strings.Repeat(" ", width-n)
+	if !inEscape && strings.Contains(text, "\x1b[") {
+		b.WriteString(ansiReset)
+	}
+	return b.String()
 }
 
 func visibleLen(text string) int {
 	n := 0
 	inEscape := false
-	for i := 0; i < len(text); i++ {
-		if text[i] == '\x1b' {
+	for _, r := range text {
+		if r == '\x1b' {
 			inEscape = true
 			continue
 		}
 		if inEscape {
-			if text[i] == 'm' {
+			if r == 'm' {
 				inEscape = false
 			}
 			continue
 		}
-		n++
+		n += runewidth.RuneWidth(r)
 	}
 	return n
 }
 
 func maxInt(a, b int) int {
 	if a > b {
-		return a
-	}
-	return b
-}
-
-func minInt(a, b int) int {
-	if a < b {
 		return a
 	}
 	return b

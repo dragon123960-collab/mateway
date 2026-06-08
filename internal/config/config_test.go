@@ -73,6 +73,20 @@ func TestModelConfigMaxTokensDefaults(t *testing.T) {
 	}
 }
 
+func TestTimezoneLocationUsesConfiguredTimezone(t *testing.T) {
+	loc, name := TimezoneLocation("UTC")
+	if name != "UTC" || loc.String() != "UTC" {
+		t.Fatalf("expected UTC location, got %q %q", name, loc.String())
+	}
+}
+
+func TestTimezoneLocationFallsBackToDefault(t *testing.T) {
+	_, name := TimezoneLocation("not/a-zone")
+	if name != DefaultTimezone() {
+		t.Fatalf("expected default timezone fallback, got %q", name)
+	}
+}
+
 func TestFeishuAccountConfigsOverlayBaseConfig(t *testing.T) {
 	disabled := false
 	cfg := FeishuConfig{

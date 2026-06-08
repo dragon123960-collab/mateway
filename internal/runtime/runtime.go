@@ -109,7 +109,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				Channel:  msg.Channel,
 				ThreadID: msg.ThreadID,
 				Text:     runtimeText(rt.Config, msg, "runtime.context_budget_exceeded", nil),
-				Style:    "error",
+				Style:    channel.StyleError,
 			},
 			TraceID:   trace.id,
 			TracePath: trace.path,
@@ -161,7 +161,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 		if activityTimedOut() {
 			text := runtimeText(rt.Config, msg, "runtime.activity_timeout", nil)
-			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), "partial")
+			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), channel.StylePartial)
 			resp.Reply.Progress = progressStepsForTask(*state, task.ID)
 			resp.TraceID = trace.id
 			resp.TracePath = trace.path
@@ -175,7 +175,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				Channel:  msg.Channel,
 				ThreadID: msg.ThreadID,
 				Text:     text,
-				Style:    "error",
+				Style:    channel.StyleError,
 				Progress: progressStepsForTask(*state, task.ID),
 			},
 			TraceID:   trace.id,
@@ -265,7 +265,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
 			Text:     renderMemoryProposalReview(rt.Config, msg, *learningResult.Proposal),
-			Style:    "memory_proposal_review",
+			Style:    channel.StyleMemoryProposalReview,
 		})
 	}
 	if learningResult == nil || learningResult.Proposal == nil {
@@ -274,10 +274,10 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			_ = trace.write(map[string]any{"type": "memory_proposal_nudge", "text": nudge})
 		}
 	}
-	style := ""
+	style := channel.MessageStyle("")
 	failed := result.StopReason != "" || emptyActionPromise
 	if failed && style == "" {
-		style = "partial"
+		style = channel.StylePartial
 	}
 	resp := Response{
 		Reply: channel.OutboundMessage{
@@ -307,37 +307,6 @@ func renderPartialReply(cfg *config.Root, msg channel.InboundMessage, text strin
 		return text
 	}
 	return runtimeText(cfg, msg, "runtime.partial.prefix", textValues("text", text))
-}
-
-func (rt Runtime) memoryProposalNudgeOptions(msg channel.InboundMessage) memory.ProposalNudgeOptions {
-	options := memory.ProposalNudgeOptions{
-		Channel:      msg.Channel,
-		Channels:     []string{"cli"},
-		Interval:     24 * time.Hour,
-		MaxProposals: 3,
-	}
-	if rt.Config == nil {
-		return options
-	}
-	cfg := rt.Config.Memory.ProposalNudge
-	if !cfg.EnabledValue() {
-		if cfg.Enabled == nil && strings.TrimSpace(cfg.Interval) == "" && len(cfg.Channels) == 0 && cfg.MaxProposals == 0 {
-			return options
-		}
-		options.Channels = nil
-		options.Channels = []string{"__disabled__"}
-		return options
-	}
-	if len(cfg.Channels) > 0 {
-		options.Channels = cfg.Channels
-	}
-	if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Interval)); err == nil && parsed > 0 {
-		options.Interval = parsed
-	}
-	if cfg.MaxProposals > 0 {
-		options.MaxProposals = cfg.MaxProposals
-	}
-	return options
 }
 
 func (rt Runtime) saveState(state *session.State, trace *traceRecorder) error {
@@ -372,7 +341,7 @@ func (rt Runtime) resetSession(msg channel.InboundMessage, state session.State, 
 	if archivePath != "" {
 		text += "\n" + runtimeText(rt.Config, msg, "runtime.session_reset.archived", textValues("archive_path", archivePath))
 	}
-	resp := rt.reply(msg, text, "session_reset")
+	resp := rt.reply(msg, text, channel.StyleSessionReset)
 	resp.TraceID = trace.id
 	resp.TracePath = trace.path
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
@@ -587,62 +556,12 @@ func (rt Runtime) withActivityWatchdog(ctx context.Context, trace *traceRecorder
 	}, timedOut.Load
 }
 
-func proposalID(proposal *memory.Proposal) string {
-	if proposal == nil {
-		return ""
-	}
-	return proposal.ID
-}
-
-func renderMemoryProposalReview(cfg *config.Root, msg channel.InboundMessage, proposal memory.Proposal) string {
-	var b strings.Builder
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.header", nil))
-	b.WriteString(proposal.ID)
-	b.WriteString(" ")
-	b.WriteString(strings.TrimSpace(proposal.Title))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.type", nil))
-	b.WriteString(defaultText(proposal.Type, "experience"))
-	b.WriteString(" / ")
-	b.WriteString(defaultText(proposal.Scope, "agent"))
-	if strings.TrimSpace(proposal.Confidence) != "" {
-		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.confidence", nil))
-		b.WriteString(strings.TrimSpace(proposal.Confidence))
-	}
-	if summary := proposalSummary(proposal); summary != "" {
-		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.summary", nil))
-		b.WriteString(summary)
-	}
-	if len(proposal.Sources) > 0 {
-		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.sources", nil))
-		b.WriteString(summarize(strings.Join(proposal.Sources, ", ")))
-	}
-	values := textValues("proposal_id", proposal.ID)
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.show", values))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.commit", values))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.reject", values))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.reply", nil))
-	return b.String()
-}
-
 func defaultText(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return fallback
 	}
 	return value
-}
-
-func proposalSummary(proposal memory.Proposal) string {
-	body := strings.TrimSpace(proposal.Body)
-	body = strings.TrimPrefix(body, "# "+strings.TrimSpace(proposal.Title))
-	body = strings.TrimSpace(body)
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
-		if line != "" && !strings.HasPrefix(line, "#") {
-			return summarize(line)
-		}
-	}
-	return ""
 }
 
 func fallbackFinalReply(raw string) string {
@@ -668,444 +587,8 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 	return out
 }
 
-func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
-	steeringSent := false
-	hooks := agentcore.Hooks{
-		Emit: func(ctx context.Context, event agentcore.Event) error {
-			if err := trace.emit(ctx, event); err != nil {
-				return err
-			}
-			switch event.Type {
-			case agentcore.EventModelStart:
-				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
-					Title:   "model",
-					Status:  "thinking",
-					Summary: "waiting for model output",
-				})
-			case agentcore.EventMessageStart:
-				if summary := summarizeAssistantToolActivity(event.Message); summary != "" {
-					rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
-						Title:      "model",
-						Status:     "thinking",
-						Summary:    summary,
-						DurationMS: event.Duration.Milliseconds(),
-					})
-				}
-			case agentcore.EventToolExecutionProgress:
-				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
-					Title:      event.ToolCall.Name,
-					Status:     "running",
-					Tool:       event.ToolCall.Name,
-					Summary:    summarizeToolCall(event.ToolCall),
-					DurationMS: event.Duration.Milliseconds(),
-				})
-			}
-			return nil
-		},
-		ToolTimeout: func(input agentcore.ToolExecutionContext) time.Duration {
-			return runtimeToolTimeout(rt.Config, input.ToolCall.Name)
-		},
-		ToolProgressInterval: func(input agentcore.ToolExecutionContext) time.Duration {
-			return runtimeToolProgressInterval(rt.Config, input.ToolCall.Name)
-		},
-		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
-			if steeringSent {
-				return nil, nil
-			}
-			steeringSent = true
-			return append([]agentcore.Message(nil), steering...), nil
-		},
-		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
-			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config}, trace)
-			if policy.Block {
-				state.AddExecutionEvent(taskID, session.ExecutionEvent{
-					Type:    "tool_blocked",
-					Status:  "failed",
-					Tool:    input.ToolCall.Name,
-					Summary: policy.Reason,
-					Evidence: map[string]any{
-						"reason": policy.Reason,
-					},
-				})
-				_ = trace.write(map[string]any{"type": "tool_blocked", "task_id": taskID, "tool": input.ToolCall.Name, "reason": policy.Reason})
-				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
-				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
-			}
-			if policy.RequireApproval {
-				approved, reason := rt.approveToolCall(context.Background(), input, policy, trace)
-				if !approved {
-					state.AddExecutionEvent(taskID, session.ExecutionEvent{
-						Type:    "tool_blocked",
-						Status:  "failed",
-						Tool:    input.ToolCall.Name,
-						Summary: reason,
-						Evidence: map[string]any{
-							"reason": reason,
-						},
-					})
-					_ = trace.write(map[string]any{"type": "approval_rejected", "task_id": taskID, "tool": input.ToolCall.Name, "reason": reason})
-					rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: reason})
-					return agentcore.BeforeToolCallResult{Block: true, Reason: reason}, nil
-				}
-				if input.ToolCall.Args == nil {
-					input.ToolCall.Args = map[string]any{}
-				}
-				input.ToolCall.Args["_mateway_approval_token"] = policy.ApprovalToken
-				_ = trace.write(map[string]any{"type": "approval_granted", "task_id": taskID, "tool": input.ToolCall.Name})
-			}
-			rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
-			return agentcore.BeforeToolCallResult{}, nil
-		},
-		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
-			observe := rt.Hooks.observe(context.Background(), ObserveHookInput{
-				Kind:       "tool_result",
-				State:      *state,
-				TaskID:     taskID,
-				ToolCall:   input.ToolCall,
-				Tool:       input.Tool,
-				ToolResult: input.ToolResult,
-			}, trace)
-			if observe.TaskStep != nil {
-				state.AddStep(taskID, *observe.TaskStep)
-				evidence := map[string]any{
-					"accepted": observe.TaskStep.Accepted,
-					"mutation": observe.TaskStep.Mutation,
-					"risk":     observe.TaskStep.Risk,
-				}
-				for key, value := range input.ToolResult.Evidence {
-					switch key {
-					case "elapsed_ms", "timed_out", "deadline_ms", "output_truncated":
-						evidence[key] = value
-					}
-				}
-				state.AddExecutionEvent(taskID, session.ExecutionEvent{
-					Type:     "tool_result",
-					Status:   observe.TaskStep.Status,
-					Tool:     input.ToolCall.Name,
-					StepID:   observe.TaskStep.ID,
-					Summary:  observe.TaskStep.Summary,
-					Evidence: evidence,
-				})
-				switch observe.TaskStep.Status {
-				case "accepted":
-				case "failed", "suspect":
-				}
-				rt.emitProgress(msg, *state, taskID, progressStepFromExecutionEvent(session.ExecutionEvent{
-					Type:     "tool_result",
-					Status:   observe.TaskStep.Status,
-					Tool:     input.ToolCall.Name,
-					Summary:  observe.TaskStep.Summary,
-					Evidence: evidence,
-				}))
-			}
-			result := compactToolResultForModel(input.ToolCall, input.ToolResult, rt.home(), trace.id)
-			return agentcore.AfterToolCallResult{ToolResult: &result}, nil
-		},
-	}
-	var followUps []agentcore.Message
-	followupSent := false
-	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
-		contract := taskContractFromState(*state, taskID)
-		currentTask := taskFromState(*state, taskID)
-		validation := validateTaskContract(contract, currentTask)
-		if contract.RequiresTools && !validation.Satisfied {
-			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": taskID, "missing": validation.Missing})
-			if followupSent {
-				return true, nil
-			}
-			followupSent = true
-			followUps = append(followUps, agentcore.Message{
-				Role:    agentcore.RoleUser,
-				Content: taskContractFollowup(validation.Missing),
-			})
-			return false, nil
-		}
-		if contract.RequiresTools {
-			_ = trace.write(map[string]any{"type": "task_contract_satisfied", "task_id": taskID})
-		}
-		if followupSent || turnHasToolEvidence(turn) || !needsAction(userText) || !looksLikeUnexecutedAction(turn.Message.Content) {
-			return false, nil
-		}
-		followupSent = true
-		if len(followUps) == 0 {
-			followUps = append(followUps, agentcore.Message{
-				Role:    agentcore.RoleUser,
-				Content: "You promised an action but did not execute any tool. Continue now with the smallest safe tool call, or state the concrete blocker that prevents execution.",
-			})
-			_ = trace.write(map[string]any{"type": "deliverable_gate_followup", "task_id": taskID, "reason": "unexecuted_commitment"})
-		}
-		return false, nil
-	}
-	hooks.GetFollowUpMessages = func(context.Context) ([]agentcore.Message, error) {
-		out := followUps
-		followUps = nil
-		return out, nil
-	}
-	return hooks
-}
-
-var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {
-	_ = cfg
-	switch strings.TrimSpace(toolName) {
-	case "project.index", "file.read":
-		return 30 * time.Second
-	case "terminal.run":
-		return 120 * time.Second
-	default:
-		return 60 * time.Second
-	}
-}
-
-func (rt Runtime) approveToolCall(ctx context.Context, input agentcore.BeforeToolCallContext, policy ToolPolicyHookResult, trace *traceRecorder) (bool, string) {
-	reason := strings.TrimSpace(policy.Reason)
-	if reason == "" {
-		reason = "tool call requires approval"
-	}
-	if rt.Hooks.ApproveToolCall == nil {
-		return false, reason
-	}
-	_ = trace.write(map[string]any{"type": "approval_requested", "tool": input.ToolCall.Name, "reason": reason})
-	decision, err := rt.Hooks.ApproveToolCall(ctx, ApprovalRequest{ToolCall: input.ToolCall, Tool: input.Tool, Reason: reason})
-	if err != nil {
-		return false, err.Error()
-	}
-	if !decision.Approved {
-		if text := strings.TrimSpace(decision.Reason); text != "" {
-			return false, text
-		}
-		return false, "tool call was rejected"
-	}
-	return true, ""
-}
-
-var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.Duration {
-	_ = cfg
-	if strings.TrimSpace(toolName) == "" {
-		return 0
-	}
-	return 30 * time.Second
-}
-
-func (rt Runtime) handlePending(_ context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
-	if state.Pending == nil {
-		return Response{}, false, nil
-	}
-	if state.Pending.Kind != "memory_proposal_review" {
-		_ = trace.write(map[string]any{"type": "pending_discarded", "pending_kind": state.Pending.Kind, "task_id": state.Pending.TaskID})
-		state.Pending = nil
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return Response{}, false, nil
-	}
-	action, ok := parseNumericMemoryProposalReviewAction(msg.Text)
-	if !ok {
-		_ = trace.write(map[string]any{"type": "pending_control_invalid_reply", "task_id": state.Pending.TaskID, "pending_kind": "memory_proposal_review"})
-		resp := rt.reply(msg, "Please reply with 1 to save this memory proposal or 2 to ignore it. To start a separate task, send /new first.", "input_required")
-		resp.TraceID = trace.id
-		resp.TracePath = trace.path
-		return resp, true, nil
-	}
-	taskID := state.Pending.TaskID
-	proposalID := state.Pending.ProposalID
-	state.Pending = nil
-	_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "memory_proposal_review", "command": action})
-	store := memory.ProposalStore{Home: rt.home(), MemoryRoot: memoryRootForConfig(rt.Config)}
-	if action == "commit" {
-		proposal, target, err := store.Commit(proposalID)
-		if err != nil {
-			if saveErr := rt.saveState(state, trace); saveErr != nil {
-				return Response{}, true, saveErr
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "memory.commit.error", textValues("error", err.Error())), "error"), true, nil
-		}
-		_ = trace.write(map[string]any{"type": "memory_proposal_review_committed", "proposal_id": proposal.ID, "target": target})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return rt.reply(msg, runtimeText(rt.Config, msg, "memory.commit.done", textValues("target", target)), "completed"), true, nil
-	}
-	proposal, err := store.Reject(proposalID, "user selected numeric reject from conversation")
-	if err != nil {
-		if saveErr := rt.saveState(state, trace); saveErr != nil {
-			return Response{}, true, saveErr
-		}
-		return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.error", textValues("error", err.Error())), "error"), true, nil
-	}
-	_ = trace.write(map[string]any{"type": "memory_proposal_review_rejected", "proposal_id": proposal.ID})
-	if err := rt.saveState(state, trace); err != nil {
-		return Response{}, true, err
-	}
-	return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.done", nil), "completed"), true, nil
-}
-
-func parseNumericMemoryProposalReviewAction(text string) (string, bool) {
-	switch strings.TrimSpace(text) {
-	case "1":
-		return "commit", true
-	case "2":
-		return "reject", true
-	default:
-		return "", false
-	}
-}
-
-func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string, map[string]any) {
-	evidence := map[string]any{}
-	for key, value := range result.Evidence {
-		evidence[key] = value
-	}
-	if tool != nil {
-		contract := agentcore.ContractFor(tool)
-		risk := tool.Risk()
-		evidence["risk"] = string(risk)
-		evidence["mutation"] = risk == agentcore.RiskGuardedMutation || risk == agentcore.RiskDangerous
-		if contract.Acceptance != "" {
-			evidence["acceptance_criteria"] = contract.Acceptance
-		}
-		if contract.Evidence != "" {
-			evidence["evidence_contract"] = contract.Evidence
-		}
-	}
-	if result.IsError {
-		evidence["acceptance"] = "failed"
-		return "failed", evidence
-	}
-	if len(result.Evidence) == 0 && strings.TrimSpace(result.Content) == "" {
-		evidence["acceptance"] = "suspect"
-		return "suspect", evidence
-	}
-	evidence["acceptance"] = "accepted"
-	return "accepted", evidence
-}
-
-func (rt Runtime) reply(msg channel.InboundMessage, text, style string) Response {
+func (rt Runtime) reply(msg channel.InboundMessage, text string, style channel.MessageStyle) Response {
 	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style}}
-}
-
-func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, taskID string, current channel.ProgressStep) {
-	if rt.ProgressSink == nil {
-		return
-	}
-	steps := progressStepsForTask(state, taskID)
-	if strings.TrimSpace(current.Title) != "" || strings.TrimSpace(current.Tool) != "" {
-		steps = append(steps, current)
-	}
-	rt.ProgressSink(channel.OutboundMessage{
-		Channel:  msg.Channel,
-		ThreadID: msg.ThreadID,
-		Text:     "Processing...",
-		Style:    "processing",
-		Progress: steps,
-	})
-}
-
-func summarizeToolCall(call agentcore.ToolCall) string {
-	switch call.Name {
-	case "terminal.run":
-		return compactProgressSummary(fmt.Sprint(call.Args["command"]))
-	case "project.index", "file.read", "file.write", "file.delete":
-		return compactProgressSummary(fmt.Sprint(call.Args["path"]))
-	case "web.search":
-		return compactProgressSummary(fmt.Sprint(call.Args["query"]))
-	case "web.fetch":
-		return compactProgressSummary(fmt.Sprint(call.Args["url"]))
-	default:
-		return ""
-	}
-}
-
-func summarizeAssistantToolActivity(message agentcore.Message) string {
-	if len(message.ToolCalls) > 0 {
-		if len(message.ToolCalls) == 1 {
-			return "prepared tool call " + message.ToolCalls[0].Name
-		}
-		return fmt.Sprintf("prepared %d tool calls", len(message.ToolCalls))
-	}
-	return ""
-}
-
-func progressStepsForTask(state session.State, taskID string) []channel.ProgressStep {
-	task := taskFromState(state, taskID)
-	events := task.Execution.Events
-	out := make([]channel.ProgressStep, 0, len(events))
-	for _, event := range events {
-		step := progressStepFromExecutionEvent(event)
-		if strings.TrimSpace(step.Title) == "" {
-			continue
-		}
-		out = append(out, step)
-	}
-	const limit = 8
-	if len(out) > limit {
-		out = out[len(out)-limit:]
-	}
-	return out
-}
-
-func progressStepFromExecutionEvent(event session.ExecutionEvent) channel.ProgressStep {
-	title := strings.TrimSpace(event.Type)
-	if event.Tool != "" {
-		title = strings.TrimSpace(event.Tool)
-	}
-	step := channel.ProgressStep{
-		Title:   title,
-		Status:  strings.TrimSpace(event.Status),
-		Tool:    strings.TrimSpace(event.Tool),
-		Summary: compactProgressSummary(event.Summary),
-	}
-	if accepted, ok := event.Evidence["accepted"].(bool); ok && accepted {
-		step.Status = firstNonEmpty(step.Status, "accepted")
-	}
-	if timedOut, ok := event.Evidence["timed_out"].(bool); ok {
-		step.TimedOut = timedOut
-	}
-	if elapsed, ok := int64Evidence(event.Evidence["elapsed_ms"]); ok {
-		step.DurationMS = elapsed
-	}
-	return step
-}
-
-func int64Evidence(value any) (int64, bool) {
-	switch v := value.(type) {
-	case int64:
-		return v, true
-	case int:
-		return int64(v), true
-	case float64:
-		return int64(v), true
-	default:
-		return 0, false
-	}
-}
-
-func compactProgressSummary(text string) string {
-	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if text == "" {
-		return ""
-	}
-	const limit = 80
-	if len(text) <= limit {
-		return text
-	}
-	return text[:limit] + fmt.Sprintf("... (%d chars)", len(text))
-}
-
-func summarize(text string) string {
-	text = strings.TrimSpace(text)
-	if len(text) <= 160 {
-		return text
-	}
-	return text[:160] + fmt.Sprintf("... (%d chars)", len(text))
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
 
 func containsAny(text string, markers []string) bool {
@@ -1173,55 +656,6 @@ func mergeTaskAndInstruction(goal, instruction string) string {
 	default:
 		return "Active task:\n" + goal + "\n\nNew user message:\n" + instruction
 	}
-}
-
-type HeuristicModel struct{}
-
-func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
-	last := lastConversationMessage(ctx.Messages)
-	if last.Role == agentcore.RoleTool {
-		return agentcore.Message{Role: agentcore.RoleAssistant, Content: last.Content}, nil
-	}
-	text := strings.TrimSpace(last.Content)
-	if path, ok := strings.CutPrefix(text, "/read "); ok {
-		return agentcore.Message{
-			Role: agentcore.RoleAssistant,
-			ToolCalls: []agentcore.ToolCall{{
-				ID:   "call_1",
-				Name: "file.read",
-				Args: map[string]any{"path": strings.TrimSpace(path)},
-			}},
-		}, nil
-	}
-	if path, ok := strings.CutPrefix(text, "/index "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": strings.TrimSpace(path)}}}}, nil
-	}
-	if rest, ok := strings.CutPrefix(text, "/write "); ok {
-		path, content, _ := strings.Cut(rest, " ")
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": strings.TrimSpace(path), "content": strings.TrimSpace(content)}}}}, nil
-	}
-	if command, ok := strings.CutPrefix(text, "/run "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": strings.TrimSpace(command)}}}}, nil
-	}
-	if query, ok := strings.CutPrefix(text, "/search "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": strings.TrimSpace(query)}}}}, nil
-	}
-	if rest, ok := strings.CutPrefix(text, "/schedule "); ok {
-		parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
-		if len(parts) == 2 {
-			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.create", Args: map[string]any{"run_at": parts[0], "text": parts[1], "session_key": "cli:scheduled"}}}}, nil
-		}
-	}
-	return agentcore.Message{Role: agentcore.RoleAssistant, Content: runtimeText(nil, channel.InboundMessage{}, "runtime.heuristic.echo", textValues("text", text))}, nil
-}
-
-func lastConversationMessage(messages []agentcore.Message) agentcore.Message {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role != agentcore.RoleSystem {
-			return messages[i]
-		}
-	}
-	return agentcore.Message{}
 }
 
 func looksLikeInputRequest(text string) bool {

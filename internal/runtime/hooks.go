@@ -13,6 +13,7 @@ import (
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
+	"github.com/dongping/mateway/internal/util"
 )
 
 const (
@@ -636,20 +637,7 @@ func taskFromState(state session.State, taskID string) session.TaskNode {
 	return session.TaskNode{ID: taskID}
 }
 
-func boolArg(value any) bool {
-	switch v := value.(type) {
-	case bool:
-		return v
-	case string:
-		return strings.EqualFold(strings.TrimSpace(v), "true") || strings.EqualFold(strings.TrimSpace(v), "yes")
-	default:
-		return false
-	}
-}
-
-func configHome(cfg *config.Root) string {
-	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
-		return cfg.App.Home
-	}
-	return config.DefaultHome()
-}
+var (
+	boolArg    = util.BoolArg
+	configHome = util.ConfigHome
+)

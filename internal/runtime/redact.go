@@ -333,13 +333,14 @@ func messageChars(messages []agentcore.Message) int {
 }
 
 func truncateMiddle(text string, limit int) (string, bool) {
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text, false
 	}
 	if limit < 80 {
-		return text[:limit], true
+		return string(runes[:limit]), true
 	}
 	head := limit / 2
 	tail := limit - head
-	return text[:head] + fmt.Sprintf("\n...[truncated %d chars]...\n", len(text)-limit) + text[len(text)-tail:], true
+	return string(runes[:head]) + fmt.Sprintf("\n...[truncated %d chars]...\n", len(runes)-limit) + string(runes[len(runes)-tail:]), true
 }

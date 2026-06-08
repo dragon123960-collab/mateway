@@ -37,7 +37,7 @@ func (w *NDJSONEventWriter) Final(resp runtime.Response, sessionKey string) erro
 	event := ProcessEvent{
 		Type:       "final.completed",
 		Text:       resp.Reply.Text,
-		Style:      resp.Reply.Style,
+		Style:      string(resp.Reply.Style),
 		TraceID:    resp.TraceID,
 		TracePath:  resp.TracePath,
 		SessionKey: sessionKey,

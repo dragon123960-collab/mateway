@@ -39,6 +39,47 @@ func TestRuntimeNoActiveTaskCreatesNewTask(t *testing.T) {
 	}
 }
 
+func TestRuntimeNewResolvesConfiguredDefaultModel(t *testing.T) {
+	cfg := &config.Root{
+		App:   config.AppConfig{Home: t.TempDir()},
+		Model: config.ModelSelection{Default: "primary"},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{{
+				ID:   "main",
+				Name: "Main",
+			}},
+		},
+		Models: []config.ModelConfig{{
+			Name:    "primary",
+			Enabled: true,
+			APIKey:  "test-key",
+		}},
+	}
+	rt := New(cfg)
+	if _, ok := rt.Model.(HeuristicModel); ok {
+		t.Fatal("runtime default model should use configured model before heuristic fallback")
+	}
+	agent := rt.Pool.AgentForSession("cli:test")
+	if agent == nil {
+		t.Fatal("expected default pool agent")
+	}
+	if _, ok := agent.Model.(HeuristicModel); ok {
+		t.Fatal("default pool agent should use configured model before heuristic fallback")
+	}
+}
+
+func TestRuntimeSystemContextUsesConfiguredTimezone(t *testing.T) {
+	cfg := &config.Root{Scheduler: config.SchedulerConfig{Timezone: "UTC"}}
+	text := buildRuntimeSystemContext(cfg, config.AgentProfileConfig{})
+	if !strings.Contains(text, " UTC\n") {
+		t.Fatalf("expected UTC timezone in runtime context, got:\n%s", text)
+	}
+	if strings.Contains(text, "Asia/Shanghai") {
+		t.Fatalf("runtime context should use configured timezone, got:\n%s", text)
+	}
+}
+
 func TestRuntimeActiveTaskSteersNewMessageIntoExistingTask(t *testing.T) {
 	rt := newTestRuntime(t)
 	state := session.State{Key: "cli:test"}
@@ -248,6 +289,43 @@ func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
 	}
 	if resp.Failed {
 		t.Fatalf("expected approved task, got %#v", resp)
+	}
+}
+
+func TestRuntimeTerminalApprovalUsesContextWithoutMutatingArgs(t *testing.T) {
+	rt := newTestRuntime(t)
+	capture := &captureApprovalTool{}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(capture)
+	rt.Tools = registry
+	args := map[string]any{"command": "echo approved; echo done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: args,
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "approved"},
+	}}, rt.Tools)
+	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
+		return ApprovalDecision{Approved: true}, nil
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected approved task, got %#v", resp)
+	}
+	if capture.approvalToken == "" {
+		t.Fatal("expected approval token in tool context")
+	}
+	if _, ok := capture.args["_mateway_approval_token"]; ok {
+		t.Fatalf("approval token should not be injected into tool args: %#v", capture.args)
+	}
+	if _, ok := args["_mateway_approval_token"]; ok {
+		t.Fatalf("approval token should not mutate model tool args: %#v", args)
 	}
 }
 
@@ -583,7 +661,7 @@ func TestDefaultRegistryContainsPiStyleTools(t *testing.T) {
 			t.Fatalf("expected default tool %s", name)
 		}
 	}
-	for _, name := range []string{"script.run", "remote.profile.create"} {
+	for _, name := range []string{"script.run"} {
 		if _, ok := registry.Get(name); ok {
 			t.Fatalf("did not expect default tool %s", name)
 		}
@@ -1155,6 +1233,26 @@ func (m *sequenceModel) Next(context.Context, agentcore.Context) (agentcore.Mess
 	}
 	m.index++
 	return m.messages[index], nil
+}
+
+type captureApprovalTool struct {
+	args          map[string]any
+	approvalToken string
+}
+
+func (t *captureApprovalTool) Name() string        { return "terminal.run" }
+func (t *captureApprovalTool) Description() string { return "capture terminal approval context" }
+func (t *captureApprovalTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"command"}}
+}
+func (t *captureApprovalTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t *captureApprovalTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{ParallelMode: "forbid"}
+}
+func (t *captureApprovalTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	t.args = call.Args
+	t.approvalToken = tool.ApprovalTokenFromContext(ctx)
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: "ok", Evidence: map[string]any{"decision": "allowed"}}
 }
 
 type runtimeSlowTool struct {

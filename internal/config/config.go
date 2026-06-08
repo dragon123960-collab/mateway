@@ -119,6 +119,33 @@ func DefaultRoot() Root {
 	return root
 }
 
+func DefaultTimezone() string {
+	return DefaultRoot().Scheduler.Timezone
+}
+
+func TimezoneLocation(timezone string) (*time.Location, string) {
+	name := strings.TrimSpace(timezone)
+	if name == "" {
+		name = DefaultTimezone()
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		name = DefaultTimezone()
+		loc, err = time.LoadLocation(name)
+		if err != nil {
+			return time.Local, time.Local.String()
+		}
+	}
+	return loc, name
+}
+
+func (r *Root) TimezoneLocation() (*time.Location, string) {
+	if r == nil {
+		return TimezoneLocation("")
+	}
+	return TimezoneLocation(r.Scheduler.Timezone)
+}
+
 type AppConfig struct {
 	Name      string `yaml:"name"`
 	Home      string `yaml:"home"`

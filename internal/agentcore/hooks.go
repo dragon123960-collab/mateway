@@ -44,8 +44,9 @@ type ToolExecutionContext struct {
 }
 
 type BeforeToolCallResult struct {
-	Block  bool
-	Reason string
+	Block   bool
+	Reason  string
+	Context context.Context
 }
 
 type AfterToolCallContext struct {

@@ -397,46 +397,15 @@ func TestTerminalPolicyAllowsRemoteProfile(t *testing.T) {
 	}
 }
 
-func TestRemoteProfileCreateStoresConfigAndSecret(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}}
-	result := RemoteProfileCreateTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{
-		"alias":    "prod",
-		"host":     "example.com",
-		"user":     "deploy",
-		"password": "secret-pass",
-	}})
-	if result.IsError {
-		t.Fatalf("expected profile create, got %#v", result)
-	}
-	data, err := os.ReadFile(filepath.Join(home, "config", "config.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "prod") || !strings.Contains(string(data), "example.com") {
-		t.Fatalf("profile not persisted:\n%s", data)
-	}
-	entry, ok, err := (secret.Store{Home: home}).Get("remote/prod/auth")
-	if err != nil || !ok || entry.Value != "secret-pass" {
-		t.Fatalf("secret entry=%#v ok=%v err=%v", entry, ok, err)
-	}
-}
-
-func TestRemoteProfileCreateRequiresOverwrite(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}}
-	tool := RemoteProfileCreateTool{Config: cfg}
-	call := agentcore.ToolCall{ID: "1", Args: map[string]any{"alias": "prod", "host": "example.com", "user": "deploy"}}
-	if result := tool.Run(context.Background(), call); result.IsError {
-		t.Fatalf("first create failed: %#v", result)
-	}
-	if result := tool.Run(context.Background(), call); !result.IsError || !strings.Contains(result.Content, "already exists") {
-		t.Fatalf("expected overwrite error, got %#v", result)
-	}
-}
-
 func TestWebFetchBlocksPrivateTargets(t *testing.T) {
-	for _, raw := range []string{"http://127.0.0.1:6379", "http://localhost:8080", "http://169.254.169.254/latest/meta-data/"} {
+	for _, raw := range []string{
+		"http://127.0.0.1:6379",
+		"http://localhost:8080",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://[::1]:8080",
+		"http://0.0.0.0:8080",
+		"http://[::]:8080",
+	} {
 		if _, ok := IsBlockedFetchURL(raw); !ok {
 			t.Fatalf("expected blocked URL %s", raw)
 		}

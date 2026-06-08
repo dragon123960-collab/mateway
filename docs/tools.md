@@ -49,7 +49,6 @@
 以下能力不在默认 registry 中：
 
 - `script.run`
-- `remote.profile.create`
 
 Helper scripts 只是普通文件，需要执行时通过 `terminal.run` 调用文件路径；需要凭证时通过 `terminal.run.env_secrets` 注入。
 

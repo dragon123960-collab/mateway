@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dongping/mateway/internal/util"
 )
 
 func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
@@ -177,14 +179,7 @@ func finalTextForStoppedTurn(message Message, toolResults []ToolResult) string {
 	return ""
 }
 
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
+var firstNonEmptyString = util.FirstNonEmptyString
 
 func toolsForContext(registry *ToolRegistry) []Tool {
 	if registry == nil {
@@ -209,6 +204,9 @@ func prepareAndExecuteTool(ctx context.Context, cfg Config, message Message, cal
 				reason = "tool execution blocked"
 			}
 			return ToolResult{ToolCallID: call.ID, Content: reason, IsError: true}, true, nil
+		}
+		if result.Context != nil {
+			ctx = result.Context
 		}
 	}
 	return cfg.Tools.Execute(ctx, call), false, nil
@@ -245,8 +243,9 @@ func executeToolCallsSerial(ctx context.Context, cfg Config, message Message, it
 }
 
 type preparedToolCall struct {
-	Call ToolCall
-	Tool Tool
+	Call    ToolCall
+	Tool    Tool
+	Context context.Context
 }
 
 func prepareParallelToolCalls(ctx context.Context, cfg Config, message Message, iteration int) ([]preparedToolCall, *ToolResult, error) {
@@ -284,8 +283,11 @@ func prepareParallelToolCalls(ctx context.Context, cfg Config, message Message, 
 				}
 				return nil, &blocked, nil
 			}
+			if result.Context != nil {
+				ctx = result.Context
+			}
 		}
-		prepared = append(prepared, preparedToolCall{Call: call, Tool: tool})
+		prepared = append(prepared, preparedToolCall{Call: call, Tool: tool, Context: ctx})
 	}
 	return prepared, nil, nil
 }
@@ -308,7 +310,11 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			result, duration := executeToolWithControls(ctx, cfg, message, item.Call, item.Tool, iteration, func(execCtx context.Context) ToolResult {
+			callCtx := ctx
+			if item.Context != nil {
+				callCtx = item.Context
+			}
+			result, duration := executeToolWithControls(callCtx, cfg, message, item.Call, item.Tool, iteration, func(execCtx context.Context) ToolResult {
 				return cfg.Tools.Execute(execCtx, item.Call)
 			})
 			results[i] = result
