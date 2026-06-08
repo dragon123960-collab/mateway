@@ -90,6 +90,41 @@ func TestInitSupportsHomeFlag(t *testing.T) {
 	}
 }
 
+func TestToolsDisableAcceptsAgentFlagAfterToolName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"tools", "disable", "terminal.run", "--agent", "main"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "terminal.run") {
+		t.Fatalf("expected config to include disabled tool:\n%s", data)
+	}
+}
+
+func TestHelpIncludesSend(t *testing.T) {
+	var out bytes.Buffer
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	printHelp()
+	_ = w.Close()
+	os.Stdout = old
+	_, _ = out.ReadFrom(r)
+	if !strings.Contains(out.String(), "mateway send --to <channel:target> <message>") {
+		t.Fatalf("help missing send:\n%s", out.String())
+	}
+}
+
 func TestMemoryLintCommandUsesHomeConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

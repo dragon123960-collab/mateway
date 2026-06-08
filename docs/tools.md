@@ -9,7 +9,7 @@
 | `file.read` | 读取本地文本文件 | 受 allowed roots 限制；拒绝目录、大文件和二进制文件。 |
 | `file.write` | 创建或替换本地文本文件 | 受 allowed roots 限制；写 core agent profile 时走 proposal；不用于回答问题。 |
 | `file.delete` | 删除本地文件或目录 | 删除工具单独强校验 allowed roots 和真实路径；目录必须 `recursive=true`；拒绝 runtime state、secret、trace、allowed root 和 VCS 目录。 |
-| `project.index` | 列出项目目录下文件 | 只做目录索引；跳过 `.git`、`node_modules`、`dist`、`build`。 |
+| `project.index` | 列出项目目录下文件 | 只做目录索引；跳过常见依赖、构建产物、VCS、缓存和大型二进制目录。 |
 
 ## 命令与 Secret
 

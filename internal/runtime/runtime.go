@@ -16,13 +16,14 @@ import (
 )
 
 type Runtime struct {
-	Config       *config.Root
-	Store        session.Store
-	Tools        *agentcore.ToolRegistry
-	Model        agentcore.Model
-	Pool         AgentPool
-	Hooks        RuntimeHooks
-	ProgressSink func(channel.OutboundMessage)
+	Config        *config.Root
+	Store         session.Store
+	Tools         *agentcore.ToolRegistry
+	Model         agentcore.Model
+	ContractModel agentcore.Model
+	Pool          AgentPool
+	Hooks         RuntimeHooks
+	ProgressSink  func(channel.OutboundMessage)
 }
 
 type Response struct {
@@ -40,11 +41,17 @@ func New(cfg *config.Root) Runtime {
 	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultResponseHookProvider{})
+	model := agentcore.Model(HeuristicModel{})
+	home := ""
+	if cfg != nil {
+		model = resolveModelForDefault(cfg)
+		home = cfg.App.Home
+	}
 	return Runtime{
 		Config: cfg,
-		Store:  session.NewStore(cfg.App.Home),
+		Store:  session.NewStore(home),
 		Tools:  tool.NewRegistry(cfg),
-		Model:  HeuristicModel{},
+		Model:  model,
 		Pool:   NewAgentPool(cfg),
 		Hooks:  hooks,
 	}
@@ -125,8 +132,12 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		"agent_id": profile.ID,
 		"task_id":  task.ID,
 	})
+	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
+	if contractContext := renderTaskContractContext(contract); contractContext != "" {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
+	}
 	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
 	agent.SystemPrompt = systemPrompt
 	agent.Messages = messages
@@ -184,10 +195,15 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	taskCompleted := false
 	emptyActionPromise := looksLikeEmptyActionPromise(finalText)
 	if state.Pending == nil {
+		contractValidation := validateTaskContract(taskContractFromState(*state, task.ID), taskFromState(*state, task.ID))
 		if result.StopReason != "" {
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
 			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
+		} else if !contractValidation.Satisfied {
+			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: strings.Join(contractValidation.Missing, "; "), Evidence: map[string]any{"missing": contractValidation.Missing}})
+			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": task.ID, "status": "failed", "missing": contractValidation.Missing})
 		} else if looksLikeInputRequest(finalText) {
 			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
@@ -659,7 +675,23 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 			if err := trace.emit(ctx, event); err != nil {
 				return err
 			}
-			if event.Type == agentcore.EventToolExecutionProgress {
+			switch event.Type {
+			case agentcore.EventModelStart:
+				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
+					Title:   "model",
+					Status:  "thinking",
+					Summary: "waiting for model output",
+				})
+			case agentcore.EventMessageStart:
+				if summary := summarizeAssistantToolActivity(event.Message); summary != "" {
+					rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
+						Title:      "model",
+						Status:     "thinking",
+						Summary:    summary,
+						DurationMS: event.Duration.Milliseconds(),
+					})
+				}
+			case agentcore.EventToolExecutionProgress:
 				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
 					Title:      event.ToolCall.Name,
 					Status:     "running",
@@ -698,6 +730,28 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				_ = trace.write(map[string]any{"type": "tool_blocked", "task_id": taskID, "tool": input.ToolCall.Name, "reason": policy.Reason})
 				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
+			}
+			if policy.RequireApproval {
+				approved, reason := rt.approveToolCall(context.Background(), input, policy, trace)
+				if !approved {
+					state.AddExecutionEvent(taskID, session.ExecutionEvent{
+						Type:    "tool_blocked",
+						Status:  "failed",
+						Tool:    input.ToolCall.Name,
+						Summary: reason,
+						Evidence: map[string]any{
+							"reason": reason,
+						},
+					})
+					_ = trace.write(map[string]any{"type": "approval_rejected", "task_id": taskID, "tool": input.ToolCall.Name, "reason": reason})
+					rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: reason})
+					return agentcore.BeforeToolCallResult{Block: true, Reason: reason}, nil
+				}
+				if input.ToolCall.Args == nil {
+					input.ToolCall.Args = map[string]any{}
+				}
+				input.ToolCall.Args["_mateway_approval_token"] = policy.ApprovalToken
+				_ = trace.write(map[string]any{"type": "approval_granted", "task_id": taskID, "tool": input.ToolCall.Name})
 			}
 			rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
@@ -751,6 +805,24 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 	var followUps []agentcore.Message
 	followupSent := false
 	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
+		contract := taskContractFromState(*state, taskID)
+		currentTask := taskFromState(*state, taskID)
+		validation := validateTaskContract(contract, currentTask)
+		if contract.RequiresTools && !validation.Satisfied {
+			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": taskID, "missing": validation.Missing})
+			if followupSent {
+				return true, nil
+			}
+			followupSent = true
+			followUps = append(followUps, agentcore.Message{
+				Role:    agentcore.RoleUser,
+				Content: taskContractFollowup(validation.Missing),
+			})
+			return false, nil
+		}
+		if contract.RequiresTools {
+			_ = trace.write(map[string]any{"type": "task_contract_satisfied", "task_id": taskID})
+		}
 		if followupSent || turnHasToolEvidence(turn) || !needsAction(userText) || !looksLikeUnexecutedAction(turn.Message.Content) {
 			return false, nil
 		}
@@ -782,6 +854,28 @@ var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {
 	default:
 		return 60 * time.Second
 	}
+}
+
+func (rt Runtime) approveToolCall(ctx context.Context, input agentcore.BeforeToolCallContext, policy ToolPolicyHookResult, trace *traceRecorder) (bool, string) {
+	reason := strings.TrimSpace(policy.Reason)
+	if reason == "" {
+		reason = "tool call requires approval"
+	}
+	if rt.Hooks.ApproveToolCall == nil {
+		return false, reason
+	}
+	_ = trace.write(map[string]any{"type": "approval_requested", "tool": input.ToolCall.Name, "reason": reason})
+	decision, err := rt.Hooks.ApproveToolCall(ctx, ApprovalRequest{ToolCall: input.ToolCall, Tool: input.Tool, Reason: reason})
+	if err != nil {
+		return false, err.Error()
+	}
+	if !decision.Approved {
+		if text := strings.TrimSpace(decision.Reason); text != "" {
+			return false, text
+		}
+		return false, "tool call was rejected"
+	}
+	return true, ""
 }
 
 var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.Duration {
@@ -919,6 +1013,16 @@ func summarizeToolCall(call agentcore.ToolCall) string {
 	default:
 		return ""
 	}
+}
+
+func summarizeAssistantToolActivity(message agentcore.Message) string {
+	if len(message.ToolCalls) > 0 {
+		if len(message.ToolCalls) == 1 {
+			return "prepared tool call " + message.ToolCalls[0].Name
+		}
+		return fmt.Sprintf("prepared %d tool calls", len(message.ToolCalls))
+	}
+	return ""
 }
 
 func progressStepsForTask(state session.State, taskID string) []channel.ProgressStep {
@@ -1162,6 +1266,8 @@ func friendlyRuntimeError(cfg *config.Root, msg channel.InboundMessage, err erro
 	raw := strings.TrimSpace(fmt.Sprint(err))
 	lower := strings.ToLower(raw)
 	switch {
+	case err == context.Canceled || strings.Contains(lower, "context canceled"):
+		return runtimeText(cfg, msg, "runtime.error.cancelled", nil)
 	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout"):
 		return runtimeText(cfg, msg, "runtime.error.timeout", nil)
 	case strings.Contains(lower, "model api key is empty"):

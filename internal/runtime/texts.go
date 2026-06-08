@@ -40,6 +40,7 @@ var runtimeTexts = map[string]string{
 	"runtime.invalid_tool_call":         "The model produced an invalid tool call, so I stopped safely.",
 	"runtime.empty_reply":               "I do not have a substantive reply yet.",
 	"runtime.error.timeout":             "The model request timed out. You can ask me to continue.",
+	"runtime.error.cancelled":           "The task was interrupted. You can continue in the same session.",
 	"runtime.error.missing_api_key":     "The configured model API key is missing.",
 	"runtime.error.all_models_failed":   "All configured models failed for this request.",
 	"runtime.error.generic":             "The runtime hit an error and stopped safely. You can ask me to continue or send /new to start over.",

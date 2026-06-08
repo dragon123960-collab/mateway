@@ -44,8 +44,9 @@ type HookProvider interface {
 }
 
 type RuntimeHooks struct {
-	Providers []HookProvider
-	Timeout   time.Duration
+	Providers       []HookProvider
+	Timeout         time.Duration
+	ApproveToolCall func(context.Context, ApprovalRequest) (ApprovalDecision, error)
 }
 
 type ContextHookProvider interface {
@@ -60,8 +61,21 @@ type ToolPolicyHookInput struct {
 }
 
 type ToolPolicyHookResult struct {
-	Block  bool
-	Reason string
+	Block           bool
+	Reason          string
+	RequireApproval bool
+	ApprovalToken   string
+}
+
+type ApprovalRequest struct {
+	ToolCall agentcore.ToolCall
+	Tool     agentcore.Tool
+	Reason   string
+}
+
+type ApprovalDecision struct {
+	Approved bool
+	Reason   string
 }
 
 type ToolPolicyHookProvider interface {
@@ -172,8 +186,8 @@ func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput,
 			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "tool_policy_hook", "provider": name, "error": err.Error()})
 			continue
 		}
-		_ = trace.write(map[string]any{"type": "hook_event", "hook": "tool_policy_hook", "provider": name, "tool": input.ToolCall.Name, "block": result.Block, "reason": result.Reason})
-		if result.Block {
+		_ = trace.write(map[string]any{"type": "hook_event", "hook": "tool_policy_hook", "provider": name, "tool": input.ToolCall.Name, "block": result.Block, "require_approval": result.RequireApproval, "reason": result.Reason})
+		if result.Block || result.RequireApproval {
 			return result
 		}
 	}
@@ -530,12 +544,25 @@ func (defaultToolPolicyHookProvider) Name() string { return "default_tool_policy
 
 func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input ToolPolicyHookInput) (ToolPolicyHookResult, error) {
 	if input.ToolCall.Name == "terminal.run" {
-		decision := tool.CheckTerminalCommand(fmt.Sprint(input.ToolCall.Args["command"]), input.Config)
+		command := fmt.Sprint(input.ToolCall.Args["command"])
+		decision := tool.CheckTerminalCommand(command, input.Config)
 		if decision.Class == "destructive" {
 			return ToolPolicyHookResult{Block: true, Reason: decision.Reason}, nil
 		}
+		if terminalCommandNeedsApproval(decision.Class) {
+			return ToolPolicyHookResult{RequireApproval: true, Reason: "terminal command requires approval: " + decision.Class, ApprovalToken: tool.TerminalRunApprovalToken(command, input.Config)}, nil
+		}
 	}
 	return ToolPolicyHookResult{}, nil
+}
+
+func terminalCommandNeedsApproval(class string) bool {
+	switch strings.TrimSpace(class) {
+	case "shell", "guarded_mutation", "unknown":
+		return true
+	default:
+		return false
+	}
 }
 
 type defaultObserveHookProvider struct{}

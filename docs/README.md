@@ -10,6 +10,8 @@
 - [工具与 Secret](./tools-and-secrets.md)
 - [临时产物与清理机制](./artifacts-and-cleanup.md)
 - [Channel 配置](./channels.md)
+- [Agent 可观测性与 Channel 渲染](./observability.md)
+- [Mateway CLI 开发计划](./cli.md)
 - [微信接入](./weixin.md)
 - [候选记忆提醒](./memory-proposal-nudge.md)
 

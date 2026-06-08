@@ -39,6 +39,9 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 		transcript = append(transcript, steering...)
 
 		modelStart := time.Now()
+		if err := emit(ctx, cfg.Hooks, Event{Type: EventModelStart, Iteration: iteration}); err != nil {
+			return Result{}, err
+		}
 		assistant, err := cfg.Model.Next(ctx, Context{
 			SystemPrompt: cfg.SystemPrompt,
 			Messages:     transcript,
@@ -133,6 +136,9 @@ func synthesizeMalformedToolCall(ctx context.Context, cfg Config, transcript []M
 		Content: "The last tool call block was malformed and cannot be executed. Do not call more tools. Provide the best final answer from the existing evidence and state what remains unverified.",
 	})
 	modelStart := time.Now()
+	if err := emit(ctx, cfg.Hooks, Event{Type: EventModelStart, Iteration: iteration + 1}); err != nil {
+		return Result{}, err
+	}
 	assistant, err := cfg.Model.Next(ctx, Context{SystemPrompt: cfg.SystemPrompt, Messages: transcript, Tools: nil})
 	modelDuration := time.Since(modelStart)
 	if err != nil {

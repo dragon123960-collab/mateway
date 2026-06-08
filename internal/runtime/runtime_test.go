@@ -223,6 +223,63 @@ func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 	}
 }
 
+func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "echo approved; echo done"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "approved"},
+	}}, rt.Tools)
+	asked := false
+	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
+		asked = true
+		return ApprovalDecision{Approved: true}, nil
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !asked {
+		t.Fatal("expected approval request")
+	}
+	if resp.Failed {
+		t.Fatalf("expected approved task, got %#v", resp)
+	}
+}
+
+func TestRuntimeTerminalApprovalRejectsCommand(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "echo rejected; echo done"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "blocked"},
+	}}, rt.Tools)
+	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
+		return ApprovalDecision{Approved: false, Reason: "user rejected"}, nil
+	}
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command")); err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	found := false
+	for _, event := range state.Tasks[0].Execution.Events {
+		if event.Type == "tool_blocked" && event.Tool == "terminal.run" && event.Summary == "user rejected" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected rejected approval event, got %#v", state.Tasks[0].Execution.Events)
+	}
+}
+
 func TestRuntimeContinuesWhenAssistantPromisesActionWithoutTool(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
@@ -254,6 +311,78 @@ func TestRuntimeContinuesWhenAssistantPromisesActionWithoutTool(t *testing.T) {
 	}
 }
 
+func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "Beijing clear; Yiwu light rain."})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will check the weather and then advise."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "web.search",
+			Args: map[string]any{"query": "Beijing Yiwu weather tomorrow 2026-06-09"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "Weather checked. Travel looks acceptable with rain precautions."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"weather travel advice","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"current weather for Beijing and Yiwu"}],"expected_outcome":"travel recommendation","completion_policy":"use web evidence before final answer"}`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "help me decide whether to travel tomorrow from Beijing to Yiwu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "Weather checked") {
+		t.Fatalf("expected contract repair to complete with tool evidence, got %#v", resp)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	if !strings.Contains(trace, "task_contract_created") || !strings.Contains(trace, "task_contract_unsatisfied") || !strings.Contains(trace, "task_contract_satisfied") {
+		t.Fatalf("expected contract lifecycle trace, got:\n%s", trace)
+	}
+	state := loadState(t, rt, "cli:test")
+	if state.Tasks[0].Execution.Contract == nil || !state.Tasks[0].Execution.Contract.RequiresTools {
+		t.Fatalf("expected stored task contract, got %#v", state.Tasks[0].Execution.Contract)
+	}
+}
+
+func TestRuntimeTaskContractAllowsNoToolTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Mateway is a local agent runtime."}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"explain Mateway","requires_tools":false,"required_tools":[],"required_evidence":[],"expected_outcome":"short explanation","completion_policy":"answer directly"}`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "explain what Mateway is"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Text != "Mateway is a local agent runtime." {
+		t.Fatalf("expected no-tool task to complete, got %#v", resp)
+	}
+}
+
+func TestRuntimeTaskContractParseFailureFallsBack(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "plain answer"}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `not json`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "answer plainly"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Text != "plain answer" {
+		t.Fatalf("expected parse failure fallback, got %#v", resp)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "task_contract_parse_failed") {
+		t.Fatalf("expected parse failure trace, got:\n%s", string(data))
+	}
+}
+
 func TestRuntimeProgressSinkEmitsToolStartAndEnd(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
@@ -275,12 +404,93 @@ func TestRuntimeProgressSinkEmitsToolStartAndEnd(t *testing.T) {
 	if len(updates) < 2 {
 		t.Fatalf("expected start and end progress updates, got %#v", updates)
 	}
-	if updates[0].Style != "processing" || len(updates[0].Progress) == 0 || updates[0].Progress[len(updates[0].Progress)-1].Status != "running" {
-		t.Fatalf("expected running progress update, got %#v", updates[0])
+	foundRunning := false
+	for _, update := range updates {
+		if update.Style != "processing" || len(update.Progress) == 0 {
+			continue
+		}
+		step := update.Progress[len(update.Progress)-1]
+		if step.Tool == "project.index" && step.Status == "running" {
+			foundRunning = true
+		}
 	}
-	last := updates[len(updates)-1]
-	if len(last.Progress) == 0 || last.Progress[len(last.Progress)-1].Tool != "project.index" || last.Progress[len(last.Progress)-1].Status != "accepted" {
-		t.Fatalf("expected accepted project.index progress, got %#v", last)
+	if !foundRunning {
+		t.Fatalf("expected running project.index progress update, got %#v", updates)
+	}
+	foundAccepted := false
+	for _, update := range updates {
+		if len(update.Progress) == 0 {
+			continue
+		}
+		step := update.Progress[len(update.Progress)-1]
+		if step.Tool == "project.index" && step.Status == "accepted" {
+			foundAccepted = true
+		}
+	}
+	if !foundAccepted {
+		t.Fatalf("expected accepted project.index progress, got %#v", updates)
+	}
+}
+
+func TestRuntimeProgressSinkEmitsModelThinking(t *testing.T) {
+	rt := newTestRuntime(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rt.Pool.agents["main"] = agentcore.NewAgent(blockingModel{
+		started: started,
+		release: release,
+		text:    "done",
+	}, rt.Tools)
+	updates := make(chan channel.OutboundMessage, 4)
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates <- msg
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := rt.Handle(context.Background(), inbound("cli:test", "think then answer"))
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("model did not start")
+	}
+	select {
+	case update := <-updates:
+		if len(update.Progress) == 0 {
+			t.Fatalf("expected progress update, got %#v", update)
+		}
+		step := update.Progress[len(update.Progress)-1]
+		if step.Title != "model" || step.Status != "thinking" || step.Summary != "waiting for model output" {
+			t.Fatalf("expected model wait progress before model returned, got %#v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected model wait progress before model returned")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeProgressSinkDoesNotEmitFinalTextAsModelProgress(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "final answer should not be progress"}, rt.Tools)
+	var updates []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates = append(updates, msg)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "answer directly")); err != nil {
+		t.Fatal(err)
+	}
+	for _, update := range updates {
+		if len(update.Progress) == 0 {
+			continue
+		}
+		step := update.Progress[len(update.Progress)-1]
+		if strings.Contains(step.Summary, "final answer should not be progress") {
+			t.Fatalf("final text leaked into progress: %#v", updates)
+		}
 	}
 }
 
@@ -325,6 +535,43 @@ func TestRuntimeProgressSinkEmitsLongRunningToolProgress(t *testing.T) {
 	}
 }
 
+func TestRuntimeCancelledContextReturnsInterruptedReply(t *testing.T) {
+	rt := newTestRuntime(t)
+	started := make(chan struct{})
+	rt.Pool.agents["main"] = agentcore.NewAgent(cancelledModel{started: started}, rt.Tools)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Response, 1)
+	errs := make(chan error, 1)
+	go func() {
+		resp, err := rt.Handle(ctx, inbound("cli:test", "long task"))
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- resp
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("model did not start")
+	}
+	cancel()
+	select {
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case resp := <-done:
+		if !resp.Failed || !strings.Contains(resp.Reply.Text, "interrupted") {
+			t.Fatalf("expected interrupted reply, got %#v", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not return after cancellation")
+	}
+	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 || state.ActiveTask != state.Tasks[0].ID || state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected interrupted task to remain active failed, got %#v", state.Tasks)
+	}
+}
+
 func TestDefaultRegistryContainsPiStyleTools(t *testing.T) {
 	registry := tool.NewRegistry(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	for _, name := range []string{
@@ -340,6 +587,29 @@ func TestDefaultRegistryContainsPiStyleTools(t *testing.T) {
 		if _, ok := registry.Get(name); ok {
 			t.Fatalf("did not expect default tool %s", name)
 		}
+	}
+}
+
+func TestAgentPoolFiltersToolsByProfileAccess(t *testing.T) {
+	cfg := &config.Root{
+		App: config.AppConfig{Home: t.TempDir()},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{{
+				ID: "main",
+				Tools: config.AccessListConfig{
+					Deny: []string{"terminal.run"},
+				},
+			}},
+		},
+	}
+	pool := NewAgentPool(cfg)
+	agent := pool.AgentForSession("cli:default")
+	if _, ok := agent.Tools.Get("terminal.run"); ok {
+		t.Fatal("terminal.run should be filtered by profile deny list")
+	}
+	if _, ok := agent.Tools.Get("file.read"); !ok {
+		t.Fatal("file.read should remain enabled")
 	}
 }
 
@@ -781,7 +1051,9 @@ func newTestRuntime(t *testing.T) Runtime {
 		Agents:    config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}},
 		Scheduler: config.SchedulerConfig{Enabled: true, Timezone: "UTC"},
 	}
-	return New(cfg)
+	rt := New(cfg)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"test task","requires_tools":false,"required_tools":[],"required_evidence":[],"expected_outcome":"answer directly","completion_policy":"answer directly"}`}
+	return rt
 }
 
 func inbound(sessionKey, text string) channel.InboundMessage {
@@ -809,6 +1081,32 @@ func (m staticTextModel) Next(context.Context, agentcore.Context) (agentcore.Mes
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
 }
 
+type blockingModel struct {
+	started chan<- struct{}
+	release <-chan struct{}
+	text    string
+}
+
+func (m blockingModel) Next(ctx context.Context, _ agentcore.Context) (agentcore.Message, error) {
+	close(m.started)
+	select {
+	case <-ctx.Done():
+		return agentcore.Message{}, ctx.Err()
+	case <-m.release:
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
+	}
+}
+
+type cancelledModel struct {
+	started chan<- struct{}
+}
+
+func (m cancelledModel) Next(ctx context.Context, _ agentcore.Context) (agentcore.Message, error) {
+	close(m.started)
+	<-ctx.Done()
+	return agentcore.Message{}, ctx.Err()
+}
+
 type captureUserModel struct {
 	text     string
 	lastUser string
@@ -822,6 +1120,14 @@ func (m *captureUserModel) Next(_ context.Context, ctx agentcore.Context) (agent
 		}
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
+}
+
+type contractJSONModel struct {
+	json string
+}
+
+func (m contractJSONModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.json}, nil
 }
 
 type capturePromptModel struct {
@@ -873,4 +1179,22 @@ func (t runtimeSlowTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 	case <-timer.C:
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: fmt.Sprint(call.Args["text"])}
 	}
+}
+
+type runtimeNamedTool struct {
+	name    string
+	content string
+}
+
+func (t runtimeNamedTool) Name() string      { return t.name }
+func (runtimeNamedTool) Description() string { return "test named tool" }
+func (runtimeNamedTool) Schema() agentcore.Schema {
+	return agentcore.Schema{}
+}
+func (runtimeNamedTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (runtimeNamedTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{ParallelMode: "read_only_ok", Evidence: "test evidence", Acceptance: "accepted when content is returned"}
+}
+func (t runtimeNamedTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: map[string]any{"test": true}}
 }

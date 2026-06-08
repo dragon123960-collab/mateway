@@ -12,6 +12,7 @@ const (
 	EventAgentEnd              EventType = "agent_end"
 	EventTurnStart             EventType = "turn_start"
 	EventTurnEnd               EventType = "turn_end"
+	EventModelStart            EventType = "model_start"
 	EventMessageStart          EventType = "message_start"
 	EventMessageEnd            EventType = "message_end"
 	EventToolExecutionStart    EventType = "tool_execution_start"

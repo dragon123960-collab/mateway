@@ -52,10 +52,27 @@ type ExecutionFrame struct {
 	Mode          string           `json:"mode,omitempty"`
 	Status        string           `json:"status,omitempty"`
 	OriginalTask  string           `json:"original_task,omitempty"`
+	Contract      *TaskContract    `json:"contract,omitempty"`
 	CurrentStepID string           `json:"current_step_id,omitempty"`
 	CurrentNodeID string           `json:"current_node_id,omitempty"`
 	Events        []ExecutionEvent `json:"events,omitempty"`
 	UpdatedAt     time.Time        `json:"updated_at,omitempty"`
+}
+
+type TaskContract struct {
+	Summary          string                 `json:"summary,omitempty"`
+	RequiresTools    bool                   `json:"requires_tools,omitempty"`
+	RequiredTools    []string               `json:"required_tools,omitempty"`
+	RequiredEvidence []TaskEvidenceContract `json:"required_evidence,omitempty"`
+	ExpectedOutcome  string                 `json:"expected_outcome,omitempty"`
+	CompletionPolicy string                 `json:"completion_policy,omitempty"`
+	CreatedAt        time.Time              `json:"created_at,omitempty"`
+}
+
+type TaskEvidenceContract struct {
+	Kind        string `json:"kind,omitempty"`
+	Tool        string `json:"tool,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type ExecutionEvent struct {
@@ -376,6 +393,22 @@ func (s *State) AddExecutionEvent(taskID string, event ExecutionEvent) {
 				event.CreatedAt = now
 			}
 			s.Tasks[i].Execution.Events = append(s.Tasks[i].Execution.Events, event)
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func (s *State) SetTaskContract(taskID string, contract TaskContract) {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			if contract.CreatedAt.IsZero() {
+				contract.CreatedAt = now
+			}
+			s.Tasks[i].Execution.Contract = &contract
 			s.Tasks[i].Execution.UpdatedAt = now
 			s.Tasks[i].UpdatedAt = now
 			return

@@ -435,16 +435,40 @@ func feishuProgressText(update channel.OutboundMessage) string {
 		b.WriteString("\n- ")
 		b.WriteString(title)
 		b.WriteString(": ")
-		b.WriteString(status)
+		b.WriteString(feishuProgressStatus(status))
 		if step.TimedOut {
 			b.WriteString(" / timed out")
 		}
 		if summary := strings.TrimSpace(step.Summary); summary != "" {
 			b.WriteString(" / ")
-			b.WriteString(summary)
+			b.WriteString(compactProgressLineText(summary, 96))
 		}
 	}
 	return b.String()
+}
+
+func feishuProgressStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "running":
+		return "call"
+	case "accepted", "completed":
+		return "success"
+	case "failed", "blocked", "suspect":
+		return "failed"
+	default:
+		if strings.TrimSpace(status) != "" {
+			return strings.TrimSpace(status)
+		}
+		return "recorded"
+	}
+}
+
+func compactProgressLineText(text string, limit int) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
 
 func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) bool {
@@ -465,11 +489,6 @@ func isSlashCommand(text string) bool {
 func sendFinalReply(ctx context.Context, sender *feishu.Sender, msg channel.InboundMessage, ackMessageID string, reply channel.OutboundMessage) error {
 	if sender == nil {
 		return fmt.Errorf("feishu sender is required")
-	}
-	if strings.TrimSpace(ackMessageID) != "" {
-		if err := sender.Update(ctx, ackMessageID, reply); err == nil {
-			return nil
-		}
 	}
 	return sender.Reply(ctx, msg, reply)
 }
@@ -583,10 +602,18 @@ func inboundDedupeKey(msg channel.InboundMessage) string {
 }
 
 func gatewayText(cfg *config.Root, msg channel.InboundMessage, key string, values map[string]string) string {
-	switch key {
-	case "gateway.processing_ack":
-		return "Processing..."
-	default:
-		return key
+	text := gatewayTexts[key]
+	if text == "" {
+		text = key
 	}
+	for key, value := range values {
+		text = strings.ReplaceAll(text, "{"+key+"}", value)
+	}
+	return text
+}
+
+var gatewayTexts = map[string]string{
+	"gateway.processing_ack":          "Processing...",
+	"gateway.processing_failed":       "The request failed while processing: {error}",
+	"gateway.media_download_failed":   "Failed to download message media: {error}",
 }

@@ -27,7 +27,6 @@ import (
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/secret"
 	"github.com/dongping/mateway/internal/session"
-	"gopkg.in/yaml.v3"
 )
 
 func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
@@ -55,6 +54,42 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(WebSearchTool{Config: root})
 	registry.Register(WebFetchTool{Config: root})
 	return registry
+}
+
+func NewRegistryForProfile(cfg *config.Root, profile config.AgentProfileConfig) *agentcore.ToolRegistry {
+	registry := NewRegistry(cfg)
+	filterRegistry(registry, profile.Tools)
+	return registry
+}
+
+func filterRegistry(registry *agentcore.ToolRegistry, access config.AccessListConfig) {
+	if registry == nil {
+		return
+	}
+	allow := normalizedSet(access.Allow)
+	deny := normalizedSet(access.Deny)
+	for _, item := range registry.List() {
+		name := item.Name()
+		key := strings.ToLower(strings.TrimSpace(name))
+		if len(allow) > 0 && !allow[key] {
+			registry.Unregister(name)
+			continue
+		}
+		if deny[key] {
+			registry.Unregister(name)
+		}
+	}
+}
+
+func normalizedSet(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value != "" {
+			out[value] = true
+		}
+	}
+	return out
 }
 
 type EchoTool struct{}
@@ -623,7 +658,6 @@ type ScheduleDeleteTool struct{ Config *config.Root }
 type ScheduleRunNowTool struct{ Config *config.Root }
 type TaskSearchTool struct{ Config *config.Root }
 type TaskResumeTool struct{ Config *config.Root }
-type RemoteProfileCreateTool struct{ Config *config.Root }
 
 func (TerminalRunTool) Name() string        { return "terminal.run" }
 func (TerminalRunTool) Description() string { return "run a local shell command" }

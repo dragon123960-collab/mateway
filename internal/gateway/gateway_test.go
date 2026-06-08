@@ -129,8 +129,35 @@ func TestFeishuProgressTextIncludesSteps(t *testing.T) {
 			{Tool: "web.search", Status: "running", Summary: "北京天气"},
 		},
 	})
-	if !strings.Contains(text, "web.search: running") || !strings.Contains(text, "北京天气") {
+	if !strings.Contains(text, "web.search: call") || !strings.Contains(text, "北京天气") {
 		t.Fatalf("unexpected progress text %q", text)
+	}
+}
+
+func TestFeishuProgressTextShowsToolResultOutcome(t *testing.T) {
+	text := feishuProgressText(channel.OutboundMessage{
+		Text: "Processing...",
+		Progress: []channel.ProgressStep{
+			{Tool: "terminal.run", Status: "accepted", Summary: "tests passed"},
+			{Tool: "file.write", Status: "failed", Summary: "permission denied"},
+		},
+	})
+	for _, want := range []string{"terminal.run: success / tests passed", "file.write: failed / permission denied"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestFeishuProgressTextCompactsLongSummary(t *testing.T) {
+	text := feishuProgressText(channel.OutboundMessage{
+		Text: "Processing...",
+		Progress: []channel.ProgressStep{
+			{Title: "model", Status: "thinking", Summary: strings.Repeat("long ", 80)},
+		},
+	})
+	if strings.Contains(text, strings.Repeat("long ", 20)) || !strings.Contains(text, "...") {
+		t.Fatalf("expected compact progress text, got %q", text)
 	}
 }
 

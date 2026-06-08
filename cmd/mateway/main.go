@@ -17,6 +17,7 @@ import (
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/channel/weixin"
+	"github.com/dongping/mateway/internal/cli"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/gateway"
 	"github.com/dongping/mateway/internal/memory"
@@ -52,6 +53,45 @@ func run(args []string) error {
 		return nil
 	}
 	switch args[0] {
+	case "chat":
+		fs := flag.NewFlagSet("mateway chat", flag.ContinueOnError)
+		sessionKey := fs.String("session", "", "session key to use")
+		cwdSession := fs.Bool("cwd-session", false, "use a session derived from the current working directory")
+		classic := fs.Bool("classic", false, "use the classic line-based REPL")
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		key := *sessionKey
+		if *cwdSession {
+			if cwd, err := os.Getwd(); err == nil {
+				key = cli.CwdSessionKey(cwd)
+			}
+		}
+		if !*classic && cli.CanRunTUI(os.Stdin, os.Stdout) {
+			return cli.RunTUI(context.Background(), cli.TUIOptions{Config: cfg, SessionKey: key, In: os.Stdin, Out: os.Stdout})
+		}
+		return cli.RunChat(context.Background(), cli.ChatOptions{Config: cfg, SessionKey: key, In: os.Stdin, Out: os.Stdout})
+	case "tui":
+		fs := flag.NewFlagSet("mateway tui", flag.ContinueOnError)
+		sessionKey := fs.String("session", "", "session key to use")
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		return cli.RunTUI(context.Background(), cli.TUIOptions{Config: cfg, SessionKey: *sessionKey, In: os.Stdin, Out: os.Stdout})
 	case "init":
 		fs := flag.NewFlagSet("mateway init", flag.ContinueOnError)
 		homeFlag := fs.String("home", "", "override MATEWAY_HOME for initialization")
@@ -68,27 +108,84 @@ func run(args []string) error {
 		fmt.Println("initialized", home)
 		return nil
 	case "ask":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: mateway ask <message>")
+		fs := flag.NewFlagSet("mateway ask", flag.ContinueOnError)
+		sessionKey := fs.String("session", "", "session key to use")
+		quiet := fs.Bool("quiet", false, "print final answer only")
+		jsonOutput := fs.Bool("json", false, "print a JSON response")
+		events := fs.Bool("events", false, "print process events as NDJSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
 		}
 		cfg, err := loadConfig()
 		if err != nil {
 			return err
 		}
-		rt := runtime.New(cfg)
-		msg := channel.InboundMessage{
-			ID:       "cli",
-			Channel:  "cli",
-			ThreadID: "cli",
-			UserID:   "local",
-			Text:     strings.Join(args[1:], " "),
+		return cli.RunAsk(context.Background(), cli.AskOptions{
+			Config:     cfg,
+			Message:    strings.Join(fs.Args(), " "),
+			SessionKey: *sessionKey,
+			Quiet:      *quiet,
+			JSON:       *jsonOutput,
+			Events:     *events,
+			In:         os.Stdin,
+			Out:        os.Stdout,
+		})
+	case "send":
+		fs := flag.NewFlagSet("mateway send", flag.ContinueOnError)
+		to := fs.String("to", "", "target in channel:id form")
+		uuid := fs.String("uuid", "", "optional idempotency key")
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
 		}
-		msg.SessionKey = gateway.SessionKey(msg)
-		resp, err := rt.Handle(context.Background(), msg)
+		cfg, err := loadConfig()
 		if err != nil {
 			return err
 		}
-		printRuntimeResponse(resp)
+		return cli.RunSend(context.Background(), cli.SendOptions{
+			Config: cfg,
+			To:     *to,
+			Text:   strings.Join(fs.Args(), " "),
+			UUID:   *uuid,
+			Out:    os.Stdout,
+		})
+	case "fetch-history":
+		fs := flag.NewFlagSet("mateway fetch-history", flag.ContinueOnError)
+		from := fs.String("from", "", "source in channel:id form")
+		sessionKey := fs.String("session", "", "session key to import into")
+		limit := fs.Int("limit", 20, "maximum messages to import")
+		sinceText := fs.String("since", "24h", "history window such as 24h or 7")
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		since, err := cli.ParseSince(*sinceText)
+		if err != nil {
+			return err
+		}
+		result, err := cli.RunFetchHistory(context.Background(), cli.FetchHistoryOptions{
+			Config:     cfg,
+			From:       *from,
+			SessionKey: *sessionKey,
+			Limit:      *limit,
+			Since:      since,
+			Out:        os.Stdout,
+		})
+		if err != nil {
+			return err
+		}
+		cli.PrintFetchHistoryResult(os.Stdout, result)
 		return nil
 	case "test":
 		return runTest(args[1:])
@@ -99,10 +196,25 @@ func run(args []string) error {
 	case "workspace":
 		return runWorkspace(args[1:])
 	case "trace":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: mateway trace <trace-jsonl-path>")
+		fs := flag.NewFlagSet("mateway trace", flag.ContinueOnError)
+		events := fs.Bool("events", false, "print process events")
+		jsonEvents := fs.Bool("json", false, "print process events as NDJSON; requires --events")
+		if err := fs.Parse(args[1:]); err != nil {
+			if err == flag.ErrHelp {
+				return nil
+			}
+			return err
 		}
-		summary, err := runtime.SummarizeTrace(args[1])
+		if len(fs.Args()) != 1 {
+			return fmt.Errorf("usage: mateway trace [--events] <trace-jsonl-path>")
+		}
+		if *events {
+			return cli.PrintTraceEventsWithOptions(os.Stdout, fs.Args()[0], cli.TraceEventsOptions{JSON: *jsonEvents})
+		}
+		if *jsonEvents {
+			return fmt.Errorf("--json requires --events")
+		}
+		summary, err := runtime.SummarizeTrace(fs.Args()[0])
 		if err != nil {
 			return err
 		}
@@ -147,6 +259,93 @@ func run(args []string) error {
 			fmt.Println("tools:", strings.Join(summary.ToolCalls, ", "))
 		}
 		return nil
+	case "tools":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mateway tools <list|enable|disable> [--agent <agent_id>] [--verbose] <tool_name>")
+		}
+		switch args[1] {
+		case "list":
+			fs := flag.NewFlagSet("mateway tools list", flag.ContinueOnError)
+			verbose := fs.Bool("verbose", false, "show descriptions and parallel mode")
+			agentID := fs.String("agent", "", "agent profile id")
+			if err := fs.Parse(args[2:]); err != nil {
+				if err == flag.ErrHelp {
+					return nil
+				}
+				return err
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return cli.PrintTools(os.Stdout, cfg, *agentID, *verbose)
+		case "enable", "disable":
+			fs := flag.NewFlagSet("mateway tools "+args[1], flag.ContinueOnError)
+			agentID := fs.String("agent", "", "agent profile id")
+			if err := fs.Parse(reorderToolAccessFlags(args[2:])); err != nil {
+				if err == flag.ErrHelp {
+					return nil
+				}
+				return err
+			}
+			if fs.NArg() != 1 {
+				return fmt.Errorf("usage: mateway tools %s <tool_name> [--agent <agent_id>]", args[1])
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			var change cli.ToolAccessChange
+			if args[1] == "enable" {
+				change, err = cli.EnableTool(cfg, *agentID, fs.Arg(0))
+			} else {
+				change, err = cli.DisableTool(cfg, *agentID, fs.Arg(0))
+			}
+			if err != nil {
+				return err
+			}
+			cli.PrintToolAccessChange(os.Stdout, change)
+			return nil
+		default:
+			return fmt.Errorf("usage: mateway tools <list|enable|disable> [--agent <agent_id>] [--verbose] <tool_name>")
+		}
+	case "model":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mateway model <show|list> [--agent <agent_id>] [--verbose]")
+		}
+		switch args[1] {
+		case "show":
+			fs := flag.NewFlagSet("mateway model show", flag.ContinueOnError)
+			agentID := fs.String("agent", "", "agent profile id")
+			verbose := fs.Bool("verbose", false, "include loaded model endpoints")
+			if err := fs.Parse(args[2:]); err != nil {
+				if err == flag.ErrHelp {
+					return nil
+				}
+				return err
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return cli.PrintModel(os.Stdout, cfg, *agentID, *verbose)
+		case "list":
+			fs := flag.NewFlagSet("mateway model list", flag.ContinueOnError)
+			verbose := fs.Bool("verbose", false, "show endpoint details")
+			if err := fs.Parse(args[2:]); err != nil {
+				if err == flag.ErrHelp {
+					return nil
+				}
+				return err
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return cli.PrintModels(os.Stdout, cfg, *verbose)
+		default:
+			return fmt.Errorf("usage: mateway model <show|list> [--agent <agent_id>] [--verbose]")
+		}
 	case "session":
 		return runSession(args[1:])
 	case "memory":
@@ -871,6 +1070,26 @@ func reorderAgentCreateFlags(args []string) []string {
 		if arg == "--default" || arg == "-default" {
 			flags = append(flags, arg)
 			continue
+		}
+		positional = append(positional, arg)
+	}
+	return append(flags, positional...)
+}
+
+func reorderToolAccessFlags(args []string) []string {
+	if len(args) < 3 || strings.HasPrefix(args[0], "-") {
+		return args
+	}
+	var flags []string
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--agent" || arg == "-agent" {
+			if i+1 < len(args) {
+				flags = append(flags, arg, args[i+1])
+				i++
+				continue
+			}
 		}
 		positional = append(positional, arg)
 	}
@@ -2516,9 +2735,17 @@ func printHelp() {
 
 Usage:
   mateway init
-  mateway ask <message>
+  mateway chat [--session <session_key>] [--cwd-session] [--classic]
+  mateway tui [--session <session_key>]
+  mateway ask [--session <session_key>] [--quiet|--json|--events] <message>
+  mateway send --to <channel:target> <message>
+  mateway fetch-history --from <channel:target> [--session <session_key>] [--limit <n>] [--since <duration>]
   mateway test [--case read-readme|project-index|web-search|write-file] [--message <task>] [--record=false]
-  mateway trace <trace-jsonl-path>
+  mateway trace [--events] [--json] <trace-jsonl-path>
+  mateway tools list [--agent <agent_id>] [--verbose]
+  mateway tools enable|disable <tool_name> [--agent <agent_id>]
+  mateway model show [--agent <agent_id>] [--verbose]
+  mateway model list [--verbose]
   mateway workspace report
   mateway session list
   mateway session show <session_key>

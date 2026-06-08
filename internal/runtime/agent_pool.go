@@ -26,7 +26,7 @@ func NewAgentPool(cfg *config.Root) AgentPool {
 		if agentID == "" {
 			continue
 		}
-		agent := agentcore.NewAgent(resolveModelForProfile(cfg, profile), tool.NewRegistry(cfg))
+		agent := agentcore.NewAgent(resolveModelForProfile(cfg, profile), tool.NewRegistryForProfile(cfg, profile))
 		agent.SystemPrompt = buildRuntimeSystemContext(cfg, profile)
 		pool.agents[agentID] = agent
 	}
@@ -227,6 +227,14 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 		return model.NewRoutedAgentModel(configs, visionConfigs)
 	}
 	return HeuristicModel{}
+}
+
+func resolveModelForDefault(cfg *config.Root) agentcore.Model {
+	if cfg == nil {
+		return HeuristicModel{}
+	}
+	profile := cfg.DefaultAgent()
+	return resolveModelForProfile(cfg, profile)
 }
 
 func resolveModelForRole(cfg *config.Root, profile config.AgentProfileConfig, role string, fallback agentcore.Model) agentcore.Model {
