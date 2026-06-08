@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
@@ -50,6 +51,168 @@ func TestResolveAllowedPathAllowsAccessiblePath(t *testing.T) {
 	}
 }
 
+func TestToolResultReadRetrievesRawRef(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	hash := "0123456789abcdef01234567"
+	dir := filepath.Join(home, "artifacts", "tool-results", hash[:2])
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "alpha\nbeta needle\ngamma\nneedle second\nomega"
+	if err := os.WriteFile(filepath.Join(dir, hash+".txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readTool := ToolResultReadTool{Config: cfg}
+	full := readTool.Run(context.Background(), agentcore.ToolCall{ID: "call_1", Args: map[string]any{"raw_ref": "tool-result:" + hash}})
+	if full.IsError || full.Content != content {
+		t.Fatalf("expected full content, got %#v", full)
+	}
+	searched := readTool.Run(context.Background(), agentcore.ToolCall{ID: "call_2", Args: map[string]any{"raw_ref": "tool-result:" + hash, "query": "needle"}})
+	if searched.IsError || !strings.Contains(searched.Content, "L2: beta needle") || searched.Evidence["matches"] != 2 {
+		t.Fatalf("expected query snippets, got %#v", searched)
+	}
+	multi := readTool.Run(context.Background(), agentcore.ToolCall{ID: "call_3", Args: map[string]any{"raw_ref": "tool-result:" + hash, "query": "needle second"}})
+	if multi.IsError || !strings.Contains(multi.Content, "L4: needle second") || multi.Evidence["matches"] != 1 {
+		t.Fatalf("expected multi-term query snippets, got %#v", multi)
+	}
+	if ranges, ok := multi.Evidence["line_ranges"].([]string); !ok || len(ranges) == 0 {
+		t.Fatalf("expected line ranges evidence, got %#v", multi.Evidence)
+	}
+}
+
+func TestProjectIndexLimitsWideDirectory(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "wide")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("file-%03d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root, "limit": 25},
+	})
+	if result.IsError {
+		t.Fatalf("project.index failed: %s", result.Content)
+	}
+	if lines := strings.Split(strings.TrimSpace(result.Content), "\n"); len(lines) != 25 {
+		t.Fatalf("expected 25 entries, got %d", len(lines))
+	}
+	if result.Evidence["partial"] != true || result.Evidence["entries"] != 25 {
+		t.Fatalf("expected partial evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestProjectIndexMarksCommonHeavyDirectories(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "repo")
+	for _, name := range []string{"node_modules", ".git", "src"} {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root},
+	})
+	if result.IsError {
+		t.Fatalf("project.index failed: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "DIR:  .git/ [skip]") || !strings.Contains(result.Content, "DIR:  node_modules/ [skip]") {
+		t.Fatalf("expected skip markers, got %q", result.Content)
+	}
+	if strings.Contains(result.Content, "DIR:  src/ [skip]") {
+		t.Fatalf("did not expect src skip marker, got %q", result.Content)
+	}
+	if result.Evidence["skipped"] != 2 {
+		t.Fatalf("expected skipped evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestProjectIndexHonorsMaxDepthAndSkipDirs(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "repo")
+	for _, path := range []string{
+		filepath.Join(root, "src", "pkg", "deep"),
+		filepath.Join(root, "generated", "nested"),
+	} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "pkg", "deep", "hidden.go"), []byte("package deep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "generated", "nested", "artifact.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root, "max_depth": 2, "skip_dirs": []any{"generated"}},
+	})
+	if result.IsError {
+		t.Fatalf("project.index failed: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "DIR:  generated/ [skip]") {
+		t.Fatalf("expected custom skip marker, got %q", result.Content)
+	}
+	if strings.Contains(result.Content, "artifact.txt") || strings.Contains(result.Content, "hidden.go") {
+		t.Fatalf("expected bounded scan to omit deep/skipped files, got %q", result.Content)
+	}
+	if result.Evidence["max_depth"] != 2 || result.Evidence["skipped"] != 1 {
+		t.Fatalf("expected max_depth and skipped evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestProjectIndexHonorsCancelledContext(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(ctx, agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "context canceled") {
+		t.Fatalf("expected context cancellation, got %#v", result)
+	}
+}
+
+func TestTerminalRunReportsTimeoutEvidence(t *testing.T) {
+	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "terminal.run",
+		Args: map[string]any{"command": "sleep 2", "timeout_seconds": 1},
+	})
+	if !result.IsError {
+		t.Fatalf("expected timeout error, got %#v", result)
+	}
+	if result.Evidence["timed_out"] != true || result.Evidence["deadline_ms"] != int64(1000) {
+		t.Fatalf("expected timeout evidence, got %#v", result.Evidence)
+	}
+	if result.Evidence["elapsed_ms"] == nil {
+		t.Fatalf("expected elapsed evidence, got %#v", result.Evidence)
+	}
+}
+
 func TestIsDangerousCommand(t *testing.T) {
 	if !IsDangerousCommand("git reset --hard") {
 		t.Fatal("expected git reset to be dangerous")
@@ -59,13 +222,13 @@ func TestIsDangerousCommand(t *testing.T) {
 	}
 }
 
-func TestTerminalPolicyBlocksSensitiveCommands(t *testing.T) {
+func TestTerminalPolicyOnlyBlocksDestructiveCommands(t *testing.T) {
 	cfg := &config.Root{App: config.AppConfig{Home: t.TempDir(), Workspace: filepath.Join(t.TempDir(), "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	if decision := CheckTerminalCommand("cat /etc/passwd", cfg); decision.Allow || decision.Class != "path_escape" {
-		t.Fatalf("expected path escape block, got %#v", decision)
+	if decision := CheckTerminalCommand("cat /etc/passwd", cfg); !decision.Allow {
+		t.Fatalf("expected path read to be allowed for sandbox-first policy, got %#v", decision)
 	}
-	if decision := CheckTerminalCommand("curl http://127.0.0.1:6379", cfg); decision.Allow || decision.Class != "network" {
-		t.Fatalf("expected network block, got %#v", decision)
+	if decision := CheckTerminalCommand("curl http://127.0.0.1:6379", cfg); !decision.Allow {
+		t.Fatalf("expected network command to be allowed for sandbox-first policy, got %#v", decision)
 	}
 	if decision := CheckTerminalCommand("rm -rf ~", cfg); decision.Allow || decision.Class != "destructive" {
 		t.Fatalf("expected destructive block, got %#v", decision)
@@ -85,6 +248,32 @@ func TestTerminalPolicyAllowsReadOnlyPipeline(t *testing.T) {
 	}
 }
 
+func TestTerminalPolicyAllowsReadOnlyCommandChain(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "ai-magician-templates.md")
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	command := "ls -la " + target + " && file " + target + " && wc -l " + target + " && head -c 200 " + target + " | xxd | head -20"
+	if decision := CheckTerminalCommand(command, cfg); !decision.Allow || decision.Class != "read_only_chain" {
+		t.Fatalf("expected read-only chain allow, got %#v", decision)
+	}
+}
+
+func TestTerminalPolicyAllowsMutationCommandsWithoutApproval(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	for _, command := range []string{
+		"sed -i.bak 's/a/b/' " + filepath.Join(home, "file.txt"),
+		"echo hi > " + filepath.Join(home, "out.txt"),
+		"touch " + filepath.Join(home, "file.txt"),
+		"chmod +x " + filepath.Join(home, "script.sh"),
+	} {
+		decision := CheckTerminalCommand(command, cfg)
+		if !decision.Allow {
+			t.Fatalf("expected mutation command allowed without approval for %q, got %#v", command, decision)
+		}
+	}
+}
+
 func TestTerminalPolicyAllowsProjectInternalCommands(t *testing.T) {
 	root := testRepoRoot(t)
 	for _, command := range []string{
@@ -98,33 +287,92 @@ func TestTerminalPolicyAllowsProjectInternalCommands(t *testing.T) {
 	}
 }
 
-func TestTerminalPolicyRejectsUnsafeProjectInternalShape(t *testing.T) {
-	root := testRepoRoot(t)
-	cases := []string{
-		filepath.Join(os.TempDir(), "mateway") + " schedule test sch_123",
-		filepath.Join(root, "build", "mateway") + " schedule test sch_123 && rm x",
-		filepath.Join(root, "build", "mateway") + " schedule test sch_123 | sh",
-	}
-	for _, command := range cases {
-		if decision := CheckTerminalCommand(command, nil); decision.Allow {
-			t.Fatalf("expected project internal command blocked for %q, got %#v", command, decision)
+func TestTerminalPolicyAllowsDevelopmentCheckCommands(t *testing.T) {
+	for _, command := range []string{
+		"go test ./...",
+		"go build ./cmd/mateway",
+		"go vet ./...",
+		"go list ./...",
+		"npm test",
+		"npm run test",
+		"pnpm test",
+		"pnpm run test",
+		"yarn test",
+		"yarn run test",
+		"git ls-files",
+		"file go.mod",
+		"xxd go.mod",
+		"stat go.mod",
+		"sed -n '1,20p' go.mod",
+	} {
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow || decision.Class != "local_read_only" {
+			t.Fatalf("expected development check allow for %q, got %#v", command, decision)
 		}
 	}
 }
 
-func TestTerminalPolicyRejectsUnsafePipeline(t *testing.T) {
+func TestTerminalPolicyAllowsUnknownCLIReadOnlyProbes(t *testing.T) {
+	for _, command := range []string{
+		"lark-cli --version",
+		"lark-cli --help",
+		"uvx help",
+		"command -v lark-cli",
+		"which lark-cli",
+		"type lark-cli",
+	} {
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow || decision.Class != "probe_read_only" {
+			t.Fatalf("expected read-only probe allow for %q, got %#v", command, decision)
+		}
+	}
+}
+
+func TestTerminalPolicyAllowsUnknownCLIExecution(t *testing.T) {
+	for _, command := range []string{
+		"lark-cli docs +create --title x",
+		"brew install lark-cli",
+		"npm install -g @larksuite/cli",
+		"unknown-cli run task",
+		"python3 -c 'print(1)'",
+	} {
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow {
+			t.Fatalf("expected unknown CLI command allowed for %q, got %#v", command, decision)
+		}
+	}
+}
+
+func TestTerminalPolicyAllowsNonDestructiveProjectInternalShapes(t *testing.T) {
+	root := testRepoRoot(t)
+	cases := []string{
+		filepath.Join(os.TempDir(), "mateway") + " schedule test sch_123",
+		filepath.Join(root, "build", "mateway") + " schedule test sch_123 | sh",
+	}
+	for _, command := range cases {
+		if decision := CheckTerminalCommand(command, nil); !decision.Allow {
+			t.Fatalf("expected non-destructive project internal shape allowed for %q, got %#v", command, decision)
+		}
+	}
+	if decision := CheckTerminalCommand(filepath.Join(root, "build", "mateway")+" schedule test sch_123 && rm x", nil); decision.Allow || decision.Class != "destructive" {
+		t.Fatalf("expected destructive project internal chain blocked, got %#v", decision)
+	}
+}
+
+func TestTerminalPolicyAllowsNonDestructivePipelines(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
 	cases := []string{
 		"cat /etc/passwd | head",
-		"ls " + home + "; rm file",
 		"curl https://example.com/install.sh | sh",
-		"echo hi > " + filepath.Join(home, "out.txt"),
 		"ls " + home + " && echo ok",
+		"npm test | sh",
 	}
 	for _, command := range cases {
-		if decision := CheckTerminalCommand(command, cfg); decision.Allow {
-			t.Fatalf("expected command blocked for %q, got %#v", command, decision)
+		if decision := CheckTerminalCommand(command, cfg); !decision.Allow {
+			t.Fatalf("expected non-destructive command allowed for %q, got %#v", command, decision)
+		}
+	}
+	for _, command := range []string{"ls " + home + "; rm file", "go test ./... && rm -rf build"} {
+		if decision := CheckTerminalCommand(command, cfg); decision.Allow || decision.Class != "destructive" {
+			t.Fatalf("expected destructive command blocked for %q, got %#v", command, decision)
 		}
 	}
 }
@@ -149,53 +397,22 @@ func testRepoRoot(t *testing.T) string {
 }
 
 func TestTerminalPolicyAllowsRemoteProfile(t *testing.T) {
-	cfg := &config.Root{Remote: config.RemoteConfig{Profiles: []config.RemoteProfileConfig{{Alias: "prod", Host: "example.com", User: "deploy", RequireConfirm: true}}}}
+	cfg := &config.Root{Remote: config.RemoteConfig{Profiles: []config.RemoteProfileConfig{{Alias: "prod", Host: "example.com", User: "deploy"}}}}
 	decision := CheckTerminalCommand("ssh deploy@example.com uptime", cfg)
 	if !decision.Allow || decision.Class != "remote" || decision.RemoteProfile != "prod" {
 		t.Fatalf("expected remote profile allow, got %#v", decision)
 	}
 }
 
-func TestRemoteProfileCreateStoresConfigAndSecret(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}}
-	result := RemoteProfileCreateTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{
-		"alias":    "prod",
-		"host":     "example.com",
-		"user":     "deploy",
-		"password": "secret-pass",
-	}})
-	if result.IsError {
-		t.Fatalf("expected profile create, got %#v", result)
-	}
-	data, err := os.ReadFile(filepath.Join(home, "config", "config.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "prod") || !strings.Contains(string(data), "example.com") {
-		t.Fatalf("profile not persisted:\n%s", data)
-	}
-	entry, ok, err := (secret.Store{Home: home}).Get("remote/prod/auth")
-	if err != nil || !ok || entry.Value != "secret-pass" {
-		t.Fatalf("secret entry=%#v ok=%v err=%v", entry, ok, err)
-	}
-}
-
-func TestRemoteProfileCreateRequiresOverwrite(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}}
-	tool := RemoteProfileCreateTool{Config: cfg}
-	call := agentcore.ToolCall{ID: "1", Args: map[string]any{"alias": "prod", "host": "example.com", "user": "deploy"}}
-	if result := tool.Run(context.Background(), call); result.IsError {
-		t.Fatalf("first create failed: %#v", result)
-	}
-	if result := tool.Run(context.Background(), call); !result.IsError || !strings.Contains(result.Content, "already exists") {
-		t.Fatalf("expected overwrite error, got %#v", result)
-	}
-}
-
 func TestWebFetchBlocksPrivateTargets(t *testing.T) {
-	for _, raw := range []string{"http://127.0.0.1:6379", "http://localhost:8080", "http://169.254.169.254/latest/meta-data/"} {
+	for _, raw := range []string{
+		"http://127.0.0.1:6379",
+		"http://localhost:8080",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://[::1]:8080",
+		"http://0.0.0.0:8080",
+		"http://[::]:8080",
+	} {
 		if _, ok := IsBlockedFetchURL(raw); !ok {
 			t.Fatalf("expected blocked URL %s", raw)
 		}
@@ -232,10 +449,81 @@ func TestTerminalRunUsesSandboxWorkdir(t *testing.T) {
 }
 
 func TestTerminalRunBlocksEvenWhenApprovalDisabled(t *testing.T) {
-	tool := TerminalRunTool{Config: &config.Root{Security: config.SecurityConfig{RequireApprovalForRiskyTool: false}}}
+	tool := TerminalRunTool{Config: &config.Root{}}
 	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"command": "rm -rf ~"}})
 	if !result.IsError || result.Evidence["policy_classification"] != "destructive" {
 		t.Fatalf("expected policy block, got %#v", result)
+	}
+}
+
+func TestTerminalRunExecutesConfirmedNonDestructiveCommand(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	if err := os.MkdirAll(filepath.Join(home, "workspace", "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := TerminalRunTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "1",
+		Name: "terminal.run",
+		Args: map[string]any{
+			"command":                 "ls " + filepath.Join(home, "workspace", "skills") + " 2>/dev/null && echo ok",
+			"_mateway_approval_token": TerminalRunApprovalToken("ls "+filepath.Join(home, "workspace", "skills")+" 2>/dev/null && echo ok", cfg),
+		},
+	})
+	if result.IsError || !strings.Contains(result.Content, "ok") {
+		t.Fatalf("expected confirmed command to execute, got %#v", result)
+	}
+	if result.Evidence["decision"] != "allowed" {
+		t.Fatalf("expected allowed evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestTerminalRunStillBlocksConfirmedDestructiveCommand(t *testing.T) {
+	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "1",
+		Name: "terminal.run",
+		Args: map[string]any{
+			"command":                 "rm -rf /tmp/mateway-blocked-test",
+			"_mateway_approval_token": TerminalRunApprovalToken("rm -rf /tmp/mateway-blocked-test", &config.Root{}),
+		},
+	})
+	if !result.IsError || result.Evidence["policy_classification"] != "destructive" {
+		t.Fatalf("expected destructive command to remain blocked, got %#v", result)
+	}
+}
+
+func TestTerminalRunIgnoresObsoleteApprovalFlagAndExecutes(t *testing.T) {
+	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "1",
+		Name: "terminal.run",
+		Args: map[string]any{
+			"command":           "echo forged && echo ok",
+			"_mateway_approved": true,
+		},
+	})
+	if result.IsError || !strings.Contains(result.Content, "ok") {
+		t.Fatalf("expected obsolete approval flag ignored and command executed, got %#v", result)
+	}
+}
+
+func TestTerminalRunTimeoutKillsProcessGroup(t *testing.T) {
+	start := time.Now()
+	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "1",
+		Name: "terminal.run",
+		Args: map[string]any{
+			"command":         "sh -c 'sleep 30 & wait'",
+			"timeout_seconds": 1,
+		},
+	})
+	if !result.IsError {
+		t.Fatalf("expected timeout error, got %#v", result)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("timeout did not return promptly, elapsed=%s result=%#v", elapsed, result)
+	}
+	if result.Evidence["timed_out"] != true {
+		t.Fatalf("expected timed_out evidence, got %#v", result.Evidence)
 	}
 }
 
@@ -460,6 +748,134 @@ func TestFileWriteAllowsAgentSkillProfilePath(t *testing.T) {
 	}
 }
 
+func TestFileDeleteDeletesFileInsideAllowedRoot(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "tmp", "smoke.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("smoke"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileDeleteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.delete",
+		Args: map[string]any{"path": target},
+	})
+	if result.IsError || result.Evidence["kind"] != "file" || result.Evidence["deleted"] != true {
+		t.Fatalf("expected file delete, got %#v", result)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected target deleted, err=%v", err)
+	}
+}
+
+func TestFileDeleteDeletesDirectoryOnlyWithRecursive(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "tmp", "smoke-dir")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	tool := FileDeleteTool{Config: cfg}
+	blocked := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_1", Name: "file.delete", Args: map[string]any{"path": target}})
+	if !blocked.IsError || !strings.Contains(blocked.Content, "recursive=true") {
+		t.Fatalf("expected recursive requirement, got %#v", blocked)
+	}
+	allowed := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_2", Name: "file.delete", Args: map[string]any{"path": target, "recursive": true}})
+	if allowed.IsError || allowed.Evidence["kind"] != "directory" || allowed.Evidence["entries"] != 1 {
+		t.Fatalf("expected directory delete, got %#v", allowed)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("expected directory deleted, err=%v", err)
+	}
+}
+
+func TestFileDeleteRejectsPathTraversalOutsideAllowedRoot(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileDeleteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.delete",
+		Args: map[string]any{"path": filepath.Join("..", "outside.txt")},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "outside allowed roots") {
+		t.Fatalf("expected traversal rejection, got %#v", result)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside file should remain, err=%v", err)
+	}
+}
+
+func TestFileDeleteRejectsAllowedRootAndProtectedStores(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	tool := FileDeleteTool{Config: cfg}
+	rootResult := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_1", Name: "file.delete", Args: map[string]any{"path": home, "recursive": true}})
+	if !rootResult.IsError || !strings.Contains(rootResult.Content, "allowed root") {
+		t.Fatalf("expected root delete rejection, got %#v", rootResult)
+	}
+	for _, rel := range []string{"config/config.yaml", "secrets/secrets.json", "trace/t.jsonl", "sessions/s.json"} {
+		target := filepath.Join(home, rel)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("state"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		result := tool.Run(context.Background(), agentcore.ToolCall{ID: "call_2", Name: "file.delete", Args: map[string]any{"path": target}})
+		if !result.IsError || !strings.Contains(result.Content, "protected path") {
+			t.Fatalf("expected protected path rejection for %s, got %#v", rel, result)
+		}
+	}
+}
+
+func TestFileDeleteRejectsSymlinkToOutsideAllowedRoot(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(home, "tmp", "outside-link")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileDeleteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.delete",
+		Args: map[string]any{"path": link},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "outside allowed roots") {
+		t.Fatalf("expected symlink outside rejection, got %#v", result)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("symlink should remain, err=%v", err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside target should remain, err=%v", err)
+	}
+}
+
 func TestScheduleCreateToolWritesTask(t *testing.T) {
 	home := t.TempDir()
 	runAt := "2026-05-29T16:30:00+08:00"
@@ -472,7 +888,7 @@ func TestScheduleCreateToolWritesTask(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected schedule error: %#v", result)
 	}
-	if result.Evidence["status"] != "pending" || result.Evidence["session_key"] != "feishu:chat_1" {
+	if result.Evidence["status"] != "active" || result.Evidence["session_key"] != "feishu:chat_1" {
 		t.Fatalf("unexpected evidence: %#v", result.Evidence)
 	}
 	if entries, err := os.ReadDir(filepath.Join(home, "schedules")); err != nil || len(entries) != 1 {
@@ -490,6 +906,42 @@ func TestFileReadRejectsLargeFile(t *testing.T) {
 	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
 	if !result.IsError || !strings.Contains(result.Content, "file too large") {
 		t.Fatalf("expected large file error, got %#v", result)
+	}
+}
+
+func TestFileReadIndexesDirectory(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "notes")
+	if err := os.MkdirAll(filepath.Join(root, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": root}})
+	if result.IsError {
+		t.Fatalf("expected directory index, got %#v", result)
+	}
+	if !strings.Contains(result.Content, "DIR:  child/") || !strings.Contains(result.Content, "FILE: a.md") {
+		t.Fatalf("unexpected directory content: %#v", result)
+	}
+	if result.Evidence["directory"] != true {
+		t.Fatalf("expected directory evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestFileReadAllowsUTF8MarkdownAcrossSampleBoundary(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "utf8.md")
+	content := strings.Repeat("a", 4095) + "魔法师\n\n中文 Markdown 内容"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if result.IsError || !strings.Contains(result.Content, "中文 Markdown 内容") {
+		t.Fatalf("expected utf-8 markdown content, got %#v", result)
 	}
 }
 

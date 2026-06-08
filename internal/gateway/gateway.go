@@ -14,7 +14,6 @@ import (
 	"github.com/dongping/mateway/internal/channel/feishu"
 	"github.com/dongping/mateway/internal/channel/weixin"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
@@ -77,17 +76,33 @@ func builtinChannelSpecs(cfg Config) []channelSpec {
 	if cfg.Config == nil {
 		return nil
 	}
-	return []channelSpec{
-		feishuChannelSpec(cfg.Config.Channels.Feishu),
-		weixinChannelSpec(cfg.Config.Channels.Weixin),
-	}
+	specs := feishuChannelSpecs(cfg.Config.Channels.Feishu)
+	specs = append(specs, weixinChannelSpec(cfg.Config.Channels.Weixin))
+	return specs
 }
 
-func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
+func feishuChannelSpecs(channelCfg config.FeishuConfig) []channelSpec {
+	accounts := channelCfg.AccountConfigs()
+	if len(accounts) == 0 {
+		accounts = []config.FeishuConfig{channelCfg}
+	}
+	specs := make([]channelSpec, 0, len(accounts))
+	for _, accountCfg := range accounts {
+		name := "feishu"
+		if accountID := strings.TrimSpace(accountCfg.DefaultAccount); accountID != "" && accountID != "default" {
+			name = "feishu:" + accountID
+		}
+		specs = append(specs, feishuChannelSpec(name, accountCfg))
+	}
+	return specs
+}
+
+func feishuChannelSpec(name string, channelCfg config.FeishuConfig) channelSpec {
 	return channelSpec{
-		Name:    "feishu",
+		Name:    name,
 		Enabled: channelCfg.Enabled,
 		Start: func(ctx context.Context, rt channelRuntime) error {
+			log.Printf("mateway feishu channel starting account=%s", strings.TrimSpace(channelCfg.DefaultAccount))
 			sender := feishu.NewSender(channelCfg)
 			return feishu.StartWebSocket(ctx, channelCfg, func(eventCtx context.Context, msg channel.InboundMessage) error {
 				if shouldIgnoreInbound(channelCfg, msg) || prepareInbound(&msg, rt.Dedupe) {
@@ -96,7 +111,7 @@ func feishuChannelSpec(channelCfg config.FeishuConfig) channelSpec {
 				downloaded, err := sender.DownloadMessageImages(eventCtx, msg, rt.Home)
 				if err != nil {
 					log.Printf("mateway gateway feishu media download error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Runtime.Config, msg, "gateway.media_download_failed", map[string]string{"error": err.Error()}), Style: "error"})
+					_ = sender.Reply(eventCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Runtime.Config, msg, "gateway.media_download_failed", map[string]string{"error": err.Error()}), Style: channel.StyleError})
 					return nil
 				}
 				msg = downloaded
@@ -282,17 +297,15 @@ func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.Inbo
 	if err != nil {
 		return resp, err
 	}
-	_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+	_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 		"type":                "gateway_done",
-		"message_id":          msg.ID,
-		"session_key":         msg.SessionKey,
 		"runtime_duration_ms": runtimeDuration.Milliseconds(),
 		"reply_duration_ms":   int64(0),
 		"total_duration_ms":   time.Since(start).Milliseconds(),
 		"reply_style":         resp.Reply.Style,
 		"follow_up_count":     len(resp.FollowUps),
 		"failed":              resp.Failed,
-	})
+	}))
 	return resp, nil
 }
 
@@ -306,40 +319,37 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 	}
 	ackMessageID := ""
 	if shouldSendProcessingAck(rt, msg) {
-		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
-			Channel:  msg.Channel,
-			ThreadID: msg.ThreadID,
-			Text:     gatewayText(rt.Config, msg, "gateway.processing_ack", nil),
-			Style:    "processing",
-		}, msg.ID+":processing")
+		id, ackErr := sender.ReplyTextWithID(runCtx, msg, gatewayText(rt.Config, msg, "gateway.processing_ack", nil), msg.ID+":processing")
 		if ackErr != nil {
 			log.Printf("mateway gateway processing ack error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, ackErr)
 		}
 		ackMessageID = id
 	}
 	runtimeStart := time.Now()
-	resp, err := rt.Handle(runCtx, msg)
+	progressRT := rt
+	if strings.TrimSpace(ackMessageID) != "" {
+		progressRT.ProgressSink = feishuProgressSink(runCtx, sender, ackMessageID)
+	}
+	resp, err := progressRT.Handle(runCtx, msg)
 	runtimeDuration := time.Since(runtimeStart)
 	if err != nil {
 		log.Printf("mateway gateway runtime error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
 		if !cardAction {
 			react(runCtx, sender, msg.ID, "CROSS_MARK")
 		}
-		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: "error"})
+		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: channel.StyleError})
 		return
 	}
 	replyStart := time.Now()
 	if err := sendFinalReply(runCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
 		log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-		_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+		_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 			"type":                "gateway_done",
-			"message_id":          msg.ID,
-			"session_key":         msg.SessionKey,
 			"runtime_duration_ms": runtimeDuration.Milliseconds(),
 			"reply_duration_ms":   time.Since(replyStart).Milliseconds(),
 			"total_duration_ms":   time.Since(start).Milliseconds(),
 			"reply_error":         err.Error(),
-		})
+		}))
 		if !cardAction {
 			react(runCtx, sender, msg.ID, "CROSS_MARK")
 		}
@@ -357,16 +367,108 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 	if !cardAction {
 		react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
 	}
-	_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+	_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 		"type":                "gateway_done",
-		"message_id":          msg.ID,
-		"session_key":         msg.SessionKey,
 		"runtime_duration_ms": runtimeDuration.Milliseconds(),
 		"reply_duration_ms":   replyDuration.Milliseconds(),
 		"total_duration_ms":   time.Since(start).Milliseconds(),
 		"reply_style":         resp.Reply.Style,
 		"failed":              resp.Failed,
-	})
+	}))
+}
+
+func gatewayTraceEvent(msg channel.InboundMessage, payload map[string]any) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["session_key"] = msg.SessionKey
+	payload["channel"] = msg.Channel
+	payload["message_id"] = msg.ID
+	payload["user_id"] = msg.UserID
+	payload["thread_id"] = msg.ThreadID
+	for _, key := range []string{"account_id", "peer_id", "message_type"} {
+		if value := strings.TrimSpace(msg.Metadata[key]); value != "" {
+			payload[key] = value
+		}
+	}
+	return payload
+}
+
+func feishuProgressSink(ctx context.Context, sender *feishu.Sender, ackMessageID string) func(channel.OutboundMessage) {
+	var lastUpdate time.Time
+	return func(update channel.OutboundMessage) {
+		if sender == nil || strings.TrimSpace(ackMessageID) == "" {
+			return
+		}
+		now := time.Now()
+		if !lastUpdate.IsZero() && now.Sub(lastUpdate) < 500*time.Millisecond {
+			return
+		}
+		lastUpdate = now
+		if text := feishuProgressText(update); text != "" {
+			if err := sender.UpdateText(ctx, ackMessageID, text); err != nil {
+				log.Printf("mateway gateway progress text update error message_id=%s: %v", ackMessageID, err)
+			}
+		}
+	}
+}
+
+func feishuProgressText(update channel.OutboundMessage) string {
+	var b strings.Builder
+	text := strings.TrimSpace(update.Text)
+	if text == "" {
+		text = "Processing..."
+	}
+	b.WriteString(text)
+	for _, step := range update.Progress {
+		title := strings.TrimSpace(step.Tool)
+		if title == "" {
+			title = strings.TrimSpace(step.Title)
+		}
+		if title == "" {
+			continue
+		}
+		status := strings.TrimSpace(step.Status)
+		if status == "" {
+			status = "recorded"
+		}
+		b.WriteString("\n- ")
+		b.WriteString(title)
+		b.WriteString(": ")
+		b.WriteString(feishuProgressStatus(status))
+		if step.TimedOut {
+			b.WriteString(" / timed out")
+		}
+		if summary := strings.TrimSpace(step.Summary); summary != "" {
+			b.WriteString(" / ")
+			b.WriteString(compactProgressLineText(summary, 96))
+		}
+	}
+	return b.String()
+}
+
+func feishuProgressStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "running":
+		return "call"
+	case "accepted", "completed":
+		return "success"
+	case "failed", "blocked", "suspect":
+		return "failed"
+	default:
+		if strings.TrimSpace(status) != "" {
+			return strings.TrimSpace(status)
+		}
+		return "recorded"
+	}
+}
+
+func compactProgressLineText(text string, limit int) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
 
 func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) bool {
@@ -387,11 +489,6 @@ func isSlashCommand(text string) bool {
 func sendFinalReply(ctx context.Context, sender *feishu.Sender, msg channel.InboundMessage, ackMessageID string, reply channel.OutboundMessage) error {
 	if sender == nil {
 		return fmt.Errorf("feishu sender is required")
-	}
-	if strings.TrimSpace(ackMessageID) != "" {
-		if err := sender.Update(ctx, ackMessageID, reply); err == nil {
-			return nil
-		}
 	}
 	return sender.Reply(ctx, msg, reply)
 }
@@ -437,10 +534,10 @@ func isCardAction(msg channel.InboundMessage) bool {
 }
 
 func reactionForReply(reply channel.OutboundMessage) string {
-	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending", "input_required", "clarify", "partial":
+	switch strings.TrimSpace(string(reply.Style)) {
+	case string(channel.StyleInputRequired), "clarify", string(channel.StylePartial):
 		return "EYES"
-	case "error", "cancelled":
+	case string(channel.StyleError), "cancelled":
 		return "CROSS_MARK"
 	default:
 		return "DONE"
@@ -505,11 +602,18 @@ func inboundDedupeKey(msg channel.InboundMessage) string {
 }
 
 func gatewayText(cfg *config.Root, msg channel.InboundMessage, key string, values map[string]string) string {
-	locale := ""
-	catalogDir := ""
-	if cfg != nil {
-		locale = cfg.App.Locale
-		catalogDir = cfg.App.MessageCatalogDir
+	text := gatewayTexts[key]
+	if text == "" {
+		text = key
 	}
-	return i18n.New(i18n.Config{CatalogDir: catalogDir}).T(i18n.ResolveLocale(locale, msg.Text), key, values)
+	for key, value := range values {
+		text = strings.ReplaceAll(text, "{"+key+"}", value)
+	}
+	return text
+}
+
+var gatewayTexts = map[string]string{
+	"gateway.processing_ack":        "Processing...",
+	"gateway.processing_failed":     "The request failed while processing: {error}",
+	"gateway.media_download_failed": "Failed to download message media: {error}",
 }

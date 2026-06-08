@@ -94,4 +94,9 @@ mateway memory proposal commit <proposal_id>
 mateway memory proposal reject <proposal_id> --reason "一次性调试记录"
 ```
 
-聊天入口中，当 runtime 正在等待 `memory_proposal_review` 时，也可以回复 `保存` / `忽略` 或 `save` / `ignore`。
+聊天入口中，当 runtime 正在等待 `memory_proposal_review` 时，只接受数字：
+
+- `1` 保存
+- `2` 忽略
+
+如果回复其他文本，runtime 会要求重新输入 `1` 或 `2`。如需开始另一个任务，先发送 `/new`。

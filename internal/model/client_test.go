@@ -15,13 +15,16 @@ import (
 func TestParseAnthropicResultUsage(t *testing.T) {
 	result, err := parseAnthropicResult([]byte(`{
 		"content":[{"type":"text","text":"hello"}],
-		"usage":{"input_tokens":12,"output_tokens":5}
+		"usage":{"input_tokens":12,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}
 	}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Text != "hello" || result.Usage.InputTokens != 12 || result.Usage.OutputTokens != 5 || result.Usage.TotalTokens != 17 {
 		t.Fatalf("unexpected result %#v", result)
+	}
+	if !result.Usage.CacheHit || result.Usage.CacheReadTokens != 7 || result.Usage.CacheWriteTokens != 3 || result.Usage.CacheInputTokens != 10 {
+		t.Fatalf("unexpected cache usage %#v", result.Usage)
 	}
 }
 
@@ -57,7 +60,7 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 				}]
 			}
 		}],
-		"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}
+		"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"prompt_tokens_details":{"cached_tokens":11}}
 	}`))
 	if err != nil {
 		t.Fatal(err)
@@ -68,27 +71,30 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 	if result.ToolCalls[0].Name != "terminal.run" || result.ToolCalls[0].Args["command"] != "go test ./..." {
 		t.Fatalf("unexpected tool call %#v", result.ToolCalls[0])
 	}
+	if !result.Usage.CacheHit || result.Usage.CacheReadTokens != 11 || result.Usage.CacheInputTokens != 11 {
+		t.Fatalf("unexpected cache usage %#v", result.Usage)
+	}
 }
 
 func TestToolParametersIncludesOptionalProperties(t *testing.T) {
 	params := toolParameters(fakeTool{
-		name:     "script.run",
-		required: []string{"name"},
+		name:     "terminal.run",
+		required: []string{"command"},
 		properties: map[string]any{
-			"name": map[string]any{"type": "string"},
-			"args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"command":     map[string]any{"type": "string"},
+			"env_secrets": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 		},
 	})
 	properties, ok := params["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("missing properties: %#v", params)
 	}
-	args, ok := properties["args"].(map[string]any)
-	if !ok || args["type"] != "array" {
-		t.Fatalf("expected args array property, got %#v", properties["args"])
+	envSecrets, ok := properties["env_secrets"].(map[string]any)
+	if !ok || envSecrets["type"] != "array" {
+		t.Fatalf("expected env_secrets array property, got %#v", properties["env_secrets"])
 	}
 	required, ok := params["required"].([]string)
-	if !ok || len(required) != 1 || required[0] != "name" {
+	if !ok || len(required) != 1 || required[0] != "command" {
 		t.Fatalf("unexpected required list: %#v", params["required"])
 	}
 }
@@ -96,10 +102,13 @@ func TestToolParametersIncludesOptionalProperties(t *testing.T) {
 func TestParseOpenAIResponsesResultUsage(t *testing.T) {
 	result := parseOpenAIResponsesResult([]byte(`{
 		"output_text":"hello",
-		"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}
+		"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28,"input_tokens_details":{"cached_tokens":9}}
 	}`))
 	if result.Text != "hello" || result.Usage.InputTokens != 20 || result.Usage.OutputTokens != 8 || result.Usage.TotalTokens != 28 {
 		t.Fatalf("unexpected result %#v", result)
+	}
+	if !result.Usage.CacheHit || result.Usage.CacheReadTokens != 9 || result.Usage.CacheInputTokens != 9 {
+		t.Fatalf("unexpected cache usage %#v", result.Usage)
 	}
 }
 
@@ -197,6 +206,27 @@ func TestClientRejectsImageWhenModelIsTextOnly(t *testing.T) {
 	_, err := client.Generate(context.Background(), "", []Message{{Role: "user", Parts: []agentcore.MessagePart{{Type: agentcore.PartImage, URI: "data:image/png;base64,abc"}}}})
 	if err == nil || !contains(err.Error(), "does not support image") {
 		t.Fatalf("expected image support error, got %v", err)
+	}
+}
+
+func TestStripImagePartsKeepsTextOnlyFallbackSafe(t *testing.T) {
+	messages := stripImageParts([]Message{{
+		Role:    "user",
+		Content: "look",
+		Parts: []agentcore.MessagePart{
+			{Type: agentcore.PartText, Text: "look"},
+			{Type: agentcore.PartImage, URI: "data:image/png;base64,abc"},
+		},
+	}})
+	if len(messages) != 1 || messagesRequireImage(messages) {
+		t.Fatalf("expected image parts stripped, got %#v", messages)
+	}
+	if len(messages[0].Parts) != 1 || messages[0].Parts[0].Type != agentcore.PartText {
+		t.Fatalf("expected text part preserved, got %#v", messages[0].Parts)
+	}
+	client := Client{Config: config.ModelConfig{Name: "text-only", Modalities: []string{"text"}}}
+	if _, err := client.Generate(context.Background(), "", messages); err == nil || contains(err.Error(), "does not support image") {
+		t.Fatalf("expected non-image error after stripping, got %v", err)
 	}
 }
 

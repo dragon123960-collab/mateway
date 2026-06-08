@@ -10,9 +10,11 @@ import (
 
 	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/schedule"
 	"github.com/dongping/mateway/internal/session"
+	"github.com/dongping/mateway/internal/skill"
 )
 
 func TestTestCaseMessage(t *testing.T) {
@@ -21,6 +23,17 @@ func TestTestCaseMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(msg, "README.md") {
+		t.Fatalf("message = %q", msg)
+	}
+}
+
+func TestTestCaseWriteFileUsesConfiguredHome(t *testing.T) {
+	home := t.TempDir()
+	msg, err := testCaseMessage("write-file", &config.Root{App: config.AppConfig{Home: home}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(msg, "/write ") || !strings.Contains(msg, filepath.Join(home, "tmp", "mateway-test-write.txt")) {
 		t.Fatalf("message = %q", msg)
 	}
 }
@@ -38,7 +51,7 @@ func TestWriteTestRecord(t *testing.T) {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
-	path, err := writeTestRecord("read-readme", "test:one", "hello", runtime.Response{Reply: channel.OutboundMessage{Text: "ok"}, TracePath: "/tmp/trace.jsonl"}, map[string]any{"ok": true})
+	path, err := writeTestRecord("read-readme", "test:one", "hello", runtime.Response{Reply: channel.OutboundMessage{Text: "ok"}, TracePath: "/tmp/trace.jsonl"}, map[string]any{"ok": true}, []testInteraction{{Message: "hello", Response: runtime.Response{Reply: channel.OutboundMessage{Text: "ok"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +67,9 @@ func TestWriteTestRecord(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"trace_path": "/tmp/trace.jsonl"`) {
 		t.Fatalf("record missing trace path = %s", data)
+	}
+	if !strings.Contains(string(data), `"interactions"`) {
+		t.Fatalf("record missing interactions = %s", data)
 	}
 }
 
@@ -71,6 +87,41 @@ func TestInitSupportsHomeFlag(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(home, rel)); err != nil {
 			t.Fatalf("expected %s under init home: %v", rel, err)
 		}
+	}
+}
+
+func TestToolsDisableAcceptsAgentFlagAfterToolName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"tools", "disable", "terminal.run", "--agent", "main"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "terminal.run") {
+		t.Fatalf("expected config to include disabled tool:\n%s", data)
+	}
+}
+
+func TestHelpIncludesSend(t *testing.T) {
+	var out bytes.Buffer
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	printHelp()
+	_ = w.Close()
+	os.Stdout = old
+	_, _ = out.ReadFrom(r)
+	if !strings.Contains(out.String(), "mateway send --to <channel:target> <message>") {
+		t.Fatalf("help missing send:\n%s", out.String())
 	}
 }
 
@@ -491,6 +542,30 @@ func TestMemoryHeartbeatDistillCommandNoModel(t *testing.T) {
 	}
 }
 
+func TestPrintSkillProposalSummariesShowsTargetAndReason(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "skills", "demo", "SKILL.md")
+	store := skill.ProposalStore{Home: home, Workspace: workspace}
+	proposal, err := store.Create(skill.CreateProposalInput{
+		TargetPath: target,
+		NewContent: "---\nname: demo\n---\n# Demo\n\nNew guidance.\n",
+		Reason:     "Repeated workflow.",
+		Sources:    []string{"observe/learning/events.jsonl:1"},
+		ModelRole:  "memory_distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error {
+		printSkillProposalSummaries(store, []string{proposal.ID})
+		return nil
+	})
+	if !strings.Contains(out, "skill_proposal_target: "+target) || !strings.Contains(out, "skill_proposal_reason: Repeated workflow.") || !strings.Contains(out, "skill_proposal_summary:") {
+		t.Fatalf("unexpected skill proposal summary:\n%s", out)
+	}
+}
+
 func TestMemoryReportCommandPrintsReadOnlySummary(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
@@ -552,34 +627,68 @@ func TestSkillListSearchInstallCommands(t *testing.T) {
 	}
 }
 
-func TestScriptSandboxAndWorkspaceReports(t *testing.T) {
+func TestSandboxAndWorkspaceReports(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
 	if err := run([]string{"init", "--home", home}); err != nil {
 		t.Fatal(err)
 	}
-	scriptPath := filepath.Join(home, "scripts", "hello")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n# mateway.name: hello\n# mateway.description: says hi\necho hi $1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	out := captureStdout(t, func() error { return run([]string{"script", "list"}) })
-	if !strings.Contains(out, "hello") || !strings.Contains(out, "says hi") {
-		t.Fatalf("unexpected script list:\n%s", out)
-	}
-	out = captureStdout(t, func() error { return run([]string{"script", "run", "hello", "there"}) })
-	if !strings.Contains(out, "exit_code: 0") || !strings.Contains(out, "hi there") {
-		t.Fatalf("unexpected script run:\n%s", out)
-	}
-	out = captureStdout(t, func() error { return run([]string{"sandbox", "report"}) })
+	out := captureStdout(t, func() error { return run([]string{"sandbox", "report"}) })
 	if !strings.Contains(out, "sandbox_enabled:") || !strings.Contains(out, "timeout_seconds:") {
 		t.Fatalf("unexpected sandbox report:\n%s", out)
 	}
 	out = captureStdout(t, func() error { return run([]string{"workspace", "report"}) })
-	if !strings.Contains(out, "workspace:") || !strings.Contains(out, "skills:") || !strings.Contains(out, "scripts:") {
+	if !strings.Contains(out, "workspace:") || !strings.Contains(out, "skills:") || strings.Contains(out, "scripts:") {
 		t.Fatalf("unexpected workspace report:\n%s", out)
+	}
+}
+
+func TestDoctorReportsConfigToolsAndSkills(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
+	for _, want := range []string{"OK\tconfig_load", "OK\ttools", "OK\tskills", "summary\t"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "script.run") {
+		t.Fatalf("doctor should not report stale script tooling for fresh init:\n%s", out)
+	}
+}
+
+func TestDoctorWarnsOnStaleSkillGuidance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "skills", "stale", "SKILL.md")
+	writeMainTestFile(t, path, "---\nname: stale\n---\n# Stale\n\nUse script.run for this task.\n")
+	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
+	if !strings.Contains(out, "WARN\tskill.stale_tooling") || !strings.Contains(out, path) {
+		t.Fatalf("doctor did not warn about stale skill:\n%s", out)
+	}
+}
+
+func TestDoctorAllowsExternalSkillWithMatewayMetadata(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "workspace", "skills", "external", "SKILL.md")
+	writeMainTestFile(t, path, "---\nname: external\nallowed-tools: Bash(external:*)\n---\n# External\n")
+	writeMainTestFile(t, filepath.Join(home, "workspace", "skills", "external", ".mateway", "metadata.yaml"), "adapter_version: \"1\"\ntool_runtime: mateway\nsource: external\n")
+	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
+	if strings.Contains(out, "WARN\tskill.external_metadata_missing") {
+		t.Fatalf("doctor should accept external metadata:\n%s", out)
+	}
+	if !strings.Contains(out, "OK\tskill.metadata") {
+		t.Fatalf("doctor should report metadata:\n%s", out)
 	}
 }
 

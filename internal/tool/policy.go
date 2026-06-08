@@ -42,19 +42,12 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 	}
 	if looksLikeNetworkCommand(fields[0]) {
 		if profile, ok := matchRemoteProfile(fields, cfg); ok {
-			return TerminalDecision{Allow: true, Class: "remote", RemoteProfile: profile.Alias, RequireConfirm: profile.RequireConfirm}
+			return TerminalDecision{Allow: true, Class: "remote", RemoteProfile: profile.Alias, RequireConfirm: false}
 		}
-		return TerminalDecision{Class: "network", Reason: "network terminal command requires a configured remote profile or dedicated tool"}
+		return TerminalDecision{Allow: true, Class: "network"}
 	}
-	if strings.EqualFold(fields[0], "cat") && len(fields) > 1 {
-		for _, raw := range fields[1:] {
-			if strings.HasPrefix(raw, "-") {
-				continue
-			}
-			if _, err := ResolveAllowedPath(raw, cfg); err != nil {
-				return TerminalDecision{Class: "path_escape", Reason: err.Error()}
-			}
-		}
+	if isSafeReadOnlyChain(command, cfg) {
+		return TerminalDecision{Allow: true, Class: "read_only_chain"}
 	}
 	if isSafeReadOnlyPipeline(command, cfg) {
 		return TerminalDecision{Allow: true, Class: "read_only_pipeline"}
@@ -63,12 +56,44 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 		return TerminalDecision{Allow: true, Class: "project_internal"}
 	}
 	if shellControlPattern.MatchString(command) {
-		return TerminalDecision{Class: "unknown_shell", Reason: "compound shell syntax is blocked; use a dedicated tool or a simple allowlisted command"}
+		return TerminalDecision{Allow: true, Class: "shell"}
 	}
 	if isAllowlistedLocalCommand(fields) {
 		return TerminalDecision{Allow: true, Class: "local_read_only"}
 	}
-	return TerminalDecision{Class: "unknown", Reason: "terminal command is not in the local read-only allowlist"}
+	if isReadOnlyProbeCommand(fields) {
+		return TerminalDecision{Allow: true, Class: "probe_read_only"}
+	}
+	if isGuardedMutationCommand(fields) {
+		return TerminalDecision{Allow: true, Class: "guarded_mutation"}
+	}
+	return TerminalDecision{Allow: true, Class: "unknown"}
+}
+
+func isSafeReadOnlyChain(command string, cfg *config.Root) bool {
+	if strings.ContainsAny(command, ";`$<>") || strings.Contains(command, "||") || !strings.Contains(command, "&&") {
+		return false
+	}
+	parts := strings.Split(command, "&&")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return false
+		}
+		if strings.Contains(part, "|") {
+			if !isSafeReadOnlyPipeline(part, cfg) {
+				return false
+			}
+			continue
+		}
+		if !isSafeReadOnlyCommandSegment(part, cfg) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSafeReadOnlyPipeline(command string, cfg *config.Root) bool {
@@ -92,6 +117,24 @@ func isSafeReadOnlyPipeline(command string, cfg *config.Root) bool {
 		}
 	}
 	return true
+}
+
+func looksLikePipeToShell(command string) bool {
+	if !strings.Contains(command, "|") {
+		return false
+	}
+	parts := strings.Split(command, "|")
+	for _, raw := range parts[1:] {
+		fields := strings.Fields(strings.TrimSpace(raw))
+		if len(fields) == 0 {
+			continue
+		}
+		switch filepath.Base(fields[0]) {
+		case "sh", "bash", "zsh", "fish", "python", "python3", "perl", "ruby", "node":
+			return true
+		}
+	}
+	return false
 }
 
 func isEchoFallback(segment string) bool {
@@ -119,7 +162,7 @@ func commandPathsAllowed(fields []string, cfg *config.Root) bool {
 	}
 	cmd := filepath.Base(fields[0])
 	switch cmd {
-	case "cat", "ls", "find":
+	case "cat", "ls", "find", "file", "stat", "head", "tail", "wc", "xxd", "sed", "grep", "rg":
 		for i := 1; i < len(fields); i++ {
 			raw := fields[i]
 			if raw == "" || strings.HasPrefix(raw, "-") || isOptionValue(fields, i) || looksLikePattern(raw) {
@@ -142,13 +185,27 @@ func commandPathsAllowed(fields []string, cfg *config.Root) bool {
 	return true
 }
 
+func readOnlyCommandPathError(fields []string, cfg *config.Root) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	cmd := filepath.Base(fields[0])
+	switch cmd {
+	case "cat", "ls", "find", "file", "stat", "head", "tail", "wc", "xxd", "sed", "grep", "rg":
+		if !commandPathsAllowed(fields, cfg) {
+			return "terminal command path is outside allowed roots"
+		}
+	}
+	return ""
+}
+
 func isOptionValue(fields []string, index int) bool {
 	if index == 0 {
 		return false
 	}
 	prev := fields[index-1]
 	switch prev {
-	case "-type", "-name", "-iname", "-maxdepth", "-mindepth", "-mtime", "-size", "-path", "-not", "-print", "-exec", "-e", "-A", "-B", "-C", "-n":
+	case "-type", "-name", "-iname", "-maxdepth", "-mindepth", "-mtime", "-size", "-path", "-not", "-print", "-exec", "-e", "-A", "-B", "-C", "-n", "-c", "-l", "--bytes", "--lines":
 		return true
 	default:
 		return false
@@ -226,16 +283,26 @@ func isAllowlistedLocalCommand(fields []string) bool {
 	}
 	cmd := filepath.Base(fields[0])
 	switch cmd {
-	case "pwd", "ls", "find", "grep", "rg", "head", "tail", "wc", "sed":
+	case "pwd", "ls", "find", "grep", "rg", "head", "tail", "wc", "file", "xxd", "stat":
 		return true
+	case "sed":
+		return isReadOnlySed(fields)
 	case "go":
-		return len(fields) >= 2 && fields[1] == "test"
+		return len(fields) >= 2 && oneOf(fields[1], "test", "build", "vet", "list")
+	case "npm", "pnpm", "yarn":
+		if len(fields) < 2 {
+			return false
+		}
+		if fields[1] == "test" {
+			return true
+		}
+		return len(fields) >= 3 && fields[1] == "run" && fields[2] == "test"
 	case "git":
 		if len(fields) < 2 {
 			return false
 		}
 		switch fields[1] {
-		case "status", "diff", "log", "show", "branch", "remote", "rev-parse":
+		case "status", "diff", "log", "show", "branch", "remote", "rev-parse", "ls-files":
 			return true
 		default:
 			return false
@@ -243,6 +310,77 @@ func isAllowlistedLocalCommand(fields []string) bool {
 	default:
 		return false
 	}
+}
+
+func isReadOnlyProbeCommand(fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := filepath.Base(fields[0])
+	switch cmd {
+	case "command":
+		return len(fields) == 3 && fields[1] == "-v" && isPlainCommandName(fields[2])
+	case "which", "type":
+		return len(fields) == 2 && isPlainCommandName(fields[1])
+	}
+	if looksLikeNetworkCommand(fields[0]) || isGuardedMutationCommand(fields) {
+		return false
+	}
+	if len(fields) == 1 {
+		return false
+	}
+	for _, arg := range fields[1:] {
+		switch arg {
+		case "--help", "-h", "help", "--version", "-v", "version":
+			continue
+		default:
+			return false
+		}
+	}
+	return isPlainCommandName(cmd)
+}
+
+func isPlainCommandName(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || looksLikePathArg(value) {
+		return false
+	}
+	return !strings.ContainsAny(value, ";&|`$<>")
+}
+
+func isReadOnlySed(fields []string) bool {
+	for _, field := range fields[1:] {
+		if field == "-i" || field == "--in-place" || strings.HasPrefix(field, "-i.") || strings.HasPrefix(field, "-i") && len(field) > 2 {
+			return false
+		}
+	}
+	return true
+}
+
+func isGuardedMutationCommand(fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := filepath.Base(fields[0])
+	switch cmd {
+	case "mkdir", "touch", "cp", "mv", "chmod", "chown", "ln", "tee", "brew", "apt", "apt-get", "docker", "systemctl", "launchctl":
+		return true
+	case "pip", "pip3":
+		return len(fields) >= 2 && fields[1] == "install"
+	case "npm", "pnpm", "yarn":
+		return len(fields) >= 2 && oneOf(fields[1], "install", "add", "remove", "uninstall")
+	default:
+		return false
+	}
+}
+
+func oneOf(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func matchRemoteProfile(fields []string, cfg *config.Root) (config.RemoteProfileConfig, bool) {

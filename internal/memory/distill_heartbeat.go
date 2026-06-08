@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
-	"github.com/dongping/mateway/internal/i18n"
 )
 
 type DistillModel interface {
@@ -43,8 +42,6 @@ type ProposalNudgeOptions struct {
 	Channels     []string
 	Interval     time.Duration
 	MaxProposals int
-	Locale       string
-	CatalogDir   string
 }
 
 type distillState struct {
@@ -419,7 +416,7 @@ func PendingProposalNudge(home, sessionKey string, now time.Time, options Propos
 	if maxProposals <= 0 {
 		maxProposals = 3
 	}
-	return renderProposalNudge(pending, maxProposals, options.Locale, options.CatalogDir), nil
+	return renderProposalNudge(pending, maxProposals), nil
 }
 
 func channelAllowed(channel string, allowed []string) bool {
@@ -452,31 +449,23 @@ func parseNudgeTime(value string) time.Time {
 	return time.Time{}
 }
 
-func renderProposalNudge(proposals []Proposal, maxProposals int, locale, catalogDir string) string {
+func renderProposalNudge(proposals []Proposal, maxProposals int) string {
 	if maxProposals > len(proposals) {
 		maxProposals = len(proposals)
 	}
-	catalog := i18n.New(i18n.Config{CatalogDir: catalogDir})
 	var b strings.Builder
-	b.WriteString(catalog.T(locale, "memory.proposal_nudge.header", map[string]string{"total": fmt.Sprint(len(proposals)), "shown": fmt.Sprint(maxProposals)}))
+	fmt.Fprintf(&b, "Pending memory proposals: %d", len(proposals))
+	if maxProposals > 0 {
+		fmt.Fprintf(&b, " (top %d available)", maxProposals)
+	}
+	fmt.Fprintf(&b, "\nReview list: mateway memory proposal list")
 	for i := 0; i < maxProposals; i++ {
 		proposal := proposals[i]
-		fmt.Fprintf(&b, "\n\n%d. %s %s\n", i+1, proposal.ID, proposal.Title)
-		b.WriteString(catalog.T(locale, "memory.proposal_nudge.type", map[string]string{
-			"type":       defaultString(proposal.Type, "experience"),
-			"scope":      defaultString(proposal.Scope, "agent"),
-			"confidence": defaultString(proposal.Confidence, "low"),
-		}))
-		if value := proposalReasonSummary(proposal); value != "" {
-			b.WriteString(catalog.T(locale, "memory.proposal_nudge.value", map[string]string{"value": value}))
-		}
-		if len(proposal.Sources) > 0 {
-			b.WriteString(catalog.T(locale, "memory.proposal_nudge.sources", map[string]string{"sources": summarizeNudgeText(strings.Join(proposal.Sources, ", "), 90)}))
-		}
-		b.WriteString(catalog.T(locale, "memory.proposal_nudge.show", map[string]string{"proposal_id": proposal.ID}))
+		fmt.Fprintf(&b, "\n%d. %s — %s", i+1, proposal.ID, summarizeNudgeText(proposal.Title, 64))
+		fmt.Fprintf(&b, "\n   show: mateway memory proposal show %s", proposal.ID)
 	}
 	if rest := len(proposals) - maxProposals; rest > 0 {
-		b.WriteString(catalog.T(locale, "memory.proposal_nudge.more", map[string]string{"rest": fmt.Sprint(rest)}))
+		fmt.Fprintf(&b, "\n... and %d more.", rest)
 	}
 	return b.String()
 }
@@ -535,8 +524,9 @@ func hashText(text string) string {
 
 func truncateDistillText(text string, limit int) string {
 	text = strings.TrimSpace(text)
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text
 	}
-	return text[:limit] + fmt.Sprintf("\n... (%d chars)", len(text))
+	return string(runes[:limit]) + fmt.Sprintf("\n... (%d chars)", len(runes))
 }

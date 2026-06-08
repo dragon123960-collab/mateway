@@ -8,7 +8,6 @@ import (
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -28,20 +27,23 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 	if strings.TrimSpace(cfg.AppID) == "" || strings.TrimSpace(cfg.AppSecret) == "" {
 		return fmt.Errorf("feishu app_id/app_secret are required")
 	}
+	accountID := strings.TrimSpace(cfg.DefaultAccount)
 	d := dispatcher.NewEventDispatcher(cfg.VerificationToken, cfg.EncryptKey).
 		OnP2MessageReceiveV1(func(eventCtx context.Context, event *larkim.P2MessageReceiveV1) error {
 			msg := NormalizeMessageReceive(event)
+			attachAccountID(&msg, accountID)
 			return receiver(eventCtx, msg)
 		}).
 		OnP2CardActionTrigger(func(eventCtx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 			msg := NormalizeCardAction(event)
+			attachAccountID(&msg, accountID)
 			if err := receiver(eventCtx, msg); err != nil {
 				return nil, err
 			}
 			return &callback.CardActionTriggerResponse{
 				Toast: &callback.Toast{
 					Type:    "info",
-					Content: i18n.New(i18n.Config{}).T(i18n.LocaleZH, "gateway.processing_ack", nil),
+					Content: "Processing...",
 				},
 			}, nil
 		}).
@@ -59,6 +61,17 @@ func StartWebSocket(ctx context.Context, cfg config.FeishuConfig, receiver Recei
 		})
 	client := ws.NewClient(cfg.AppID, cfg.AppSecret, ws.WithEventHandler(d))
 	return client.Start(ctx)
+}
+
+func attachAccountID(msg *channel.InboundMessage, accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if msg == nil || accountID == "" {
+		return
+	}
+	if msg.Metadata == nil {
+		msg.Metadata = map[string]string{}
+	}
+	msg.Metadata["account_id"] = accountID
 }
 
 func NormalizeMessageReceive(event *larkim.P2MessageReceiveV1) channel.InboundMessage {
@@ -162,9 +175,9 @@ func extractCardActionText(action *callback.CallBackAction) string {
 	}
 	switch extractCardActionDecision(action) {
 	case "confirm":
-		return i18n.New(i18n.Config{}).T(i18n.LocaleZH, "aliases.confirm.primary", nil)
+		return "1"
 	case "cancel":
-		return i18n.New(i18n.Config{}).T(i18n.LocaleZH, "aliases.cancel.primary", nil)
+		return "2"
 	}
 	return strings.TrimSpace(action.InputValue)
 }

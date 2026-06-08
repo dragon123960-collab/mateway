@@ -23,7 +23,6 @@ type Root struct {
 	Memory    MemoryConfig    `yaml:"memory"`
 	Learning  LearningConfig  `yaml:"learning"`
 	Skills    SkillsConfig    `yaml:"skills"`
-	Scripts   ScriptsConfig   `yaml:"scripts"`
 	Remote    RemoteConfig    `yaml:"remote"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
 	Agents    AgentsConfig    `yaml:"agents"`
@@ -39,18 +38,24 @@ func DefaultRoot() Root {
 			Fallbacks: []string{},
 		},
 		Execution: ExecutionConfig{
-			MaxParallelTools:        4,
-			MaxIterations:           intPtr(50),
-			InactivityTimeout:       "5m",
-			MaxNoProgressTurns:      2,
-			MaxRepeatedToolFailures: 3,
+			MaxParallelTools:  4,
+			MaxIterations:     intPtr(50),
+			InactivityTimeout: "5m",
+			ContextBudget: ContextBudgetConfig{
+				Enabled:                boolPtr(true),
+				SoftRatio:              0.65,
+				HardRatio:              0.90,
+				RecentTurns:            8,
+				ToolResultTargetTokens: 1200,
+				MaxVisibleTools:        8,
+				TraceTelemetry:         boolPtr(true),
+			},
 		},
 		Memory: MemoryConfig{
 			Enabled:           true,
 			RecentDays:        3,
 			AutoPropose:       true,
 			AutoCommitLowRisk: false,
-			RequireConfirmFor: []string{"user_preference", "org_knowledge", "long_memory", "skill_candidate"},
 			ProposalNudge: ProposalNudgeConfig{
 				Enabled:      boolPtr(true),
 				Interval:     "24h",
@@ -59,28 +64,21 @@ func DefaultRoot() Root {
 			},
 		},
 		Learning: LearningConfig{Enabled: true, SkillCrystallization: SkillCrystallizationConfig{
-			Enabled:            true,
-			SuccessThreshold:   3,
-			MinConfidence:      "medium",
-			RequireUserConfirm: true,
-			AskTiming:          "next_interaction",
+			Enabled:          true,
+			SuccessThreshold: 3,
+			MinConfidence:    "medium",
 		}},
 		Scheduler: SchedulerConfig{
 			Enabled:  false,
 			Timezone: "Asia/Shanghai",
 			Interval: "30s",
 		},
-		Scripts: ScriptsConfig{
-			Dirs:                     []string{},
-			AutoDiscoverSkillScripts: boolPtr(false),
-		},
 		Remote: RemoteConfig{
 			Profiles: []RemoteProfileConfig{},
 		},
 		Security: SecurityConfig{
-			EnforceWorkspacePaths:       true,
-			RequireApprovalForRiskyTool: true,
-			AccessiblePaths:             []string{},
+			EnforceWorkspacePaths: true,
+			AccessiblePaths:       []string{},
 			TerminalSandbox: TerminalSandboxConfig{
 				Enabled:        false,
 				Mode:           "restricted",
@@ -130,19 +128,43 @@ func DefaultRoot() Root {
 	return root
 }
 
+func DefaultTimezone() string {
+	return DefaultRoot().Scheduler.Timezone
+}
+
+func TimezoneLocation(timezone string) (*time.Location, string) {
+	name := strings.TrimSpace(timezone)
+	if name == "" {
+		name = DefaultTimezone()
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		name = DefaultTimezone()
+		loc, err = time.LoadLocation(name)
+		if err != nil {
+			return time.Local, time.Local.String()
+		}
+	}
+	return loc, name
+}
+
+func (r *Root) TimezoneLocation() (*time.Location, string) {
+	if r == nil {
+		return TimezoneLocation("")
+	}
+	return TimezoneLocation(r.Scheduler.Timezone)
+}
+
 type AppConfig struct {
-	Name              string `yaml:"name"`
-	Home              string `yaml:"home"`
-	Workspace         string `yaml:"workspace"`
-	Locale            string `yaml:"locale"`
-	MessageCatalogDir string `yaml:"message_catalog_dir"`
+	Name      string `yaml:"name"`
+	Home      string `yaml:"home"`
+	Workspace string `yaml:"workspace"`
 }
 
 type SecurityConfig struct {
-	EnforceWorkspacePaths       bool                  `yaml:"enforce_workspace_paths"`
-	RequireApprovalForRiskyTool bool                  `yaml:"require_approval_for_risky_tools"`
-	AccessiblePaths             []string              `yaml:"accessible_paths"`
-	TerminalSandbox             TerminalSandboxConfig `yaml:"terminal_sandbox"`
+	EnforceWorkspacePaths bool                  `yaml:"enforce_workspace_paths"`
+	AccessiblePaths       []string              `yaml:"accessible_paths"`
+	TerminalSandbox       TerminalSandboxConfig `yaml:"terminal_sandbox"`
 }
 
 type TerminalSandboxConfig struct {
@@ -311,11 +333,69 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelTools        int    `yaml:"max_parallel_tools"`
-	MaxIterations           *int   `yaml:"max_iterations"`
-	InactivityTimeout       string `yaml:"inactivity_timeout"`
-	MaxNoProgressTurns      int    `yaml:"max_no_progress_turns"`
-	MaxRepeatedToolFailures int    `yaml:"max_repeated_tool_failures"`
+	MaxParallelTools  int                 `yaml:"max_parallel_tools"`
+	MaxIterations     *int                `yaml:"max_iterations"`
+	InactivityTimeout string              `yaml:"inactivity_timeout"`
+	ContextBudget     ContextBudgetConfig `yaml:"context_budget"`
+}
+
+type ContextBudgetConfig struct {
+	Enabled                *bool   `yaml:"enabled"`
+	SoftRatio              float64 `yaml:"soft_ratio"`
+	HardRatio              float64 `yaml:"hard_ratio"`
+	RecentTurns            int     `yaml:"recent_turns"`
+	ToolResultTargetTokens int     `yaml:"tool_result_target_tokens"`
+	MaxVisibleTools        int     `yaml:"max_visible_tools"`
+	TraceTelemetry         *bool   `yaml:"trace_telemetry"`
+}
+
+func (c ContextBudgetConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+func (c ContextBudgetConfig) TraceTelemetryValue() bool {
+	if c.TraceTelemetry == nil {
+		return true
+	}
+	return *c.TraceTelemetry
+}
+
+func (c ContextBudgetConfig) SoftRatioValue() float64 {
+	if c.SoftRatio <= 0 || c.SoftRatio > 1 {
+		return 0.65
+	}
+	return c.SoftRatio
+}
+
+func (c ContextBudgetConfig) HardRatioValue() float64 {
+	if c.HardRatio <= 0 || c.HardRatio > 1 {
+		return 0.90
+	}
+	return c.HardRatio
+}
+
+func (c ContextBudgetConfig) RecentTurnsValue() int {
+	if c.RecentTurns <= 0 {
+		return 8
+	}
+	return c.RecentTurns
+}
+
+func (c ContextBudgetConfig) ToolResultTargetTokensValue() int {
+	if c.ToolResultTargetTokens <= 0 {
+		return 1200
+	}
+	return c.ToolResultTargetTokens
+}
+
+func (c ContextBudgetConfig) MaxVisibleToolsValue() int {
+	if c.MaxVisibleTools <= 0 {
+		return 8
+	}
+	return c.MaxVisibleTools
 }
 
 func (c ExecutionConfig) MaxIterationsValue() int {
@@ -342,7 +422,6 @@ type MemoryConfig struct {
 	RecentDays        int                 `yaml:"recent_days"`
 	AutoPropose       bool                `yaml:"auto_propose"`
 	AutoCommitLowRisk bool                `yaml:"auto_commit_low_risk"`
-	RequireConfirmFor []string            `yaml:"require_confirm_for"`
 	ProposalNudge     ProposalNudgeConfig `yaml:"proposal_nudge"`
 }
 
@@ -366,27 +445,13 @@ type LearningConfig struct {
 }
 
 type SkillCrystallizationConfig struct {
-	Enabled            bool   `yaml:"enabled"`
-	SuccessThreshold   int    `yaml:"success_threshold"`
-	MinConfidence      string `yaml:"min_confidence"`
-	RequireUserConfirm bool   `yaml:"require_user_confirm"`
-	AskTiming          string `yaml:"ask_timing"`
+	Enabled          bool   `yaml:"enabled"`
+	SuccessThreshold int    `yaml:"success_threshold"`
+	MinConfidence    string `yaml:"min_confidence"`
 }
 
 type SkillsConfig struct {
 	Catalogs []SkillCatalogConfig `yaml:"catalogs"`
-}
-
-type ScriptsConfig struct {
-	Dirs                     []string `yaml:"dirs"`
-	AutoDiscoverSkillScripts *bool    `yaml:"auto_discover_skill_scripts"`
-}
-
-func (c ScriptsConfig) AutoDiscoverSkillScriptsValue() bool {
-	if c.AutoDiscoverSkillScripts == nil {
-		return false
-	}
-	return *c.AutoDiscoverSkillScripts
 }
 
 type RemoteConfig struct {
@@ -400,7 +465,6 @@ type RemoteProfileConfig struct {
 	Port           int      `yaml:"port"`
 	AuthSecretID   string   `yaml:"auth_secret_id"`
 	AllowedClasses []string `yaml:"allowed_classes"`
-	RequireConfirm bool     `yaml:"require_confirm"`
 }
 
 type SkillCatalogConfig struct {
@@ -476,6 +540,8 @@ type ChannelsConfig struct {
 
 type FeishuConfig struct {
 	Enabled              bool                  `yaml:"enabled"`
+	DefaultAccount       string                `yaml:"default_account"`
+	Accounts             []FeishuAccountConfig `yaml:"accounts"`
 	AppID                string                `yaml:"app_id"`
 	AppIDEnv             string                `yaml:"app_id_env"`
 	AppSecret            string                `yaml:"app_secret"`
@@ -488,6 +554,25 @@ type FeishuConfig struct {
 	BotName              string                `yaml:"bot_name"`
 	AutoReply            bool                  `yaml:"auto_reply"`
 	MentionRequiredGroup bool                  `yaml:"mention_required_in_group"`
+	Webhook              FeishuWebhookConfig   `yaml:"webhook"`
+	WebSocket            FeishuWebSocketConfig `yaml:"websocket"`
+}
+
+type FeishuAccountConfig struct {
+	ID                   string                `yaml:"id"`
+	Enabled              *bool                 `yaml:"enabled"`
+	AppID                string                `yaml:"app_id"`
+	AppIDEnv             string                `yaml:"app_id_env"`
+	AppSecret            string                `yaml:"app_secret"`
+	AppSecretEnv         string                `yaml:"app_secret_env"`
+	VerificationToken    string                `yaml:"verification_token"`
+	VerificationTokenEnv string                `yaml:"verification_token_env"`
+	EncryptKey           string                `yaml:"encrypt_key"`
+	EncryptKeyEnv        string                `yaml:"encrypt_key_env"`
+	BaseURL              string                `yaml:"base_url"`
+	BotName              string                `yaml:"bot_name"`
+	AutoReply            *bool                 `yaml:"auto_reply"`
+	MentionRequiredGroup *bool                 `yaml:"mention_required_in_group"`
 	Webhook              FeishuWebhookConfig   `yaml:"webhook"`
 	WebSocket            FeishuWebSocketConfig `yaml:"websocket"`
 }
@@ -531,6 +616,48 @@ func (c FeishuConfig) ResolveSecrets() FeishuConfig {
 	c.VerificationToken = firstNonEmpty(c.VerificationToken, getenv(c.VerificationTokenEnv))
 	c.EncryptKey = firstNonEmpty(c.EncryptKey, getenv(c.EncryptKeyEnv))
 	return c
+}
+
+func (c FeishuConfig) AccountConfigs() []FeishuConfig {
+	base := c
+	base.Accounts = nil
+	if strings.TrimSpace(base.DefaultAccount) == "" {
+		base.DefaultAccount = "default"
+	}
+	if len(c.Accounts) == 0 {
+		if strings.TrimSpace(base.AppID) == "" && strings.TrimSpace(base.AppIDEnv) == "" &&
+			strings.TrimSpace(base.AppSecret) == "" && strings.TrimSpace(base.AppSecretEnv) == "" {
+			return nil
+		}
+		return []FeishuConfig{base}
+	}
+	out := make([]FeishuConfig, 0, len(c.Accounts))
+	for _, account := range c.Accounts {
+		cfg := base
+		cfg.Accounts = nil
+		if id := strings.TrimSpace(account.ID); id != "" {
+			cfg.DefaultAccount = id
+		}
+		if account.Enabled != nil {
+			cfg.Enabled = *account.Enabled
+		}
+		cfg.AppID, cfg.AppIDEnv = overlaySecretRef(cfg.AppID, cfg.AppIDEnv, account.AppID, account.AppIDEnv)
+		cfg.AppSecret, cfg.AppSecretEnv = overlaySecretRef(cfg.AppSecret, cfg.AppSecretEnv, account.AppSecret, account.AppSecretEnv)
+		cfg.VerificationToken, cfg.VerificationTokenEnv = overlaySecretRef(cfg.VerificationToken, cfg.VerificationTokenEnv, account.VerificationToken, account.VerificationTokenEnv)
+		cfg.EncryptKey, cfg.EncryptKeyEnv = overlaySecretRef(cfg.EncryptKey, cfg.EncryptKeyEnv, account.EncryptKey, account.EncryptKeyEnv)
+		cfg.BaseURL = overlayString(cfg.BaseURL, account.BaseURL)
+		cfg.BotName = overlayString(cfg.BotName, account.BotName)
+		if account.AutoReply != nil {
+			cfg.AutoReply = *account.AutoReply
+		}
+		if account.MentionRequiredGroup != nil {
+			cfg.MentionRequiredGroup = *account.MentionRequiredGroup
+		}
+		cfg.Webhook = overlayFeishuWebhook(cfg.Webhook, account.Webhook)
+		cfg.WebSocket = overlayFeishuWebSocket(cfg.WebSocket, account.WebSocket)
+		out = append(out, cfg)
+	}
+	return out
 }
 
 func (c SearchProviderConfig) ResolvedAPIKey() string {
@@ -625,7 +752,7 @@ func (r *Root) NormalizeForUse() {
 	r.applyDefaults()
 	r.normalizeSearch()
 	r.normalizeSkills()
-	r.normalizeScripts()
+	r.normalizeRemote()
 	r.normalizeAgents()
 }
 
@@ -633,9 +760,6 @@ func (r *Root) applyDefaults() {
 	defaults := DefaultRoot()
 	if strings.TrimSpace(r.App.Name) == "" {
 		r.App.Name = defaults.App.Name
-	}
-	if strings.TrimSpace(r.App.Locale) == "" {
-		r.App.Locale = "auto"
 	}
 	if strings.TrimSpace(r.Model.Default) == "" {
 		r.Model.Default = defaults.Model.Default
@@ -657,17 +781,32 @@ func (r *Root) applyDefaults() {
 	if strings.TrimSpace(r.Execution.InactivityTimeout) == "" {
 		r.Execution.InactivityTimeout = defaults.Execution.InactivityTimeout
 	}
-	if r.Execution.MaxNoProgressTurns <= 0 {
-		r.Execution.MaxNoProgressTurns = defaults.Execution.MaxNoProgressTurns
+	if r.Execution.ContextBudget.Enabled == nil {
+		r.Execution.ContextBudget.Enabled = defaults.Execution.ContextBudget.Enabled
 	}
-	if r.Execution.MaxRepeatedToolFailures <= 0 {
-		r.Execution.MaxRepeatedToolFailures = defaults.Execution.MaxRepeatedToolFailures
+	if r.Execution.ContextBudget.SoftRatio <= 0 {
+		r.Execution.ContextBudget.SoftRatio = defaults.Execution.ContextBudget.SoftRatio
+	}
+	if r.Execution.ContextBudget.HardRatio <= 0 {
+		r.Execution.ContextBudget.HardRatio = defaults.Execution.ContextBudget.HardRatio
+	}
+	if r.Execution.ContextBudget.HardRatio < r.Execution.ContextBudget.SoftRatio {
+		r.Execution.ContextBudget.HardRatio = defaults.Execution.ContextBudget.HardRatio
+	}
+	if r.Execution.ContextBudget.RecentTurns <= 0 {
+		r.Execution.ContextBudget.RecentTurns = defaults.Execution.ContextBudget.RecentTurns
+	}
+	if r.Execution.ContextBudget.ToolResultTargetTokens <= 0 {
+		r.Execution.ContextBudget.ToolResultTargetTokens = defaults.Execution.ContextBudget.ToolResultTargetTokens
+	}
+	if r.Execution.ContextBudget.MaxVisibleTools <= 0 {
+		r.Execution.ContextBudget.MaxVisibleTools = defaults.Execution.ContextBudget.MaxVisibleTools
+	}
+	if r.Execution.ContextBudget.TraceTelemetry == nil {
+		r.Execution.ContextBudget.TraceTelemetry = defaults.Execution.ContextBudget.TraceTelemetry
 	}
 	if r.Memory.RecentDays <= 0 {
 		r.Memory.RecentDays = defaults.Memory.RecentDays
-	}
-	if len(r.Memory.RequireConfirmFor) == 0 {
-		r.Memory.RequireConfirmFor = defaults.Memory.RequireConfirmFor
 	}
 	proposalNudgeUnset := strings.TrimSpace(r.Memory.ProposalNudge.Interval) == "" && len(r.Memory.ProposalNudge.Channels) == 0 && r.Memory.ProposalNudge.MaxProposals == 0 && r.Memory.ProposalNudge.Enabled == nil
 	if proposalNudgeUnset {
@@ -687,9 +826,6 @@ func (r *Root) applyDefaults() {
 	}
 	if r.Learning.SkillCrystallization.SuccessThreshold <= 0 {
 		r.Learning.SkillCrystallization.SuccessThreshold = defaults.Learning.SkillCrystallization.SuccessThreshold
-	}
-	if strings.TrimSpace(r.Learning.SkillCrystallization.AskTiming) == "" {
-		r.Learning.SkillCrystallization.AskTiming = defaults.Learning.SkillCrystallization.AskTiming
 	}
 	if strings.TrimSpace(r.Scheduler.Timezone) == "" {
 		r.Scheduler.Timezone = defaults.Scheduler.Timezone
@@ -764,13 +900,7 @@ func (r *Root) normalizeSkills() {
 	}
 }
 
-func (r *Root) normalizeScripts() {
-	if r.Scripts.Dirs == nil {
-		r.Scripts.Dirs = []string{}
-	}
-	if r.Scripts.AutoDiscoverSkillScripts == nil {
-		r.Scripts.AutoDiscoverSkillScripts = DefaultRoot().Scripts.AutoDiscoverSkillScripts
-	}
+func (r *Root) normalizeRemote() {
 	if r.Remote.Profiles == nil {
 		r.Remote.Profiles = []RemoteProfileConfig{}
 	}
@@ -986,6 +1116,43 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func overlayString(base, value string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return base
+}
+
+func overlaySecretRef(baseValue, baseEnv, value, env string) (string, string) {
+	if strings.TrimSpace(value) != "" {
+		return value, env
+	}
+	if strings.TrimSpace(env) != "" {
+		return "", env
+	}
+	return baseValue, baseEnv
+}
+
+func overlayFeishuWebhook(base, value FeishuWebhookConfig) FeishuWebhookConfig {
+	if value.Enabled {
+		base.Enabled = true
+	}
+	if strings.TrimSpace(value.Addr) != "" {
+		base.Addr = value.Addr
+	}
+	if strings.TrimSpace(value.Path) != "" {
+		base.Path = value.Path
+	}
+	return base
+}
+
+func overlayFeishuWebSocket(base, value FeishuWebSocketConfig) FeishuWebSocketConfig {
+	if value.Enabled {
+		base.Enabled = true
+	}
+	return base
 }
 
 func boolPtr(value bool) *bool {

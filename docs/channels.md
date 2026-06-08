@@ -34,6 +34,34 @@ channel 配置位于：
 
 `mateway channel list` 会跳过 `.sample.yaml` 和 `.example.yaml`。
 
+## 飞书多机器人
+
+`channels/feishu.yaml` 支持一个 channel 下的多个机器人账号。顶层字段作为共享默认值，`feishu.accounts[]` 中的每个账号会启动一个独立 WebSocket client，并把账号 id 写入入站消息的 `metadata.account_id`。
+
+```yaml
+feishu:
+  enabled: true
+  base_url: https://open.feishu.cn
+  websocket:
+    enabled: true
+  accounts:
+    - id: ops-bot
+      app_id_env: MATEWAY_FEISHU_OPS_APP_ID
+      app_secret_env: MATEWAY_FEISHU_OPS_APP_SECRET
+    - id: local-bot
+      app_id_env: MATEWAY_FEISHU_LOCAL_APP_ID
+      app_secret_env: MATEWAY_FEISHU_LOCAL_APP_SECRET
+```
+
+然后用 account id 绑定不同 agent：
+
+```bash
+mateway agent bind --channel feishu --account-id ops-bot ops
+mateway agent bind --channel feishu --account-id local-bot local
+```
+
+如果还要在同一个机器人内按群聊或私聊分流，可以继续加 `--peer-id <open_chat_id>`。绑定匹配顺序会同时检查 `channel`、`account_id` 和 `peer_id`，未命中则使用默认 agent。
+
 ## 开发新 Channel 的边界
 
 新增稳定 channel 时，优先做成内置 channel spec：

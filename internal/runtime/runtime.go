@@ -2,33 +2,29 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
-	"github.com/dongping/mateway/internal/agentprofile"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/memory"
-	"github.com/dongping/mateway/internal/schedule"
-	"github.com/dongping/mateway/internal/script"
 	"github.com/dongping/mateway/internal/session"
 	"github.com/dongping/mateway/internal/tool"
 )
 
 type Runtime struct {
-	Config *config.Root
-	Store  session.Store
-	Tools  *agentcore.ToolRegistry
-	Model  agentcore.Model
-	Pool   AgentPool
-	Hooks  RuntimeHooks
+	Config        *config.Root
+	Store         session.Store
+	Tools         *agentcore.ToolRegistry
+	Model         agentcore.Model
+	ContractModel agentcore.Model
+	Pool          AgentPool
+	Hooks         RuntimeHooks
+	ProgressSink  func(channel.OutboundMessage)
 }
 
 type Response struct {
@@ -43,17 +39,20 @@ func New(cfg *config.Root) Runtime {
 	hooks := defaultRuntimeHooks()
 	hooks.Providers = append(hooks.Providers, staticContextHookProvider{config: cfg})
 	hooks.Providers = append(hooks.Providers, memorySafeReadHookProvider{config: cfg})
-	hooks.Providers = append(hooks.Providers, modelFollowupHookProvider{})
-	hooks.Providers = append(hooks.Providers, modelPendingIntentHookProvider{})
-	hooks.Providers = append(hooks.Providers, defaultCompletionReviewHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultToolPolicyHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultObserveHookProvider{})
 	hooks.Providers = append(hooks.Providers, defaultResponseHookProvider{})
+	model := agentcore.Model(HeuristicModel{})
+	home := ""
+	if cfg != nil {
+		model = resolveModelForDefault(cfg)
+		home = cfg.App.Home
+	}
 	return Runtime{
 		Config: cfg,
-		Store:  session.NewStore(cfg.App.Home),
+		Store:  session.NewStore(home),
 		Tools:  tool.NewRegistry(cfg),
-		Model:  HeuristicModel{},
+		Model:  model,
 		Pool:   NewAgentPool(cfg),
 		Hooks:  hooks,
 	}
@@ -69,7 +68,8 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	if err != nil {
 		return Response{}, err
 	}
-	_ = trace.write(map[string]any{"type": "request", "session_key": msg.SessionKey, "channel": msg.Channel, "text": msg.Text})
+	trace.setIdentity(traceIdentityForMessage(msg))
+	_ = trace.write(map[string]any{"type": "request", "text": msg.Text})
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
 	}()
@@ -84,50 +84,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		}
 		return resp, err
 	}
-	if resp, handled, err := rt.maybeRecallArchivedTask(ctx, &state, msg, trace); handled || err != nil {
-		if handled && err == nil {
-			resp.TraceID = trace.id
-			resp.TracePath = trace.path
-			_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
-		}
-		return resp, err
-	}
-	agent := rt.Pool.AgentForMessage(msg)
-	if agent == nil {
-		agent = agentcore.NewAgent(rt.Model, rt.Tools)
-	}
-	followupModel := rt.Pool.RoleModelForMessage(msg, "followup", agent.Model)
-	decision := rt.Hooks.resolveFollowup(ctx, FollowupHookInput{State: state, Text: msg.Text, Model: followupModel, Locale: runtimeLocale(rt.Config, msg), CatalogDir: runtimeCatalogDir(rt.Config)}, trace)
-	if decision.Kind == followupClarify {
-		task := state.StartTask(msg.Text)
-		applyCompletionContract(task, msg.Text)
-		state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: decision.ClarifyPrompt, ResumeText: decision.Reason}
-		state.BlockActiveTask("await_user_input")
-		if err := rt.saveState(&state, trace); err != nil {
-			return Response{}, err
-		}
-		resp := rt.reply(msg, decision.ClarifyPrompt, "clarify")
-		resp.TraceID = trace.id
-		resp.TracePath = trace.path
-		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
-		return resp, nil
-	}
 	userText := strings.TrimSpace(msg.Text)
-	if decision.Kind == followupContinuation {
-		task := state.ActivateTask(decision.TaskID)
-		if task == nil {
-			task = state.StartTask(msg.Text)
-			applyCompletionContract(task, msg.Text)
-		} else if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
-			applyCompletionContract(task, task.Goal)
-		}
-		if strings.TrimSpace(decision.ResolvedUserText) != "" {
-			userText = decision.ResolvedUserText
-		}
-		return rt.runTask(ctx, msg, &state, task, userText, trace)
+	task := state.EnsureTask(msg.Text)
+	if task.Goal != userText && state.ActiveTask == task.ID {
+		userText = mergeTaskAndInstruction(task.Goal, userText)
 	}
-	task := state.StartTask(msg.Text)
-	applyCompletionContract(task, msg.Text)
 	return rt.runTask(ctx, msg, &state, task, userText, trace)
 }
 
@@ -149,8 +110,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				Channel:  msg.Channel,
 				ThreadID: msg.ThreadID,
 				Text:     runtimeText(rt.Config, msg, "runtime.context_budget_exceeded", nil),
-				Style:    "error",
-				Locale:   runtimeLocale(rt.Config, msg),
+				Style:    channel.StyleError,
 			},
 			TraceID:   trace.id,
 			TracePath: trace.path,
@@ -169,21 +129,54 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		agent = agentcore.NewAgent(rt.Model, rt.Tools)
 	}
 	profile := rt.Pool.ProfileForMessage(msg)
+	trace.setIdentity(map[string]any{
+		"agent_id": profile.ID,
+		"task_id":  task.ID,
+	})
+	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	agent.SystemPrompt = prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
-	agent.Messages = messages
-	agent.MaxParallelTools = maxParallelTools(rt.Config)
-	agent.MaxIterations = maxIterations(rt.Config)
-	reviewModel := rt.Pool.RoleModelForMessage(msg, "review", agent.Model)
-	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
-	defer stopActivityWatch()
-	agentHooks, runtimeStopReason := rt.hooksForState(state, task.ID, userText, runtimeLocale(rt.Config, msg), reviewModel, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
+	if contractContext := renderTaskContractContext(contract); contractContext != "" {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
+	}
+	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
+	contextMessages := rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
 		UserText: userText,
 		Profile:  profile,
-	}, trace))
+	}, trace)
+	if len(contextMessages) > 0 {
+		messages = append(messages, contextMessages...)
+	}
+	modelCfg := rt.Pool.ModelConfigForMessage(msg)
+	_ = trace.write(map[string]any{
+		"type":                   "model_route_selected",
+		"model":                  modelCfg.Model,
+		"model_name":             modelCfg.Name,
+		"provider":               modelCfg.Provider,
+		"context_window_tokens":  modelCfg.ContextWindow,
+		"max_output_tokens":      modelCfg.MaxTokensValue(),
+		"context_budget_enabled": rt.Config.Execution.ContextBudget.EnabledValue(),
+	})
+	var budgetResults []contextBudgetResult
+	agent.Model = budgetedModel{
+		inner:       agent.Model,
+		config:      rt.Config,
+		modelConfig: modelCfg,
+		trace:       trace,
+		state:       *state,
+		taskID:      task.ID,
+		results:     &budgetResults,
+	}
+	agent.SystemPrompt = systemPrompt
+	agent.Messages = messages
+	agent.MaxParallelTools = maxParallelTools(rt.Config)
+	agent.MaxIterations = maxIterations(rt.Config)
+	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
+	defer stopActivityWatch()
+	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil)
 	agent.Hooks = agentHooks
 	result, err := agent.Continue(runCtx)
 	if err != nil {
@@ -193,7 +186,8 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 		if activityTimedOut() {
 			text := runtimeText(rt.Config, msg, "runtime.activity_timeout", nil)
-			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), "partial")
+			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), channel.StylePartial)
+			resp.Reply.Progress = progressStepsForTask(*state, task.ID)
 			resp.TraceID = trace.id
 			resp.TracePath = trace.path
 			resp.Failed = true
@@ -206,8 +200,8 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				Channel:  msg.Channel,
 				ThreadID: msg.ThreadID,
 				Text:     text,
-				Style:    "error",
-				Locale:   runtimeLocale(rt.Config, msg),
+				Style:    channel.StyleError,
+				Progress: progressStepsForTask(*state, task.ID),
 			},
 			TraceID:   trace.id,
 			TracePath: trace.path,
@@ -217,84 +211,43 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 		return resp, nil
 	}
-	if result.StopReason == "" {
-		result.StopReason = runtimeStopReason()
-	}
 
 	state.Messages = redactMessagesForStorage(result.Messages)
 	finalText := redactSecretString(result.FinalText)
 	usage := usageFromMessages(result.Messages)
+	addUsage(&usage, usageFromBudgetResults(budgetResults))
 	addUsage(&state.Usage, usage)
 	writeUsageTrace(trace, usage)
-	if state.Pending != nil && state.Pending.Kind == "confirm_tool" {
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, err
-		}
-		question := strings.TrimSpace(state.Pending.Question)
-		if question == "" {
-			question = runtimeText(rt.Config, msg, "approval.confirm.generic", nil)
-		}
-		resp := rt.reply(msg, question, "approval_pending")
-		resp.TraceID = trace.id
-		resp.TracePath = trace.path
-		_ = trace.write(map[string]any{"type": "approval_pending", "task_id": state.Pending.TaskID, "tool_call": state.Pending.ToolCall})
-		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
-		return resp, nil
-	}
 	taskCompleted := false
-	blockedByFinalWarning := false
+	emptyActionPromise := looksLikeEmptyActionPromise(finalText)
 	if state.Pending == nil {
+		contractValidation := validateTaskContract(taskContractFromState(*state, task.ID), taskFromState(*state, task.ID))
 		if result.StopReason != "" {
-			blockedByFinalWarning = true
 			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
 			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
+		} else if !contractValidation.Satisfied {
+			state.BlockActiveTask("failed")
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: strings.Join(contractValidation.Missing, "; "), Evidence: map[string]any{"missing": contractValidation.Missing}})
+			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": task.ID, "status": "failed", "missing": contractValidation.Missing})
 		} else if looksLikeInputRequest(finalText) {
-			state.Pending = &session.PendingAction{Kind: "user_input", TaskID: task.ID, Question: finalText}
-			state.BlockActiveTask("await_user_input")
-		} else if warning := finalTextWarning(finalText); warning != "" {
-			blockedByFinalWarning = true
+			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
+			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
+		} else if emptyActionPromise {
 			state.BlockActiveTask("failed")
-			_ = trace.write(map[string]any{"type": "task_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "text": finalText})
-		} else if warning := completionContractWarning(activeTaskSnapshot(state, task.ID), finalText); warning != "" {
-			blockedByFinalWarning = true
-			state.BlockActiveTask("failed")
-			_ = trace.write(map[string]any{"type": "completion_contract_blocked", "task_id": task.ID, "status": "failed", "reason": warning, "contract": activeTaskSnapshot(state, task.ID).CompletionContract, "text": finalText})
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
+			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			updateSessionSummary(state, task.ID, finalText, "completed", trace)
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
 			taskCompleted = true
 		}
 	}
 	if err := rt.saveState(state, trace); err != nil {
 		return Response{}, err
-	}
-	if proposalID := pendingAgentProfileProposalID(task); proposalID != "" {
-		state.Pending = &session.PendingAction{
-			Kind:       "agent_profile_proposal_review",
-			TaskID:     task.ID,
-			ProposalID: proposalID,
-			Question:   runtimeText(rt.Config, msg, "agent_profile.review.question", nil),
-		}
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, err
-		}
-	}
-	if scheduleID := pendingScheduleID(result.Messages); scheduleID != "" {
-		state.Pending = &session.PendingAction{
-			Kind:       "schedule_review",
-			TaskID:     task.ID,
-			ScheduleID: scheduleID,
-			Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
-		}
-		state.BlockActiveTask("await_schedule_test")
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, err
-		}
-		resp := rt.reply(msg, state.Pending.Question, "schedule_review_pending")
-		resp.TraceID = trace.id
-		resp.TracePath = trace.path
-		_ = trace.write(map[string]any{"type": "schedule_review_pending", "schedule_id": scheduleID})
-		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
-		return resp, nil
 	}
 
 	var learningResult *memory.LearningResult
@@ -325,7 +278,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 					Kind:       "memory_proposal_review",
 					TaskID:     task.ID,
 					ProposalID: learningResult.Proposal.ID,
-					Question:   runtimeText(rt.Config, msg, "memory.review.question", nil),
+					Question:   "1 save, 2 ignore",
 				}
 				if err := rt.saveState(state, trace); err != nil {
 					return Response{}, err
@@ -333,15 +286,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			}
 		}
 	}
-	text := redactSecretString(rt.Hooks.response(ctx, ResponseHookInput{RawText: finalText, LearningResult: learningResult, Locale: runtimeLocale(rt.Config, msg), CatalogDir: runtimeCatalogDir(rt.Config)}, trace))
+	text := redactSecretString(rt.Hooks.response(ctx, ResponseHookInput{RawText: finalText, LearningResult: learningResult}, trace))
 	var followUps []channel.OutboundMessage
 	if learningResult != nil && learningResult.Proposal != nil {
 		followUps = append(followUps, channel.OutboundMessage{
 			Channel:  msg.Channel,
 			ThreadID: msg.ThreadID,
 			Text:     renderMemoryProposalReview(rt.Config, msg, *learningResult.Proposal),
-			Style:    "memory_proposal_review",
-			Locale:   runtimeLocale(rt.Config, msg),
+			Style:    channel.StyleMemoryProposalReview,
 		})
 	}
 	if learningResult == nil || learningResult.Proposal == nil {
@@ -350,12 +302,10 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			_ = trace.write(map[string]any{"type": "memory_proposal_nudge", "text": nudge})
 		}
 	}
-	if blockedByFinalWarning {
-		text = renderPartialReply(rt.Config, msg, text)
-	}
-	style := ""
-	if blockedByFinalWarning && style == "" {
-		style = "partial"
+	style := channel.MessageStyle("")
+	failed := result.StopReason != "" || emptyActionPromise
+	if failed && style == "" {
+		style = channel.StylePartial
 	}
 	resp := Response{
 		Reply: channel.OutboundMessage{
@@ -363,12 +313,11 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			ThreadID: msg.ThreadID,
 			Text:     text,
 			Style:    style,
-			Locale:   runtimeLocale(rt.Config, msg),
 		},
 		FollowUps: followUps,
 		TraceID:   trace.id,
 		TracePath: trace.path,
-		Failed:    blockedByFinalWarning,
+		Failed:    failed,
 	}
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 	for _, followUp := range followUps {
@@ -386,39 +335,6 @@ func renderPartialReply(cfg *config.Root, msg channel.InboundMessage, text strin
 		return text
 	}
 	return runtimeText(cfg, msg, "runtime.partial.prefix", textValues("text", text))
-}
-
-func (rt Runtime) memoryProposalNudgeOptions(msg channel.InboundMessage) memory.ProposalNudgeOptions {
-	options := memory.ProposalNudgeOptions{
-		Channel:      msg.Channel,
-		Channels:     []string{"cli"},
-		Interval:     24 * time.Hour,
-		MaxProposals: 3,
-		Locale:       runtimeLocale(rt.Config, msg),
-		CatalogDir:   runtimeCatalogDir(rt.Config),
-	}
-	if rt.Config == nil {
-		return options
-	}
-	cfg := rt.Config.Memory.ProposalNudge
-	if !cfg.EnabledValue() {
-		if cfg.Enabled == nil && strings.TrimSpace(cfg.Interval) == "" && len(cfg.Channels) == 0 && cfg.MaxProposals == 0 {
-			return options
-		}
-		options.Channels = nil
-		options.Channels = []string{"__disabled__"}
-		return options
-	}
-	if len(cfg.Channels) > 0 {
-		options.Channels = cfg.Channels
-	}
-	if parsed, err := time.ParseDuration(strings.TrimSpace(cfg.Interval)); err == nil && parsed > 0 {
-		options.Interval = parsed
-	}
-	if cfg.MaxProposals > 0 {
-		options.MaxProposals = cfg.MaxProposals
-	}
-	return options
 }
 
 func (rt Runtime) saveState(state *session.State, trace *traceRecorder) error {
@@ -453,7 +369,7 @@ func (rt Runtime) resetSession(msg channel.InboundMessage, state session.State, 
 	if archivePath != "" {
 		text += "\n" + runtimeText(rt.Config, msg, "runtime.session_reset.archived", textValues("archive_path", archivePath))
 	}
-	resp := rt.reply(msg, text, "session_reset")
+	resp := rt.reply(msg, text, channel.StyleSessionReset)
 	resp.TraceID = trace.id
 	resp.TracePath = trace.path
 	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style, "runtime_duration_ms": time.Since(start).Milliseconds()})
@@ -462,99 +378,6 @@ func (rt Runtime) resetSession(msg channel.InboundMessage, state session.State, 
 
 func hasSessionState(state session.State) bool {
 	return len(state.Messages) > 0 || len(state.Tasks) > 0 || state.Pending != nil || state.ActiveTask != "" || state.Usage.Requests > 0
-}
-
-type archivedTaskCandidate struct {
-	ArchiveID string
-	Task      session.TaskNode
-}
-
-func (rt Runtime) maybeRecallArchivedTask(_ context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
-	if state == nil || len(state.Tasks) > 0 || state.Pending != nil {
-		return Response{}, false, nil
-	}
-	text := strings.TrimSpace(msg.Text)
-	normalized := normalizeFollowupText(text)
-	if !isHistoricalCue(normalized) && !isFollowupCue(normalized) && !isRetryCue(normalized) {
-		return Response{}, false, nil
-	}
-	candidates, err := rt.archivedTaskCandidates(state.Key, text, 5)
-	if err != nil {
-		_ = trace.write(map[string]any{"type": "archive_task_recall_error", "error": err.Error()})
-		return Response{}, false, nil
-	}
-	if len(candidates) == 0 {
-		return Response{}, false, nil
-	}
-	if len(candidates) == 1 {
-		candidate := candidates[0]
-		state.Pending = &session.PendingAction{
-			Kind:       "archive_task_recall",
-			TaskID:     candidate.Task.ID,
-			ArchiveID:  candidate.ArchiveID,
-			Question:   renderArchiveRecallQuestion(rt.Config, msg, candidate),
-			ResumeText: text,
-		}
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		_ = trace.write(map[string]any{"type": "archive_task_recall_pending", "archive_id": candidate.ArchiveID, "task_id": candidate.Task.ID, "candidates": 1})
-		return rt.reply(msg, state.Pending.Question, "archive_recall_pending"), true, nil
-	}
-	textOut := renderArchiveRecallCandidates(rt.Config, msg, candidates)
-	_ = trace.write(map[string]any{"type": "archive_task_recall_clarify", "candidates": len(candidates)})
-	return rt.reply(msg, textOut, "clarify"), true, nil
-}
-
-func (rt Runtime) archivedTaskCandidates(sessionKey, text string, limit int) ([]archivedTaskCandidate, error) {
-	ids, err := rt.Store.ListArchives(sessionKey)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	normalized := normalizeFollowupText(text)
-	var out []archivedTaskCandidate
-	for i := len(ids) - 1; i >= 0 && len(out) < limit; i-- {
-		archived, _, err := rt.Store.LoadArchive(sessionKey, ids[i])
-		if err != nil {
-			continue
-		}
-		for j := len(archived.Tasks) - 1; j >= 0 && len(out) < limit; j-- {
-			task := archived.Tasks[j]
-			haystack := normalizeFollowupText(task.Goal + " " + task.Summary)
-			if tokenOverlap(normalized, haystack) >= 1 || containsAny(normalized, runtimeCueList(rt.Config, "router.archive_recall.cues")) {
-				out = append(out, archivedTaskCandidate{ArchiveID: ids[i], Task: task})
-			}
-		}
-	}
-	return out, nil
-}
-
-func renderArchiveRecallQuestion(cfg *config.Root, msg channel.InboundMessage, candidate archivedTaskCandidate) string {
-	goal := summarize(candidate.Task.Goal)
-	if goal == "" {
-		goal = candidate.Task.ID
-	}
-	return runtimeText(cfg, msg, "runtime.archive_recall.question", textValues("goal", goal))
-}
-
-func renderArchiveRecallCandidates(cfg *config.Root, msg channel.InboundMessage, candidates []archivedTaskCandidate) string {
-	var b strings.Builder
-	b.WriteString(runtimeText(cfg, msg, "runtime.archive_recall.candidates", nil))
-	for i, candidate := range candidates {
-		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, summarize(candidate.Task.Goal)))
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func archivedTaskRecallText(task session.TaskNode, archiveID, current string) string {
-	return "Continue from an archived task in the current new session.\nArchive ID: " + strings.TrimSpace(archiveID) +
-		"\nArchived task ID: " + strings.TrimSpace(task.ID) +
-		"\nArchived task goal: " + strings.TrimSpace(task.Goal) +
-		"\nArchived task summary: " + strings.TrimSpace(task.Summary) +
-		"\nCurrent user request: " + strings.TrimSpace(current)
 }
 
 func writeCompactTrace(trace *traceRecorder, eventType string, stats messageCompactStats) {
@@ -624,6 +447,13 @@ func usageFromMessages(messages []agentcore.Message) session.Usage {
 		usage.Requests++
 		usage.InputTokens += msg.Usage.InputTokens
 		usage.OutputTokens += msg.Usage.OutputTokens
+		if msg.Usage.CacheHit {
+			usage.CacheHits++
+		}
+		usage.CacheReadTokens += msg.Usage.CacheReadTokens
+		usage.CacheWriteTokens += msg.Usage.CacheWriteTokens
+		usage.CacheInputTokens += msg.Usage.CacheInputTokens
+		usage.CacheOutputTokens += msg.Usage.CacheOutputTokens
 		total := msg.Usage.TotalTokens
 		if total == 0 {
 			total = msg.Usage.InputTokens + msg.Usage.OutputTokens
@@ -641,6 +471,15 @@ func addUsage(total *session.Usage, delta session.Usage) {
 	total.InputTokens += delta.InputTokens
 	total.OutputTokens += delta.OutputTokens
 	total.TotalTokens += delta.TotalTokens
+	total.EstimatedInputTokens += delta.EstimatedInputTokens
+	total.SavedEstimatedTokens += delta.SavedEstimatedTokens
+	total.CompactedMessages += delta.CompactedMessages
+	total.CompactedToolResults += delta.CompactedToolResults
+	total.CacheHits += delta.CacheHits
+	total.CacheReadTokens += delta.CacheReadTokens
+	total.CacheWriteTokens += delta.CacheWriteTokens
+	total.CacheInputTokens += delta.CacheInputTokens
+	total.CacheOutputTokens += delta.CacheOutputTokens
 	total.Cost += delta.Cost
 }
 
@@ -649,12 +488,41 @@ func writeUsageTrace(trace *traceRecorder, usage session.Usage) {
 		return
 	}
 	_ = trace.write(map[string]any{
-		"type":          "model_usage",
-		"requests":      usage.Requests,
-		"input_tokens":  usage.InputTokens,
-		"output_tokens": usage.OutputTokens,
-		"total_tokens":  usage.TotalTokens,
+		"type":                   "model_usage",
+		"requests":               usage.Requests,
+		"input_tokens":           usage.InputTokens,
+		"output_tokens":          usage.OutputTokens,
+		"total_tokens":           usage.TotalTokens,
+		"estimated_input_tokens": usage.EstimatedInputTokens,
+		"saved_estimated_tokens": usage.SavedEstimatedTokens,
+		"compacted_messages":     usage.CompactedMessages,
+		"compacted_tool_results": usage.CompactedToolResults,
+		"cache_hits":             usage.CacheHits,
+		"cache_read_tokens":      usage.CacheReadTokens,
+		"cache_write_tokens":     usage.CacheWriteTokens,
+		"cache_input_tokens":     usage.CacheInputTokens,
+		"cache_output_tokens":    usage.CacheOutputTokens,
 	})
+}
+
+func traceIdentityForMessage(msg channel.InboundMessage) map[string]any {
+	identity := map[string]any{
+		"session_key": msg.SessionKey,
+		"channel":     msg.Channel,
+		"message_id":  msg.ID,
+		"user_id":     msg.UserID,
+		"thread_id":   msg.ThreadID,
+	}
+	if accountID := strings.TrimSpace(msg.Metadata["account_id"]); accountID != "" {
+		identity["account_id"] = accountID
+	}
+	if peerID := strings.TrimSpace(msg.Metadata["peer_id"]); peerID != "" {
+		identity["peer_id"] = peerID
+	}
+	if messageType := strings.TrimSpace(msg.Metadata["message_type"]); messageType != "" {
+		identity["message_type"] = messageType
+	}
+	return identity
 }
 
 func (rt Runtime) home() string {
@@ -677,20 +545,6 @@ func maxIterations(cfg *config.Root) int {
 		return 50
 	}
 	return cfg.Execution.MaxIterationsValue()
-}
-
-func maxNoProgressTurns(cfg *config.Root) int {
-	if cfg == nil || cfg.Execution.MaxNoProgressTurns <= 0 {
-		return 2
-	}
-	return cfg.Execution.MaxNoProgressTurns
-}
-
-func maxRepeatedToolFailures(cfg *config.Root) int {
-	if cfg == nil || cfg.Execution.MaxRepeatedToolFailures <= 0 {
-		return 3
-	}
-	return cfg.Execution.MaxRepeatedToolFailures
 }
 
 func inactivityTimeout(cfg *config.Root) time.Duration {
@@ -755,126 +609,6 @@ func (rt Runtime) withActivityWatchdog(ctx context.Context, trace *traceRecorder
 	}, timedOut.Load
 }
 
-func proposalID(proposal *memory.Proposal) string {
-	if proposal == nil {
-		return ""
-	}
-	return proposal.ID
-}
-
-func proposalIDFromEvidence(evidence map[string]any) string {
-	id, ok := evidence["proposal_id"].(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(id)
-}
-
-func pendingScheduleID(messages []agentcore.Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		if msg.Role != agentcore.RoleAssistant {
-			continue
-		}
-		for _, call := range msg.ToolCalls {
-			if call.Name != "schedule.create" {
-				continue
-			}
-			if raw := strings.TrimSpace(fmt.Sprint(call.Args["require_test"])); strings.EqualFold(raw, "false") || strings.EqualFold(raw, "no") {
-				return ""
-			}
-			if id := scheduleIDFromFollowingToolResult(messages, i, call.ID); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
-}
-
-func scheduleCreateRequiresTest(call agentcore.ToolCall) bool {
-	raw := strings.TrimSpace(fmt.Sprint(call.Args["require_test"]))
-	return !strings.EqualFold(raw, "false") && !strings.EqualFold(raw, "no")
-}
-
-func scheduleIDFromToolResult(result agentcore.ToolResult) string {
-	if result.Evidence != nil {
-		if id, ok := result.Evidence["id"].(string); ok && strings.TrimSpace(id) != "" {
-			return strings.TrimSpace(id)
-		}
-	}
-	fields := strings.Fields(result.Content)
-	for i, field := range fields {
-		if field == "scheduled" && i+1 < len(fields) {
-			return strings.TrimSpace(fields[i+1])
-		}
-	}
-	return ""
-}
-
-func pendingAgentProfileProposalID(task *session.TaskNode) string {
-	if task == nil {
-		return ""
-	}
-	for i := len(task.Steps) - 1; i >= 0; i-- {
-		if task.Steps[i].Tool != "file.write" || task.Steps[i].Status != "accepted" {
-			continue
-		}
-		id, ok := task.Steps[i].Evidence["proposal_id"].(string)
-		if ok && strings.TrimSpace(id) != "" {
-			return id
-		}
-	}
-	return ""
-}
-
-func scheduleIDFromFollowingToolResult(messages []agentcore.Message, assistantIndex int, toolCallID string) string {
-	for _, msg := range messages[assistantIndex+1:] {
-		if msg.Role == agentcore.RoleAssistant {
-			break
-		}
-		if msg.Role != agentcore.RoleTool || msg.ToolCallID != toolCallID {
-			continue
-		}
-		fields := strings.Fields(msg.Content)
-		for i, field := range fields {
-			if field == "scheduled" && i+1 < len(fields) {
-				return strings.TrimSpace(fields[i+1])
-			}
-		}
-	}
-	return ""
-}
-
-func renderMemoryProposalReview(cfg *config.Root, msg channel.InboundMessage, proposal memory.Proposal) string {
-	var b strings.Builder
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.header", nil))
-	b.WriteString(proposal.ID)
-	b.WriteString(" ")
-	b.WriteString(strings.TrimSpace(proposal.Title))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.type", nil))
-	b.WriteString(defaultText(proposal.Type, "experience"))
-	b.WriteString(" / ")
-	b.WriteString(defaultText(proposal.Scope, "agent"))
-	if strings.TrimSpace(proposal.Confidence) != "" {
-		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.confidence", nil))
-		b.WriteString(strings.TrimSpace(proposal.Confidence))
-	}
-	if summary := proposalSummary(proposal); summary != "" {
-		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.summary", nil))
-		b.WriteString(summary)
-	}
-	if len(proposal.Sources) > 0 {
-		b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.sources", nil))
-		b.WriteString(summarize(strings.Join(proposal.Sources, ", ")))
-	}
-	values := textValues("proposal_id", proposal.ID)
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.show", values))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.commit", values))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.reject", values))
-	b.WriteString(runtimeText(cfg, msg, "memory.proposal_review.reply", nil))
-	return b.String()
-}
-
 func defaultText(value, fallback string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -883,25 +617,11 @@ func defaultText(value, fallback string) string {
 	return value
 }
 
-func proposalSummary(proposal memory.Proposal) string {
-	body := strings.TrimSpace(proposal.Body)
-	body = strings.TrimPrefix(body, "# "+strings.TrimSpace(proposal.Title))
-	body = strings.TrimSpace(body)
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
-		if line != "" && !strings.HasPrefix(line, "#") {
-			return summarize(line)
-		}
-	}
-	return ""
-}
-
-func fallbackFinalReply(raw, locale, catalogDir string) string {
-	catalog := i18n.New(i18n.Config{CatalogDir: catalogDir})
+func fallbackFinalReply(raw string) string {
 	if strings.Contains(strings.ToUpper(raw), "[TOOL_CALL]") {
-		return catalog.T(locale, "runtime.invalid_tool_call", nil)
+		return runtimeText(nil, channel.InboundMessage{}, "runtime.invalid_tool_call", nil)
 	}
-	return catalog.T(locale, "runtime.empty_reply", nil)
+	return runtimeText(nil, channel.InboundMessage{}, "runtime.empty_reply", nil)
 }
 
 func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
@@ -920,1065 +640,8 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 	return out
 }
 
-func activeTaskSnapshot(state *session.State, taskID string) session.TaskNode {
-	if state == nil {
-		return session.TaskNode{}
-	}
-	for _, task := range state.Tasks {
-		if task.ID == taskID {
-			return task
-		}
-	}
-	return session.TaskNode{}
-}
-
-func applyCompletionContract(task *session.TaskNode, text string) {
-	if task == nil {
-		return
-	}
-	if looksLikeActionTask(text) {
-		task.CompletionContract = session.CompletionContract{
-			TaskType:          "action",
-			RequiresMutation:  true,
-			AllowsBlocker:     true,
-			RequiresLLMReview: true,
-			SuccessCondition:  "At least one accepted mutation tool step exists, or the task records a concrete blocker that prevents execution.",
-		}
-		return
-	}
-	task.CompletionContract = session.CompletionContract{
-		TaskType:          "informational",
-		RequiresLLMReview: true,
-		SuccessCondition:  "Final answer is grounded in accepted evidence or clearly states what remains unverified.",
-	}
-}
-
-func looksLikeActionTask(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	if lower == "" {
-		return false
-	}
-	if strings.HasPrefix(lower, "/read") || strings.HasPrefix(lower, "/search") {
-		return false
-	}
-	for _, cue := range runtimeCueList(nil, "router.action.info_cues") {
-		if strings.Contains(lower, cue) {
-			return false
-		}
-	}
-	for _, cue := range runtimeCueList(nil, "router.action.action_cues") {
-		if strings.Contains(lower, cue) {
-			return true
-		}
-	}
-	if containsAny(lower, runtimeCueList(nil, "router.action.generate_cues")) {
-		for _, artifact := range runtimeCueList(nil, "router.action.generated_artifacts") {
-			if strings.Contains(lower, artifact) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isActionAckFollowup(text string) bool {
-	normalized := normalizeFollowupText(text)
-	if normalized == "" {
-		return false
-	}
-	return looksLikeNonSubstantiveActionAck(text) ||
-		containsExactCue(normalized, runtimeCueList(nil, "router.action.ack_exact")) ||
-		containsAny(normalized, runtimeCueList(nil, "router.action.ack_contains"))
-}
-
-func completionContractWarning(task session.TaskNode, finalText string) string {
-	contract := task.CompletionContract
-	if !contract.RequiresMutation {
-		return ""
-	}
-	if hasAcceptedMutationStep(task) {
-		return ""
-	}
-	if contract.AllowsBlocker && looksLikeConcreteBlocker(finalText) {
-		return ""
-	}
-	return "missing_accepted_mutation_evidence"
-}
-
-func hasAcceptedMutationStep(task session.TaskNode) bool {
-	for _, step := range task.Steps {
-		if step.Accepted && step.Mutation {
-			return true
-		}
-		if step.Status == "accepted" {
-			risk := strings.TrimSpace(step.Risk)
-			if risk == string(agentcore.RiskGuardedMutation) || risk == string(agentcore.RiskDangerous) {
-				return true
-			}
-			if accepted, _ := step.Evidence["acceptance"].(string); accepted == "accepted" {
-				if mutation, _ := step.Evidence["mutation"].(bool); mutation {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func looksLikeConcreteBlocker(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	if lower == "" {
-		return false
-	}
-	for _, blocker := range runtimeCueList(nil, "router.blocker.cues") {
-		if strings.Contains(lower, blocker) {
-			return true
-		}
-	}
-	return false
-}
-
-func (rt Runtime) hooksForState(state *session.State, taskID, userText, locale string, model agentcore.Model, trace *traceRecorder, steering []agentcore.Message) (agentcore.Hooks, func() string) {
-	steeringSent := false
-	var followUps []agentcore.Message
-	noProgressTurns := 0
-	maxNoProgressTurns := maxNoProgressTurns(rt.Config)
-	maxRepeatedToolFailures := maxRepeatedToolFailures(rt.Config)
-	lastFailureSignature := ""
-	repeatedToolFailures := 0
-	stopReason := ""
-	runtimeStopReason := func() string {
-		return stopReason
-	}
-	hooks := agentcore.Hooks{
-		Emit: trace.emit,
-		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
-			if steeringSent {
-				return nil, nil
-			}
-			steeringSent = true
-			return append([]agentcore.Message(nil), steering...), nil
-		},
-		ShouldStopAfterTurn: func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
-			if len(turn.Message.ToolCalls) != 0 {
-				return false, nil
-			}
-			task := activeTaskSnapshot(state, taskID)
-			review := rt.Hooks.completionReview(context.Background(), CompletionReviewInput{
-				UserText:           userText,
-				Task:               task,
-				FinalText:          turn.Message.Content,
-				TranscriptMessages: turn.Messages,
-				Model:              model,
-			}, trace)
-			_ = trace.write(map[string]any{
-				"type":               "completion_review",
-				"task_id":            taskID,
-				"completed":          review.Completed,
-				"reason":             review.Reason,
-				"missing_items":      review.MissingItems,
-				"suggested_followup": review.SuggestedFollowUp,
-			})
-			if !review.Completed {
-				noProgressTurns++
-				if maxNoProgressTurns > 0 && noProgressTurns >= maxNoProgressTurns {
-					_ = trace.write(map[string]any{
-						"type":          "task_no_progress",
-						"task_id":       taskID,
-						"turns":         noProgressTurns,
-						"reason":        review.Reason,
-						"missing_items": review.MissingItems,
-					})
-					stopReason = "task_no_progress"
-					return true, nil
-				}
-				followUp := strings.TrimSpace(review.SuggestedFollowUp)
-				if followUp == "" {
-					followUp = "Continue now. Immediately execute the next required step with tools. If you cannot call a tool, state the concrete blocker and what user input or permission is needed. Do not only describe a plan."
-				}
-				followUps = append(followUps, agentcore.Message{Role: agentcore.RoleUser, Content: followUp})
-			} else {
-				noProgressTurns = 0
-			}
-			return false, nil
-		},
-		GetFollowUpMessages: func(context.Context) ([]agentcore.Message, error) {
-			if len(followUps) == 0 {
-				return nil, nil
-			}
-			out := followUps
-			followUps = nil
-			return out, nil
-		},
-		BeforeToolCall: func(_ context.Context, input agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
-			approvalKey, approvalClass := taskApprovalKey(input.ToolCall, input.Tool, rt.Config)
-			if state.HasTaskApproval(taskID, approvalKey) && taskApprovalCanReuse(input.ToolCall, rt.Config) {
-				_ = trace.write(map[string]any{"type": "approval_reused", "task_id": taskID, "tool": input.ToolCall.Name, "approval_key": approvalKey, "class": approvalClass})
-				return agentcore.BeforeToolCallResult{}, nil
-			}
-			policy := rt.Hooks.toolPolicy(context.Background(), ToolPolicyHookInput{ToolCall: input.ToolCall, Tool: input.Tool, Config: rt.Config, Locale: locale}, trace)
-			if policy.Block {
-				_ = trace.write(map[string]any{"type": "approval_required", "task_id": taskID, "tool": input.ToolCall.Name, "approval_key": approvalKey, "class": approvalClass, "reason": policy.Reason})
-				state.Pending = &session.PendingAction{
-					Kind:              "confirm_tool",
-					TaskID:            taskID,
-					Question:          policy.Reason,
-					ToolCall:          input.ToolCall,
-					ResumeText:        policy.ResumeText,
-					AuthorizationOnly: policy.AuthorizationOnly,
-				}
-				state.BlockActiveTask("await_confirm")
-				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
-			}
-			return agentcore.BeforeToolCallResult{}, nil
-		},
-		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
-			noProgressTurns = 0
-			observe := rt.Hooks.observe(context.Background(), ObserveHookInput{
-				Kind:       "tool_result",
-				State:      *state,
-				TaskID:     taskID,
-				ToolCall:   input.ToolCall,
-				Tool:       input.Tool,
-				ToolResult: input.ToolResult,
-			}, trace)
-			if observe.TaskStep != nil {
-				state.AddStep(taskID, *observe.TaskStep)
-				switch observe.TaskStep.Status {
-				case "accepted":
-					lastFailureSignature = ""
-					repeatedToolFailures = 0
-				case "failed", "suspect":
-					signature := toolFailureSignature(input.ToolCall)
-					if signature == lastFailureSignature {
-						repeatedToolFailures++
-					} else {
-						lastFailureSignature = signature
-						repeatedToolFailures = 1
-					}
-					if maxRepeatedToolFailures > 0 && repeatedToolFailures >= maxRepeatedToolFailures {
-						_ = trace.write(map[string]any{
-							"type":      "tool_failure_loop",
-							"task_id":   taskID,
-							"tool":      input.ToolCall.Name,
-							"signature": signature,
-							"count":     repeatedToolFailures,
-							"status":    observe.TaskStep.Status,
-						})
-						result := input.ToolResult
-						result.IsError = true
-						result.Content = strings.TrimSpace(result.Content)
-						if result.Content == "" {
-							result.Content = runtimeText(rt.Config, channel.InboundMessage{Text: userText}, "runtime.tool_failure_loop", nil)
-						} else {
-							result.Content += "\n\n" + runtimeText(rt.Config, channel.InboundMessage{Text: userText}, "runtime.tool_failure_loop", nil)
-						}
-						return agentcore.AfterToolCallResult{ToolResult: &result, Terminate: true, StopReason: "tool_failure_loop"}, nil
-					}
-				}
-			}
-			return agentcore.AfterToolCallResult{}, nil
-		},
-	}
-	return hooks, runtimeStopReason
-}
-
-func toolFailureSignature(call agentcore.ToolCall) string {
-	data, err := json.Marshal(call.Args)
-	if err != nil {
-		data = []byte(fmt.Sprint(call.Args))
-	}
-	sum := sha256.Sum256([]byte(call.Name + "\x00" + string(data)))
-	return call.Name + ":" + hex.EncodeToString(sum[:8])
-}
-
-func taskApprovalKey(call agentcore.ToolCall, def agentcore.Tool, cfg *config.Root) (string, string) {
-	class := ""
-	switch call.Name {
-	case "terminal.run":
-		decision := tool.CheckTerminalCommand(fmt.Sprint(call.Args["command"]), cfg)
-		class = decision.Class
-	case "script.run":
-		class = "script"
-	case "secret.set":
-		class = "secret"
-	default:
-		if def != nil {
-			class = string(def.Risk())
-		}
-	}
-	if strings.TrimSpace(class) == "" {
-		class = "guarded_mutation"
-	}
-	return call.Name + ":" + class, class
-}
-
-func taskApprovalCanReuse(call agentcore.ToolCall, cfg *config.Root) bool {
-	switch call.Name {
-	case "secret.set":
-		return false
-	case "script.run":
-		return false
-	case "terminal.run":
-		command := fmt.Sprint(call.Args["command"])
-		if tool.IsDangerousCommand(command) {
-			return false
-		}
-		decision := tool.CheckTerminalCommand(command, cfg)
-		return decision.Allow
-	default:
-		return true
-	}
-}
-
-func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
-	if state.Pending == nil {
-		return Response{}, false, nil
-	}
-	text := strings.TrimSpace(msg.Text)
-	switch state.Pending.Kind {
-	case "confirm_tool":
-		control, hasControl := rt.pendingControl(msg, text)
-		if hasControl {
-			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
-		}
-		if control == "cancel" || (!hasControl && rt.isCancel(msg, text)) {
-			_ = trace.write(map[string]any{"type": "approval_denied", "task_id": state.Pending.TaskID, "tool": state.Pending.ToolCall.Name})
-			state.Pending = nil
-			state.BlockActiveTask("cancelled")
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.cancelled", nil), "cancelled"), true, nil
-		}
-		if !(control == "approve" || control == "continue" || (!hasControl && rt.isConfirm(msg, text))) {
-			return rt.reply(msg, runtimeText(rt.Config, msg, "approval.confirm.generic", nil), "approval_pending"), true, nil
-		}
-		pending := *state.Pending
-		pendingTaskID := pending.TaskID
-		call := pending.ToolCall
-		state.Pending = nil
-		taskID := strings.TrimSpace(pendingTaskID)
-		if taskID == "" {
-			taskID = state.ActiveTask
-		}
-		_ = trace.write(map[string]any{"type": "pending_confirmed", "tool_call": call})
-		approvalKey, approvalClass := taskApprovalKey(call, nil, rt.Config)
-		if taskApprovalCanReuse(call, rt.Config) {
-			state.AddTaskApproval(taskID, session.TaskApproval{Key: approvalKey, Tool: call.Name, Class: approvalClass})
-			_ = trace.write(map[string]any{"type": "approval_granted", "task_id": taskID, "tool": call.Name, "approval_key": approvalKey, "class": approvalClass})
-		}
-		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "confirm_tool", "command": firstNonEmpty(control, "approve")})
-		if call.Name == "script.run" {
-			if record, err := script.Authorize(rt.Config, strings.TrimSpace(fmt.Sprint(call.Args["name"]))); err == nil {
-				_ = trace.write(map[string]any{"type": "script_authorized", "script": record.Name, "path": record.Path, "source": record.Source, "hash": record.Hash})
-			}
-		}
-		if pending.AuthorizationOnly {
-			task := state.ActivateTask(taskID)
-			if task == nil {
-				task = state.EnsureTask("authorized script")
-			}
-			userText := mergeTaskAndInstruction(task.Goal, firstNonEmpty(pending.ResumeText, text))
-			_ = trace.write(map[string]any{"type": "pending_authorization_only_continue", "task_id": task.ID, "tool_call": call})
-			resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
-			return resp, true, err
-		}
-		result := rt.Tools.Execute(ctx, call)
-		toolDef, _ := rt.Tools.Get(call.Name)
-		observe := rt.Hooks.observe(ctx, ObserveHookInput{
-			Kind:       "tool_result",
-			State:      *state,
-			TaskID:     taskID,
-			ToolCall:   call,
-			Tool:       toolDef,
-			ToolResult: result,
-		}, trace)
-		status := ""
-		evidence := map[string]any{}
-		if observe.TaskStep != nil {
-			state.AddStep(taskID, *observe.TaskStep)
-			status = observe.TaskStep.Status
-			evidence = observe.TaskStep.Evidence
-		}
-		_ = trace.write(map[string]any{"type": "tool_execution_end", "tool_call": call, "tool_result": redactToolResult(result), "acceptance": status, "evidence": redactSecrets(evidence)})
-		state.Messages = append(state.Messages, agentcore.Message{Role: agentcore.RoleTool, ToolCallID: call.ID, Content: result.Content})
-		if proposalID := proposalIDFromEvidence(evidence); proposalID != "" {
-			state.Pending = &session.PendingAction{
-				Kind:       "agent_profile_proposal_review",
-				TaskID:     taskID,
-				ProposalID: proposalID,
-				Question:   runtimeText(rt.Config, msg, "agent_profile.review.question", nil),
-			}
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, result.Content, "completed"), true, nil
-		}
-		if result.IsError {
-			task := state.ActivateTask(taskID)
-			if task == nil {
-				task = state.EnsureTask("confirmed tool result")
-			}
-			_ = trace.write(map[string]any{
-				"type":      "pending_tool_failed_continue",
-				"task_id":   task.ID,
-				"tool_call": call,
-				"reason":    result.Content,
-			})
-			resp, err := rt.runTask(ctx, msg, state, task, "", trace)
-			return resp, true, err
-		}
-		task := state.ActivateTask(taskID)
-		if task == nil {
-			task = state.EnsureTask("confirmed tool result")
-		}
-		if call.Name == "schedule.create" && scheduleCreateRequiresTest(call) {
-			scheduleID := scheduleIDFromToolResult(result)
-			if scheduleID != "" {
-				state.Pending = &session.PendingAction{
-					Kind:       "schedule_review",
-					TaskID:     task.ID,
-					ScheduleID: scheduleID,
-					Question:   runtimeText(rt.Config, msg, "schedule.review.question", textValues("schedule_id", scheduleID)),
-				}
-				state.BlockActiveTask("await_schedule_test")
-				if err := rt.saveState(state, trace); err != nil {
-					return Response{}, true, err
-				}
-				_ = trace.write(map[string]any{"type": "schedule_review_pending", "schedule_id": scheduleID, "source": "pending_confirmed_tool"})
-				return rt.reply(msg, state.Pending.Question, "schedule_review_pending"), true, nil
-			}
-		}
-		replyText := rt.summarizeConfirmedToolResult(ctx, msg, *task, call, result, trace)
-		state.CompleteActiveTaskWithSummary(summarize(replyText), trace.id, trace.path)
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return rt.reply(msg, replyText, "completed"), true, nil
-	case "memory_proposal_review":
-		control, hasControl := rt.pendingControl(msg, text)
-		if hasControl {
-			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
-		}
-		action, ok := rt.parseMemoryProposalReviewAction(msg, text)
-		if !ok && (control == "approve" || control == "continue") {
-			action, ok = "commit", true
-		}
-		if !ok && (control == "ignore" || control == "cancel") {
-			action, ok = "reject", true
-		}
-		if !ok {
-			if rt.shouldBypassMemoryProposalReview(msg, text) {
-				_ = trace.write(map[string]any{"type": "memory_proposal_review_bypassed", "proposal_id": state.Pending.ProposalID, "text": text})
-				state.Pending = nil
-				if err := rt.saveState(state, trace); err != nil {
-					return Response{}, true, err
-				}
-				return Response{}, false, nil
-			}
-			_ = trace.write(map[string]any{"type": "memory_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
-			state.Pending = nil
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return Response{}, false, nil
-		}
-		taskID := state.Pending.TaskID
-		proposalID := state.Pending.ProposalID
-		state.Pending = nil
-		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "memory_proposal_review", "command": firstNonEmpty(control, action)})
-		store := memory.ProposalStore{Home: rt.home(), MemoryRoot: memoryRootForConfig(rt.Config)}
-		if action == "commit" {
-			proposal, target, err := store.Commit(proposalID)
-			if err != nil {
-				if saveErr := rt.saveState(state, trace); saveErr != nil {
-					return Response{}, true, saveErr
-				}
-				return rt.reply(msg, runtimeText(rt.Config, msg, "memory.commit.error", textValues("error", err.Error())), "error"), true, nil
-			}
-			_ = trace.write(map[string]any{"type": "memory_proposal_review_committed", "proposal_id": proposal.ID, "target": target})
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "memory.commit.done", textValues("target", target)), "completed"), true, nil
-		}
-		proposal, err := store.Reject(proposalID, "user ignored from conversation")
-		if err != nil {
-			if saveErr := rt.saveState(state, trace); saveErr != nil {
-				return Response{}, true, saveErr
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.error", textValues("error", err.Error())), "error"), true, nil
-		}
-		_ = trace.write(map[string]any{"type": "memory_proposal_review_rejected", "proposal_id": proposal.ID})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.done", nil), "completed"), true, nil
-	case "agent_profile_proposal_review":
-		control, hasControl := rt.pendingControl(msg, text)
-		if hasControl {
-			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
-		}
-		action, ok := rt.parseAgentProfileProposalReviewAction(msg, text)
-		if !ok && (control == "approve" || control == "continue") {
-			action, ok = "promote", true
-		}
-		if !ok && (control == "ignore" || control == "cancel") {
-			action, ok = "reject", true
-		}
-		if !ok {
-			if rt.shouldBypassAgentProfileProposalReview(msg, text) {
-				_ = trace.write(map[string]any{"type": "agent_profile_proposal_review_deferred", "proposal_id": state.Pending.ProposalID, "text": text})
-				state.Pending = nil
-				if err := rt.saveState(state, trace); err != nil {
-					return Response{}, true, err
-				}
-				return Response{}, false, nil
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.review.pending", nil), "agent_profile_review_pending"), true, nil
-		}
-		taskID := state.Pending.TaskID
-		proposalID := state.Pending.ProposalID
-		state.Pending = nil
-		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "agent_profile_proposal_review", "command": firstNonEmpty(control, action)})
-		store := agentprofile.NewStore(rt.Config)
-		if action == "promote" {
-			proposal, backupDir, err := store.Promote(proposalID)
-			if err != nil {
-				if saveErr := rt.saveState(state, trace); saveErr != nil {
-					return Response{}, true, saveErr
-				}
-				return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.promote.error", textValues("error", err.Error())), "error"), true, nil
-			}
-			_ = trace.write(map[string]any{"type": "agent_profile_proposal_promoted", "proposal_id": proposal.ID, "target": proposal.TargetPath, "backup_dir": backupDir})
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.promote.done", textValues("target", proposal.TargetPath, "backup", backupDir)), "completed"), true, nil
-		}
-		proposal, err := store.Reject(proposalID, "user rejected from conversation")
-		if err != nil {
-			if saveErr := rt.saveState(state, trace); saveErr != nil {
-				return Response{}, true, saveErr
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.reject.error", textValues("error", err.Error())), "error"), true, nil
-		}
-		_ = trace.write(map[string]any{"type": "agent_profile_proposal_rejected", "proposal_id": proposal.ID})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return rt.reply(msg, runtimeText(rt.Config, msg, "agent_profile.reject.done", nil), "completed"), true, nil
-	case "schedule_review":
-		control, hasControl := rt.pendingControl(msg, text)
-		if hasControl {
-			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": state.Pending.TaskID, "pending_kind": state.Pending.Kind, "text": text, "command": control})
-		}
-		action, ok := rt.parseScheduleReviewAction(msg, text)
-		if !ok && (control == "run" || control == "approve" || control == "continue") {
-			action, ok = "test", true
-		}
-		if !ok && control == "cancel" {
-			action, ok = "cancel", true
-		}
-		if !ok {
-			if shouldBypassScheduleReview(text) {
-				_ = trace.write(map[string]any{"type": "schedule_review_bypassed", "schedule_id": state.Pending.ScheduleID, "text": text})
-				state.Pending = nil
-				if err := rt.saveState(state, trace); err != nil {
-					return Response{}, true, err
-				}
-				return Response{}, false, nil
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.review.pending", textValues("schedule_id", state.Pending.ScheduleID)), "schedule_review_pending"), true, nil
-		}
-		scheduleID := state.Pending.ScheduleID
-		taskID := state.Pending.TaskID
-		state.Pending = nil
-		_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "schedule_review", "command": firstNonEmpty(control, action)})
-		if action == "cancel" {
-			store := schedule.Store{Home: rt.home()}
-			if _, err := store.Pause(scheduleID); err != nil {
-				if saveErr := rt.saveState(state, trace); saveErr != nil {
-					return Response{}, true, saveErr
-				}
-				return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.cancel.error", textValues("error", err.Error())), "error"), true, nil
-			}
-			blockTask(state, taskID, "cancelled")
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.cancel.done", nil), "cancelled"), true, nil
-		}
-		task, record, err := rt.testAndActivateSchedule(ctx, scheduleID)
-		if err != nil {
-			if saveErr := rt.saveState(state, trace); saveErr != nil {
-				return Response{}, true, saveErr
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.test.error", textValues("error", err.Error())), "error"), true, nil
-		}
-		state.ActivateTask(taskID)
-		state.CompleteActiveTaskWithSummary(runtimeText(rt.Config, msg, "schedule.test.summary", textValues("task_id", task.ID)), trace.id, trace.path)
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		_ = trace.write(map[string]any{"type": "schedule_review_tested", "schedule_id": task.ID, "run_id": record.ID, "status": record.Status})
-		return rt.reply(msg, runtimeText(rt.Config, msg, "schedule.test.done", textValues("task_id", task.ID, "run_at", task.RunAt)), "completed"), true, nil
-	case "archive_task_recall":
-		pending := *state.Pending
-		if rt.isCancel(msg, text) {
-			state.Pending = nil
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.archive_recall.cancelled", nil), "cancelled"), true, nil
-		}
-		if !rt.isConfirm(msg, text) {
-			return rt.reply(msg, pending.Question, "archive_recall_pending"), true, nil
-		}
-		archived, _, err := rt.Store.LoadArchive(state.Key, pending.ArchiveID)
-		if err != nil {
-			state.Pending = nil
-			if saveErr := rt.saveState(state, trace); saveErr != nil {
-				return Response{}, true, saveErr
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.archive_recall.load_error", textValues("error", err.Error())), "error"), true, nil
-		}
-		oldTask := taskByID(archived, pending.TaskID)
-		if oldTask == nil {
-			state.Pending = nil
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.archive_recall.missing", nil), "error"), true, nil
-		}
-		state.Pending = nil
-		userText := archivedTaskRecallText(*oldTask, pending.ArchiveID, text)
-		goal := strings.TrimSpace(pending.ResumeText)
-		if goal == "" {
-			goal = text
-		}
-		task := state.StartTask(goal)
-		applyCompletionContract(task, goal)
-		_ = trace.write(map[string]any{"type": "archive_task_recall_confirmed", "archive_id": pending.ArchiveID, "old_task_id": pending.TaskID, "new_task_id": task.ID})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
-		return resp, true, err
-	case "user_input":
-		pending := *state.Pending
-		if control, ok := rt.pendingControl(msg, text); ok {
-			_ = trace.write(map[string]any{"type": "pending_control_normalized", "task_id": pending.TaskID, "pending_kind": pending.Kind, "text": text, "command": control})
-			taskID := pending.TaskID
-			switch control {
-			case "cancel":
-				state.Pending = nil
-				blockTask(state, taskID, "cancelled")
-				if err := rt.saveState(state, trace); err != nil {
-					return Response{}, true, err
-				}
-				_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "user_input", "command": control})
-				return rt.reply(msg, runtimeText(rt.Config, msg, "runtime.cancelled", nil), "cancelled"), true, nil
-			case "approve", "continue", "run":
-				state.Pending = nil
-				state.Messages = append(state.Messages, agentcore.Message{Role: agentcore.RoleUser, Content: text})
-				if task := state.ActivateTask(taskID); task != nil {
-					userText := mergeTaskAndInstruction(task.Goal, text)
-					if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
-						applyCompletionContract(task, task.Goal)
-					}
-					_ = trace.write(map[string]any{"type": "pending_control_executed", "task_id": taskID, "pending_kind": "user_input", "command": control})
-					resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
-					return resp, true, err
-				}
-			}
-		}
-		_ = trace.write(map[string]any{"type": "pending_control_fallback_to_llm", "task_id": pending.TaskID, "pending_kind": pending.Kind, "text": text})
-		intentModel := rt.Pool.RoleModelForMessage(msg, "router", nil)
-		if intentModel == nil {
-			agent := rt.Pool.AgentForMessage(msg)
-			var fallback agentcore.Model
-			if agent != nil {
-				fallback = agent.Model
-			}
-			intentModel = rt.Pool.RoleModelForMessage(msg, "followup", fallback)
-		}
-		catalogDir := ""
-		if rt.Config != nil {
-			catalogDir = rt.Config.App.MessageCatalogDir
-		}
-		intent := rt.Hooks.pendingIntent(ctx, PendingIntentInput{State: *state, Pending: pending, Text: text, Model: intentModel, Locale: runtimeLocale(rt.Config, msg), CatalogDir: catalogDir}, trace)
-		switch intent.Kind {
-		case "new_task":
-			taskID := pending.TaskID
-			state.Pending = nil
-			blockTask(state, taskID, "interrupted")
-			if state.ActiveTask == taskID {
-				state.ActiveTask = ""
-			}
-			_ = trace.write(map[string]any{"type": "pending_user_input_bypassed", "task_id": taskID, "text": text, "reason": intent.Reason})
-			if err := rt.saveState(state, trace); err != nil {
-				return Response{}, true, err
-			}
-			return Response{}, false, nil
-		}
-		taskID := pending.TaskID
-		state.Pending = nil
-		state.Messages = append(state.Messages,
-			agentcore.Message{Role: agentcore.RoleUser, Content: text},
-		)
-		if task := state.ActivateTask(taskID); task != nil && intent.Kind == "action_ack" {
-			userText := mergeTaskAndInstruction(task.Goal, text)
-			_ = trace.write(map[string]any{"type": "pending_user_input_bound", "task_id": taskID, "text": text, "reason": intent.Reason})
-			if strings.TrimSpace(task.CompletionContract.SuccessCondition) == "" {
-				applyCompletionContract(task, task.Goal)
-			}
-			resp, err := rt.runTask(ctx, msg, state, task, userText, trace)
-			return resp, true, err
-		}
-		_ = trace.write(map[string]any{"type": "pending_user_input", "task_id": taskID, "text": text, "reason": intent.Reason})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return Response{}, false, nil
-	default:
-		state.Pending = nil
-		return Response{}, false, nil
-	}
-}
-
-func (rt Runtime) summarizeConfirmedToolResult(ctx context.Context, msg channel.InboundMessage, task session.TaskNode, call agentcore.ToolCall, result agentcore.ToolResult, trace *traceRecorder) string {
-	agent := rt.Pool.AgentForMessage(msg)
-	if agent == nil {
-		agent = agentcore.NewAgent(rt.Model, rt.Tools)
-	}
-	if agent.Model == nil {
-		return result.Content
-	}
-	modelCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	summary, err := agent.Model.Next(modelCtx, agentcore.Context{
-		SystemPrompt: "Summarize a confirmed tool execution for the original task. Do not call tools. Return a concise user-facing task-level update.",
-		Messages: []agentcore.Message{{
-			Role: agentcore.RoleUser,
-			Content: "Original task:\n" + task.Goal +
-				"\n\nConfirmed tool:\n" + call.Name +
-				"\n\nTool output:\n" + result.Content +
-				"\n\nExplain what was completed and what remains, if anything.",
-		}},
-		Tools: nil,
-	})
-	if err != nil {
-		_ = trace.write(map[string]any{"type": "pending_confirm_summary_error", "error": err.Error()})
-		return result.Content
-	}
-	text := strings.TrimSpace(summary.Content)
-	if text == "" {
-		return result.Content
-	}
-	return text
-}
-
-func (rt Runtime) parseMemoryProposalReviewAction(msg channel.InboundMessage, text string) (string, bool) {
-	action, ok := runtimeAlias(rt.Config, msg, text, "memory_commit", "memory_reject")
-	switch {
-	case ok && action == "memory_commit":
-		return "commit", true
-	case ok && action == "memory_reject":
-		return "reject", true
-	default:
-		return "", false
-	}
-}
-
-func (rt Runtime) shouldBypassMemoryProposalReview(msg channel.InboundMessage, text string) bool {
-	normalized := normalizeFollowupText(text)
-	if normalized == "" {
-		return false
-	}
-	if rt.isConfirm(msg, normalized) || rt.isCancel(msg, normalized) {
-		return false
-	}
-	if isShortContextDependent(normalized) {
-		return false
-	}
-	return true
-}
-
-func (rt Runtime) parseAgentProfileProposalReviewAction(msg channel.InboundMessage, text string) (string, bool) {
-	action, ok := runtimeAlias(rt.Config, msg, text, "promote", "reject")
-	switch {
-	case ok && action == "promote":
-		return "promote", true
-	case ok && action == "reject":
-		return "reject", true
-	default:
-		return "", false
-	}
-}
-
-func (rt Runtime) shouldBypassAgentProfileProposalReview(msg channel.InboundMessage, text string) bool {
-	normalized := normalizeFollowupText(text)
-	if normalized == "" || rt.isConfirm(msg, normalized) || rt.isCancel(msg, normalized) || isShortContextDependent(normalized) {
-		return false
-	}
-	return true
-}
-
-func (rt Runtime) parseScheduleReviewAction(msg channel.InboundMessage, text string) (string, bool) {
-	action, ok := runtimeAlias(rt.Config, msg, text, "run", "cancel")
-	switch {
-	case ok && action == "run":
-		return "test", true
-	case ok && action == "cancel":
-		return "cancel", true
-	default:
-		return "", false
-	}
-}
-
-func shouldBypassScheduleReview(text string) bool {
-	normalized := normalizeFollowupText(text)
-	return looksLikeStandaloneTaskRequest(normalized)
-}
-
-func (rt Runtime) testAndActivateSchedule(ctx context.Context, scheduleID string) (schedule.Task, schedule.RunRecord, error) {
-	store := schedule.Store{Home: rt.home()}
-	task, err := store.Read(scheduleID)
-	if err != nil {
-		return task, schedule.RunRecord{}, err
-	}
-	startedAt := time.Now()
-	sessionKey := strings.TrimSpace(task.SessionKey)
-	if sessionKey == "" {
-		sessionKey = "schedule:" + task.ID
-	}
-	runRuntime := New(rt.Config)
-	resp, runErr := runRuntime.Handle(ctx, channel.InboundMessage{
-		ID:         task.ID,
-		Channel:    "schedule",
-		SessionKey: sessionKey,
-		Text:       task.Text,
-		Metadata:   map[string]string{"scheduled_task_id": task.ID, "scheduled_run_kind": "test"},
-	})
-	status := "success"
-	errText := ""
-	output := ""
-	tracePath := ""
-	if runErr != nil {
-		status = "error"
-		errText = runErr.Error()
-	} else {
-		output = strings.TrimSpace(resp.Reply.Text)
-		tracePath = resp.TracePath
-		if resp.Failed {
-			status = "error"
-			errText = strings.TrimSpace(resp.Reply.Text)
-		}
-	}
-	record, recordErr := store.RecordRun(schedule.RunRecord{
-		TaskID:     task.ID,
-		Kind:       "test",
-		Status:     status,
-		StartedAt:  startedAt.Format(time.RFC3339),
-		FinishedAt: time.Now().Format(time.RFC3339),
-		SessionKey: sessionKey,
-		Output:     output,
-		TracePath:  tracePath,
-		Error:      errText,
-	})
-	if recordErr != nil {
-		return task, record, recordErr
-	}
-	if status != "success" {
-		if markErr := store.MarkError(task, time.Now(), record); markErr != nil {
-			return task, record, markErr
-		}
-		return task, record, fmt.Errorf(firstNonEmpty(errText, "scheduled task test failed"))
-	}
-	if err := store.MarkTested(task, time.Now(), record); err != nil {
-		return task, record, err
-	}
-	task, err = store.Read(scheduleID)
-	return task, record, err
-}
-
-func blockTask(state *session.State, taskID, status string) {
-	if state == nil || strings.TrimSpace(taskID) == "" {
-		return
-	}
-	for i := range state.Tasks {
-		if state.Tasks[i].ID == taskID {
-			state.Tasks[i].Status = status
-			state.Tasks[i].UpdatedAt = time.Now()
-			return
-		}
-	}
-}
-
-func shouldBypassUserInputPending(pending *session.PendingAction, text string) bool {
-	if pending == nil || pending.Kind != "user_input" {
-		return false
-	}
-	normalized := normalizeFollowupText(text)
-	if normalized == "" || isConfirm(normalized) || isCancel(normalized) {
-		return false
-	}
-	if isFollowupCue(normalized) || isHistoricalCue(normalized) || isRetryCue(normalized) || isShortContextDependent(normalized) {
-		return false
-	}
-	return looksLikeStandaloneTaskRequest(normalized)
-}
-
-func looksLikeStandaloneTaskRequest(text string) bool {
-	hasVerb := false
-	for _, verb := range runtimeCueList(nil, "router.standalone_task.verbs") {
-		if strings.Contains(text, verb) {
-			hasVerb = true
-			break
-		}
-	}
-	if !hasVerb {
-		return false
-	}
-	for _, marker := range runtimeCueList(nil, "router.standalone_task.markers") {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string, map[string]any) {
-	evidence := map[string]any{}
-	for key, value := range result.Evidence {
-		evidence[key] = value
-	}
-	if tool != nil {
-		contract := agentcore.ContractFor(tool)
-		risk := tool.Risk()
-		evidence["risk"] = string(risk)
-		evidence["mutation"] = risk == agentcore.RiskGuardedMutation || risk == agentcore.RiskDangerous
-		if contract.Acceptance != "" {
-			evidence["acceptance_criteria"] = contract.Acceptance
-		}
-		if contract.Evidence != "" {
-			evidence["evidence_contract"] = contract.Evidence
-		}
-	}
-	if result.IsError {
-		evidence["acceptance"] = "failed"
-		return "failed", evidence
-	}
-	if len(result.Evidence) == 0 && strings.TrimSpace(result.Content) == "" {
-		evidence["acceptance"] = "suspect"
-		return "suspect", evidence
-	}
-	evidence["acceptance"] = "accepted"
-	return "accepted", evidence
-}
-
-func (rt Runtime) reply(msg channel.InboundMessage, text, style string) Response {
-	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style, Locale: runtimeLocale(rt.Config, msg)}}
-}
-
-func (rt Runtime) isConfirm(msg channel.InboundMessage, text string) bool {
-	_, ok := runtimeAlias(rt.Config, msg, text, "confirm")
-	return ok
-}
-
-func (rt Runtime) isCancel(msg channel.InboundMessage, text string) bool {
-	_, ok := runtimeAlias(rt.Config, msg, text, "cancel")
-	return ok
-}
-
-func (rt Runtime) pendingControl(msg channel.InboundMessage, text string) (string, bool) {
-	action, ok := runtimeAlias(rt.Config, msg, text, "approve", "confirm", "continue", "run", "ignore", "cancel")
-	if !ok {
-		return "", false
-	}
-	switch action {
-	case "confirm":
-		return "approve", true
-	case "approve", "continue", "run", "ignore", "cancel":
-		return action, true
-	default:
-		return "", false
-	}
-}
-
-func isConfirm(text string) bool {
-	_, ok := i18n.New(i18n.Config{}).MatchAlias("", text, "confirm")
-	return ok
-}
-
-func isCancel(text string) bool {
-	_, ok := i18n.New(i18n.Config{}).MatchAlias("", text, "cancel")
-	return ok
-}
-
-func summarize(text string) string {
-	text = strings.TrimSpace(text)
-	if len(text) <= 160 {
-		return text
-	}
-	return text[:160] + fmt.Sprintf("... (%d chars)", len(text))
-}
-
-func finalTextWarning(text string) string {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	switch {
-	case containsAny(lower, runtimeCueList(nil, "router.warning.malformed_cues")):
-		return "tool_call_format_issue"
-	case looksLikeNonSubstantiveActionAck(text):
-		return "non_substantive_action_ack"
-	case looksLikeUnexecutedNextStep(text):
-		return "unexecuted_next_step"
-	default:
-		return ""
-	}
-}
-
-func looksLikeUnexecutedNextStep(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return true
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, "：") {
-		return true
-	}
-	for _, phrase := range runtimeCueList(nil, "router.unexecuted.pending_phrases") {
-		if strings.Contains(lower, phrase) || strings.Contains(trimmed, phrase) {
-			return true
-		}
-	}
-	hasAction := false
-	for _, cue := range runtimeCueList(nil, "router.unexecuted.action_cues") {
-		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
-			hasAction = true
-			break
-		}
-	}
-	if !hasAction {
-		return false
-	}
-	for _, cue := range runtimeCueList(nil, "router.unexecuted.work_cues") {
-		if strings.Contains(lower, cue) || strings.Contains(trimmed, cue) {
-			return true
-		}
-	}
-	return false
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
+func (rt Runtime) reply(msg channel.InboundMessage, text string, style channel.MessageStyle) Response {
+	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style}}
 }
 
 func containsAny(text string, markers []string) bool {
@@ -1990,53 +653,62 @@ func containsAny(text string, markers []string) bool {
 	return false
 }
 
-type HeuristicModel struct{}
-
-func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
-	last := lastConversationMessage(ctx.Messages)
-	if last.Role == agentcore.RoleTool {
-		return agentcore.Message{Role: agentcore.RoleAssistant, Content: last.Content}, nil
+func turnHasToolEvidence(turn agentcore.TurnContext) bool {
+	if len(turn.ToolResults) > 0 {
+		return true
 	}
-	text := strings.TrimSpace(last.Content)
-	if path, ok := strings.CutPrefix(text, "/read "); ok {
-		return agentcore.Message{
-			Role: agentcore.RoleAssistant,
-			ToolCalls: []agentcore.ToolCall{{
-				ID:   "call_1",
-				Name: "file.read",
-				Args: map[string]any{"path": strings.TrimSpace(path)},
-			}},
-		}, nil
-	}
-	if path, ok := strings.CutPrefix(text, "/index "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": strings.TrimSpace(path)}}}}, nil
-	}
-	if rest, ok := strings.CutPrefix(text, "/write "); ok {
-		path, content, _ := strings.Cut(rest, " ")
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.write", Args: map[string]any{"path": strings.TrimSpace(path), "content": strings.TrimSpace(content)}}}}, nil
-	}
-	if command, ok := strings.CutPrefix(text, "/run "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": strings.TrimSpace(command)}}}}, nil
-	}
-	if query, ok := strings.CutPrefix(text, "/search "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": strings.TrimSpace(query)}}}}, nil
-	}
-	if rest, ok := strings.CutPrefix(text, "/schedule "); ok {
-		parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
-		if len(parts) == 2 {
-			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.create", Args: map[string]any{"run_at": parts[0], "text": parts[1], "session_key": "cli:scheduled"}}}}, nil
+	for _, msg := range turn.Messages {
+		if msg.Role == agentcore.RoleTool {
+			return true
 		}
 	}
-	return agentcore.Message{Role: agentcore.RoleAssistant, Content: i18n.New(i18n.Config{}).T(i18n.LocaleZH, "runtime.heuristic.echo", textValues("text", text))}, nil
+	return false
 }
 
-func lastConversationMessage(messages []agentcore.Message) agentcore.Message {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role != agentcore.RoleSystem {
-			return messages[i]
+func needsAction(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"read", "check", "inspect", "look at", "review", "fix", "run", "test", "build", "create", "write", "update", "delete", "commit", "trace", "source code", "file", "directory", "repo", "/users/", "~/.mateway",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
 		}
 	}
-	return agentcore.Message{}
+	return false
+}
+
+func looksLikeUnexecutedCommitment(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"i will ", "i'll ", "let me ", "i'm going to ", "i am going to ", "next i will ", "i need to ", "i should ", "i plan to ", "will check", "will inspect", "will run", "will create", "will update",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeUnexecutedAction(text string) bool {
+	return looksLikeUnexecutedCommitment(text) || looksLikeEmptyActionPromise(text)
+}
+
+func mergeTaskAndInstruction(goal, instruction string) string {
+	goal = strings.TrimSpace(goal)
+	instruction = strings.TrimSpace(instruction)
+	switch {
+	case goal == "":
+		return instruction
+	case instruction == "":
+		return goal
+	case strings.EqualFold(goal, instruction):
+		return instruction
+	default:
+		return "Active task:\n" + goal + "\n\nNew user message:\n" + instruction
+	}
 }
 
 func looksLikeInputRequest(text string) bool {
@@ -2059,10 +731,33 @@ func looksLikeInputRequest(text string) bool {
 		containsAny(lower, runtimeCueList(nil, "router.input_request.question"))
 }
 
+func looksLikeEmptyActionPromise(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	if len([]rune(trimmed)) > 120 {
+		return false
+	}
+	if !strings.HasSuffix(trimmed, ":") && !strings.HasSuffix(trimmed, "：") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if containsAny(lower, []string{"i will", "i'll", "let me", "first", "then", "now i", "checking", "confirm"}) {
+		return true
+	}
+	return len([]rune(trimmed)) <= 40
+}
+
 func friendlyRuntimeError(cfg *config.Root, msg channel.InboundMessage, err error) string {
+	if errors.Is(err, errContextBudgetHardLimit) {
+		return runtimeText(cfg, msg, "runtime.context_budget_exceeded", nil)
+	}
 	raw := strings.TrimSpace(fmt.Sprint(err))
 	lower := strings.ToLower(raw)
 	switch {
+	case err == context.Canceled || strings.Contains(lower, "context canceled"):
+		return runtimeText(cfg, msg, "runtime.error.cancelled", nil)
 	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout"):
 		return runtimeText(cfg, msg, "runtime.error.timeout", nil)
 	case strings.Contains(lower, "model api key is empty"):

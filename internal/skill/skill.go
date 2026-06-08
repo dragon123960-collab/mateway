@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/secret"
+	"gopkg.in/yaml.v3"
 )
 
 type Skill struct {
@@ -51,8 +53,17 @@ type InstallInput struct {
 }
 
 type InstallResult struct {
-	Name string
-	Path string
+	Name         string
+	Path         string
+	MetadataPath string
+}
+
+type Metadata struct {
+	AdapterVersion string    `yaml:"adapter_version"`
+	Source         string    `yaml:"source"`
+	InstalledAt    time.Time `yaml:"installed_at"`
+	ToolRuntime    string    `yaml:"tool_runtime"`
+	Notes          []string  `yaml:"notes,omitempty"`
 }
 
 func List(workspace string) ([]Skill, error) {
@@ -165,7 +176,49 @@ func Install(input InstallInput) (InstallResult, error) {
 	if err := os.WriteFile(target, data, 0o644); err != nil {
 		return InstallResult{}, err
 	}
-	return InstallResult{Name: name, Path: target}, nil
+	metadataPath, err := writeMetadata(filepath.Dir(target), Metadata{
+		AdapterVersion: "1",
+		Source:         source,
+		InstalledAt:    time.Now().UTC(),
+		ToolRuntime:    "mateway",
+		Notes: []string{
+			"Original SKILL.md is preserved. Mateway-specific adaptation lives in this metadata directory.",
+			"Use terminal.run for command execution; use file.read/write/delete for local files; use secret.set and terminal.run.env_secrets for credentials.",
+		},
+	})
+	if err != nil {
+		return InstallResult{}, err
+	}
+	return InstallResult{Name: name, Path: target, MetadataPath: metadataPath}, nil
+}
+
+func ReadMetadata(skillDir string) (Metadata, bool, error) {
+	path := filepath.Join(skillDir, ".mateway", "metadata.yaml")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return Metadata{}, false, nil
+	}
+	if err != nil {
+		return Metadata{}, false, err
+	}
+	var metadata Metadata
+	if err := yaml.Unmarshal(data, &metadata); err != nil {
+		return Metadata{}, false, err
+	}
+	return metadata, true, nil
+}
+
+func writeMetadata(skillDir string, metadata Metadata) (string, error) {
+	dir := filepath.Join(skillDir, ".mateway")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "metadata.yaml")
+	data, err := yaml.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, data, 0o644)
 }
 
 func ParseHeader(text string) Skill {

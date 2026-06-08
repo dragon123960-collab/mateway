@@ -8,14 +8,16 @@ import (
 type EventType string
 
 const (
-	EventAgentStart         EventType = "agent_start"
-	EventAgentEnd           EventType = "agent_end"
-	EventTurnStart          EventType = "turn_start"
-	EventTurnEnd            EventType = "turn_end"
-	EventMessageStart       EventType = "message_start"
-	EventMessageEnd         EventType = "message_end"
-	EventToolExecutionStart EventType = "tool_execution_start"
-	EventToolExecutionEnd   EventType = "tool_execution_end"
+	EventAgentStart            EventType = "agent_start"
+	EventAgentEnd              EventType = "agent_end"
+	EventTurnStart             EventType = "turn_start"
+	EventTurnEnd               EventType = "turn_end"
+	EventModelStart            EventType = "model_start"
+	EventMessageStart          EventType = "message_start"
+	EventMessageEnd            EventType = "message_end"
+	EventToolExecutionStart    EventType = "tool_execution_start"
+	EventToolExecutionProgress EventType = "tool_execution_progress"
+	EventToolExecutionEnd      EventType = "tool_execution_end"
 )
 
 type Event struct {
@@ -35,9 +37,16 @@ type BeforeToolCallContext struct {
 	Tool     Tool
 }
 
+type ToolExecutionContext struct {
+	Message  Message
+	ToolCall ToolCall
+	Tool     Tool
+}
+
 type BeforeToolCallResult struct {
-	Block  bool
-	Reason string
+	Block   bool
+	Reason  string
+	Context context.Context
 }
 
 type AfterToolCallContext struct {
@@ -65,11 +74,13 @@ type NextTurnUpdate struct {
 }
 
 type Hooks struct {
-	Emit                EventSink
-	BeforeToolCall      func(context.Context, BeforeToolCallContext) (BeforeToolCallResult, error)
-	AfterToolCall       func(context.Context, AfterToolCallContext) (AfterToolCallResult, error)
-	ShouldStopAfterTurn func(context.Context, TurnContext) (bool, error)
-	PrepareNextTurn     func(context.Context, TurnContext) (NextTurnUpdate, error)
-	GetSteeringMessages func(context.Context) ([]Message, error)
-	GetFollowUpMessages func(context.Context) ([]Message, error)
+	Emit                 EventSink
+	BeforeToolCall       func(context.Context, BeforeToolCallContext) (BeforeToolCallResult, error)
+	AfterToolCall        func(context.Context, AfterToolCallContext) (AfterToolCallResult, error)
+	ToolTimeout          func(ToolExecutionContext) time.Duration
+	ToolProgressInterval func(ToolExecutionContext) time.Duration
+	ShouldStopAfterTurn  func(context.Context, TurnContext) (bool, error)
+	PrepareNextTurn      func(context.Context, TurnContext) (NextTurnUpdate, error)
+	GetSteeringMessages  func(context.Context) ([]Message, error)
+	GetFollowUpMessages  func(context.Context) ([]Message, error)
 }

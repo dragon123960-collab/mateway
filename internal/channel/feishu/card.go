@@ -2,11 +2,10 @@ package feishu
 
 import (
 	"encoding/json"
-	"os"
+	"strconv"
 	"strings"
 
 	"github.com/dongping/mateway/internal/channel"
-	"github.com/dongping/mateway/internal/i18n"
 )
 
 func renderReplyMessage(reply channel.OutboundMessage) (string, string, error) {
@@ -37,7 +36,6 @@ func renderReplyCard(reply channel.OutboundMessage, text string) (string, string
 }
 
 func buildCardElements(reply channel.OutboundMessage, text string) []map[string]any {
-	actions := approvalActions(reply)
 	elements := []map[string]any{
 		{
 			"tag": "div",
@@ -47,13 +45,19 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			},
 		},
 	}
-	if len(actions) > 0 {
+	if len(reply.Progress) > 0 {
 		elements = append(elements, map[string]any{
-			"tag":     "action",
-			"actions": actions,
+			"tag": "hr",
+		})
+		elements = append(elements, map[string]any{
+			"tag": "div",
+			"text": map[string]any{
+				"tag":     "lark_md",
+				"content": "**Process**\n" + renderProgress(reply.Progress),
+			},
 		})
 	}
-	if note := cardFooterNote(reply, text, len(actions) > 0); note != "" {
+	if note := cardFooterNote(reply); note != "" {
 		elements = append(elements, map[string]any{
 			"tag": "note",
 			"elements": []map[string]any{
@@ -67,63 +71,70 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 	return elements
 }
 
-func approvalActions(reply channel.OutboundMessage) []map[string]any {
-	if strings.TrimSpace(reply.Style) != "approval_pending" {
-		return nil
-	}
-	if !feishuApprovalButtonsEnabled() {
-		return nil
-	}
-	locale := feishuReplyLocale(reply)
-	catalog := i18n.New(i18n.Config{})
-	value := func(decision, text string) map[string]any {
-		out := map[string]any{
-			"mateway_action": "approval",
-			"decision":       decision,
-			"mateway_text":   text,
+func renderProgress(steps []channel.ProgressStep) string {
+	var b strings.Builder
+	for _, step := range steps {
+		line := renderProgressLine(step)
+		if line == "" {
+			continue
 		}
-		if threadID := strings.TrimSpace(reply.ThreadID); threadID != "" {
-			out["mateway_thread_id"] = threadID
-			out["mateway_session_key"] = firstNonEmpty(strings.TrimSpace(reply.Channel), "feishu") + ":" + threadID
+		if b.Len() > 0 {
+			b.WriteString("\n")
 		}
-		return out
+		b.WriteString(line)
 	}
-	return []map[string]any{
-		{
-			"tag":  "button",
-			"type": "primary",
-			"text": map[string]any{
-				"tag":     "plain_text",
-				"content": catalog.T(locale, "feishu.button.confirm", nil),
-			},
-			"value": value("confirm", catalog.T(locale, "aliases.confirm.primary", nil)),
-		},
-		{
-			"tag":  "button",
-			"type": "default",
-			"text": map[string]any{
-				"tag":     "plain_text",
-				"content": catalog.T(locale, "feishu.button.cancel", nil),
-			},
-			"value": value("cancel", catalog.T(locale, "aliases.cancel.primary", nil)),
-		},
-	}
+	return b.String()
 }
 
-func feishuApprovalButtonsEnabled() bool {
-	value := strings.ToLower(strings.TrimSpace(os.Getenv("MATEWAY_FEISHU_APPROVAL_BUTTONS")))
-	return value == "1" || value == "true" || value == "yes" || value == "on"
+func renderProgressLine(step channel.ProgressStep) string {
+	title := firstNonEmpty(strings.TrimSpace(step.Tool), strings.TrimSpace(step.Title))
+	if title == "" {
+		return ""
+	}
+	status := strings.TrimSpace(step.Status)
+	if status == "" {
+		status = "recorded"
+	}
+	var details []string
+	details = append(details, status)
+	if step.DurationMS > 0 {
+		details = append(details, formatDurationMS(step.DurationMS))
+	}
+	if step.TimedOut {
+		details = append(details, "timed out")
+	}
+	if summary := strings.TrimSpace(step.Summary); summary != "" {
+		details = append(details, truncateProgressText(summary, 72))
+	}
+	return "- `" + escapeInlineCode(title) + "`: " + strings.Join(details, " / ")
 }
 
-func headerTemplateForStyle(style string) string {
-	switch strings.TrimSpace(style) {
-	case "approval_pending":
+func truncateProgressText(text string, limit int) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
+}
+
+func formatDurationMS(ms int64) string {
+	if ms >= 1000 {
+		return strconv.FormatFloat(float64(ms)/1000, 'f', 1, 64) + "s"
+	}
+	return strconv.FormatInt(ms, 10) + "ms"
+}
+
+func escapeInlineCode(text string) string {
+	return strings.ReplaceAll(text, "`", "'")
+}
+
+func headerTemplateForStyle(style channel.MessageStyle) string {
+	switch style {
+	case channel.StylePartial:
 		return "orange"
-	case "partial":
-		return "orange"
-	case "input_required":
+	case channel.StyleInputRequired, channel.StyleProcessing:
 		return "blue"
-	case "error":
+	case channel.StyleError:
 		return "red"
 	default:
 		return "green"
@@ -134,72 +145,27 @@ func feishuCardTitle(reply channel.OutboundMessage) string {
 	if title := strings.TrimSpace(reply.Title); title != "" {
 		return title
 	}
-	catalog := i18n.New(i18n.Config{})
-	locale := feishuReplyLocale(reply)
-	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending":
-		return catalog.T(locale, "feishu.title.approval_pending", nil)
-	case "input_required":
-		return catalog.T(locale, "feishu.title.input_required", nil)
-	case "error":
-		return catalog.T(locale, "feishu.title.error", nil)
+	switch reply.Style {
+	case channel.StyleInputRequired:
+		return "Mateway Needs More Information"
+	case channel.StyleError:
+		return "Mateway Failed"
 	default:
-		return catalog.T(locale, "feishu.title.default", nil)
+		return "Mateway"
 	}
 }
 
-func cardFooterNote(reply channel.OutboundMessage, text string, hasActions bool) string {
-	catalog := i18n.New(i18n.Config{})
-	locale := feishuReplyLocale(reply)
-	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending":
-		if hasActions || approvalTextMentionsConfirmAndCancel(text) {
-			return ""
-		}
-		return catalog.T(locale, "feishu.footer.approval_pending", nil)
-	case "partial":
-		return catalog.T(locale, "feishu.footer.partial", nil)
-	case "input_required":
-		return catalog.T(locale, "feishu.footer.input_required", nil)
-	case "error":
-		return catalog.T(locale, "feishu.footer.error", nil)
+func cardFooterNote(reply channel.OutboundMessage) string {
+	switch reply.Style {
+	case channel.StylePartial:
+		return "Status: partial"
+	case channel.StyleInputRequired:
+		return "Please reply directly with the missing information."
+	case channel.StyleError:
+		return "The task stopped at a safe point. You can add more information and retry."
 	default:
-		return catalog.T(locale, "feishu.footer.default", map[string]string{"status": firstNonEmpty(strings.TrimSpace(reply.Style), "completed")})
+		return "Status: " + firstNonEmpty(strings.TrimSpace(string(reply.Style)), string(channel.StyleCompleted))
 	}
-}
-
-func approvalTextMentionsConfirmAndCancel(text string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(text))
-	if normalized == "" {
-		return false
-	}
-	catalog := i18n.New(i18n.Config{})
-	hasConfirm := false
-	for _, cue := range splitCardCueList(catalog.T(i18n.LocaleZH, "feishu.approval_text.confirm_cues", nil)) {
-		if strings.Contains(normalized, cue) {
-			hasConfirm = true
-			break
-		}
-	}
-	hasCancel := false
-	for _, cue := range splitCardCueList(catalog.T(i18n.LocaleZH, "feishu.approval_text.cancel_cues", nil)) {
-		if strings.Contains(normalized, cue) {
-			hasCancel = true
-			break
-		}
-	}
-	return hasConfirm && hasCancel
-}
-
-func splitCardCueList(text string) []string {
-	var out []string
-	for _, item := range strings.Split(text, ",") {
-		item = strings.TrimSpace(strings.ToLower(item))
-		if item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
 }
 
 func sanitizeFeishuText(reply channel.OutboundMessage) string {
@@ -261,22 +227,14 @@ func looksLikeToolCallDetailLine(lower, trimmed string) bool {
 }
 
 func fallbackFeishuText(reply channel.OutboundMessage) string {
-	catalog := i18n.New(i18n.Config{})
-	locale := feishuReplyLocale(reply)
-	switch strings.TrimSpace(reply.Style) {
-	case "approval_pending":
-		return catalog.T(locale, "feishu.fallback.approval_pending", nil)
-	case "input_required":
-		return catalog.T(locale, "feishu.fallback.input_required", nil)
-	case "error":
-		return catalog.T(locale, "feishu.fallback.error", nil)
+	switch reply.Style {
+	case channel.StyleInputRequired:
+		return "I need one more piece of information before I can continue."
+	case channel.StyleError:
+		return "The task failed and stopped at a safe point."
 	default:
-		return catalog.T(locale, "feishu.fallback.default", nil)
+		return "Done."
 	}
-}
-
-func feishuReplyLocale(reply channel.OutboundMessage) string {
-	return i18n.ResolveLocale(reply.Locale, reply.Text)
 }
 
 func looksLikeJSONToolPlan(text string) bool {

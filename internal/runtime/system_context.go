@@ -17,14 +17,17 @@ import (
 func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConfig) string {
 	var b strings.Builder
 	b.WriteString("Runtime context:\n")
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
+	loc, timezone := cfg.TimezoneLocation()
+	now := time.Now().In(loc)
 	today := now.Format("2006-01-02")
 	b.WriteString("- Current date: ")
 	b.WriteString(today)
 	b.WriteString("\n")
 	b.WriteString("- Current time: ")
 	b.WriteString(now.Format("15:04"))
-	b.WriteString(" Asia/Shanghai\n")
+	b.WriteString(" ")
+	b.WriteString(timezone)
+	b.WriteString("\n")
 	b.WriteString("- Operating system: ")
 	b.WriteString(runtime.GOOS)
 	b.WriteString("/")
@@ -39,7 +42,7 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 	if cfg != nil {
 		writeContextLine(&b, "- Mateway home: ", cfg.App.Home)
 		writeContextLine(&b, "- Workspace root: ", cfg.App.Workspace)
-		b.WriteString(fmt.Sprintf("- Security: enforce_workspace_paths=%v, require_approval_for_risky_tools=%v\n", cfg.Security.EnforceWorkspacePaths, cfg.Security.RequireApprovalForRiskyTool))
+		b.WriteString(fmt.Sprintf("- Security: enforce_workspace_paths=%v, terminal_sandbox=%v\n", cfg.Security.EnforceWorkspacePaths, cfg.Security.TerminalSandbox.Enabled))
 		if len(cfg.Search.ProviderOrder) > 0 {
 			b.WriteString("- Web search provider order: ")
 			b.WriteString(strings.Join(cfg.Search.ProviderOrder, ", "))
@@ -113,11 +116,74 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	}
 	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
 	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
+	b.WriteString("- A message like \"I will check now\" or \"let me confirm\" is not a final answer. If you say you will check, confirm, create, update, or inspect something, call the required tool in the same turn.\n")
+	b.WriteString("- For long tasks, work in verifiable stages, preserve completed stage evidence, and summarize progress between stages when possible.\n")
+	b.WriteString("- If a tool is slow, cancelled, or timed out, name the tool, elapsed time, and fallback action instead of asking the user to keep waiting.\n")
+	b.WriteString("- When creating or updating long-term memory pages under workspace/memory/agents/<agent>/, update that agent's index.md navigation page in the same task.\n")
 	if prompt := strings.TrimSpace(systemPrompt); prompt != "" {
 		b.WriteString("\n")
 		b.WriteString(prompt)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func appendPreviousTaskContext(systemPrompt string, state session.State, currentTaskID string) string {
+	tasks := recentPreviousTasks(state, currentTaskID, 3)
+	sessionSummary := renderSessionSummaryContext(state.Summary)
+	if len(tasks) == 0 && sessionSummary == "" {
+		return strings.TrimSpace(systemPrompt)
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(systemPrompt))
+	if b.Len() > 0 {
+		b.WriteString("\n\n")
+	}
+	if sessionSummary != "" {
+		b.WriteString(sessionSummary)
+		b.WriteString("\n\n")
+	}
+	if len(tasks) == 0 {
+		return strings.TrimSpace(b.String())
+	}
+	b.WriteString("Continuity judgment:\n")
+	b.WriteString("- These are recent tasks from this session, not active instructions by themselves.\n")
+	b.WriteString("- Use them to decide whether the current user message is likely continuing prior work, especially when the message is short, has no clear standalone object, or appears to confirm a blocker from a prior task.\n")
+	b.WriteString("- If the current message is clearly a new task, ignore this context and work on the current task.\n")
+	b.WriteString("- If the user likely wants to continue a previous task, continue toward that previous task's original goal rather than treating the short message as the whole goal.\n")
+	for _, task := range tasks {
+		b.WriteString("- title: ")
+		b.WriteString(summarize(task.Goal))
+		b.WriteString("\n  status: ")
+		b.WriteString(defaultText(task.Status, "unknown"))
+		if strings.TrimSpace(task.Summary) != "" {
+			b.WriteString("\n  summary: ")
+			b.WriteString(summarize(task.Summary))
+		}
+		if strings.TrimSpace(task.TraceID) != "" {
+			b.WriteString("\n  trace_id: ")
+			b.WriteString(strings.TrimSpace(task.TraceID))
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func recentPreviousTasks(state session.State, currentTaskID string, limit int) []session.TaskNode {
+	if limit <= 0 {
+		return nil
+	}
+	var out []session.TaskNode
+	for i := len(state.Tasks) - 1; i >= 0 && len(out) < limit; i-- {
+		task := state.Tasks[i]
+		if task.ID == currentTaskID {
+			continue
+		}
+		out = append(out, task)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 func splitMergedTaskInstruction(text string) (string, string, bool) {

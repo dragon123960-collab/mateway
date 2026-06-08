@@ -14,34 +14,33 @@ type State struct {
 	Key        string              `json:"key"`
 	Messages   []agentcore.Message `json:"messages"`
 	Tasks      []TaskNode          `json:"tasks,omitempty"`
+	Summary    SessionSummary      `json:"summary,omitempty"`
 	ActiveTask string              `json:"active_task,omitempty"`
 	Pending    *PendingAction      `json:"pending,omitempty"`
 	Usage      Usage               `json:"usage,omitempty"`
 	UpdatedAt  time.Time           `json:"updated_at"`
 }
 
-type TaskNode struct {
-	ID                 string             `json:"id"`
-	ParentID           string             `json:"parent_id,omitempty"`
-	Goal               string             `json:"goal"`
-	Summary            string             `json:"summary,omitempty"`
-	Status             string             `json:"status"`
-	CompletionContract CompletionContract `json:"completion_contract,omitempty"`
-	Steps              []TaskStep         `json:"steps,omitempty"`
-	Approvals          []TaskApproval     `json:"approvals,omitempty"`
-	TraceID            string             `json:"trace_id,omitempty"`
-	TracePath          string             `json:"trace_path,omitempty"`
-	CreatedAt          time.Time          `json:"created_at"`
-	UpdatedAt          time.Time          `json:"updated_at"`
+type SessionSummary struct {
+	Text      string    `json:"text,omitempty"`
+	Tasks     []string  `json:"tasks,omitempty"`
+	OpenItems []string  `json:"open_items,omitempty"`
+	Evidence  []string  `json:"evidence,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
-type CompletionContract struct {
-	RequiredTools     []string `json:"required_tools,omitempty"`
-	RequiresLLMReview bool     `json:"requires_llm_review,omitempty"`
-	SuccessCondition  string   `json:"success_condition,omitempty"`
-	TaskType          string   `json:"task_type,omitempty"`
-	RequiresMutation  bool     `json:"requires_mutation,omitempty"`
-	AllowsBlocker     bool     `json:"allows_blocker,omitempty"`
+type TaskNode struct {
+	ID        string         `json:"id"`
+	ParentID  string         `json:"parent_id,omitempty"`
+	Goal      string         `json:"goal"`
+	Summary   string         `json:"summary,omitempty"`
+	Status    string         `json:"status"`
+	Execution ExecutionFrame `json:"execution,omitempty"`
+	Steps     []TaskStep     `json:"steps,omitempty"`
+	TraceID   string         `json:"trace_id,omitempty"`
+	TracePath string         `json:"trace_path,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
 }
 
 type TaskStep struct {
@@ -57,31 +56,67 @@ type TaskStep struct {
 	Mutation           bool           `json:"mutation,omitempty"`
 }
 
-type TaskApproval struct {
-	Key       string    `json:"key"`
-	Tool      string    `json:"tool"`
-	Class     string    `json:"class,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+type ExecutionFrame struct {
+	ID            string           `json:"id,omitempty"`
+	Mode          string           `json:"mode,omitempty"`
+	Status        string           `json:"status,omitempty"`
+	OriginalTask  string           `json:"original_task,omitempty"`
+	Contract      *TaskContract    `json:"contract,omitempty"`
+	CurrentStepID string           `json:"current_step_id,omitempty"`
+	CurrentNodeID string           `json:"current_node_id,omitempty"`
+	Events        []ExecutionEvent `json:"events,omitempty"`
+	UpdatedAt     time.Time        `json:"updated_at,omitempty"`
+}
+
+type TaskContract struct {
+	Summary          string                 `json:"summary,omitempty"`
+	RequiresTools    bool                   `json:"requires_tools,omitempty"`
+	RequiredTools    []string               `json:"required_tools,omitempty"`
+	RequiredEvidence []TaskEvidenceContract `json:"required_evidence,omitempty"`
+	ExpectedOutcome  string                 `json:"expected_outcome,omitempty"`
+	CompletionPolicy string                 `json:"completion_policy,omitempty"`
+	CreatedAt        time.Time              `json:"created_at,omitempty"`
+}
+
+type TaskEvidenceContract struct {
+	Kind        string `json:"kind,omitempty"`
+	Tool        string `json:"tool,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type ExecutionEvent struct {
+	ID        string         `json:"id,omitempty"`
+	Type      string         `json:"type"`
+	Status    string         `json:"status,omitempty"`
+	Tool      string         `json:"tool,omitempty"`
+	StepID    string         `json:"step_id,omitempty"`
+	Summary   string         `json:"summary,omitempty"`
+	Evidence  map[string]any `json:"evidence,omitempty"`
+	CreatedAt time.Time      `json:"created_at,omitempty"`
 }
 
 type PendingAction struct {
-	Kind              string             `json:"kind"`
-	TaskID            string             `json:"task_id"`
-	ProposalID        string             `json:"proposal_id,omitempty"`
-	ScheduleID        string             `json:"schedule_id,omitempty"`
-	ArchiveID         string             `json:"archive_id,omitempty"`
-	Question          string             `json:"question,omitempty"`
-	ToolCall          agentcore.ToolCall `json:"tool_call,omitempty"`
-	ResumeText        string             `json:"resume_text,omitempty"`
-	AuthorizationOnly bool               `json:"authorization_only,omitempty"`
+	Kind       string `json:"kind"`
+	TaskID     string `json:"task_id"`
+	ProposalID string `json:"proposal_id,omitempty"`
+	Question   string `json:"question,omitempty"`
 }
 
 type Usage struct {
-	Requests     int     `json:"requests,omitempty"`
-	InputTokens  int     `json:"input_tokens,omitempty"`
-	OutputTokens int     `json:"output_tokens,omitempty"`
-	TotalTokens  int     `json:"total_tokens,omitempty"`
-	Cost         float64 `json:"cost,omitempty"`
+	Requests             int     `json:"requests,omitempty"`
+	InputTokens          int     `json:"input_tokens,omitempty"`
+	OutputTokens         int     `json:"output_tokens,omitempty"`
+	TotalTokens          int     `json:"total_tokens,omitempty"`
+	EstimatedInputTokens int     `json:"estimated_input_tokens,omitempty"`
+	SavedEstimatedTokens int     `json:"saved_estimated_tokens,omitempty"`
+	CompactedMessages    int     `json:"compacted_messages,omitempty"`
+	CompactedToolResults int     `json:"compacted_tool_results,omitempty"`
+	CacheHits            int     `json:"cache_hits,omitempty"`
+	CacheReadTokens      int     `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens     int     `json:"cache_write_tokens,omitempty"`
+	CacheInputTokens     int     `json:"cache_input_tokens,omitempty"`
+	CacheOutputTokens    int     `json:"cache_output_tokens,omitempty"`
+	Cost                 float64 `json:"cost,omitempty"`
 }
 
 type Store struct {
@@ -227,6 +262,7 @@ func (s *State) StartTask(goal string) *TaskNode {
 	if task.Goal == "" {
 		task.Goal = "Untitled task"
 	}
+	task.Execution = newExecutionFrame(task.ID, task.Goal, now)
 	s.Tasks = append(s.Tasks, task)
 	s.ActiveTask = task.ID
 	return &s.Tasks[len(s.Tasks)-1]
@@ -238,6 +274,9 @@ func (s *State) ActivateTask(taskID string) *TaskNode {
 		if s.Tasks[i].ID == taskID {
 			s.ActiveTask = taskID
 			s.Tasks[i].Status = "running"
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = "running"
+			s.Tasks[i].Execution.UpdatedAt = now
 			s.Tasks[i].UpdatedAt = now
 			return &s.Tasks[i]
 		}
@@ -247,7 +286,7 @@ func (s *State) ActivateTask(taskID string) *TaskNode {
 
 func IsOpenTaskStatus(status string) bool {
 	switch strings.TrimSpace(status) {
-	case "", "running", "await_confirm", "await_user_input":
+	case "", "running", "await_user_input", "resuming", "failed":
 		return true
 	default:
 		return false
@@ -262,51 +301,12 @@ func (s *State) AddStep(taskID string, step TaskStep) {
 				step.ID = nextStepID(len(s.Tasks[i].Steps) + 1)
 			}
 			s.Tasks[i].Steps = append(s.Tasks[i].Steps, step)
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.CurrentStepID = step.ID
+			s.Tasks[i].Execution.UpdatedAt = now
 			s.Tasks[i].UpdatedAt = now
 			return
 		}
-	}
-}
-
-func (s *State) HasTaskApproval(taskID, key string) bool {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	for i := range s.Tasks {
-		if s.Tasks[i].ID != taskID || !IsOpenTaskStatus(s.Tasks[i].Status) {
-			continue
-		}
-		for _, approval := range s.Tasks[i].Approvals {
-			if approval.Key == key {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (s *State) AddTaskApproval(taskID string, approval TaskApproval) {
-	approval.Key = strings.TrimSpace(approval.Key)
-	if approval.Key == "" {
-		return
-	}
-	now := time.Now()
-	if approval.CreatedAt.IsZero() {
-		approval.CreatedAt = now
-	}
-	for i := range s.Tasks {
-		if s.Tasks[i].ID != taskID {
-			continue
-		}
-		for _, existing := range s.Tasks[i].Approvals {
-			if existing.Key == approval.Key {
-				return
-			}
-		}
-		s.Tasks[i].Approvals = append(s.Tasks[i].Approvals, approval)
-		s.Tasks[i].UpdatedAt = now
-		return
 	}
 }
 
@@ -314,7 +314,12 @@ func (s *State) CompleteActiveTask() {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {
 			s.Tasks[i].Status = "completed"
-			s.Tasks[i].UpdatedAt = time.Now()
+			now := time.Now()
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = "completed"
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			s.ActiveTask = ""
 			return
 		}
 	}
@@ -327,7 +332,29 @@ func (s *State) CompleteActiveTaskWithSummary(summary, traceID, tracePath string
 			s.Tasks[i].Summary = strings.TrimSpace(summary)
 			s.Tasks[i].TraceID = strings.TrimSpace(traceID)
 			s.Tasks[i].TracePath = strings.TrimSpace(tracePath)
-			s.Tasks[i].UpdatedAt = time.Now()
+			now := time.Now()
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = "completed"
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			s.ActiveTask = ""
+			return
+		}
+	}
+}
+
+func (s *State) AwaitUserInputActiveTaskWithSummary(summary, traceID, tracePath string) {
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == s.ActiveTask {
+			s.Tasks[i].Status = "await_user_input"
+			s.Tasks[i].Summary = strings.TrimSpace(summary)
+			s.Tasks[i].TraceID = strings.TrimSpace(traceID)
+			s.Tasks[i].TracePath = strings.TrimSpace(tracePath)
+			now := time.Now()
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = executionStatusForTaskStatus("await_user_input")
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
 			return
 		}
 	}
@@ -337,9 +364,131 @@ func (s *State) BlockActiveTask(kind string) {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {
 			s.Tasks[i].Status = kind
-			s.Tasks[i].UpdatedAt = time.Now()
+			now := time.Now()
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = executionStatusForTaskStatus(kind)
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
 			return
 		}
+	}
+}
+
+func (s *State) EnsureExecutionFrame(taskID string) *ExecutionFrame {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].UpdatedAt = now
+			return &s.Tasks[i].Execution
+		}
+	}
+	return nil
+}
+
+func (s *State) SetExecutionStatus(taskID, status string) {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.Status = strings.TrimSpace(status)
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func (s *State) AddExecutionEvent(taskID string, event ExecutionEvent) {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			if event.ID == "" {
+				event.ID = nextEventID(len(s.Tasks[i].Execution.Events) + 1)
+			}
+			if event.CreatedAt.IsZero() {
+				event.CreatedAt = now
+			}
+			s.Tasks[i].Execution.Events = append(s.Tasks[i].Execution.Events, event)
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func (s *State) SetTaskContract(taskID string, contract TaskContract) {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			if contract.CreatedAt.IsZero() {
+				contract.CreatedAt = now
+			}
+			s.Tasks[i].Execution.Contract = &contract
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func (s State) TaskByID(taskID string) *TaskNode {
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			return &s.Tasks[i]
+		}
+	}
+	return nil
+}
+
+func newExecutionFrame(taskID, goal string, now time.Time) ExecutionFrame {
+	return ExecutionFrame{
+		ID:           "frame-" + taskID,
+		Mode:         "agent_loop",
+		Status:       "running",
+		OriginalTask: strings.TrimSpace(goal),
+		UpdatedAt:    now,
+	}
+}
+
+func ensureExecutionFrame(task *TaskNode, now time.Time) {
+	if strings.TrimSpace(task.Execution.ID) == "" {
+		task.Execution = newExecutionFrame(task.ID, task.Goal, now)
+		task.Execution.Status = executionStatusForTaskStatus(task.Status)
+		return
+	}
+	if strings.TrimSpace(task.Execution.Mode) == "" {
+		task.Execution.Mode = "agent_loop"
+	}
+	if strings.TrimSpace(task.Execution.Status) == "" {
+		task.Execution.Status = executionStatusForTaskStatus(task.Status)
+	}
+	if strings.TrimSpace(task.Execution.OriginalTask) == "" {
+		task.Execution.OriginalTask = strings.TrimSpace(task.Goal)
+	}
+	if task.Execution.UpdatedAt.IsZero() {
+		task.Execution.UpdatedAt = now
+	}
+}
+
+func executionStatusForTaskStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "await_confirm":
+		return "awaiting_confirmation"
+	case "await_user_input", "await_schedule_test":
+		return "awaiting_user_input"
+	case "completed":
+		return "completed"
+	case "failed":
+		return "failed"
+	case "cancelled":
+		return "cancelled"
+	case "resuming":
+		return "resuming"
+	default:
+		return "running"
 	}
 }
 
@@ -361,4 +510,8 @@ func nextTaskID(n int) string {
 
 func nextStepID(n int) string {
 	return "step-" + time.Now().Format("150405") + "-" + strings.TrimLeft(strings.ReplaceAll(time.Duration(n).String(), "ns", ""), "0")
+}
+
+func nextEventID(n int) string {
+	return "event-" + time.Now().Format("150405") + "-" + strings.TrimLeft(strings.ReplaceAll(time.Duration(n).String(), "ns", ""), "0")
 }

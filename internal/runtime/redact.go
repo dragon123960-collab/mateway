@@ -12,6 +12,8 @@ const redactedSecret = "[REDACTED_SECRET]"
 const (
 	storedRecentMessagesLimit = 20
 	storedToolContentLimit    = 2048
+	modelToolContentLimit     = 8192
+	traceContentLimit         = 4096
 	modelPromptCharBudget     = 120000
 )
 
@@ -58,6 +60,39 @@ func redactSecrets(value any) any {
 	default:
 		return v
 	}
+}
+
+func compactTraceValue(value any) any {
+	switch v := value.(type) {
+	case agentcore.Message:
+		v.Content = truncateTraceString(v.Content)
+		return v
+	case agentcore.ToolResult:
+		v.Content = truncateTraceString(v.Content)
+		return v
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = compactTraceValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = compactTraceValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func truncateTraceString(text string) string {
+	if len(text) <= traceContentLimit {
+		return text
+	}
+	truncated, _ := truncateMiddle(text, traceContentLimit)
+	return truncated
 }
 
 func redactMessagePart(part agentcore.MessagePart) agentcore.MessagePart {
@@ -167,6 +202,25 @@ func shouldRedactAssignedSecretValue(value string) bool {
 func isSecretKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	normalized = strings.ReplaceAll(normalized, "-", "_")
+	for _, safe := range []string{
+		"input_tokens",
+		"output_tokens",
+		"total_tokens",
+		"estimated_input_tokens",
+		"saved_estimated_tokens",
+		"soft_limit_tokens",
+		"hard_limit_tokens",
+		"context_window_tokens",
+		"max_output_tokens",
+		"cache_read_tokens",
+		"cache_write_tokens",
+		"cache_input_tokens",
+		"cache_output_tokens",
+	} {
+		if normalized == safe {
+			return false
+		}
+	}
 	for _, marker := range []string{"secret", "token", "api_key", "apikey", "password", "passwd", "pwd", "smtp_pass", "imap_pass", "pop3_pass", "authorization", "auth_code"} {
 		if strings.Contains(normalized, marker) {
 			return true
@@ -182,7 +236,7 @@ func redactPayload(payload map[string]any) map[string]any {
 			out[key] = redactedSecret
 			continue
 		}
-		out[key] = redactSecrets(value)
+		out[key] = compactTraceValue(redactSecrets(value))
 	}
 	return out
 }
@@ -243,10 +297,13 @@ func compactMessagesForStorage(messages []agentcore.Message) ([]agentcore.Messag
 
 func prepareMessagesForModel(messages []agentcore.Message) ([]agentcore.Message, messageCompactStats, error) {
 	prepared, stats := compactMessagesForStorage(redactMessagesForStorage(messages))
+	prepared = shrinkToolMessages(prepared, modelToolContentLimit)
+	stats.AfterChars = messageChars(prepared)
+	stats.AfterMessages = len(prepared)
 	if messageChars(prepared) <= modelPromptCharBudget {
 		return prepared, stats, nil
 	}
-	for limit := storedToolContentLimit / 2; limit >= 256; limit /= 2 {
+	for limit := storedToolContentLimit; limit >= 256; limit /= 2 {
 		prepared = shrinkToolMessages(prepared, limit)
 		if messageChars(prepared) <= modelPromptCharBudget {
 			stats.AfterChars = messageChars(prepared)
@@ -295,13 +352,14 @@ func messageChars(messages []agentcore.Message) int {
 }
 
 func truncateMiddle(text string, limit int) (string, bool) {
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text, false
 	}
 	if limit < 80 {
-		return text[:limit], true
+		return string(runes[:limit]), true
 	}
 	head := limit / 2
 	tail := limit - head
-	return text[:head] + fmt.Sprintf("\n...[truncated %d chars]...\n", len(text)-limit) + text[len(text)-tail:], true
+	return string(runes[:head]) + fmt.Sprintf("\n...[truncated %d chars]...\n", len(runes)-limit) + string(runes[len(runes)-tail:]), true
 }

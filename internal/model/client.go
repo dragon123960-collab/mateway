@@ -19,6 +19,7 @@ import (
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
+	"github.com/dongping/mateway/internal/util"
 )
 
 type Client struct {
@@ -106,6 +107,7 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, ag
 	var errors []string
 	nativeMessages := modelMessagesNative(agentMessages)
 	textMessages := modelMessagesText(agentMessages)
+	textOnlyMessages := stripImageParts(textMessages)
 	if messagesRequireImage(nativeMessages) && !m.Client.Config.SupportsModality("image") {
 		if result, err := m.generateViaVision(ctx, buildTextSystemPrompt(system, tools), textMessages); err == nil {
 			return result, nil
@@ -113,7 +115,7 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, ag
 			errors = append(errors, "vision: "+err.Error())
 		}
 	}
-	result, err := m.generateForClient(ctx, m.Client, system, nativeMessages, textMessages, tools)
+	result, err := m.generateForClient(ctx, m.Client, system, nativeMessages, textOnlyMessages, tools)
 	if err == nil {
 		return result, nil
 	}
@@ -144,6 +146,25 @@ func (m AgentModel) generateForClient(ctx context.Context, client Client, system
 		return GenerateResult{}, fmt.Errorf("native tools failed: %v; text fallback failed: %v", err, textErr)
 	}
 	return client.Generate(ctx, buildTextSystemPrompt(system, tools), textMessages)
+}
+
+func stripImageParts(messages []Message) []Message {
+	out := make([]Message, 0, len(messages))
+	for _, msg := range messages {
+		if !messageHasImage(msg) {
+			out = append(out, msg)
+			continue
+		}
+		copy := msg
+		copy.Parts = nil
+		for _, part := range msg.Parts {
+			if part.Type != agentcore.PartImage {
+				copy.Parts = append(copy.Parts, part)
+			}
+		}
+		out = append(out, copy)
+	}
+	return out
 }
 
 func (m AgentModel) generateViaVision(ctx context.Context, system string, messages []Message) (GenerateResult, error) {
@@ -355,8 +376,9 @@ func buildSystemPrompt(base string, tools []agentcore.Tool, includeTextProtocol 
 }
 
 func currentDatePrompt() string {
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
-	return fmt.Sprintf("Current date: %s. Current time: %s. Timezone: Asia/Shanghai. Treat any date before %s as historical, not current. For weather, news, prices, schedules, or other time-sensitive answers, use available tools and verify the result date matches today before presenting it as current.", now.Format("2006-01-02"), now.Format("15:04"), now.Format("2006-01-02"))
+	loc, timezone := config.TimezoneLocation("")
+	now := time.Now().In(loc)
+	return fmt.Sprintf("Current date: %s. Current time: %s. Timezone: %s. Treat any date before %s as historical, not current. For weather, news, prices, schedules, or other time-sensitive answers, use available tools and verify the result date matches today before presenting it as current.", now.Format("2006-01-02"), now.Format("15:04"), timezone, now.Format("2006-01-02"))
 }
 
 func writeContractLine(b *strings.Builder, label, value string) {
@@ -1008,8 +1030,10 @@ func parseAnthropicResult(data []byte) (GenerateResult, error) {
 			Message string `json:"message"`
 		} `json:"error"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -1036,7 +1060,14 @@ func parseAnthropicResult(data []byte) (GenerateResult, error) {
 			calls = append(calls, agentcore.ToolCall{ID: id, Name: toolNameFromAPI(item.Name), Args: args})
 		}
 	}
-	usage := agentcore.Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens}
+	usage := agentcore.Usage{
+		InputTokens:      payload.Usage.InputTokens,
+		OutputTokens:     payload.Usage.OutputTokens,
+		CacheReadTokens:  payload.Usage.CacheReadInputTokens,
+		CacheWriteTokens: payload.Usage.CacheCreationInputTokens,
+	}
+	usage.CacheInputTokens = usage.CacheReadTokens + usage.CacheWriteTokens
+	usage.CacheHit = usage.CacheReadTokens > 0
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	return GenerateResult{Text: strings.TrimSpace(strings.Join(parts, "\n")), ToolCalls: calls, Usage: usage}, nil
 }
@@ -1071,9 +1102,15 @@ func parseOpenAIResult(data []byte) (GenerateResult, error) {
 			Type    string `json:"type"`
 		} `json:"error"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			TotalTokens         int `json:"total_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -1119,7 +1156,14 @@ func parseOpenAIResult(data []byte) (GenerateResult, error) {
 			calls = append(calls, agentcore.ToolCall{ID: id, Name: toolNameFromAPI(name), Args: args})
 		}
 	}
-	usage := agentcore.Usage{InputTokens: payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens, TotalTokens: payload.Usage.TotalTokens}
+	usage := agentcore.Usage{
+		InputTokens:      payload.Usage.PromptTokens,
+		OutputTokens:     payload.Usage.CompletionTokens,
+		TotalTokens:      payload.Usage.TotalTokens,
+		CacheReadTokens:  payload.Usage.PromptTokensDetails.CachedTokens,
+		CacheInputTokens: payload.Usage.PromptTokensDetails.CachedTokens,
+	}
+	usage.CacheHit = usage.CacheReadTokens > 0
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
@@ -1141,15 +1185,25 @@ func parseOpenAIResponsesResult(data []byte) GenerateResult {
 		} `json:"output"`
 		OutputText string `json:"output_text"`
 		Usage      struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-			TotalTokens  int `json:"total_tokens"`
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			TotalTokens        int `json:"total_tokens"`
+			InputTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return GenerateResult{}
 	}
-	usage := agentcore.Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens, TotalTokens: payload.Usage.TotalTokens}
+	usage := agentcore.Usage{
+		InputTokens:      payload.Usage.InputTokens,
+		OutputTokens:     payload.Usage.OutputTokens,
+		TotalTokens:      payload.Usage.TotalTokens,
+		CacheReadTokens:  payload.Usage.InputTokensDetails.CachedTokens,
+		CacheInputTokens: payload.Usage.InputTokensDetails.CachedTokens,
+	}
+	usage.CacheHit = usage.CacheReadTokens > 0
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
@@ -1168,20 +1222,13 @@ func parseOpenAIResponsesResult(data []byte) GenerateResult {
 }
 
 func usagePtr(usage agentcore.Usage) *agentcore.Usage {
-	if usage.Provider == "" && usage.Model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+	if usage.Provider == "" && usage.Model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 && usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 && usage.CacheInputTokens == 0 && usage.CacheOutputTokens == 0 {
 		return nil
 	}
 	return &usage
 }
 
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
+var firstNonEmptyString = util.FirstNonEmptyString
 
 func stripReasoning(text string) string {
 	for {

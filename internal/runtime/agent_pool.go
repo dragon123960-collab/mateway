@@ -26,7 +26,7 @@ func NewAgentPool(cfg *config.Root) AgentPool {
 		if agentID == "" {
 			continue
 		}
-		agent := agentcore.NewAgent(resolveModelForProfile(cfg, profile), tool.NewRegistry(cfg))
+		agent := agentcore.NewAgent(resolveModelForProfile(cfg, profile), tool.NewRegistryForProfile(cfg, profile))
 		agent.SystemPrompt = buildRuntimeSystemContext(cfg, profile)
 		pool.agents[agentID] = agent
 	}
@@ -69,6 +69,17 @@ func (p AgentPool) RoleModelForMessage(msg channel.InboundMessage, role string, 
 	}
 	profile := p.ProfileForMessage(msg)
 	return resolveModelForRole(p.config, profile, role, fallback)
+}
+
+func (p AgentPool) ModelConfigForMessage(msg channel.InboundMessage) config.ModelConfig {
+	if p.config == nil {
+		return config.ModelConfig{}
+	}
+	profile := p.ProfileForMessage(msg)
+	if cfg, ok := modelConfigForProfile(p.config, profile); ok {
+		return cfg
+	}
+	return config.ModelConfig{}
 }
 
 func (p AgentPool) profileForID(agentID string) config.AgentProfileConfig {
@@ -115,13 +126,24 @@ func (p AgentPool) resolveAgentIDForMessage(msg channel.InboundMessage) string {
 	if peerID == "" {
 		peerID = strings.TrimSpace(msg.ThreadID)
 	}
+	bestAgentID := ""
+	bestScore := -1
 	for _, binding := range p.config.Agents.Bindings {
 		if !bindingMatches(binding, channelName, accountID, peerID) {
 			continue
 		}
-		if strings.TrimSpace(binding.AgentID) != "" {
-			return strings.TrimSpace(binding.AgentID)
+		agentID := strings.TrimSpace(binding.AgentID)
+		if agentID == "" {
+			continue
 		}
+		score := bindingSpecificity(binding)
+		if score > bestScore {
+			bestScore = score
+			bestAgentID = agentID
+		}
+	}
+	if bestAgentID != "" {
+		return bestAgentID
 	}
 	return p.config.Agents.Default
 }
@@ -137,6 +159,17 @@ func bindingMatches(binding config.AgentBindingConfig, channelName, accountID, p
 		return false
 	}
 	return true
+}
+
+func bindingSpecificity(binding config.AgentBindingConfig) int {
+	score := 0
+	if strings.TrimSpace(binding.AccountID) != "" {
+		score++
+	}
+	if strings.TrimSpace(binding.PeerID) != "" {
+		score++
+	}
+	return score
 }
 
 func (p AgentPool) profileByID(agentID string) (config.AgentProfileConfig, bool) {
@@ -205,6 +238,40 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 		return model.NewRoutedAgentModel(configs, visionConfigs)
 	}
 	return HeuristicModel{}
+}
+
+func modelConfigForProfile(cfg *config.Root, profile config.AgentProfileConfig) (config.ModelConfig, bool) {
+	var names []string
+	if modelName := strings.TrimSpace(profile.Model.Default); modelName != "" {
+		names = append(names, modelName)
+	}
+	if len(names) == 0 {
+		if modelName := strings.TrimSpace(cfg.Model.Default); modelName != "" {
+			names = append(names, modelName)
+		}
+	}
+	names = append(names, profile.Model.Fallbacks...)
+	names = append(names, cfg.Model.Fallbacks...)
+	seen := map[string]bool{}
+	for _, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if cfg, ok := enabledModelByName(cfg, key); ok {
+			return cfg, true
+		}
+	}
+	return config.ModelConfig{}, false
+}
+
+func resolveModelForDefault(cfg *config.Root) agentcore.Model {
+	if cfg == nil {
+		return HeuristicModel{}
+	}
+	profile := cfg.DefaultAgent()
+	return resolveModelForProfile(cfg, profile)
 }
 
 func resolveModelForRole(cfg *config.Root, profile config.AgentProfileConfig, role string, fallback agentcore.Model) agentcore.Model {

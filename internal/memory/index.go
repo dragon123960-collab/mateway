@@ -132,10 +132,11 @@ func stringSlice(value any) []string {
 
 func snippet(text string, limit int) string {
 	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text
 	}
-	return strings.TrimSpace(text[:limit])
+	return strings.TrimSpace(string(runes[:limit]))
 }
 
 func hasError(issues []Issue) bool {

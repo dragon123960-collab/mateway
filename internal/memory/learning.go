@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -36,7 +35,7 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 	now := time.Now().Format(time.RFC3339)
 	id := "diary_" + time.Now().Format("20060102_150405_000000")
 	diaryPath := filepath.Join(home, "observe", "diary", id+".md")
-	diary := renderDiary(event, now)
+	diary := cleanMemoryText(renderDiary(event, now))
 	if err := os.MkdirAll(filepath.Dir(diaryPath), 0o755); err != nil {
 		return LearningResult{}, err
 	}
@@ -51,7 +50,7 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 		if err := os.MkdirAll(filepath.Dir(reflectionPath), 0o755); err != nil {
 			return result, err
 		}
-		if err := os.WriteFile(reflectionPath, []byte(renderReflection(event, now)), 0o644); err != nil {
+		if err := os.WriteFile(reflectionPath, []byte(cleanMemoryText(renderReflection(event, now))), 0o644); err != nil {
 			return result, err
 		}
 		result.ReflectionPath = reflectionPath
@@ -61,7 +60,7 @@ func RecordTaskCompletion(event LearningEvent) (LearningResult, error) {
 			Type:       "experience",
 			Scope:      "agent",
 			Title:      proposalTitle(event),
-			Body:       proposalBody(event),
+			Body:       cleanMemoryText(proposalBody(event)),
 			Sources:    learningSources(event),
 			Confidence: "low",
 		})
@@ -262,14 +261,15 @@ func likelyCause(event LearningEvent) string {
 }
 
 func memoryCueList(key string) []string {
-	var out []string
-	for _, item := range strings.Split(i18n.New(i18n.Config{}).T(i18n.LocaleZH, key, nil), ",") {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
+	return memoryCueLists[key]
+}
+
+var memoryCueLists = map[string][]string{
+	"memory.learning.strong_cues":     {"remember", "memory", "preference", "rule", "decision", "lesson", "workflow", "next time", "记住", "记忆", "偏好", "规则", "以后"},
+	"memory.learning.correction_cues": {"wrong", "incorrect", "should", "next time don't", "do not do that", "correction", "不对", "错误", "应该", "以后不要", "纠正"},
+	"memory.learning.not_found_cues":  {"not found", "missing", "找不到", "缺少"},
+	"memory.learning.permission_cues": {"denied", "permission", "权限"},
+	"memory.distill.score_cues":       {"failed", "error", "preference", "remember", "纠正", "以后不要", "以后要", "修复", "失败"},
 }
 
 func alternativeStrategy(event LearningEvent) string {
@@ -345,7 +345,11 @@ func proposalBody(event LearningEvent) string {
 		b.WriteString(text)
 		b.WriteString("\n")
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(cleanMemoryText(b.String()))
+}
+
+func cleanMemoryText(text string) string {
+	return strings.ToValidUTF8(text, "")
 }
 
 func learningSources(event LearningEvent) []string {

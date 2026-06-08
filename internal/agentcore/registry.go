@@ -22,6 +22,12 @@ func (r *ToolRegistry) Register(tool Tool) {
 	r.tools[tool.Name()] = tool
 }
 
+func (r *ToolRegistry) Unregister(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.tools, name)
+}
+
 func (r *ToolRegistry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -62,5 +68,27 @@ func (r *ToolRegistry) Execute(ctx context.Context, call ToolCall) ToolResult {
 			}
 		}
 	}
-	return tool.Run(ctx, call)
+	done := make(chan ToolResult, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- ToolResult{
+					ToolCallID: call.ID,
+					Content:    fmt.Sprintf("tool %q panicked: %v", call.Name, r),
+					IsError:    true,
+				}
+			}
+		}()
+		done <- tool.Run(ctx, call)
+	}()
+	select {
+	case result := <-done:
+		return result
+	case <-ctx.Done():
+		return ToolResult{
+			ToolCallID: call.ID,
+			Content:    fmt.Sprintf("tool %q cancelled: %v", call.Name, ctx.Err()),
+			IsError:    true,
+		}
+	}
 }

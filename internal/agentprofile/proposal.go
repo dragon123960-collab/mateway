@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/i18n"
 	"github.com/dongping/mateway/internal/secret"
 )
 
@@ -251,14 +250,11 @@ func UnsafePromptContext(text string) bool {
 }
 
 func proposalCueList(key string) []string {
-	var out []string
-	for _, item := range strings.Split(i18n.New(i18n.Config{}).T(i18n.LocaleZH, key, nil), ",") {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
+	return proposalCueLists[key]
+}
+
+var proposalCueLists = map[string][]string{
+	"agent_profile.unsafe_markers": {"[tool_call]", "[/tool_call]", "<system>", "</system>", "role: system", "role: assistant", "ignore previous instructions"},
 }
 
 func UnifiedDiff(oldText, newText string) string {

@@ -202,8 +202,9 @@ func stripSkillFrontMatter(text string) string {
 }
 
 func truncateString(text string, limit int) string {
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text
 	}
-	return strings.TrimSpace(text[:limit]) + "\n..."
+	return strings.TrimSpace(string(runes[:limit])) + "\n..."
 }

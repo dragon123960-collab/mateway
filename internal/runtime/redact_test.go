@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
@@ -22,6 +23,25 @@ func TestRedactSecretString(t *testing.T) {
 	}
 	if strings.Count(got, redactedSecret) != 3 {
 		t.Fatalf("expected redactions, got %q", got)
+	}
+}
+
+func TestRuntimeTruncationKeepsValidUTF8(t *testing.T) {
+	input := strings.Repeat("认", 100)
+	middle, truncated := truncateMiddle(input, 81)
+	if !truncated {
+		t.Fatal("expected truncateMiddle to truncate")
+	}
+	if !utf8.ValidString(middle) {
+		t.Fatalf("truncateMiddle returned invalid UTF-8: %q", middle)
+	}
+	progress := compactProgressSummary(input)
+	if !utf8.ValidString(progress) {
+		t.Fatalf("compactProgressSummary returned invalid UTF-8: %q", progress)
+	}
+	summary := summarize(input)
+	if !utf8.ValidString(summary) {
+		t.Fatalf("summarize returned invalid UTF-8: %q", summary)
 	}
 }
 

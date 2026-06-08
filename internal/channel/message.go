@@ -10,6 +10,18 @@ const (
 	PartFile  PartType = "file"
 )
 
+type MessageStyle string
+
+const (
+	StyleCompleted            MessageStyle = "completed"
+	StyleError                MessageStyle = "error"
+	StyleInputRequired        MessageStyle = "input_required"
+	StyleMemoryProposalReview MessageStyle = "memory_proposal_review"
+	StylePartial              MessageStyle = "partial"
+	StyleProcessing           MessageStyle = "processing"
+	StyleSessionReset         MessageStyle = "session_reset"
+)
+
 type InboundMessage struct {
 	ID         string
 	Channel    string
@@ -26,8 +38,17 @@ type OutboundMessage struct {
 	ThreadID string
 	Text     string
 	Title    string
-	Style    string
-	Locale   string
+	Style    MessageStyle
+	Progress []ProgressStep
+}
+
+type ProgressStep struct {
+	Title      string
+	Status     string
+	Tool       string
+	Summary    string
+	DurationMS int64
+	TimedOut   bool
 }
 
 type OutboundBatch struct {

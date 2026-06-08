@@ -73,6 +73,51 @@ func TestModelConfigMaxTokensDefaults(t *testing.T) {
 	}
 }
 
+func TestTimezoneLocationUsesConfiguredTimezone(t *testing.T) {
+	loc, name := TimezoneLocation("UTC")
+	if name != "UTC" || loc.String() != "UTC" {
+		t.Fatalf("expected UTC location, got %q %q", name, loc.String())
+	}
+}
+
+func TestTimezoneLocationFallsBackToDefault(t *testing.T) {
+	_, name := TimezoneLocation("not/a-zone")
+	if name != DefaultTimezone() {
+		t.Fatalf("expected default timezone fallback, got %q", name)
+	}
+}
+
+func TestFeishuAccountConfigsOverlayBaseConfig(t *testing.T) {
+	disabled := false
+	cfg := FeishuConfig{
+		Enabled:              true,
+		DefaultAccount:       "main",
+		AppID:                "base-direct-app",
+		AppIDEnv:             "BASE_APP_ID",
+		AppSecret:            "base-direct-secret",
+		AppSecretEnv:         "BASE_SECRET",
+		BaseURL:              "https://open.feishu.cn",
+		BotName:              "mateway",
+		AutoReply:            true,
+		MentionRequiredGroup: true,
+		WebSocket:            FeishuWebSocketConfig{Enabled: true},
+		Accounts: []FeishuAccountConfig{
+			{ID: "ops", AppIDEnv: "OPS_APP_ID"},
+			{ID: "local", Enabled: &disabled, AppIDEnv: "LOCAL_APP_ID", AppSecretEnv: "LOCAL_SECRET"},
+		},
+	}
+	accounts := cfg.AccountConfigs()
+	if len(accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(accounts))
+	}
+	if accounts[0].DefaultAccount != "ops" || accounts[0].AppID != "" || accounts[0].AppIDEnv != "OPS_APP_ID" || accounts[0].AppSecret != "base-direct-secret" || accounts[0].AppSecretEnv != "BASE_SECRET" || !accounts[0].Enabled {
+		t.Fatalf("unexpected ops account: %#v", accounts[0])
+	}
+	if accounts[1].DefaultAccount != "local" || accounts[1].AppID != "" || accounts[1].AppIDEnv != "LOCAL_APP_ID" || accounts[1].AppSecret != "" || accounts[1].AppSecretEnv != "LOCAL_SECRET" || accounts[1].Enabled {
+		t.Fatalf("unexpected local account: %#v", accounts[1])
+	}
+}
+
 func TestExecutionConfigDefaults(t *testing.T) {
 	root := Root{}
 	root.NormalizeForUse()
@@ -88,11 +133,11 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	if root.Execution.InactivityTimeoutDuration() != 5*time.Minute {
 		t.Fatalf("default inactivity timeout duration = %s", root.Execution.InactivityTimeoutDuration())
 	}
-	if root.Execution.MaxNoProgressTurns != 2 {
-		t.Fatalf("default no-progress turns = %d", root.Execution.MaxNoProgressTurns)
+	if !root.Execution.ContextBudget.EnabledValue() || root.Execution.ContextBudget.SoftRatio != 0.65 || root.Execution.ContextBudget.HardRatio != 0.90 {
+		t.Fatalf("unexpected context budget defaults: %#v", root.Execution.ContextBudget)
 	}
-	if root.Execution.MaxRepeatedToolFailures != 3 {
-		t.Fatalf("default repeated tool failures = %d", root.Execution.MaxRepeatedToolFailures)
+	if root.Execution.ContextBudget.RecentTurns != 8 || root.Execution.ContextBudget.ToolResultTargetTokens != 1200 || root.Execution.ContextBudget.MaxVisibleTools != 8 || !root.Execution.ContextBudget.TraceTelemetryValue() {
+		t.Fatalf("unexpected context budget defaults: %#v", root.Execution.ContextBudget)
 	}
 	zero := 0
 	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
@@ -107,15 +152,9 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestSecurityScriptAndRemoteDefaults(t *testing.T) {
+func TestRemoteDefaults(t *testing.T) {
 	root := Root{}
 	root.NormalizeForUse()
-	if root.Scripts.AutoDiscoverSkillScriptsValue() {
-		t.Fatal("external skill scripts should not be auto-authorized by default")
-	}
-	if root.Scripts.Dirs == nil {
-		t.Fatal("expected scripts dirs default")
-	}
 	if root.Remote.Profiles == nil {
 		t.Fatal("expected remote profiles default")
 	}
@@ -236,14 +275,6 @@ func TestEnsureDefaultConfigFilesCreatesSamplesAndRealConfig(t *testing.T) {
 	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "agent.md"), []string{"# Main Assistant agent", "## Operating Rules", "Do not claim a tool"})
 	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "soul.md"), []string{"# Main Assistant soul", "You are Main Assistant", "## Boundaries"})
 	assertPromptTemplate(t, filepath.Join(home, "workspace", "agents", "main", "user.md"), []string{"No stable user preferences recorded yet.", "## Communication Preferences", "Do not store passwords"})
-}
-
-func TestDefaultConfigLocale(t *testing.T) {
-	cfg := DefaultRoot()
-	cfg.NormalizeForUse()
-	if cfg.App.Locale != "auto" {
-		t.Fatalf("expected locale auto, got %q", cfg.App.Locale)
-	}
 }
 
 func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {
