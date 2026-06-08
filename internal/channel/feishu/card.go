@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/dongping/mateway/internal/channel"
@@ -44,6 +45,18 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			},
 		},
 	}
+	if len(reply.Progress) > 0 {
+		elements = append(elements, map[string]any{
+			"tag": "hr",
+		})
+		elements = append(elements, map[string]any{
+			"tag": "div",
+			"text": map[string]any{
+				"tag":     "lark_md",
+				"content": "**Process**\n" + renderProgress(reply.Progress),
+			},
+		})
+	}
 	if note := cardFooterNote(reply); note != "" {
 		elements = append(elements, map[string]any{
 			"tag": "note",
@@ -58,11 +71,68 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 	return elements
 }
 
+func renderProgress(steps []channel.ProgressStep) string {
+	var b strings.Builder
+	for _, step := range steps {
+		line := renderProgressLine(step)
+		if line == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func renderProgressLine(step channel.ProgressStep) string {
+	title := firstNonEmpty(strings.TrimSpace(step.Tool), strings.TrimSpace(step.Title))
+	if title == "" {
+		return ""
+	}
+	status := strings.TrimSpace(step.Status)
+	if status == "" {
+		status = "recorded"
+	}
+	var details []string
+	details = append(details, status)
+	if step.DurationMS > 0 {
+		details = append(details, formatDurationMS(step.DurationMS))
+	}
+	if step.TimedOut {
+		details = append(details, "timed out")
+	}
+	if summary := strings.TrimSpace(step.Summary); summary != "" {
+		details = append(details, truncateProgressText(summary, 72))
+	}
+	return "- `" + escapeInlineCode(title) + "`: " + strings.Join(details, " / ")
+}
+
+func truncateProgressText(text string, limit int) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
+}
+
+func formatDurationMS(ms int64) string {
+	if ms >= 1000 {
+		return strconv.FormatFloat(float64(ms)/1000, 'f', 1, 64) + "s"
+	}
+	return strconv.FormatInt(ms, 10) + "ms"
+}
+
+func escapeInlineCode(text string) string {
+	return strings.ReplaceAll(text, "`", "'")
+}
+
 func headerTemplateForStyle(style string) string {
 	switch strings.TrimSpace(style) {
 	case "partial":
 		return "orange"
-	case "input_required":
+	case "input_required", "processing":
 		return "blue"
 	case "error":
 		return "red"

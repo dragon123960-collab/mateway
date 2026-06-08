@@ -107,7 +107,33 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Println("trace:", summary.Path)
+		if summary.TraceID != "" {
+			fmt.Println("trace_id:", summary.TraceID)
+		}
+		if summary.SessionKey != "" {
+			fmt.Println("session_key:", summary.SessionKey)
+		}
+		if summary.Channel != "" {
+			fmt.Println("channel:", summary.Channel)
+		}
+		if summary.AccountID != "" {
+			fmt.Println("account_id:", summary.AccountID)
+		}
+		if summary.AgentID != "" {
+			fmt.Println("agent_id:", summary.AgentID)
+		}
+		if summary.TaskID != "" {
+			fmt.Println("task_id:", summary.TaskID)
+		}
+		if summary.MessageID != "" {
+			fmt.Println("message_id:", summary.MessageID)
+		}
 		fmt.Println("events:", summary.Events)
+		if !summary.RuntimeDone {
+			fmt.Printf("complete: false runtime_done=%t gateway_done=%t\n", summary.RuntimeDone, summary.GatewayDone)
+		} else {
+			fmt.Println("complete: true")
+		}
 		fmt.Println("model_ms:", summary.ModelDurationMS)
 		fmt.Println("tool_ms:", summary.ToolDurationMS)
 		fmt.Println("runtime_ms:", summary.RuntimeDurationMS)
@@ -2378,7 +2404,7 @@ func searchProviderKnown(name string) bool {
 func doctorToolRegistry(cfg *config.Root) []doctorCheck {
 	registry := runtime.New(cfg).Tools
 	defaultNames := []string{
-		"file.read", "file.write", "file.delete", "project.index", "terminal.run", "web.search", "web.fetch", "secret.set",
+		"file.read", "file.write", "file.delete", "project.index", "terminal.run", "tool_result.read", "web.search", "web.fetch", "secret.set",
 		"schedule.create", "schedule.list", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run_now",
 		"task.search", "task.resume",
 	}

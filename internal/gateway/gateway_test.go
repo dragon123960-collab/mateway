@@ -122,6 +122,18 @@ func TestShouldSendProcessingAckSkipsNewSessionCommand(t *testing.T) {
 	}
 }
 
+func TestFeishuProgressTextIncludesSteps(t *testing.T) {
+	text := feishuProgressText(channel.OutboundMessage{
+		Text: "Processing...",
+		Progress: []channel.ProgressStep{
+			{Tool: "web.search", Status: "running", Summary: "北京天气"},
+		},
+	})
+	if !strings.Contains(text, "web.search: running") || !strings.Contains(text, "北京天气") {
+		t.Fatalf("unexpected progress text %q", text)
+	}
+}
+
 func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
 	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	state, err := rt.Store.Load("cli:test")

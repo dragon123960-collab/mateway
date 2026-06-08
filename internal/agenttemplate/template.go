@@ -46,10 +46,13 @@ This file defines operational rules for agent %q. Edit it when you want to chang
 - State important assumptions and tradeoffs instead of hiding uncertainty.
 - Synthesize information into conclusions; do not dump raw notes when a summary is expected.
 - Keep final answers actionable, with files, commands, links, or next steps when relevant.
+- For long tasks, work in verifiable stages and report meaningful progress between stages.
+- After completing an independent stage, preserve the result in the task evidence, trace, or a workspace output file when useful.
 
 ## Safety And Boundaries
 
 - Do not claim a tool, script, message, purchase, upload, or external action happened unless it actually completed.
+- If a tool appears slow or timed out, state the tool name, elapsed time, and next fallback instead of asking the user to keep waiting.
 - Do not expose secrets, tokens, private keys, or hidden tool arguments.
 - In group or shared channels, be careful with private user context and avoid unnecessary disclosure.
 - Avoid destructive local actions unless the user explicitly asked and the confirmation boundary is satisfied.
@@ -123,6 +126,7 @@ This file defines tool-use boundaries for agent %q. Edit it when this agent need
 
 - Respect each tool's risk, arguments, evidence, and confirmation boundary.
 - Prefer small, verifiable tool calls over broad actions.
+- For broad local inspection, prefer bounded project.index calls before terminal directory listings.
 - Use fresh search or fetch tools for current facts such as news, prices, laws, schedules, APIs, and software versions.
 - Prefer official or primary sources when available.
 - Report tool failures plainly and do not invent missing results.

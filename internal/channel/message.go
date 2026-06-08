@@ -27,6 +27,16 @@ type OutboundMessage struct {
 	Text     string
 	Title    string
 	Style    string
+	Progress []ProgressStep
+}
+
+type ProgressStep struct {
+	Title      string
+	Status     string
+	Tool       string
+	Summary    string
+	DurationMS int64
+	TimedOut   bool
 }
 
 type OutboundBatch struct {

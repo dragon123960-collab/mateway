@@ -51,6 +51,7 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry.Register(ScheduleRunNowTool{Config: root})
 	registry.Register(TaskSearchTool{Config: root})
 	registry.Register(TaskResumeTool{Config: root})
+	registry.Register(ToolResultReadTool{Config: root})
 	registry.Register(WebSearchTool{Config: root})
 	registry.Register(WebFetchTool{Config: root})
 	return registry
@@ -80,6 +81,7 @@ type FileWriteTool struct{ Config *config.Root }
 type FileReadTool struct{ Config *config.Root }
 type FileDeleteTool struct{ Config *config.Root }
 type ProjectIndexTool struct{ Config *config.Root }
+type ToolResultReadTool struct{ Config *config.Root }
 
 func (FileWriteTool) Name() string        { return "file.write" }
 func (FileWriteTool) Description() string { return "write a local text file" }
@@ -336,17 +338,27 @@ func countDirectoryEntries(root string) (int, error) {
 	return count, err
 }
 
-func (ProjectIndexTool) Name() string        { return "project.index" }
-func (ProjectIndexTool) Description() string { return "list files and directories under a path (non-recursive)" }
+func (ProjectIndexTool) Name() string { return "project.index" }
+func (ProjectIndexTool) Description() string {
+	return "list files and directories under a path with bounded depth and common heavy directories skipped"
+}
 func (ProjectIndexTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"path"}}
+	return agentcore.Schema{
+		Required: []string{"path"},
+		Properties: map[string]any{
+			"path":      map[string]any{"type": "string"},
+			"limit":     map[string]any{"type": "integer", "description": "Maximum entries to return. Defaults to 200 and is capped at 5000."},
+			"max_depth": map[string]any{"type": "integer", "description": "Maximum directory depth below path. Defaults to 4 and is capped at 8."},
+			"skip_dirs": map[string]any{"type": "array", "description": "Directory names to list with [skip] and not descend into."},
+		},
+	}
 }
 func (ProjectIndexTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Use before reading a project when you need an overview of the directory structure. Call with a specific subdirectory path to explore deeper levels.",
+		WhenToUse:            "Use before reading a project when you need a bounded overview of the directory structure. Keep max_depth and limit small unless the user explicitly asks for a broader scan.",
 		WhenNotToUse:         "Do not use as a replacement for reading a specific file whose path is already known.",
-		OutputContract:       "Return directory entries with DIR: and FILE: prefixes, sorted with directories first.",
-		Evidence:             "Return scanned root path and entry count.",
+		OutputContract:       "Return relative directory entries with DIR: and FILE: prefixes. Common generated/cache/vendor directories are listed with [skip] guidance instead of hidden.",
+		Evidence:             "Return scanned root path, entry count, skipped entry count, limit, max_depth, partial, and elapsed time.",
 		Acceptance:           "Accepted when the directory scan succeeds and returns entry count evidence.",
 		SoftFailureSignals:   []string{"path is not a directory", "permission denied", "outside allowed roots"},
 		ParallelMode:         "read_only_ok",
@@ -355,30 +367,249 @@ func (ProjectIndexTool) ToolContract() agentcore.ToolContract {
 	}
 }
 func (ProjectIndexTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
-func (t ProjectIndexTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func (t ProjectIndexTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	start := time.Now()
 	root, err := ResolveAllowedPath(fmt.Sprint(call.Args["path"]), t.Config)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
 	}
-	entries, err := os.ReadDir(root)
+	info, err := os.Stat(root)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": root}}
 	}
+	if !info.IsDir() {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "path is not a directory", IsError: true, Evidence: map[string]any{"path": root}}
+	}
+	limit := boundedIntArg(call.Args["limit"], 200, 1, 5000)
+	maxDepth := boundedIntArg(call.Args["max_depth"], 4, 1, 8)
+	skipDirs := projectIndexSkipDirs(call.Args["skip_dirs"])
+	entries, partial, skipped, err := readProjectIndexEntries(ctx, root, limit, maxDepth, skipDirs)
+	evidence := map[string]any{
+		"path":       root,
+		"entries":    len(entries),
+		"limit":      limit,
+		"max_depth":  maxDepth,
+		"partial":    partial,
+		"skipped":    skipped,
+		"elapsed_ms": time.Since(start).Milliseconds(),
+	}
+	if err != nil {
+		evidence["partial"] = len(entries) > 0
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: evidence}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(projectIndexEntryLines(entries), "\n"), Evidence: evidence}
+}
+
+type projectIndexEntry struct {
+	Path    string
+	IsDir   bool
+	Skipped bool
+}
+
+func readProjectIndexEntries(ctx context.Context, root string, limit, maxDepth int, skipDirs map[string]bool) ([]projectIndexEntry, bool, int, error) {
+	root = filepath.Clean(root)
+	entries := make([]projectIndexEntry, 0, limit)
+	skipped := 0
+	partial := false
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			partial = len(entries) > 0
+			return ctx.Err()
+		default:
+		}
+		if path == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		depth := pathDepth(rel)
+		if depth > maxDepth {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		skip := d.IsDir() && skipDirs[strings.ToLower(d.Name())]
+		if len(entries) >= limit {
+			partial = true
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return filepath.SkipAll
+		}
+		entries = append(entries, projectIndexEntry{Path: filepath.ToSlash(rel), IsDir: d.IsDir(), Skipped: skip})
+		if skip {
+			skipped++
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err == filepath.SkipAll {
+		err = nil
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir
+		}
+		return entries[i].Path < entries[j].Path
+	})
+	return entries, partial, skipped, err
+}
+
+func pathDepth(rel string) int {
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return 0
+	}
+	return strings.Count(rel, string(filepath.Separator)) + 1
+}
+
+func projectIndexEntryLines(entries []projectIndexEntry) []string {
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir {
+			suffix := "/"
+			if entry.Skipped {
+				suffix += " [skip]"
+			}
+			lines = append(lines, "DIR:  "+entry.Path+suffix)
+		} else {
+			lines = append(lines, "FILE: "+entry.Path)
+		}
+	}
+	return lines
+}
+
+func projectIndexSkipDirs(value any) map[string]bool {
+	out := defaultProjectIndexSkipDirs()
+	for _, item := range stringSliceArg(value) {
+		name := strings.ToLower(strings.TrimSpace(item))
+		if name != "" {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+func defaultProjectIndexSkipDirs() map[string]bool {
+	out := map[string]bool{}
+	for _, name := range []string{
+		".git", ".hg", ".svn",
+		"node_modules", "bower_components", "vendor",
+		"dist", "build", "out", "target", "bin", "obj", "coverage",
+		".next", ".nuxt", ".svelte-kit", ".astro", ".vite", ".parcel-cache", ".turbo", ".docusaurus",
+		".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox",
+		"__pycache__", ".venv", "venv", "env", ".env", "site-packages",
+		"Pods", "DerivedData", ".gradle", ".idea", ".vscode",
+		"tmp", "temp", ".tmp", "logs",
+	} {
+		out[strings.ToLower(name)] = true
+	}
+	return out
+}
+
+func indexDirectoryToolResult(ctx context.Context, callID, path string, limit int) agentcore.ToolResult {
+	start := time.Now()
+	entries, partial, err := readDirEntriesLimited(ctx, path, limit)
+	evidence := map[string]any{
+		"path":       path,
+		"entries":    len(entries),
+		"limit":      limit,
+		"partial":    partial,
+		"elapsed_ms": time.Since(start).Milliseconds(),
+		"directory":  true,
+	}
+	if err != nil {
+		evidence["partial"] = len(entries) > 0
+		return agentcore.ToolResult{ToolCallID: callID, Content: err.Error(), IsError: true, Evidence: evidence}
+	}
+	lines, skipped := directoryEntryLines(entries)
+	evidence["skipped"] = skipped
+	return agentcore.ToolResult{ToolCallID: callID, Content: strings.Join(lines, "\n"), Evidence: evidence}
+}
+
+func directoryEntryLines(entries []os.DirEntry) ([]string, int) {
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].IsDir() != entries[j].IsDir() {
 			return entries[i].IsDir()
 		}
 		return entries[i].Name() < entries[j].Name()
 	})
-	var lines []string
+	lines := make([]string, 0, len(entries))
+	skipped := 0
 	for _, entry := range entries {
 		if entry.IsDir() {
-			lines = append(lines, "DIR:  "+entry.Name()+"/")
+			suffix := "/"
+			if shouldSkipProjectIndexDir(entry.Name()) {
+				suffix += " [skip]"
+				skipped++
+			}
+			lines = append(lines, "DIR:  "+entry.Name()+suffix)
 		} else {
 			lines = append(lines, "FILE: "+entry.Name())
 		}
 	}
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"path": root, "entries": len(entries)}}
+	return lines, skipped
+}
+
+func shouldSkipProjectIndexDir(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return false
+	}
+	switch normalized {
+	case ".git", ".hg", ".svn",
+		"node_modules", "bower_components", "vendor",
+		"dist", "build", "out", "target", "bin", "obj", "coverage",
+		".next", ".nuxt", ".svelte-kit", ".astro", ".vite", ".parcel-cache", ".turbo",
+		".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox",
+		"__pycache__", ".venv", "venv", "env", ".env", "site-packages",
+		"Pods", "DerivedData", ".gradle", ".idea", ".vscode",
+		"tmp", "temp", ".tmp", "logs":
+		return true
+	default:
+		return false
+	}
+}
+
+func readDirEntriesLimited(ctx context.Context, root string, limit int) ([]os.DirEntry, bool, error) {
+	dir, err := os.Open(root)
+	if err != nil {
+		return nil, false, err
+	}
+	defer dir.Close()
+	entries := make([]os.DirEntry, 0, limit)
+	for len(entries) < limit {
+		select {
+		case <-ctx.Done():
+			return entries, len(entries) > 0, ctx.Err()
+		default:
+		}
+		batchSize := limit - len(entries)
+		if batchSize > 128 {
+			batchSize = 128
+		}
+		batch, err := dir.ReadDir(batchSize)
+		if len(batch) > 0 {
+			entries = append(entries, batch...)
+		}
+		if err == io.EOF {
+			return entries, false, nil
+		}
+		if err != nil {
+			return entries, len(entries) > 0, err
+		}
+	}
+	if _, err := dir.ReadDir(1); err == io.EOF {
+		return entries, false, nil
+	}
+	return entries, true, nil
 }
 
 type TerminalRunTool struct{ Config *config.Root }
@@ -424,6 +655,7 @@ func (TerminalRunTool) ToolContract() agentcore.ToolContract {
 }
 func (TerminalRunTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
 func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	start := time.Now()
 	command := fmt.Sprint(call.Args["command"])
 	if err := rejectCommandContainingKnownSecret(command, t.Config); err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"blocked": true, "reason": "secret_literal"}}
@@ -443,14 +675,12 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 			Evidence:   map[string]any{"command": command, "policy_classification": decision.Class, "decision": "blocked", "reason": decision.Reason},
 		}
 	}
-	timeout := terminalTimeout(t.Config)
-	if seconds := intArg(call.Args["timeout_seconds"]); seconds > 0 {
-		timeout = time.Duration(seconds) * time.Second
-	}
+	timeout := terminalDeadline(command, call.Args["timeout_seconds"], t.Config)
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	execName, execArgs := terminalCommand(t.Config, command)
 	cmd := exec.CommandContext(timeoutCtx, execName, execArgs...)
+	configureTerminalProcess(cmd)
 	envSecrets, err := terminalEnvSecrets(call.Args["env_secrets"], t.Config)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"command": command}}
@@ -466,23 +696,24 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		cmd.Dir = workdir
 	}
 	output, err := cmd.CombinedOutput()
-	const maxTerminalOutput = 512 * 1024
-	raw := string(output)
-	if len(raw) > maxTerminalOutput {
-		raw = raw[:maxTerminalOutput] + "\n... (output truncated at 512KB)"
-	}
+	elapsed := time.Since(start)
+	timedOut := timeoutCtx.Err() == context.DeadlineExceeded
+	cancelled := timeoutCtx.Err() == context.Canceled
+	raw, outputTruncated := truncateToolOutput(string(output), 512*1024)
 	result := strings.TrimSpace(raw)
-	if err != nil {
-		if result == "" {
-			result = err.Error()
-		}
-		evidence := map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}
-		if len(envSecrets.Evidence) > 0 {
-			evidence["env_secrets"] = envSecrets.Evidence
-		}
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: evidence}
+	evidence := map[string]any{
+		"command":               command,
+		"policy_classification": decision.Class,
+		"decision":              "allowed",
+		"timed_out":             timedOut,
+		"cancelled":             cancelled,
+		"elapsed_ms":            elapsed.Milliseconds(),
+		"deadline_ms":           timeout.Milliseconds(),
+		"output_truncated":      outputTruncated,
 	}
-	evidence := map[string]any{"command": command, "policy_classification": decision.Class, "decision": "allowed"}
+	if timedOut {
+		evidence["kill_signal"] = terminalKillSignal()
+	}
 	if len(envSecrets.Evidence) > 0 {
 		evidence["env_secrets"] = envSecrets.Evidence
 	}
@@ -494,6 +725,17 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 	}
 	if t.Config != nil && t.Config.Security.TerminalSandbox.Enabled {
 		evidence["sandbox"] = t.Config.Security.TerminalSandbox.Mode
+	}
+	if err != nil {
+		if result == "" {
+			result = err.Error()
+		}
+		if timedOut {
+			result = "command timed out after " + timeout.String()
+		} else if cancelled {
+			result = "command cancelled: " + timeoutCtx.Err().Error()
+		}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: evidence}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: evidence}
 }
@@ -1300,6 +1542,77 @@ func terminalTimeout(cfg *config.Root) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func terminalDeadline(command string, requested any, cfg *config.Root) time.Duration {
+	timeout := terminalTimeout(cfg)
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	if isInspectCommand(command) && timeout < 60*time.Second {
+		timeout = 60 * time.Second
+	}
+	if isBuildOrTestCommand(command) && timeout < 300*time.Second {
+		timeout = 300 * time.Second
+	}
+	max := 600 * time.Second
+	if isBuildOrTestCommand(command) {
+		max = 1800 * time.Second
+	}
+	if isDestructiveCommand(command) {
+		max = 60 * time.Second
+		if timeout > 20*time.Second {
+			timeout = 20 * time.Second
+		}
+	}
+	if seconds := intArg(requested); seconds > 0 {
+		timeout = time.Duration(seconds) * time.Second
+	}
+	if timeout > max {
+		return max
+	}
+	return timeout
+}
+
+func isInspectCommand(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	for _, marker := range []string{"ls ", "ls\t", "find ", "du ", "grep ", "rg ", "cat ", "sed ", "head ", "tail ", "pwd", "stat ", "wc "} {
+		if strings.HasPrefix(lower, marker) || strings.Contains(lower, "&& "+marker) || strings.Contains(lower, "; "+marker) || strings.Contains(lower, "| "+marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBuildOrTestCommand(command string) bool {
+	lower := strings.ToLower(command)
+	for _, marker := range []string{"go test", "go build", "npm test", "npm run", "pnpm test", "pnpm run", "yarn test", "pytest", "cargo test", "mvn test"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDestructiveCommand(command string) bool {
+	lower := strings.ToLower(command)
+	for _, marker := range []string{"rm ", "rm\t", "mv ", "mv\t", "sudo ", "chmod ", "chown ", "dd "} {
+		if strings.HasPrefix(lower, marker) || strings.Contains(lower, "&& "+marker) || strings.Contains(lower, "; "+marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateToolOutput(raw string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 || len(raw) <= maxBytes {
+		return raw, false
+	}
+	out := raw[:maxBytes]
+	for !utf8.ValidString(out) && len(out) > 0 {
+		out = out[:len(out)-1]
+	}
+	return out + "\n... (output truncated at 512KB)", true
+}
+
 func terminalCommand(cfg *config.Root, command string) (string, []string) {
 	if cfg != nil && cfg.Security.TerminalSandbox.Enabled && len(cfg.Security.TerminalSandbox.CommandPrefix) > 0 {
 		prefix := cfg.Security.TerminalSandbox.CommandPrefix
@@ -1503,7 +1816,7 @@ func (WebSearchTool) ToolContract() agentcore.ToolContract {
 }
 func (WebSearchTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (t WebSearchTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	query := strings.TrimSpace(fmt.Sprint(call.Args["query"]))
+	query := stringArg(call.Args, "query")
 	if query == "" {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: "query is required", IsError: true}
 	}
@@ -1906,6 +2219,20 @@ func intArg(value any) int {
 	}
 }
 
+func boundedIntArg(value any, fallback, min, max int) int {
+	n := intArg(value)
+	if n == 0 {
+		n = fallback
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
 func (EchoTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (EchoTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: fmt.Sprint(call.Args["text"])}
@@ -1920,17 +2247,17 @@ func (FileReadTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
 		WhenToUse:            "Use when the task requires reading a known local text file.",
 		WhenNotToUse:         "Do not use when the file path is unknown; inspect the project first with project.index.",
-		OutputContract:       "Return the file text content and path/byte evidence.",
-		Evidence:             "Return read path and byte count.",
-		Acceptance:           "Accepted when the file exists, is readable, and evidence includes path and bytes.",
-		SoftFailureSignals:   []string{"no such file or directory", "permission denied", "is a directory", "outside allowed roots"},
+		OutputContract:       "Return file text content for files. For directories, return the same non-recursive index format as project.index.",
+		Evidence:             "Return read path and byte count for files; return path, entries, limit, partial, and directory=true for directories.",
+		Acceptance:           "Accepted when the file or directory exists, is readable, and evidence describes what was read.",
+		SoftFailureSignals:   []string{"no such file or directory", "permission denied", "outside allowed roots"},
 		ParallelMode:         "read_only_ok",
 		ReusePolicy:          "stable_read",
 		ConfirmationBoundary: "safe read; no confirmation.",
 	}
 }
 func (FileReadTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
-func (t FileReadTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func (t FileReadTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	path, err := ResolveAllowedPath(fmt.Sprint(call.Args["path"]), t.Config)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
@@ -1940,7 +2267,7 @@ func (t FileReadTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	if info.IsDir() {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: "path is a directory", IsError: true, Evidence: map[string]any{"path": path}}
+		return indexDirectoryToolResult(ctx, call.ID, path, boundedIntArg(call.Args["limit"], 120, 1, 1000))
 	}
 	if info.Size() > 512*1024 {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: fmt.Sprintf("file too large: %d bytes", info.Size()), IsError: true, Evidence: map[string]any{"path": path, "bytes": info.Size()}}
@@ -1973,4 +2300,136 @@ func isLikelyBinary(data []byte) bool {
 		}
 	}
 	return !utf8.Valid(data)
+}
+
+func (ToolResultReadTool) Name() string { return "tool_result.read" }
+func (ToolResultReadTool) Description() string {
+	return "retrieve original tool output by raw_ref from a compacted tool result"
+}
+func (ToolResultReadTool) Schema() agentcore.Schema {
+	return agentcore.Schema{
+		Required: []string{"raw_ref"},
+		Properties: map[string]any{
+			"raw_ref": map[string]any{"type": "string", "description": "Reference from compacted tool result evidence, formatted as tool-result:<hash>."},
+			"query":   map[string]any{"type": "string", "description": "Optional text to search within the original output."},
+			"limit":   map[string]any{"type": "integer", "description": "Maximum characters to return. Defaults to 12000 and is capped at 50000."},
+		},
+	}
+}
+func (ToolResultReadTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use when prior tool result evidence contains raw_ref and the compacted output is insufficient.",
+		WhenNotToUse:         "Do not use for normal file paths or URLs; use file.read or web.fetch for those.",
+		OutputContract:       "Return original tool output, or query-matching line snippets when query is provided.",
+		Evidence:             "Return raw_ref, bytes, limit, partial, and query metadata when used.",
+		Acceptance:           "Accepted when raw_ref exists in the local artifact store and readable content is returned.",
+		SoftFailureSignals:   []string{"invalid raw_ref", "raw_ref not found"},
+		ParallelMode:         "read_only_ok",
+		ReusePolicy:          "stable_read",
+		ConfirmationBoundary: "safe read; no confirmation.",
+	}
+}
+func (ToolResultReadTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (t ToolResultReadTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	rawRef := strings.TrimSpace(fmt.Sprint(call.Args["raw_ref"]))
+	hash, err := parseToolResultRawRef(rawRef)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"raw_ref": rawRef}}
+	}
+	path := toolResultArtifactPath(t.Config, hash)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "raw_ref not found", IsError: true, Evidence: map[string]any{"raw_ref": rawRef}}
+	}
+	limit := boundedIntArg(call.Args["limit"], 12000, 1, 50000)
+	query := stringArg(call.Args, "query")
+	evidence := map[string]any{
+		"raw_ref": rawRef,
+		"bytes":   len(data),
+		"limit":   limit,
+	}
+	content := string(data)
+	if query != "" {
+		content, evidence["matches"] = searchToolResultContent(content, query, limit)
+		evidence["query"] = query
+		evidence["partial"] = len(content) >= limit
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: content, Evidence: evidence}
+	}
+	if len(content) > limit {
+		content = content[:limit] + fmt.Sprintf("\n...[truncated %d chars; call tool_result.read with a query or higher limit for more]...", len(data)-limit)
+		evidence["partial"] = true
+	} else {
+		evidence["partial"] = false
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: content, Evidence: evidence}
+}
+
+func parseToolResultRawRef(rawRef string) (string, error) {
+	hash, ok := strings.CutPrefix(strings.TrimSpace(rawRef), "tool-result:")
+	if !ok || len(hash) != 24 {
+		return "", fmt.Errorf("invalid raw_ref")
+	}
+	for _, r := range hash {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return "", fmt.Errorf("invalid raw_ref")
+		}
+	}
+	return hash, nil
+}
+
+func toolResultArtifactPath(cfg *config.Root, hash string) string {
+	home := config.DefaultHome()
+	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
+		home = cfg.App.Home
+	}
+	return filepath.Join(home, "artifacts", "tool-results", hash[:2], hash+".txt")
+}
+
+func searchToolResultContent(content, query string, limit int) (string, int) {
+	queryLower := strings.ToLower(query)
+	lines := strings.Split(content, "\n")
+	var out []string
+	matches := 0
+	for idx, line := range lines {
+		if !strings.Contains(strings.ToLower(line), queryLower) {
+			continue
+		}
+		matches++
+		start := idx - 2
+		if start < 0 {
+			start = 0
+		}
+		end := idx + 3
+		if end > len(lines) {
+			end = len(lines)
+		}
+		if len(out) > 0 {
+			out = append(out, "--")
+		}
+		for i := start; i < end; i++ {
+			out = append(out, fmt.Sprintf("L%d: %s", i+1, lines[i]))
+		}
+		if len(strings.Join(out, "\n")) >= limit {
+			break
+		}
+	}
+	if matches == 0 {
+		return "no matches", 0
+	}
+	result := strings.Join(out, "\n")
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, matches
+}
+
+func stringArg(args map[string]any, key string) string {
+	if args == nil {
+		return ""
+	}
+	value, ok := args[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }

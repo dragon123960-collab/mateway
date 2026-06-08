@@ -114,6 +114,8 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
 	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
 	b.WriteString("- A message like \"I will check now\" or \"let me confirm\" is not a final answer. If you say you will check, confirm, create, update, or inspect something, call the required tool in the same turn.\n")
+	b.WriteString("- For long tasks, work in verifiable stages, preserve completed stage evidence, and summarize progress between stages when possible.\n")
+	b.WriteString("- If a tool is slow, cancelled, or timed out, name the tool, elapsed time, and fallback action instead of asking the user to keep waiting.\n")
 	if prompt := strings.TrimSpace(systemPrompt); prompt != "" {
 		b.WriteString("\n")
 		b.WriteString(prompt)

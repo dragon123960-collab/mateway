@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -23,6 +24,11 @@ import (
 
 type Sender struct {
 	client *lark.Client
+}
+
+func jsonMarshalStringContent(text string) (string, error) {
+	content, err := json.Marshal(map[string]string{"text": text})
+	return string(content), err
 }
 
 func NewSender(cfg config.FeishuConfig) *Sender {
@@ -71,6 +77,38 @@ func (s *Sender) ReplyWithID(ctx context.Context, original channel.InboundMessag
 	return *resp.Data.MessageId, nil
 }
 
+func (s *Sender) ReplyTextWithID(ctx context.Context, original channel.InboundMessage, text, uuid string) (string, error) {
+	if strings.TrimSpace(original.ID) == "" {
+		return "", fmt.Errorf("feishu message id is required")
+	}
+	content, err := jsonMarshalStringContent(text)
+	if err != nil {
+		return "", err
+	}
+	body := larkim.NewReplyMessageReqBodyBuilder().
+		MsgType("text").
+		Content(content).
+		ReplyInThread(false)
+	if strings.TrimSpace(uuid) != "" {
+		body.Uuid(uuid)
+	}
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(original.ID).
+		Body(body.Build()).
+		Build()
+	resp, err := s.client.Im.Message.Reply(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("feishu text reply failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil || resp.Data.MessageId == nil {
+		return "", nil
+	}
+	return *resp.Data.MessageId, nil
+}
+
 func (s *Sender) Update(ctx context.Context, messageID string, reply channel.OutboundMessage) error {
 	if strings.TrimSpace(messageID) == "" {
 		return fmt.Errorf("feishu message id is required")
@@ -89,6 +127,28 @@ func (s *Sender) Update(ctx context.Context, messageID string, reply channel.Out
 	}
 	if !resp.Success() {
 		return fmt.Errorf("feishu update failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+func (s *Sender) UpdateText(ctx context.Context, messageID, text string) error {
+	if strings.TrimSpace(messageID) == "" {
+		return fmt.Errorf("feishu message id is required")
+	}
+	content, err := jsonMarshalStringContent(text)
+	if err != nil {
+		return err
+	}
+	req := larkim.NewUpdateMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewUpdateMessageReqBodyBuilder().MsgType("text").Content(content).Build()).
+		Build()
+	resp, err := s.client.Im.Message.Update(ctx, req)
+	if err != nil {
+		return err
+	}
+	if !resp.Success() {
+		return fmt.Errorf("feishu text update failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
 }

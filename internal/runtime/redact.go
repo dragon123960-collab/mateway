@@ -12,6 +12,7 @@ const redactedSecret = "[REDACTED_SECRET]"
 const (
 	storedRecentMessagesLimit = 20
 	storedToolContentLimit    = 2048
+	modelToolContentLimit     = 8192
 	traceContentLimit         = 4096
 	modelPromptCharBudget     = 120000
 )
@@ -277,10 +278,13 @@ func compactMessagesForStorage(messages []agentcore.Message) ([]agentcore.Messag
 
 func prepareMessagesForModel(messages []agentcore.Message) ([]agentcore.Message, messageCompactStats, error) {
 	prepared, stats := compactMessagesForStorage(redactMessagesForStorage(messages))
+	prepared = shrinkToolMessages(prepared, modelToolContentLimit)
+	stats.AfterChars = messageChars(prepared)
+	stats.AfterMessages = len(prepared)
 	if messageChars(prepared) <= modelPromptCharBudget {
 		return prepared, stats, nil
 	}
-	for limit := storedToolContentLimit / 2; limit >= 256; limit /= 2 {
+	for limit := storedToolContentLimit; limit >= 256; limit /= 2 {
 		prepared = shrinkToolMessages(prepared, limit)
 		if messageChars(prepared) <= modelPromptCharBudget {
 			stats.AfterChars = messageChars(prepared)

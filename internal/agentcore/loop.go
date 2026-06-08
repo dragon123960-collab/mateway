@@ -22,7 +22,7 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 		if cfg.MaxIterations > 0 && iteration >= cfg.MaxIterations {
 			result := Result{
 				Messages:   transcript,
-				FinalText:  "已达到最大执行轮数，任务已停止，避免无限循环。",
+				FinalText:  "Maximum agent iterations reached; execution stopped to avoid an infinite loop.",
 				Iterations: iteration,
 				StopReason: "max_iterations_exceeded",
 			}
@@ -84,18 +84,11 @@ func Run(ctx context.Context, cfg Config, messages []Message) (Result, error) {
 			if err != nil {
 				return Result{}, err
 			}
-		if !stop && len(followUps) > 0 {
-			transcript = append(transcript, followUps...)
-			continue
-		}
-		if iteration == 1 && cfg.Tools != nil {
-			transcript = append(transcript, Message{
-				Role:    RoleUser,
-				Content: "Are you sure this is complete? If the task requires tools, use them now.",
-			})
-			continue
-		}
-		result := Result{
+			if !stop && len(followUps) > 0 {
+				transcript = append(transcript, followUps...)
+				continue
+			}
+			result := Result{
 				Messages:   transcript,
 				FinalText:  strings.TrimSpace(assistant.Content),
 				Iterations: iteration,
@@ -150,7 +143,7 @@ func synthesizeMalformedToolCall(ctx context.Context, cfg Config, transcript []M
 	}
 	if len(assistant.ToolCalls) > 0 || looksLikeMalformedToolCall(assistant.Content) {
 		assistant.ToolCalls = nil
-		assistant.Content = "工具调用格式无效，已停止执行。已有工具结果已保留在 trace 中；请重试或把任务说得更具体。"
+		assistant.Content = "Malformed tool call output; execution stopped. Existing tool results are preserved in the trace."
 	}
 	if err := emit(ctx, cfg.Hooks, Event{Type: EventMessageStart, Message: assistant, Iteration: iteration + 1, Duration: modelDuration}); err != nil {
 		return Result{}, err
@@ -309,9 +302,11 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			toolStart := time.Now()
-			results[i] = cfg.Tools.Execute(ctx, item.Call)
-			durations[i] = time.Since(toolStart)
+			result, duration := executeToolWithControls(ctx, cfg, message, item.Call, item.Tool, iteration, func(execCtx context.Context) ToolResult {
+				return cfg.Tools.Execute(execCtx, item.Call)
+			})
+			results[i] = result
+			durations[i] = duration
 		}(i, item)
 	}
 	wg.Wait()
@@ -340,9 +335,15 @@ func executeOneToolCall(ctx context.Context, cfg Config, message Message, call T
 	if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionStart, Message: message, ToolCall: call, Iteration: iteration}); err != nil {
 		return ToolResult{}, "", err
 	}
-	toolStart := time.Now()
-	result, blocked, err := prepareAndExecuteTool(ctx, cfg, message, call)
-	toolDuration := time.Since(toolStart)
+	tool, _ := cfg.Tools.Get(call.Name)
+	var blocked bool
+	var execErr error
+	result, toolDuration := executeToolWithControls(ctx, cfg, message, call, tool, iteration, func(execCtx context.Context) ToolResult {
+		var runResult ToolResult
+		runResult, blocked, execErr = prepareAndExecuteTool(execCtx, cfg, message, call)
+		return runResult
+	})
+	err := execErr
 	if err != nil {
 		return ToolResult{}, "", err
 	}
@@ -364,6 +365,106 @@ func executeOneToolCall(ctx context.Context, cfg Config, message Message, call T
 		return ToolResult{}, "", err
 	}
 	return result, stopReason, nil
+}
+
+func executeToolWithControls(ctx context.Context, cfg Config, message Message, call ToolCall, tool Tool, iteration int, run func(context.Context) ToolResult) (ToolResult, time.Duration) {
+	deadline := toolTimeout(cfg.Hooks, message, call, tool)
+	execCtx := ctx
+	cancel := func() {}
+	if deadline > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, deadline)
+	}
+	defer cancel()
+	stopProgress := startToolProgress(ctx, cfg, message, call, iteration, deadline, toolProgressInterval(cfg.Hooks, message, call, tool))
+	defer stopProgress()
+	toolStart := time.Now()
+	result := run(execCtx)
+	duration := time.Since(toolStart)
+	return enrichToolTimeoutResult(result, call, execCtx, duration, deadline), duration
+}
+
+func toolTimeout(hooks Hooks, message Message, call ToolCall, tool Tool) time.Duration {
+	if hooks.ToolTimeout == nil {
+		return 0
+	}
+	timeout := hooks.ToolTimeout(ToolExecutionContext{Message: message, ToolCall: call, Tool: tool})
+	if timeout < 0 {
+		return 0
+	}
+	return timeout
+}
+
+func toolProgressInterval(hooks Hooks, message Message, call ToolCall, tool Tool) time.Duration {
+	if hooks.ToolProgressInterval == nil {
+		return 0
+	}
+	interval := hooks.ToolProgressInterval(ToolExecutionContext{Message: message, ToolCall: call, Tool: tool})
+	if interval < 0 {
+		return 0
+	}
+	return interval
+}
+
+func startToolProgress(ctx context.Context, cfg Config, message Message, call ToolCall, iteration int, deadline, interval time.Duration) func() {
+	if interval <= 0 || cfg.Hooks.Emit == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-timer.C:
+				elapsed := time.Since(start)
+				result := ToolResult{
+					ToolCallID: call.ID,
+					Evidence: map[string]any{
+						"elapsed_ms":  elapsed.Milliseconds(),
+						"deadline_ms": deadline.Milliseconds(),
+					},
+				}
+				_ = emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionProgress, Message: message, ToolCall: call, ToolResult: result, Iteration: iteration, Duration: elapsed})
+				timer.Reset(interval)
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+func enrichToolTimeoutResult(result ToolResult, call ToolCall, ctx context.Context, duration, deadline time.Duration) ToolResult {
+	if result.ToolCallID == "" {
+		result.ToolCallID = call.ID
+	}
+	if result.Evidence == nil {
+		result.Evidence = map[string]any{}
+	}
+	if _, ok := result.Evidence["elapsed_ms"]; !ok {
+		result.Evidence["elapsed_ms"] = duration.Milliseconds()
+	}
+	if deadline > 0 {
+		if _, ok := result.Evidence["deadline_ms"]; !ok {
+			result.Evidence["deadline_ms"] = deadline.Milliseconds()
+		}
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		result.IsError = true
+		result.Evidence["timed_out"] = true
+		if strings.TrimSpace(result.Content) == "" || strings.Contains(result.Content, context.DeadlineExceeded.Error()) {
+			result.Content = fmt.Sprintf("tool %q timed out after %s", call.Name, deadline)
+		}
+	} else if ctx.Err() == context.Canceled {
+		result.IsError = true
+		if _, ok := result.Evidence["cancelled"]; !ok {
+			result.Evidence["cancelled"] = true
+		}
+	}
+	return result
 }
 
 func shouldRunToolCallsInParallel(cfg Config, calls []ToolCall) bool {

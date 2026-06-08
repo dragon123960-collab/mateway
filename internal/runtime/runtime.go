@@ -16,12 +16,13 @@ import (
 )
 
 type Runtime struct {
-	Config *config.Root
-	Store  session.Store
-	Tools  *agentcore.ToolRegistry
-	Model  agentcore.Model
-	Pool   AgentPool
-	Hooks  RuntimeHooks
+	Config       *config.Root
+	Store        session.Store
+	Tools        *agentcore.ToolRegistry
+	Model        agentcore.Model
+	Pool         AgentPool
+	Hooks        RuntimeHooks
+	ProgressSink func(channel.OutboundMessage)
 }
 
 type Response struct {
@@ -59,7 +60,8 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	if err != nil {
 		return Response{}, err
 	}
-	_ = trace.write(map[string]any{"type": "request", "session_key": msg.SessionKey, "channel": msg.Channel, "text": msg.Text})
+	trace.setIdentity(traceIdentityForMessage(msg))
+	_ = trace.write(map[string]any{"type": "request", "text": msg.Text})
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
 	}()
@@ -119,6 +121,10 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		agent = agentcore.NewAgent(rt.Model, rt.Tools)
 	}
 	profile := rt.Pool.ProfileForMessage(msg)
+	trace.setIdentity(map[string]any{
+		"agent_id": profile.ID,
+		"task_id":  task.ID,
+	})
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
 	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
@@ -128,7 +134,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxIterations = maxIterations(rt.Config)
 	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
 	defer stopActivityWatch()
-	agentHooks := rt.hooksForState(state, task.ID, userText, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
+	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
 		TaskID:   task.ID,
@@ -145,6 +151,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		if activityTimedOut() {
 			text := runtimeText(rt.Config, msg, "runtime.activity_timeout", nil)
 			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), "partial")
+			resp.Reply.Progress = progressStepsForTask(*state, task.ID)
 			resp.TraceID = trace.id
 			resp.TracePath = trace.path
 			resp.Failed = true
@@ -158,6 +165,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 				ThreadID: msg.ThreadID,
 				Text:     text,
 				Style:    "error",
+				Progress: progressStepsForTask(*state, task.ID),
 			},
 			TraceID:   trace.id,
 			TracePath: trace.path,
@@ -459,6 +467,26 @@ func writeUsageTrace(trace *traceRecorder, usage session.Usage) {
 	})
 }
 
+func traceIdentityForMessage(msg channel.InboundMessage) map[string]any {
+	identity := map[string]any{
+		"session_key": msg.SessionKey,
+		"channel":     msg.Channel,
+		"message_id":  msg.ID,
+		"user_id":     msg.UserID,
+		"thread_id":   msg.ThreadID,
+	}
+	if accountID := strings.TrimSpace(msg.Metadata["account_id"]); accountID != "" {
+		identity["account_id"] = accountID
+	}
+	if peerID := strings.TrimSpace(msg.Metadata["peer_id"]); peerID != "" {
+		identity["peer_id"] = peerID
+	}
+	if messageType := strings.TrimSpace(msg.Metadata["message_type"]); messageType != "" {
+		identity["message_type"] = messageType
+	}
+	return identity
+}
+
 func (rt Runtime) home() string {
 	home := config.DefaultHome()
 	if rt.Config != nil && strings.TrimSpace(rt.Config.App.Home) != "" {
@@ -624,10 +652,30 @@ func memorySkills(skills []discoveredSkill) []memory.SkillEvidence {
 	return out
 }
 
-func (rt Runtime) hooksForState(state *session.State, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
 	hooks := agentcore.Hooks{
-		Emit: trace.emit,
+		Emit: func(ctx context.Context, event agentcore.Event) error {
+			if err := trace.emit(ctx, event); err != nil {
+				return err
+			}
+			if event.Type == agentcore.EventToolExecutionProgress {
+				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
+					Title:      event.ToolCall.Name,
+					Status:     "running",
+					Tool:       event.ToolCall.Name,
+					Summary:    summarizeToolCall(event.ToolCall),
+					DurationMS: event.Duration.Milliseconds(),
+				})
+			}
+			return nil
+		},
+		ToolTimeout: func(input agentcore.ToolExecutionContext) time.Duration {
+			return runtimeToolTimeout(rt.Config, input.ToolCall.Name)
+		},
+		ToolProgressInterval: func(input agentcore.ToolExecutionContext) time.Duration {
+			return runtimeToolProgressInterval(rt.Config, input.ToolCall.Name)
+		},
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
 			if steeringSent {
 				return nil, nil
@@ -648,8 +696,10 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, t
 					},
 				})
 				_ = trace.write(map[string]any{"type": "tool_blocked", "task_id": taskID, "tool": input.ToolCall.Name, "reason": policy.Reason})
+				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
 			}
+			rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
 		},
 		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
@@ -663,27 +713,83 @@ func (rt Runtime) hooksForState(state *session.State, taskID, userText string, t
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
+				evidence := map[string]any{
+					"accepted": observe.TaskStep.Accepted,
+					"mutation": observe.TaskStep.Mutation,
+					"risk":     observe.TaskStep.Risk,
+				}
+				for key, value := range input.ToolResult.Evidence {
+					switch key {
+					case "elapsed_ms", "timed_out", "deadline_ms", "output_truncated":
+						evidence[key] = value
+					}
+				}
 				state.AddExecutionEvent(taskID, session.ExecutionEvent{
-					Type:    "tool_result",
-					Status:  observe.TaskStep.Status,
-					Tool:    input.ToolCall.Name,
-					StepID:  observe.TaskStep.ID,
-					Summary: observe.TaskStep.Summary,
-					Evidence: map[string]any{
-						"accepted": observe.TaskStep.Accepted,
-						"mutation": observe.TaskStep.Mutation,
-						"risk":     observe.TaskStep.Risk,
-					},
+					Type:     "tool_result",
+					Status:   observe.TaskStep.Status,
+					Tool:     input.ToolCall.Name,
+					StepID:   observe.TaskStep.ID,
+					Summary:  observe.TaskStep.Summary,
+					Evidence: evidence,
 				})
 				switch observe.TaskStep.Status {
 				case "accepted":
 				case "failed", "suspect":
 				}
+				rt.emitProgress(msg, *state, taskID, progressStepFromExecutionEvent(session.ExecutionEvent{
+					Type:     "tool_result",
+					Status:   observe.TaskStep.Status,
+					Tool:     input.ToolCall.Name,
+					Summary:  observe.TaskStep.Summary,
+					Evidence: evidence,
+				}))
 			}
-			return agentcore.AfterToolCallResult{}, nil
+			result := compactToolResultForModel(input.ToolCall, input.ToolResult, rt.home(), trace.id)
+			return agentcore.AfterToolCallResult{ToolResult: &result}, nil
 		},
 	}
+	var followUps []agentcore.Message
+	followupSent := false
+	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
+		if followupSent || turnHasToolEvidence(turn) || !needsAction(userText) || !looksLikeUnexecutedAction(turn.Message.Content) {
+			return false, nil
+		}
+		followupSent = true
+		if len(followUps) == 0 {
+			followUps = append(followUps, agentcore.Message{
+				Role:    agentcore.RoleUser,
+				Content: "You promised an action but did not execute any tool. Continue now with the smallest safe tool call, or state the concrete blocker that prevents execution.",
+			})
+			_ = trace.write(map[string]any{"type": "deliverable_gate_followup", "task_id": taskID, "reason": "unexecuted_commitment"})
+		}
+		return false, nil
+	}
+	hooks.GetFollowUpMessages = func(context.Context) ([]agentcore.Message, error) {
+		out := followUps
+		followUps = nil
+		return out, nil
+	}
 	return hooks
+}
+
+var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {
+	_ = cfg
+	switch strings.TrimSpace(toolName) {
+	case "project.index", "file.read":
+		return 30 * time.Second
+	case "terminal.run":
+		return 120 * time.Second
+	default:
+		return 60 * time.Second
+	}
+}
+
+var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.Duration {
+	_ = cfg
+	if strings.TrimSpace(toolName) == "" {
+		return 0
+	}
+	return 30 * time.Second
 }
 
 func (rt Runtime) handlePending(_ context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
@@ -783,6 +889,104 @@ func (rt Runtime) reply(msg channel.InboundMessage, text, style string) Response
 	return Response{Reply: channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: text, Style: style}}
 }
 
+func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, taskID string, current channel.ProgressStep) {
+	if rt.ProgressSink == nil {
+		return
+	}
+	steps := progressStepsForTask(state, taskID)
+	if strings.TrimSpace(current.Title) != "" || strings.TrimSpace(current.Tool) != "" {
+		steps = append(steps, current)
+	}
+	rt.ProgressSink(channel.OutboundMessage{
+		Channel:  msg.Channel,
+		ThreadID: msg.ThreadID,
+		Text:     "Processing...",
+		Style:    "processing",
+		Progress: steps,
+	})
+}
+
+func summarizeToolCall(call agentcore.ToolCall) string {
+	switch call.Name {
+	case "terminal.run":
+		return compactProgressSummary(fmt.Sprint(call.Args["command"]))
+	case "project.index", "file.read", "file.write", "file.delete":
+		return compactProgressSummary(fmt.Sprint(call.Args["path"]))
+	case "web.search":
+		return compactProgressSummary(fmt.Sprint(call.Args["query"]))
+	case "web.fetch":
+		return compactProgressSummary(fmt.Sprint(call.Args["url"]))
+	default:
+		return ""
+	}
+}
+
+func progressStepsForTask(state session.State, taskID string) []channel.ProgressStep {
+	task := taskFromState(state, taskID)
+	events := task.Execution.Events
+	out := make([]channel.ProgressStep, 0, len(events))
+	for _, event := range events {
+		step := progressStepFromExecutionEvent(event)
+		if strings.TrimSpace(step.Title) == "" {
+			continue
+		}
+		out = append(out, step)
+	}
+	const limit = 8
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+func progressStepFromExecutionEvent(event session.ExecutionEvent) channel.ProgressStep {
+	title := strings.TrimSpace(event.Type)
+	if event.Tool != "" {
+		title = strings.TrimSpace(event.Tool)
+	}
+	step := channel.ProgressStep{
+		Title:   title,
+		Status:  strings.TrimSpace(event.Status),
+		Tool:    strings.TrimSpace(event.Tool),
+		Summary: compactProgressSummary(event.Summary),
+	}
+	if accepted, ok := event.Evidence["accepted"].(bool); ok && accepted {
+		step.Status = firstNonEmpty(step.Status, "accepted")
+	}
+	if timedOut, ok := event.Evidence["timed_out"].(bool); ok {
+		step.TimedOut = timedOut
+	}
+	if elapsed, ok := int64Evidence(event.Evidence["elapsed_ms"]); ok {
+		step.DurationMS = elapsed
+	}
+	return step
+}
+
+func int64Evidence(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func compactProgressSummary(text string) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if text == "" {
+		return ""
+	}
+	const limit = 80
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + fmt.Sprintf("... (%d chars)", len(text))
+}
+
 func summarize(text string) string {
 	text = strings.TrimSpace(text)
 	if len(text) <= 160 {
@@ -807,6 +1011,49 @@ func containsAny(text string, markers []string) bool {
 		}
 	}
 	return false
+}
+
+func turnHasToolEvidence(turn agentcore.TurnContext) bool {
+	if len(turn.ToolResults) > 0 {
+		return true
+	}
+	for _, msg := range turn.Messages {
+		if msg.Role == agentcore.RoleTool {
+			return true
+		}
+	}
+	return false
+}
+
+func needsAction(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"read", "check", "inspect", "look at", "review", "fix", "run", "test", "build", "create", "write", "update", "delete", "commit", "trace", "source code", "file", "directory", "repo", "/users/", "~/.mateway",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeUnexecutedCommitment(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"i will ", "i'll ", "let me ", "i'm going to ", "i am going to ", "next i will ", "i need to ", "i should ", "i plan to ", "will check", "will inspect", "will run", "will create", "will update",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeUnexecutedAction(text string) bool {
+	return looksLikeUnexecutedCommitment(text) || looksLikeEmptyActionPromise(text)
 }
 
 func mergeTaskAndInstruction(goal, instruction string) string {

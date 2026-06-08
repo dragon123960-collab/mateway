@@ -79,6 +79,105 @@ func TestRunExecutesSafeReadToolCallsInParallel(t *testing.T) {
 	}
 }
 
+func TestRunToolTimeoutReturnsStructuredError(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "late"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 200 * time.Millisecond})
+	var observed ToolResult
+	_, err := Run(context.Background(), Config{
+		Model: &model,
+		Tools: registry,
+		Hooks: Hooks{
+			ToolTimeout: func(ToolExecutionContext) time.Duration {
+				return 20 * time.Millisecond
+			},
+			AfterToolCall: func(_ context.Context, ctx AfterToolCallContext) (AfterToolCallResult, error) {
+				observed = ctx.ToolResult
+				return AfterToolCallResult{}, nil
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "use slow tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observed.IsError || observed.Evidence["timed_out"] != true {
+		t.Fatalf("expected timed out tool result, got %#v", observed)
+	}
+	if observed.Evidence["deadline_ms"] != int64(20) || observed.Evidence["elapsed_ms"] == nil {
+		t.Fatalf("expected timeout evidence, got %#v", observed.Evidence)
+	}
+}
+
+func TestRunParallelToolTimeoutDoesNotHangBatch(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.slow_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 200 * time.Millisecond})
+	start := time.Now()
+	result, err := Run(context.Background(), Config{
+		Model:            &model,
+		Tools:            registry,
+		MaxParallelTools: 4,
+		Hooks: Hooks{
+			ToolTimeout: func(ToolExecutionContext) time.Duration {
+				return 20 * time.Millisecond
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "read files"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("expected parallel timeout promptly, elapsed %s", elapsed)
+	}
+	messages := strings.Join(toolMessages(result.Messages), "\n")
+	if !strings.Contains(messages, "timed out") {
+		t.Fatalf("expected timeout tool messages, got %#v", toolMessages(result.Messages))
+	}
+}
+
+func TestRunEmitsToolExecutionProgress(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "ok"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 80 * time.Millisecond})
+	progressEvents := 0
+	_, err := Run(context.Background(), Config{
+		Model: &model,
+		Tools: registry,
+		Hooks: Hooks{
+			ToolProgressInterval: func(ToolExecutionContext) time.Duration {
+				return 20 * time.Millisecond
+			},
+			Emit: func(_ context.Context, event Event) error {
+				if event.Type == EventToolExecutionProgress {
+					progressEvents++
+					if event.Duration <= 0 || event.ToolResult.Evidence["elapsed_ms"] == nil {
+						t.Fatalf("missing progress evidence: %#v", event)
+					}
+				}
+				return nil
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "use slow tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progressEvents == 0 {
+		t.Fatal("expected at least one progress event")
+	}
+}
+
 func TestRunSerializesMixedParallelModes(t *testing.T) {
 	model := scriptedModel{messages: []Message{
 		{Role: RoleAssistant, ToolCalls: []ToolCall{

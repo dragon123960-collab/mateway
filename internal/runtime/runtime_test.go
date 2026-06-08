@@ -142,6 +142,58 @@ func TestRuntimeStopsWhenModelReturnsNoToolCallWithoutReview(t *testing.T) {
 	}
 }
 
+func TestRuntimeTraceIncludesIdentity(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "done"}, rt.Tools)
+	msg := inbound("feishu:acct:thread", "inspect")
+	msg.Channel = "feishu"
+	msg.ID = "msg-1"
+	msg.ThreadID = "thread-1"
+	msg.UserID = "user-1"
+	msg.Metadata = map[string]string{"account_id": "acct", "peer_id": "thread-1", "message_type": "text"}
+
+	resp, err := rt.Handle(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	for _, want := range []string{
+		`"session_key":"feishu:acct:thread"`,
+		`"channel":"feishu"`,
+		`"account_id":"acct"`,
+		`"agent_id":"main"`,
+		`"message_id":"msg-1"`,
+		`"task_id":"task-`,
+	} {
+		if !strings.Contains(trace, want) {
+			t.Fatalf("trace missing %s:\n%s", want, trace)
+		}
+	}
+}
+
+func TestTraceSummaryReportsIdentityAndIncomplete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.jsonl")
+	if err := os.WriteFile(path, []byte(
+		`{"type":"request","trace_id":"trace-1","session_key":"feishu:acct:thread","channel":"feishu","account_id":"acct","agent_id":"main","task_id":"task-1","message_id":"msg-1"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := SummarizeTrace(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.SessionKey != "feishu:acct:thread" || summary.AccountID != "acct" || summary.AgentID != "main" || summary.TaskID != "task-1" {
+		t.Fatalf("summary identity mismatch: %#v", summary)
+	}
+	if summary.RuntimeDone || summary.GatewayDone {
+		t.Fatalf("expected incomplete trace summary, got %#v", summary)
+	}
+}
+
 func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
@@ -168,6 +220,108 @@ func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected destructive terminal block event, got %#v", state.Tasks[0].Execution.Events)
+	}
+}
+
+func TestRuntimeContinuesWhenAssistantPromisesActionWithoutTool(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will check now."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "project.index",
+			Args: map[string]any{"path": rt.Config.App.Home},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "checked"},
+	}}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "review files in ~/.mateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "checked" {
+		t.Fatalf("reply = %q", resp.Reply.Text)
+	}
+	if len(resp.Reply.Progress) != 0 {
+		t.Fatalf("completed reply should not include progress, got %#v", resp.Reply.Progress)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "deliverable_gate_followup") {
+		t.Fatalf("expected deliverable gate trace, got:\n%s", string(data))
+	}
+}
+
+func TestRuntimeProgressSinkEmitsToolStartAndEnd(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "project.index",
+			Args: map[string]any{"path": rt.Config.App.Home},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "checked"},
+	}}, rt.Tools)
+	var updates []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates = append(updates, msg)
+	}
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "review files in ~/.mateway")); err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) < 2 {
+		t.Fatalf("expected start and end progress updates, got %#v", updates)
+	}
+	if updates[0].Style != "processing" || len(updates[0].Progress) == 0 || updates[0].Progress[len(updates[0].Progress)-1].Status != "running" {
+		t.Fatalf("expected running progress update, got %#v", updates[0])
+	}
+	last := updates[len(updates)-1]
+	if len(last.Progress) == 0 || last.Progress[len(last.Progress)-1].Tool != "project.index" || last.Progress[len(last.Progress)-1].Status != "accepted" {
+		t.Fatalf("expected accepted project.index progress, got %#v", last)
+	}
+}
+
+func TestRuntimeProgressSinkEmitsLongRunningToolProgress(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeSlowTool{delay: 80 * time.Millisecond})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "test.runtime_slow",
+			Args: map[string]any{"text": "ok"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "checked"},
+	}}, rt.Tools)
+	var updates []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates = append(updates, msg)
+	}
+	oldInterval := runtimeToolProgressInterval
+	runtimeToolProgressInterval = func(*config.Root, string) time.Duration {
+		return 20 * time.Millisecond
+	}
+	defer func() { runtimeToolProgressInterval = oldInterval }()
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "run slow tool")); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, update := range updates {
+		if len(update.Progress) == 0 {
+			continue
+		}
+		step := update.Progress[len(update.Progress)-1]
+		if step.Tool == "test.runtime_slow" && step.Status == "running" && step.DurationMS > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected long-running progress update, got %#v", updates)
 	}
 }
 
@@ -424,27 +578,60 @@ func TestRuntimeInputRequestKeepsTaskActiveForUserContinuation(t *testing.T) {
 
 func TestRuntimeEmptyActionPromiseDoesNotCompleteTask(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "好，我来把授权收尾确认："}, rt.Tools)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "Confirming authorization:"},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "project.index",
+			Args: map[string]any{"path": rt.Config.App.Home},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "authorization checked"},
+	}}, rt.Tools)
 
-	resp, err := rt.Handle(context.Background(), inbound("cli:test", "开通了"))
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "check authorization files"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Text != "authorization checked" || resp.Failed {
+		t.Fatalf("expected same-turn repair to complete, got resp=%#v", resp)
+	}
+	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 || state.ActiveTask != "" || state.Tasks[0].Status != "completed" {
+		t.Fatalf("expected repaired task to complete, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "deliverable_gate_followup") {
+		t.Fatalf("expected deliverable gate trace, got:\n%s", string(data))
+	}
+}
+
+func TestRuntimeEmptyActionPromiseFallsBackAfterOneRepair(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "Confirming authorization:"},
+		{Role: agentcore.RoleAssistant, Content: "Still confirming:"},
+	}}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "check authorization files"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.Reply.Style != "partial" || !resp.Failed {
-		t.Fatalf("expected empty action promise to be partial, got resp=%#v", resp)
+		t.Fatalf("expected repeated empty action promise to be partial, got resp=%#v", resp)
 	}
 	state := loadState(t, rt, "cli:test")
 	if len(state.Tasks) != 1 || state.ActiveTask != state.Tasks[0].ID || state.Tasks[0].Status != "failed" {
-		t.Fatalf("expected empty action promise to keep failed task active, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
+		t.Fatalf("expected repeated empty action promise to keep failed task active, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
 	}
-
-	model := &captureUserModel{text: "continuing"}
-	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
-	if _, err := rt.Handle(context.Background(), inbound("cli:test", "继续")); err != nil {
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(model.lastUser, "开通了") || !strings.Contains(model.lastUser, "继续") {
-		t.Fatalf("expected continuation to steer into empty-promise task, got %q", model.lastUser)
+	if strings.Count(string(data), "deliverable_gate_followup") != 1 {
+		t.Fatalf("expected exactly one deliverable gate follow-up, got:\n%s", string(data))
 	}
 }
 
@@ -518,6 +705,70 @@ func TestCompactMessagesForStorageDropsSystemTruncatesToolAndKeepsRecent(t *test
 	}
 	if stats.DroppedSystem != 1 || stats.TruncatedTools != 1 || stats.DroppedOld == 0 {
 		t.Fatalf("unexpected stats %#v", stats)
+	}
+}
+
+func TestCompactToolResultForModelAddsHeadroom(t *testing.T) {
+	home := t.TempDir()
+	result := compactToolResultForModel(agentcore.ToolCall{ID: "call_1", Name: "file.read"}, agentcore.ToolResult{
+		ToolCallID: "call_1",
+		Content:    strings.Repeat("x", modelToolContentLimit+500),
+		Evidence:   map[string]any{"path": "/tmp/result"},
+	}, home, "trace-1")
+	if len(result.Content) > modelToolContentLimit+320 || !strings.Contains(result.Content, "truncated") {
+		t.Fatalf("expected compacted model tool result, got %d chars", len(result.Content))
+	}
+	if result.Evidence["model_content_truncated"] != true || result.Evidence["model_content_limit"] != modelToolContentLimit {
+		t.Fatalf("expected truncation evidence, got %#v", result.Evidence)
+	}
+	rawRef, ok := result.Evidence["raw_ref"].(string)
+	if !ok || !strings.HasPrefix(rawRef, "tool-result:") {
+		t.Fatalf("expected raw_ref evidence, got %#v", result.Evidence)
+	}
+	rawPath, ok := result.Evidence["raw_path"].(string)
+	if !ok {
+		t.Fatalf("expected raw_path evidence, got %#v", result.Evidence)
+	}
+	data, err := os.ReadFile(rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != modelToolContentLimit+500 {
+		t.Fatalf("expected stored raw content, got %d bytes", len(data))
+	}
+}
+
+func TestCompactToolResultForModelCompactsLogs(t *testing.T) {
+	content := strings.Join([]string{
+		strings.Repeat("boot\n", 400),
+		"warning: slow path",
+		strings.Repeat("noise\n", 1200),
+		"fatal: command timed out",
+		strings.Repeat("done\n", 400),
+	}, "\n")
+	result := compactToolResultForModel(agentcore.ToolCall{Name: "terminal.run"}, agentcore.ToolResult{
+		ToolCallID: "call_1",
+		Content:    content,
+	}, t.TempDir(), "trace-1")
+	if !strings.Contains(result.Content, "priority lines") || !strings.Contains(result.Content, "fatal: command timed out") {
+		t.Fatalf("expected priority log lines, got %q", result.Content)
+	}
+	if result.Evidence["model_content_compressor"] != "log" {
+		t.Fatalf("expected log compressor evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestCompactToolResultForModelCompactsHTML(t *testing.T) {
+	content := "<html><head><style>.x{}</style><script>alert(1)</script></head><body><h1>Title</h1><p>" + strings.Repeat("body ", 3000) + "</p></body></html>"
+	result := compactToolResultForModel(agentcore.ToolCall{Name: "web.fetch"}, agentcore.ToolResult{
+		ToolCallID: "call_1",
+		Content:    content,
+	}, t.TempDir(), "trace-1")
+	if strings.Contains(result.Content, "<script") || !strings.Contains(result.Content, "Title") {
+		t.Fatalf("expected html text extraction, got %q", result.Content[:minInt(len(result.Content), 200)])
+	}
+	if result.Evidence["model_content_compressor"] != "html_text" {
+		t.Fatalf("expected html compressor evidence, got %#v", result.Evidence)
 	}
 }
 
@@ -598,4 +849,28 @@ func (m *sequenceModel) Next(context.Context, agentcore.Context) (agentcore.Mess
 	}
 	m.index++
 	return m.messages[index], nil
+}
+
+type runtimeSlowTool struct {
+	delay time.Duration
+}
+
+func (runtimeSlowTool) Name() string        { return "test.runtime_slow" }
+func (runtimeSlowTool) Description() string { return "test runtime slow" }
+func (runtimeSlowTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"text"}}
+}
+func (runtimeSlowTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (runtimeSlowTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{ParallelMode: "read_only_ok"}
+}
+func (t runtimeSlowTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	timer := time.NewTimer(t.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: ctx.Err().Error(), IsError: true}
+	case <-timer.C:
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: fmt.Sprint(call.Args["text"])}
+	}
 }

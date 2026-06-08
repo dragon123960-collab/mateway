@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
@@ -14,6 +15,7 @@ import (
 type traceRecorder struct {
 	id      string
 	path    string
+	base    map[string]any
 	onWrite func()
 }
 
@@ -28,6 +30,24 @@ func newTraceRecorder(cfg *config.Root) (*traceRecorder, error) {
 	}
 	id := time.Now().Format("20060102-150405.000000")
 	return &traceRecorder{id: id, path: filepath.Join(dir, id+".jsonl")}, nil
+}
+
+func (r *traceRecorder) setIdentity(values map[string]any) {
+	if r == nil {
+		return
+	}
+	if r.base == nil {
+		r.base = map[string]any{}
+	}
+	for key, value := range values {
+		if key == "" || value == nil {
+			continue
+		}
+		if text, ok := value.(string); ok && text == "" {
+			continue
+		}
+		r.base[key] = value
+	}
 }
 
 func (r *traceRecorder) emit(ctx context.Context, event agentcore.Event) error {
@@ -57,6 +77,16 @@ func (r *traceRecorder) write(payload map[string]any) error {
 	if r.onWrite != nil {
 		r.onWrite()
 	}
+	if len(r.base) > 0 {
+		merged := make(map[string]any, len(r.base)+len(payload))
+		for key, value := range r.base {
+			merged[key] = value
+		}
+		for key, value := range payload {
+			merged[key] = value
+		}
+		payload = merged
+	}
 	payload = redactPayload(payload)
 	payload["trace_id"] = r.id
 	payload["time"] = time.Now().Format(time.RFC3339Nano)
@@ -67,8 +97,16 @@ func AppendTraceEvent(path string, payload map[string]any) error {
 	if path == "" {
 		return nil
 	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
 	payload = redactPayload(payload)
 	payload["time"] = time.Now().Format(time.RFC3339Nano)
+	if _, ok := payload["trace_id"]; !ok {
+		if id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)); id != "" {
+			payload["trace_id"] = id
+		}
+	}
 	return appendTracePayload(path, payload)
 }
 

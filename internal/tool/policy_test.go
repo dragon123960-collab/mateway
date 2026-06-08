@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/config"
@@ -47,6 +48,161 @@ func TestResolveAllowedPathAllowsAccessiblePath(t *testing.T) {
 	}
 	if path != filepath.Join(extra, "ok.txt") {
 		t.Fatalf("path = %q", path)
+	}
+}
+
+func TestToolResultReadRetrievesRawRef(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}}
+	hash := "0123456789abcdef01234567"
+	dir := filepath.Join(home, "artifacts", "tool-results", hash[:2])
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "alpha\nbeta needle\ngamma\nneedle second\nomega"
+	if err := os.WriteFile(filepath.Join(dir, hash+".txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readTool := ToolResultReadTool{Config: cfg}
+	full := readTool.Run(context.Background(), agentcore.ToolCall{ID: "call_1", Args: map[string]any{"raw_ref": "tool-result:" + hash}})
+	if full.IsError || full.Content != content {
+		t.Fatalf("expected full content, got %#v", full)
+	}
+	searched := readTool.Run(context.Background(), agentcore.ToolCall{ID: "call_2", Args: map[string]any{"raw_ref": "tool-result:" + hash, "query": "needle"}})
+	if searched.IsError || !strings.Contains(searched.Content, "L2: beta needle") || searched.Evidence["matches"] != 2 {
+		t.Fatalf("expected query snippets, got %#v", searched)
+	}
+}
+
+func TestProjectIndexLimitsWideDirectory(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "wide")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("file-%03d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root, "limit": 25},
+	})
+	if result.IsError {
+		t.Fatalf("project.index failed: %s", result.Content)
+	}
+	if lines := strings.Split(strings.TrimSpace(result.Content), "\n"); len(lines) != 25 {
+		t.Fatalf("expected 25 entries, got %d", len(lines))
+	}
+	if result.Evidence["partial"] != true || result.Evidence["entries"] != 25 {
+		t.Fatalf("expected partial evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestProjectIndexMarksCommonHeavyDirectories(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "repo")
+	for _, name := range []string{"node_modules", ".git", "src"} {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root},
+	})
+	if result.IsError {
+		t.Fatalf("project.index failed: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "DIR:  .git/ [skip]") || !strings.Contains(result.Content, "DIR:  node_modules/ [skip]") {
+		t.Fatalf("expected skip markers, got %q", result.Content)
+	}
+	if strings.Contains(result.Content, "DIR:  src/ [skip]") {
+		t.Fatalf("did not expect src skip marker, got %q", result.Content)
+	}
+	if result.Evidence["skipped"] != 2 {
+		t.Fatalf("expected skipped evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestProjectIndexHonorsMaxDepthAndSkipDirs(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "repo")
+	for _, path := range []string{
+		filepath.Join(root, "src", "pkg", "deep"),
+		filepath.Join(root, "generated", "nested"),
+	} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "pkg", "deep", "hidden.go"), []byte("package deep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "generated", "nested", "artifact.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root, "max_depth": 2, "skip_dirs": []any{"generated"}},
+	})
+	if result.IsError {
+		t.Fatalf("project.index failed: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "DIR:  generated/ [skip]") {
+		t.Fatalf("expected custom skip marker, got %q", result.Content)
+	}
+	if strings.Contains(result.Content, "artifact.txt") || strings.Contains(result.Content, "hidden.go") {
+		t.Fatalf("expected bounded scan to omit deep/skipped files, got %q", result.Content)
+	}
+	if result.Evidence["max_depth"] != 2 || result.Evidence["skipped"] != 1 {
+		t.Fatalf("expected max_depth and skipped evidence, got %#v", result.Evidence)
+	}
+}
+
+func TestProjectIndexHonorsCancelledContext(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := ProjectIndexTool{Config: cfg}.Run(ctx, agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "project.index",
+		Args: map[string]any{"path": root},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "context canceled") {
+		t.Fatalf("expected context cancellation, got %#v", result)
+	}
+}
+
+func TestTerminalRunReportsTimeoutEvidence(t *testing.T) {
+	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "terminal.run",
+		Args: map[string]any{"command": "sleep 2", "timeout_seconds": 1},
+	})
+	if !result.IsError {
+		t.Fatalf("expected timeout error, got %#v", result)
+	}
+	if result.Evidence["timed_out"] != true || result.Evidence["deadline_ms"] != int64(1000) {
+		t.Fatalf("expected timeout evidence, got %#v", result.Evidence)
+	}
+	if result.Evidence["elapsed_ms"] == nil {
+		t.Fatalf("expected elapsed evidence, got %#v", result.Evidence)
 	}
 }
 
@@ -371,6 +527,27 @@ func TestTerminalRunIgnoresObsoleteApprovalFlagAndExecutes(t *testing.T) {
 	})
 	if result.IsError || !strings.Contains(result.Content, "ok") {
 		t.Fatalf("expected obsolete approval flag ignored and command executed, got %#v", result)
+	}
+}
+
+func TestTerminalRunTimeoutKillsProcessGroup(t *testing.T) {
+	start := time.Now()
+	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "1",
+		Name: "terminal.run",
+		Args: map[string]any{
+			"command":         "sh -c 'sleep 30 & wait'",
+			"timeout_seconds": 1,
+		},
+	})
+	if !result.IsError {
+		t.Fatalf("expected timeout error, got %#v", result)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("timeout did not return promptly, elapsed=%s result=%#v", elapsed, result)
+	}
+	if result.Evidence["timed_out"] != true {
+		t.Fatalf("expected timed_out evidence, got %#v", result.Evidence)
 	}
 }
 
@@ -753,6 +930,28 @@ func TestFileReadRejectsLargeFile(t *testing.T) {
 	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
 	if !result.IsError || !strings.Contains(result.Content, "file too large") {
 		t.Fatalf("expected large file error, got %#v", result)
+	}
+}
+
+func TestFileReadIndexesDirectory(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "notes")
+	if err := os.MkdirAll(filepath.Join(root, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": root}})
+	if result.IsError {
+		t.Fatalf("expected directory index, got %#v", result)
+	}
+	if !strings.Contains(result.Content, "DIR:  child/") || !strings.Contains(result.Content, "FILE: a.md") {
+		t.Fatalf("unexpected directory content: %#v", result)
+	}
+	if result.Evidence["directory"] != true {
+		t.Fatalf("expected directory evidence, got %#v", result.Evidence)
 	}
 }
 

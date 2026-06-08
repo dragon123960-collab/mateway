@@ -297,17 +297,15 @@ func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.Inbo
 	if err != nil {
 		return resp, err
 	}
-	_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+	_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 		"type":                "gateway_done",
-		"message_id":          msg.ID,
-		"session_key":         msg.SessionKey,
 		"runtime_duration_ms": runtimeDuration.Milliseconds(),
 		"reply_duration_ms":   int64(0),
 		"total_duration_ms":   time.Since(start).Milliseconds(),
 		"reply_style":         resp.Reply.Style,
 		"follow_up_count":     len(resp.FollowUps),
 		"failed":              resp.Failed,
-	})
+	}))
 	return resp, nil
 }
 
@@ -321,19 +319,18 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 	}
 	ackMessageID := ""
 	if shouldSendProcessingAck(rt, msg) {
-		id, ackErr := sender.ReplyWithID(runCtx, msg, channel.OutboundMessage{
-			Channel:  msg.Channel,
-			ThreadID: msg.ThreadID,
-			Text:     gatewayText(rt.Config, msg, "gateway.processing_ack", nil),
-			Style:    "processing",
-		}, msg.ID+":processing")
+		id, ackErr := sender.ReplyTextWithID(runCtx, msg, gatewayText(rt.Config, msg, "gateway.processing_ack", nil), msg.ID+":processing")
 		if ackErr != nil {
 			log.Printf("mateway gateway processing ack error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, ackErr)
 		}
 		ackMessageID = id
 	}
 	runtimeStart := time.Now()
-	resp, err := rt.Handle(runCtx, msg)
+	progressRT := rt
+	if strings.TrimSpace(ackMessageID) != "" {
+		progressRT.ProgressSink = feishuProgressSink(runCtx, sender, ackMessageID)
+	}
+	resp, err := progressRT.Handle(runCtx, msg)
 	runtimeDuration := time.Since(runtimeStart)
 	if err != nil {
 		log.Printf("mateway gateway runtime error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
@@ -346,15 +343,13 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 	replyStart := time.Now()
 	if err := sendFinalReply(runCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
 		log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
-		_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+		_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 			"type":                "gateway_done",
-			"message_id":          msg.ID,
-			"session_key":         msg.SessionKey,
 			"runtime_duration_ms": runtimeDuration.Milliseconds(),
 			"reply_duration_ms":   time.Since(replyStart).Milliseconds(),
 			"total_duration_ms":   time.Since(start).Milliseconds(),
 			"reply_error":         err.Error(),
-		})
+		}))
 		if !cardAction {
 			react(runCtx, sender, msg.ID, "CROSS_MARK")
 		}
@@ -372,16 +367,84 @@ func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.Inb
 	if !cardAction {
 		react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
 	}
-	_ = runtime.AppendTraceEvent(resp.TracePath, map[string]any{
+	_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 		"type":                "gateway_done",
-		"message_id":          msg.ID,
-		"session_key":         msg.SessionKey,
 		"runtime_duration_ms": runtimeDuration.Milliseconds(),
 		"reply_duration_ms":   replyDuration.Milliseconds(),
 		"total_duration_ms":   time.Since(start).Milliseconds(),
 		"reply_style":         resp.Reply.Style,
 		"failed":              resp.Failed,
-	})
+	}))
+}
+
+func gatewayTraceEvent(msg channel.InboundMessage, payload map[string]any) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["session_key"] = msg.SessionKey
+	payload["channel"] = msg.Channel
+	payload["message_id"] = msg.ID
+	payload["user_id"] = msg.UserID
+	payload["thread_id"] = msg.ThreadID
+	for _, key := range []string{"account_id", "peer_id", "message_type"} {
+		if value := strings.TrimSpace(msg.Metadata[key]); value != "" {
+			payload[key] = value
+		}
+	}
+	return payload
+}
+
+func feishuProgressSink(ctx context.Context, sender *feishu.Sender, ackMessageID string) func(channel.OutboundMessage) {
+	var lastUpdate time.Time
+	return func(update channel.OutboundMessage) {
+		if sender == nil || strings.TrimSpace(ackMessageID) == "" {
+			return
+		}
+		now := time.Now()
+		if !lastUpdate.IsZero() && now.Sub(lastUpdate) < 500*time.Millisecond {
+			return
+		}
+		lastUpdate = now
+		if text := feishuProgressText(update); text != "" {
+			if err := sender.UpdateText(ctx, ackMessageID, text); err != nil {
+				log.Printf("mateway gateway progress text update error message_id=%s: %v", ackMessageID, err)
+			}
+		}
+	}
+}
+
+func feishuProgressText(update channel.OutboundMessage) string {
+	var b strings.Builder
+	text := strings.TrimSpace(update.Text)
+	if text == "" {
+		text = "Processing..."
+	}
+	b.WriteString(text)
+	for _, step := range update.Progress {
+		title := strings.TrimSpace(step.Tool)
+		if title == "" {
+			title = strings.TrimSpace(step.Title)
+		}
+		if title == "" {
+			continue
+		}
+		status := strings.TrimSpace(step.Status)
+		if status == "" {
+			status = "recorded"
+		}
+		b.WriteString("\n- ")
+		b.WriteString(title)
+		b.WriteString(": ")
+		b.WriteString(status)
+		if step.TimedOut {
+			b.WriteString(" / timed out")
+		}
+		if summary := strings.TrimSpace(step.Summary); summary != "" {
+			b.WriteString(" / ")
+			b.WriteString(summary)
+		}
+	}
+	return b.String()
 }
 
 func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) bool {
