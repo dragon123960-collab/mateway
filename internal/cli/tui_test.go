@@ -428,10 +428,49 @@ func TestTUISidebarShowsLiveTaskWhileRunning(t *testing.T) {
 	if strings.Contains(lines, "old completed task") {
 		t.Fatalf("live sidebar should not show old task:\n%s", lines)
 	}
-	for _, want := range []string{"Status: Thinking", "Goal: 我们来具体看看", "Search DeepSeek V4 Pro"} {
+	for _, want := range []string{"▾ Contract pending", "[•] 我们来具体看看"} {
 		if !strings.Contains(lines, want) {
 			t.Fatalf("live sidebar missing %q:\n%s", want, lines)
 		}
+	}
+	if strings.Contains(lines, "Recent steps") || strings.Contains(lines, "DeepSeek V4 Pro") {
+		t.Fatalf("pending contract sidebar should not show process steps:\n%s", lines)
+	}
+}
+
+func TestTUISidebarShowsStoredContractWhileRunning(t *testing.T) {
+	state := session.State{
+		Key:        "cli:default",
+		ActiveTask: "task-1",
+		Tasks: []session.TaskNode{{
+			ID:     "task-1",
+			Status: "running",
+			Execution: session.ExecutionFrame{Contract: &session.TaskContract{
+				Summary:       "search current facts",
+				RequiredTools: []string{"web.search"},
+			}},
+			Steps: []session.TaskStep{{
+				Tool:     "web.search",
+				Status:   "accepted",
+				Accepted: true,
+			}},
+		}},
+	}
+	home := t.TempDir()
+	if err := session.NewStore(home).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: home}}, "cli:default")
+	app.running = true
+	app.currentTask = "fallback text should not be primary"
+	lines := strings.Join(app.sidebarSummary(state).TaskLines, "\n")
+	for _, want := range []string{"▾ Contract running", "[✓] search current facts", "[✓] Search"} {
+		if !strings.Contains(lines, want) {
+			t.Fatalf("running contract missing %q:\n%s", want, lines)
+		}
+	}
+	if strings.Contains(lines, "Recent steps") || strings.Contains(lines, "fallback text should not be primary") {
+		t.Fatalf("running sidebar should prefer contract checklist:\n%s", lines)
 	}
 }
 
@@ -552,8 +591,12 @@ func TestTUICommandPanelRunsDirectCommand(t *testing.T) {
 	}
 }
 
-func TestTUICommandPanelFillsParameterizedCommand(t *testing.T) {
-	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
+func TestTUICommandPanelOpensSessionPicker(t *testing.T) {
+	home := t.TempDir()
+	if err := session.NewStore(home).Save(session.State{Key: "cli:other"}); err != nil {
+		t.Fatal(err)
+	}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: home}}, "cli:default")
 	app.input.SetValue("switch session")
 	app.commandPanel = true
 	items := app.filteredCommandItems()
@@ -568,8 +611,11 @@ func TestTUICommandPanelFillsParameterizedCommand(t *testing.T) {
 	if next.commandPanel {
 		t.Fatal("command panel should close after enter")
 	}
-	if !strings.HasPrefix(next.input.Value(), "/session") {
-		t.Fatalf("input should be filled with session command, got %q", next.input.Value())
+	if next.input.Value() != "" {
+		t.Fatalf("session action should clear input, got %q", next.input.Value())
+	}
+	if next.picker == nil || next.picker.Kind != "sessions" {
+		t.Fatalf("session action should open sessions picker, got %#v", next.picker)
 	}
 }
 
@@ -585,6 +631,9 @@ func TestTUICommandPaletteViewShowsGroupedOverlay(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("palette missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Contains(view, "mateway gateway status") || strings.Contains(view, "mateway memory proposal list") {
+		t.Fatalf("palette should not show raw external commands:\n%s", view)
 	}
 }
 

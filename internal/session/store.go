@@ -14,10 +14,19 @@ type State struct {
 	Key        string              `json:"key"`
 	Messages   []agentcore.Message `json:"messages"`
 	Tasks      []TaskNode          `json:"tasks,omitempty"`
+	Summary    SessionSummary      `json:"summary,omitempty"`
 	ActiveTask string              `json:"active_task,omitempty"`
 	Pending    *PendingAction      `json:"pending,omitempty"`
 	Usage      Usage               `json:"usage,omitempty"`
 	UpdatedAt  time.Time           `json:"updated_at"`
+}
+
+type SessionSummary struct {
+	Text      string    `json:"text,omitempty"`
+	Tasks     []string  `json:"tasks,omitempty"`
+	OpenItems []string  `json:"open_items,omitempty"`
+	Evidence  []string  `json:"evidence,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 type TaskNode struct {
@@ -94,11 +103,20 @@ type PendingAction struct {
 }
 
 type Usage struct {
-	Requests     int     `json:"requests,omitempty"`
-	InputTokens  int     `json:"input_tokens,omitempty"`
-	OutputTokens int     `json:"output_tokens,omitempty"`
-	TotalTokens  int     `json:"total_tokens,omitempty"`
-	Cost         float64 `json:"cost,omitempty"`
+	Requests             int     `json:"requests,omitempty"`
+	InputTokens          int     `json:"input_tokens,omitempty"`
+	OutputTokens         int     `json:"output_tokens,omitempty"`
+	TotalTokens          int     `json:"total_tokens,omitempty"`
+	EstimatedInputTokens int     `json:"estimated_input_tokens,omitempty"`
+	SavedEstimatedTokens int     `json:"saved_estimated_tokens,omitempty"`
+	CompactedMessages    int     `json:"compacted_messages,omitempty"`
+	CompactedToolResults int     `json:"compacted_tool_results,omitempty"`
+	CacheHits            int     `json:"cache_hits,omitempty"`
+	CacheReadTokens      int     `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens     int     `json:"cache_write_tokens,omitempty"`
+	CacheInputTokens     int     `json:"cache_input_tokens,omitempty"`
+	CacheOutputTokens    int     `json:"cache_output_tokens,omitempty"`
+	Cost                 float64 `json:"cost,omitempty"`
 }
 
 type Store struct {

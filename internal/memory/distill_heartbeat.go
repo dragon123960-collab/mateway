@@ -454,21 +454,18 @@ func renderProposalNudge(proposals []Proposal, maxProposals int) string {
 		maxProposals = len(proposals)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Pending memory proposals (%d total, showing %d):", len(proposals), maxProposals)
+	fmt.Fprintf(&b, "Pending memory proposals: %d", len(proposals))
+	if maxProposals > 0 {
+		fmt.Fprintf(&b, " (top %d available)", maxProposals)
+	}
+	fmt.Fprintf(&b, "\nReview list: mateway memory proposal list")
 	for i := 0; i < maxProposals; i++ {
 		proposal := proposals[i]
-		fmt.Fprintf(&b, "\n\n%d. %s %s\n", i+1, proposal.ID, proposal.Title)
-		fmt.Fprintf(&b, "Type: %s / %s, confidence: %s", defaultString(proposal.Type, "experience"), defaultString(proposal.Scope, "agent"), defaultString(proposal.Confidence, "low"))
-		if value := proposalReasonSummary(proposal); value != "" {
-			fmt.Fprintf(&b, "\nValue: %s", value)
-		}
-		if len(proposal.Sources) > 0 {
-			fmt.Fprintf(&b, "\nSources: %s", summarizeNudgeText(strings.Join(proposal.Sources, ", "), 90))
-		}
-		fmt.Fprintf(&b, "\nReview: mateway memory proposal show %s", proposal.ID)
+		fmt.Fprintf(&b, "\n%d. %s — %s", i+1, proposal.ID, summarizeNudgeText(proposal.Title, 64))
+		fmt.Fprintf(&b, "\n   show: mateway memory proposal show %s", proposal.ID)
 	}
 	if rest := len(proposals) - maxProposals; rest > 0 {
-		fmt.Fprintf(&b, "\n\n... and %d more.", rest)
+		fmt.Fprintf(&b, "\n... and %d more.", rest)
 	}
 	return b.String()
 }

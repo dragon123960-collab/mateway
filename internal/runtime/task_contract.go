@@ -35,7 +35,26 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		return session.TaskContract{}
 	}
 	if task.Execution.Contract != nil {
+		_ = trace.write(map[string]any{"type": "task_contract_reused", "task_id": task.ID})
 		return *task.Execution.Contract
+	}
+	if shouldSkipTaskContractModel(task.Goal, userText) {
+		contract := fallbackTaskContract(task.Goal, userText)
+		if strings.TrimSpace(contract.Summary) == "" {
+			contract.Summary = summarize(firstNonEmpty(userText, task.Goal))
+		}
+		state.SetTaskContract(task.ID, contract)
+		_ = trace.write(map[string]any{
+			"type":           "task_contract_skipped",
+			"task_id":        task.ID,
+			"reason":         "simple_non_tool_turn",
+			"summary":        contract.Summary,
+			"requires_tools": contract.RequiresTools,
+		})
+		if updated := state.TaskByID(task.ID); updated != nil {
+			*task = *updated
+		}
+		return contract
 	}
 	contractModel := rt.Pool.RoleModelForMessage(msg, "contract", model)
 	if rt.ContractModel != nil {
@@ -63,6 +82,33 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		*task = *updated
 	}
 	return contract
+}
+
+func shouldSkipTaskContractModel(goal, userText string) bool {
+	text := strings.TrimSpace(firstNonEmpty(userText, goal))
+	if text == "" || len([]rune(text)) > 240 {
+		return false
+	}
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"read ", "write ", "edit ", "create ", "delete ", "run ", "test ", "fix ", "implement ",
+		"file", "repo", "repository", "project", "code", "web", "http", "https", "today", "latest",
+		"weather", "price", "schedule", "news", "search", "lookup", "verify", "check", "travel",
+		"decide", "answer",
+	} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	for _, prefix := range []string{"hi", "hello", "thanks", "thank you", "what is ", "what are ", "how does ", "why is ", "explain "} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	if strings.HasSuffix(text, "?") {
+		return len(strings.Fields(text)) <= 12
+	}
+	return false
 }
 
 func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNode, userText string, model agentcore.Model) (session.TaskContract, error) {

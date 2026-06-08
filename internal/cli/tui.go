@@ -876,7 +876,11 @@ func (m *tuiModel) sidebarSummary(state session.State) tuiSidebarSummary {
 	}
 	out.UsageLines = usageLines(usage)
 	if m.running {
-		out.TaskLines = m.liveTaskLines()
+		if task, ok := selectedTask(state); ok && task.Execution.Contract != nil {
+			out.TaskLines = taskSidebarLines(task)
+		} else {
+			out.TaskLines = []string{"▾ Contract pending", "[•] " + compactInline(firstNonEmpty(m.currentTask, "waiting for runtime contract"), 84)}
+		}
 	} else {
 		out.TaskLines = taskLines(state)
 	}
@@ -939,6 +943,19 @@ func usageLines(usage session.Usage) []string {
 	if usage.Cost > 0 {
 		lines = append(lines, fmt.Sprintf("$%.4f", usage.Cost))
 	}
+	if usage.EstimatedInputTokens > 0 {
+		lines = append(lines, fmt.Sprintf("est in %d", usage.EstimatedInputTokens))
+	}
+	if usage.SavedEstimatedTokens > 0 {
+		lines = append(lines, fmt.Sprintf("saved est %d", usage.SavedEstimatedTokens))
+	}
+	if usage.CompactedMessages > 0 || usage.CompactedToolResults > 0 {
+		lines = append(lines, fmt.Sprintf("compact msg %d / tool %d", usage.CompactedMessages, usage.CompactedToolResults))
+	}
+	if usage.CacheHits > 0 || usage.CacheReadTokens > 0 || usage.CacheWriteTokens > 0 {
+		lines = append(lines, fmt.Sprintf("cache hits %d", usage.CacheHits))
+		lines = append(lines, fmt.Sprintf("cache read %d / write %d", usage.CacheReadTokens, usage.CacheWriteTokens))
+	}
 	return lines
 }
 
@@ -948,6 +965,16 @@ func traceSummaryLines(summary runtime.TraceSummary) []string {
 	lines = append(lines, fmt.Sprintf("%d events", summary.Events))
 	if summary.ModelRequests > 0 {
 		lines = append(lines, fmt.Sprintf("%d model calls", summary.ModelRequests))
+	}
+	if summary.SavedEstimatedTokens > 0 {
+		lines = append(lines, fmt.Sprintf("saved est %d tokens", summary.SavedEstimatedTokens))
+	}
+	if summary.CompactedMessages > 0 || summary.CompactedToolResults > 0 {
+		lines = append(lines, fmt.Sprintf("compact msg %d / tool %d", summary.CompactedMessages, summary.CompactedToolResults))
+	}
+	if summary.CacheHits > 0 || summary.CacheReadTokens > 0 || summary.CacheWriteTokens > 0 {
+		lines = append(lines, fmt.Sprintf("cache hits %d", summary.CacheHits))
+		lines = append(lines, fmt.Sprintf("cache read %d / write %d", summary.CacheReadTokens, summary.CacheWriteTokens))
 	}
 	if summary.ModelDurationMS > 0 || summary.ToolDurationMS > 0 || summary.RuntimeDurationMS > 0 {
 		lines = append(lines, fmt.Sprintf("model %s", durationText(summary.ModelDurationMS)))
@@ -1230,6 +1257,7 @@ type commandPanelItem struct {
 	Example  string
 	Shortcut string
 	Direct   bool
+	Action   string
 }
 
 func allCommandPanelItems() []commandPanelItem {
@@ -1240,12 +1268,9 @@ func allCommandPanelItems() []commandPanelItem {
 		{Section: "Suggested", Label: "Switch model", Command: "/model", What: "open model selector", Example: "/model", Shortcut: "ctrl+x m", Direct: true},
 		{Section: "Suggested", Label: "Manage tools", Command: "/tools", What: "open tool selector", Example: "/tools", Direct: true},
 
-		{Section: "Session", Label: "List sessions", Command: "/sessions", What: "open session selector", Example: "/sessions", Direct: true},
-		{Section: "Session", Label: "Switch session", Command: "/session <key>", What: "attach this TUI to a session", Example: "/session feishu:oc_xxx"},
-		{Section: "Session", Label: "Resume session", Command: "/resume <key>", What: "copy another channel session here", Example: "/resume feishu:oc_xxx"},
-		{Section: "Session", Label: "Attach session", Command: "/resume --attach <key>", What: "continue another session directly", Example: "/resume --attach feishu:oc_xxx"},
+		{Section: "Session", Label: "Switch session", Command: "/sessions", What: "choose an existing CLI, Feishu, or Weixin session", Example: "/sessions", Direct: true, Action: "sessions"},
+		{Section: "Session", Label: "Resume from session", Command: "/sessions", What: "choose a session first, then continue from it", Example: "/sessions", Direct: true, Action: "sessions"},
 		{Section: "Session", Label: "Show session", Command: "/show", What: "show messages, tasks, and active task", Example: "/show", Direct: true},
-		{Section: "Session", Label: "Fork session", Command: "/resume <key>", What: "fork remote/local context into this session", Example: "/resume weixin:user_xxx"},
 
 		{Section: "Observe", Label: "Trace summary", Command: "/trace [path|key]", What: "summarize trace or session", Example: "/trace"},
 		{Section: "Observe", Label: "Process events", Command: "/events [path|key]", What: "show model/tool/final events", Example: "/events"},
@@ -1256,17 +1281,14 @@ func allCommandPanelItems() []commandPanelItem {
 
 		{Section: "Tools", Label: "Manage tools", Command: "/tools", What: "open tool enable/disable selector", Example: "/tools", Direct: true},
 		{Section: "Tools", Label: "Tool details", Command: "/tools --verbose", What: "show arguments and boundaries", Example: "/tools --verbose", Direct: true},
-		{Section: "Tools", Label: "Enable tool", Command: "/tools enable <tool>", What: "enable one tool", Example: "/tools enable project.index"},
-		{Section: "Tools", Label: "Disable tool", Command: "/tools disable <tool>", What: "disable one tool", Example: "/tools disable terminal.run"},
+		{Section: "Tools", Label: "Enable or disable tool", Command: "/tools", What: "choose a tool from the selector", Example: "/tools", Direct: true, Action: "tools"},
 
-		{Section: "Channel", Label: "Send to channel", Command: "mateway send --to <target>", What: "send a message to Feishu or Weixin", Example: "mateway send --to feishu:oc_xxx done"},
-		{Section: "Channel", Label: "Fetch history", Command: "mateway fetch-history --from <target>", What: "pull remote channel history", Example: "mateway fetch-history --from feishu:oc_xxx"},
+		{Section: "Channel", Label: "Choose channel session", Command: "/sessions", What: "switch to a Feishu or Weixin session already known locally", Example: "/sessions", Direct: true, Action: "sessions"},
 
-		{Section: "Memory", Label: "Search memory", Command: "mateway memory search <query>", What: "search local agent memory", Example: "mateway memory search deployment"},
-		{Section: "Memory", Label: "Memory proposals", Command: "mateway memory proposal list", What: "review pending memory changes", Example: "mateway memory proposal list"},
+		{Section: "Memory", Label: "Memory proposals", Command: "/memory proposals", What: "show how to review pending memory changes", Example: "/memory proposals", Direct: true, Action: "memory_proposals"},
 
-		{Section: "Local", Label: "Workspace report", Command: "mateway workspace report", What: "inspect runtime home and workspace", Example: "mateway workspace report"},
-		{Section: "Local", Label: "Gateway status", Command: "mateway gateway status", What: "check local gateway state", Example: "mateway gateway status"},
+		{Section: "Local", Label: "Workspace report", Command: "/workspace", What: "show local runtime paths and current workspace", Example: "/workspace", Direct: true, Action: "workspace"},
+		{Section: "Local", Label: "Gateway status", Command: "/gateway", What: "show local gateway status command", Example: "/gateway", Direct: true, Action: "gateway"},
 		{Section: "Local", Label: "Help", Command: "/help", What: "show full command guide", Example: "/help", Direct: true},
 		{Section: "Local", Label: "Exit", Command: "/exit", What: "leave the TUI", Example: "/exit", Direct: true},
 	}
@@ -1327,6 +1349,11 @@ func (m *tuiModel) updateCommandPanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.commandIndex = 0
 		}
 		item := items[m.commandIndex]
+		if cmd := m.runCommandPanelAction(item); cmd != nil {
+			m.commandPanel = false
+			m.input.SetValue("")
+			return m, cmd
+		}
 		value := commandFillValue(item)
 		m.commandPanel = false
 		m.input.SetValue(value)
@@ -1459,6 +1486,28 @@ func (m *tuiModel) runTaskCmd(text string) tea.Cmd {
 		go m.runTask(text)
 		return nil
 	}
+}
+
+func (m *tuiModel) runCommandPanelAction(item commandPanelItem) tea.Cmd {
+	switch item.Action {
+	case "sessions":
+		if err := m.openSessionsPicker(); err != nil {
+			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+		}
+	case "models":
+		m.openModelsPicker()
+	case "tools":
+		m.openToolsPicker()
+	case "memory_proposals":
+		m.showMemoryProposalHelp()
+	case "workspace":
+		m.showWorkspaceSummary()
+	case "gateway":
+		m.showGatewayStatusHelp()
+	default:
+		return nil
+	}
+	return func() tea.Msg { return nil }
 }
 
 func (m *tuiModel) runTask(text string) {
@@ -1603,8 +1652,10 @@ func (m *tuiModel) handleSlash(cmd SlashCommand) bool {
 		m.addEvent(colorize("• Thinking", ansiDim, true))
 		go m.runTask("/new")
 	case "session":
-		if len(cmd.Args) != 1 {
-			m.addEvent(colorize("usage: /session <session_key>", ansiYellow, true))
+		if len(cmd.Args) == 0 {
+			if err := m.openSessionsPicker(); err != nil {
+				m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			}
 			return false
 		}
 		next := ResolveSessionKey(cmd.Args[0])
@@ -1705,9 +1756,25 @@ func (m *tuiModel) handleSlash(cmd SlashCommand) bool {
 		}
 		m.addOutput(out.String())
 	case "resume":
+		if len(cmd.Args) == 0 {
+			if err := m.openSessionsPicker(); err != nil {
+				m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
+			}
+			return false
+		}
 		if err := m.resume(cmd.Args); err != nil {
 			m.addEvent(colorize("error: "+err.Error(), ansiRed, true))
 		}
+	case "memory":
+		if len(cmd.Args) > 0 && cmd.Args[0] == "proposals" {
+			m.showMemoryProposalHelp()
+		} else {
+			m.addEvent(colorize("usage: /memory proposals", ansiYellow, true))
+		}
+	case "workspace":
+		m.showWorkspaceSummary()
+	case "gateway":
+		m.showGatewayStatusHelp()
 	default:
 		m.addEvent(colorize("unknown command: /"+cmd.Name, ansiYellow, true))
 	}
@@ -1744,6 +1811,30 @@ func (m *tuiModel) openSessionsPicker() error {
 	}
 	m.picker = &tuiPicker{Kind: "sessions", Title: "Sessions", Items: items}
 	return nil
+}
+
+func (m *tuiModel) showMemoryProposalHelp() {
+	m.addEvent(colorize("Memory proposals", ansiGreen, true))
+	m.addEvent("review pending memory changes from a shell:")
+	m.addEvent("  mateway memory proposal list")
+	m.addEvent("  mateway memory proposal show <proposal_id>")
+	m.addEvent("  mateway memory proposal commit <proposal_id>")
+	m.addEvent("  mateway memory proposal reject <proposal_id> --reason \"...\"")
+}
+
+func (m *tuiModel) showWorkspaceSummary() {
+	m.addEvent(colorize("Workspace", ansiGreen, true))
+	m.addEvent("home: " + firstNonEmpty(m.cfg.App.Home, "~/.mateway"))
+	if wd, err := os.Getwd(); err == nil {
+		m.addEvent("cwd:  " + wd)
+	}
+	m.addEvent("details: mateway workspace report")
+}
+
+func (m *tuiModel) showGatewayStatusHelp() {
+	m.addEvent(colorize("Gateway", ansiGreen, true))
+	m.addEvent("check local gateway from a shell:")
+	m.addEvent("  mateway gateway status")
 }
 
 func (m *tuiModel) openModelsPicker() {

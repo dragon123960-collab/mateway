@@ -202,6 +202,25 @@ func shouldRedactAssignedSecretValue(value string) bool {
 func isSecretKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	normalized = strings.ReplaceAll(normalized, "-", "_")
+	for _, safe := range []string{
+		"input_tokens",
+		"output_tokens",
+		"total_tokens",
+		"estimated_input_tokens",
+		"saved_estimated_tokens",
+		"soft_limit_tokens",
+		"hard_limit_tokens",
+		"context_window_tokens",
+		"max_output_tokens",
+		"cache_read_tokens",
+		"cache_write_tokens",
+		"cache_input_tokens",
+		"cache_output_tokens",
+	} {
+		if normalized == safe {
+			return false
+		}
+	}
 	for _, marker := range []string{"secret", "token", "api_key", "apikey", "password", "passwd", "pwd", "smtp_pass", "imap_pass", "pop3_pass", "authorization", "auth_code"} {
 		if strings.Contains(normalized, marker) {
 			return true

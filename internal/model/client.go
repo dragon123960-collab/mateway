@@ -1030,8 +1030,10 @@ func parseAnthropicResult(data []byte) (GenerateResult, error) {
 			Message string `json:"message"`
 		} `json:"error"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -1058,7 +1060,14 @@ func parseAnthropicResult(data []byte) (GenerateResult, error) {
 			calls = append(calls, agentcore.ToolCall{ID: id, Name: toolNameFromAPI(item.Name), Args: args})
 		}
 	}
-	usage := agentcore.Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens}
+	usage := agentcore.Usage{
+		InputTokens:      payload.Usage.InputTokens,
+		OutputTokens:     payload.Usage.OutputTokens,
+		CacheReadTokens:  payload.Usage.CacheReadInputTokens,
+		CacheWriteTokens: payload.Usage.CacheCreationInputTokens,
+	}
+	usage.CacheInputTokens = usage.CacheReadTokens + usage.CacheWriteTokens
+	usage.CacheHit = usage.CacheReadTokens > 0
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	return GenerateResult{Text: strings.TrimSpace(strings.Join(parts, "\n")), ToolCalls: calls, Usage: usage}, nil
 }
@@ -1093,9 +1102,15 @@ func parseOpenAIResult(data []byte) (GenerateResult, error) {
 			Type    string `json:"type"`
 		} `json:"error"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			TotalTokens         int `json:"total_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -1141,7 +1156,14 @@ func parseOpenAIResult(data []byte) (GenerateResult, error) {
 			calls = append(calls, agentcore.ToolCall{ID: id, Name: toolNameFromAPI(name), Args: args})
 		}
 	}
-	usage := agentcore.Usage{InputTokens: payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens, TotalTokens: payload.Usage.TotalTokens}
+	usage := agentcore.Usage{
+		InputTokens:      payload.Usage.PromptTokens,
+		OutputTokens:     payload.Usage.CompletionTokens,
+		TotalTokens:      payload.Usage.TotalTokens,
+		CacheReadTokens:  payload.Usage.PromptTokensDetails.CachedTokens,
+		CacheInputTokens: payload.Usage.PromptTokensDetails.CachedTokens,
+	}
+	usage.CacheHit = usage.CacheReadTokens > 0
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
@@ -1163,15 +1185,25 @@ func parseOpenAIResponsesResult(data []byte) GenerateResult {
 		} `json:"output"`
 		OutputText string `json:"output_text"`
 		Usage      struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-			TotalTokens  int `json:"total_tokens"`
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			TotalTokens        int `json:"total_tokens"`
+			InputTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return GenerateResult{}
 	}
-	usage := agentcore.Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens, TotalTokens: payload.Usage.TotalTokens}
+	usage := agentcore.Usage{
+		InputTokens:      payload.Usage.InputTokens,
+		OutputTokens:     payload.Usage.OutputTokens,
+		TotalTokens:      payload.Usage.TotalTokens,
+		CacheReadTokens:  payload.Usage.InputTokensDetails.CachedTokens,
+		CacheInputTokens: payload.Usage.InputTokensDetails.CachedTokens,
+	}
+	usage.CacheHit = usage.CacheReadTokens > 0
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
@@ -1190,7 +1222,7 @@ func parseOpenAIResponsesResult(data []byte) GenerateResult {
 }
 
 func usagePtr(usage agentcore.Usage) *agentcore.Usage {
-	if usage.Provider == "" && usage.Model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+	if usage.Provider == "" && usage.Model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 && usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 && usage.CacheInputTokens == 0 && usage.CacheOutputTokens == 0 {
 		return nil
 	}
 	return &usage

@@ -132,8 +132,11 @@ func TestPendingProposalNudgeOncePerDay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text, "Pending memory proposals") || !strings.Contains(text, "mateway memory proposal show") || !strings.Contains(text, "Body") {
+	if !strings.Contains(text, "Pending memory proposals: 1") || !strings.Contains(text, "mateway memory proposal list") || !strings.Contains(text, "mateway memory proposal show") {
 		t.Fatalf("unexpected nudge: %q", text)
+	}
+	if strings.Contains(text, "Body") {
+		t.Fatalf("nudge should stay compact and avoid proposal body: %q", text)
 	}
 	text, err = PendingProposalNudge(home, "cli:test", now.Add(time.Hour), ProposalNudgeOptions{Channel: "cli", Channels: []string{"cli"}, Interval: 24 * time.Hour, MaxProposals: 3})
 	if err != nil {

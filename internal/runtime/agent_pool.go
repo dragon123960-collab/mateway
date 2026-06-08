@@ -71,6 +71,17 @@ func (p AgentPool) RoleModelForMessage(msg channel.InboundMessage, role string, 
 	return resolveModelForRole(p.config, profile, role, fallback)
 }
 
+func (p AgentPool) ModelConfigForMessage(msg channel.InboundMessage) config.ModelConfig {
+	if p.config == nil {
+		return config.ModelConfig{}
+	}
+	profile := p.ProfileForMessage(msg)
+	if cfg, ok := modelConfigForProfile(p.config, profile); ok {
+		return cfg
+	}
+	return config.ModelConfig{}
+}
+
 func (p AgentPool) profileForID(agentID string) config.AgentProfileConfig {
 	if profile, ok := p.profileByID(agentID); ok {
 		return profile
@@ -227,6 +238,32 @@ func resolveModelForProfile(cfg *config.Root, profile config.AgentProfileConfig)
 		return model.NewRoutedAgentModel(configs, visionConfigs)
 	}
 	return HeuristicModel{}
+}
+
+func modelConfigForProfile(cfg *config.Root, profile config.AgentProfileConfig) (config.ModelConfig, bool) {
+	var names []string
+	if modelName := strings.TrimSpace(profile.Model.Default); modelName != "" {
+		names = append(names, modelName)
+	}
+	if len(names) == 0 {
+		if modelName := strings.TrimSpace(cfg.Model.Default); modelName != "" {
+			names = append(names, modelName)
+		}
+	}
+	names = append(names, profile.Model.Fallbacks...)
+	names = append(names, cfg.Model.Fallbacks...)
+	seen := map[string]bool{}
+	for _, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if cfg, ok := enabledModelByName(cfg, key); ok {
+			return cfg, true
+		}
+	}
+	return config.ModelConfig{}, false
 }
 
 func resolveModelForDefault(cfg *config.Root) agentcore.Model {

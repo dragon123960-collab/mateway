@@ -74,6 +74,18 @@ func compactToolContent(toolName, content string, limit int) (string, string) {
 		if compacted := compactLogContent(content, limit); len(compacted) < len(content) {
 			return compacted, "log"
 		}
+	case "file.read":
+		if compacted := compactFileReadContent(content, limit); len(compacted) < len(content) {
+			return compacted, "file_read"
+		}
+	case "project.index":
+		if compacted := compactProjectIndexContent(content, limit); len(compacted) < len(content) {
+			return compacted, "project_index"
+		}
+	case "web.search", "memory.search", "task.search":
+		if compacted := compactSearchContent(content, limit); len(compacted) < len(content) {
+			return compacted, "search_hits"
+		}
 	case "web.fetch":
 		if compacted := compactHTMLContent(content, limit); len(compacted) < len(content) {
 			return compacted, "html_text"
@@ -91,6 +103,87 @@ func compactToolContent(toolName, content string, limit int) (string, string) {
 	return content, ""
 }
 
+func compactFileReadContent(content string, limit int) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) <= 80 {
+		out, _ := truncateMiddle(content, limit)
+		return out
+	}
+	headCount := minInt(40, len(lines))
+	tailCount := minInt(20, len(lines)-headCount)
+	priority := priorityLines(lines, 40)
+	var b strings.Builder
+	b.WriteString("[model compacted file content]\n")
+	b.WriteString("first lines:\n")
+	b.WriteString(strings.Join(lines[:headCount], "\n"))
+	if len(priority) > 0 {
+		b.WriteString("\n\nmatched lines:\n")
+		b.WriteString(strings.Join(priority, "\n"))
+	}
+	if tailCount > 0 {
+		b.WriteString("\n\nlast lines:\n")
+		b.WriteString(strings.Join(lines[len(lines)-tailCount:], "\n"))
+	}
+	out := b.String()
+	if len(out) > limit {
+		out, _ = truncateMiddle(out, limit)
+	}
+	return out
+}
+
+func compactProjectIndexContent(content string, limit int) string {
+	lines := strings.Split(content, "\n")
+	kept := make([]string, 0, 160)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.Contains(trimmed, "[skip]") || strings.HasPrefix(trimmed, "DIR:") || strings.HasPrefix(trimmed, "FILE:") {
+			kept = append(kept, line)
+		}
+		if len(kept) >= 160 {
+			break
+		}
+	}
+	if len(kept) == 0 {
+		out, _ := truncateMiddle(content, limit)
+		return out
+	}
+	out := "[model compacted project index]\n" + strings.Join(kept, "\n")
+	if len(out) > limit {
+		out, _ = truncateMiddle(out, limit)
+	}
+	return out
+}
+
+func compactSearchContent(content string, limit int) string {
+	lines := strings.Split(content, "\n")
+	kept := make([]string, 0, 80)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.Contains(lower, "http://") || strings.Contains(lower, "https://") || strings.Contains(lower, "title") || strings.Contains(lower, "path") || strings.Contains(lower, "summary") || strings.Contains(lower, "score") {
+			kept = append(kept, line)
+		}
+		if len(kept) >= 80 {
+			break
+		}
+	}
+	if len(kept) == 0 {
+		out, _ := truncateMiddle(content, limit)
+		return out
+	}
+	out := "[model compacted search results]\n" + strings.Join(kept, "\n")
+	if len(out) > limit {
+		out, _ = truncateMiddle(out, limit)
+	}
+	return out
+}
+
 func compactLogContent(content string, limit int) string {
 	lines := strings.Split(content, "\n")
 	if len(lines) <= 20 {
@@ -99,26 +192,7 @@ func compactLogContent(content string, limit int) string {
 	}
 	headCount := minInt(20, len(lines))
 	tailCount := minInt(40, len(lines)-headCount)
-	priority := make([]string, 0, 40)
-	seen := map[string]bool{}
-	for idx, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || !logPriorityPattern.MatchString(trimmed) {
-			continue
-		}
-		key := trimmed
-		if len(key) > 240 {
-			key = key[:240]
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		priority = append(priority, lineNumbered(idx+1, line))
-		if len(priority) >= 40 {
-			break
-		}
-	}
+	priority := priorityLines(lines, 40)
 	var b strings.Builder
 	b.WriteString("[model compacted terminal output]\n")
 	b.WriteString("first lines:\n")
@@ -136,6 +210,30 @@ func compactLogContent(content string, limit int) string {
 		out, _ = truncateMiddle(out, limit)
 	}
 	return out
+}
+
+func priorityLines(lines []string, limit int) []string {
+	priority := make([]string, 0, limit)
+	seen := map[string]bool{}
+	for idx, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || !logPriorityPattern.MatchString(trimmed) {
+			continue
+		}
+		key := trimmed
+		if len(key) > 240 {
+			key = key[:240]
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		priority = append(priority, lineNumbered(idx+1, line))
+		if len(priority) >= limit {
+			break
+		}
+	}
+	return priority
 }
 
 func compactHTMLContent(content string, limit int) string {

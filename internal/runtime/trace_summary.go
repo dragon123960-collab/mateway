@@ -9,29 +9,38 @@ import (
 )
 
 type TraceSummary struct {
-	Path              string
-	TraceID           string
-	SessionKey        string
-	Channel           string
-	AccountID         string
-	AgentID           string
-	TaskID            string
-	MessageID         string
-	UserID            string
-	ThreadID          string
-	Events            int
-	ModelDurationMS   int64
-	ToolDurationMS    int64
-	RuntimeDurationMS int64
-	ReplyDurationMS   int64
-	TotalDurationMS   int64
-	RuntimeDone       bool
-	GatewayDone       bool
-	ModelRequests     int
-	InputTokens       int
-	OutputTokens      int
-	TotalTokens       int
-	ToolCalls         []string
+	Path                 string
+	TraceID              string
+	SessionKey           string
+	Channel              string
+	AccountID            string
+	AgentID              string
+	TaskID               string
+	MessageID            string
+	UserID               string
+	ThreadID             string
+	Events               int
+	ModelDurationMS      int64
+	ToolDurationMS       int64
+	RuntimeDurationMS    int64
+	ReplyDurationMS      int64
+	TotalDurationMS      int64
+	RuntimeDone          bool
+	GatewayDone          bool
+	ModelRequests        int
+	InputTokens          int
+	OutputTokens         int
+	TotalTokens          int
+	EstimatedInputTokens int
+	SavedEstimatedTokens int
+	CompactedMessages    int
+	CompactedToolResults int
+	CacheHits            int
+	CacheReadTokens      int
+	CacheWriteTokens     int
+	CacheInputTokens     int
+	CacheOutputTokens    int
+	ToolCalls            []string
 }
 
 func SummarizeTrace(path string) (TraceSummary, error) {
@@ -88,6 +97,20 @@ func SummarizeTrace(path string) (TraceSummary, error) {
 				out.OutputTokens += int(number(event["output_tokens"]))
 				out.TotalTokens += int(number(event["total_tokens"]))
 			}
+			out.SavedEstimatedTokens += int(number(event["saved_estimated_tokens"]))
+			out.CompactedMessages += int(number(event["compacted_messages"]))
+			out.CompactedToolResults += int(number(event["compacted_tool_results"]))
+			out.CacheHits += int(number(event["cache_hits"]))
+			out.CacheReadTokens += int(number(event["cache_read_tokens"]))
+			out.CacheWriteTokens += int(number(event["cache_write_tokens"]))
+			out.CacheInputTokens += int(number(event["cache_input_tokens"]))
+			out.CacheOutputTokens += int(number(event["cache_output_tokens"]))
+		case "context_budget_estimated":
+			out.EstimatedInputTokens += int(number(event["estimated_input_tokens"]))
+		case "context_budget_compacted":
+			out.SavedEstimatedTokens += int(number(event["saved_estimated_tokens"]))
+			out.CompactedMessages += int(number(event["compacted_messages"]))
+			out.CompactedToolResults += int(number(event["compacted_tool_results"]))
 		case "tool_execution_end":
 			out.ToolDurationMS += duration
 			if call, ok := event["tool_call"].(map[string]any); ok {

@@ -195,6 +195,14 @@ execution:
   max_parallel_tools: 4
   max_iterations: 50
   inactivity_timeout: 5m
+  context_budget:
+    enabled: true
+    soft_ratio: 0.65
+    hard_ratio: 0.90
+    recent_turns: 8
+    tool_result_target_tokens: 1200
+    max_visible_tools: 8
+    trace_telemetry: true
 
 memory:
   enabled: true

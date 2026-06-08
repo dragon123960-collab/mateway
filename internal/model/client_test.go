@@ -15,13 +15,16 @@ import (
 func TestParseAnthropicResultUsage(t *testing.T) {
 	result, err := parseAnthropicResult([]byte(`{
 		"content":[{"type":"text","text":"hello"}],
-		"usage":{"input_tokens":12,"output_tokens":5}
+		"usage":{"input_tokens":12,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}
 	}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Text != "hello" || result.Usage.InputTokens != 12 || result.Usage.OutputTokens != 5 || result.Usage.TotalTokens != 17 {
 		t.Fatalf("unexpected result %#v", result)
+	}
+	if !result.Usage.CacheHit || result.Usage.CacheReadTokens != 7 || result.Usage.CacheWriteTokens != 3 || result.Usage.CacheInputTokens != 10 {
+		t.Fatalf("unexpected cache usage %#v", result.Usage)
 	}
 }
 
@@ -57,7 +60,7 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 				}]
 			}
 		}],
-		"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}
+		"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"prompt_tokens_details":{"cached_tokens":11}}
 	}`))
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +70,9 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 	}
 	if result.ToolCalls[0].Name != "terminal.run" || result.ToolCalls[0].Args["command"] != "go test ./..." {
 		t.Fatalf("unexpected tool call %#v", result.ToolCalls[0])
+	}
+	if !result.Usage.CacheHit || result.Usage.CacheReadTokens != 11 || result.Usage.CacheInputTokens != 11 {
+		t.Fatalf("unexpected cache usage %#v", result.Usage)
 	}
 }
 
@@ -96,10 +102,13 @@ func TestToolParametersIncludesOptionalProperties(t *testing.T) {
 func TestParseOpenAIResponsesResultUsage(t *testing.T) {
 	result := parseOpenAIResponsesResult([]byte(`{
 		"output_text":"hello",
-		"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}
+		"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28,"input_tokens_details":{"cached_tokens":9}}
 	}`))
 	if result.Text != "hello" || result.Usage.InputTokens != 20 || result.Usage.OutputTokens != 8 || result.Usage.TotalTokens != 28 {
 		t.Fatalf("unexpected result %#v", result)
+	}
+	if !result.Usage.CacheHit || result.Usage.CacheReadTokens != 9 || result.Usage.CacheInputTokens != 9 {
+		t.Fatalf("unexpected cache usage %#v", result.Usage)
 	}
 }
 

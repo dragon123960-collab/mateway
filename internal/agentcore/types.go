@@ -42,11 +42,16 @@ type MessagePart struct {
 }
 
 type Usage struct {
-	Provider     string `json:"provider,omitempty"`
-	Model        string `json:"model,omitempty"`
-	InputTokens  int    `json:"input_tokens,omitempty"`
-	OutputTokens int    `json:"output_tokens,omitempty"`
-	TotalTokens  int    `json:"total_tokens,omitempty"`
+	Provider          string `json:"provider,omitempty"`
+	Model             string `json:"model,omitempty"`
+	InputTokens       int    `json:"input_tokens,omitempty"`
+	OutputTokens      int    `json:"output_tokens,omitempty"`
+	TotalTokens       int    `json:"total_tokens,omitempty"`
+	CacheHit          bool   `json:"cache_hit,omitempty"`
+	CacheReadTokens   int    `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens  int    `json:"cache_write_tokens,omitempty"`
+	CacheInputTokens  int    `json:"cache_input_tokens,omitempty"`
+	CacheOutputTokens int    `json:"cache_output_tokens,omitempty"`
 }
 
 type ToolCall struct {

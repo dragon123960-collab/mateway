@@ -72,6 +72,13 @@ func TestToolResultReadRetrievesRawRef(t *testing.T) {
 	if searched.IsError || !strings.Contains(searched.Content, "L2: beta needle") || searched.Evidence["matches"] != 2 {
 		t.Fatalf("expected query snippets, got %#v", searched)
 	}
+	multi := readTool.Run(context.Background(), agentcore.ToolCall{ID: "call_3", Args: map[string]any{"raw_ref": "tool-result:" + hash, "query": "needle second"}})
+	if multi.IsError || !strings.Contains(multi.Content, "L4: needle second") || multi.Evidence["matches"] != 1 {
+		t.Fatalf("expected multi-term query snippets, got %#v", multi)
+	}
+	if ranges, ok := multi.Evidence["line_ranges"].([]string); !ok || len(ranges) == 0 {
+		t.Fatalf("expected line ranges evidence, got %#v", multi.Evidence)
+	}
 }
 
 func TestProjectIndexLimitsWideDirectory(t *testing.T) {

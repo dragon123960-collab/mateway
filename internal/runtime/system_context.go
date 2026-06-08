@@ -129,13 +129,21 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 
 func appendPreviousTaskContext(systemPrompt string, state session.State, currentTaskID string) string {
 	tasks := recentPreviousTasks(state, currentTaskID, 3)
-	if len(tasks) == 0 {
+	sessionSummary := renderSessionSummaryContext(state.Summary)
+	if len(tasks) == 0 && sessionSummary == "" {
 		return strings.TrimSpace(systemPrompt)
 	}
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(systemPrompt))
 	if b.Len() > 0 {
 		b.WriteString("\n\n")
+	}
+	if sessionSummary != "" {
+		b.WriteString(sessionSummary)
+		b.WriteString("\n\n")
+	}
+	if len(tasks) == 0 {
+		return strings.TrimSpace(b.String())
 	}
 	b.WriteString("Continuity judgment:\n")
 	b.WriteString("- These are recent tasks from this session, not active instructions by themselves.\n")

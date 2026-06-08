@@ -133,6 +133,12 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	if root.Execution.InactivityTimeoutDuration() != 5*time.Minute {
 		t.Fatalf("default inactivity timeout duration = %s", root.Execution.InactivityTimeoutDuration())
 	}
+	if !root.Execution.ContextBudget.EnabledValue() || root.Execution.ContextBudget.SoftRatio != 0.65 || root.Execution.ContextBudget.HardRatio != 0.90 {
+		t.Fatalf("unexpected context budget defaults: %#v", root.Execution.ContextBudget)
+	}
+	if root.Execution.ContextBudget.RecentTurns != 8 || root.Execution.ContextBudget.ToolResultTargetTokens != 1200 || root.Execution.ContextBudget.MaxVisibleTools != 8 || !root.Execution.ContextBudget.TraceTelemetryValue() {
+		t.Fatalf("unexpected context budget defaults: %#v", root.Execution.ContextBudget)
+	}
 	zero := 0
 	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
 	root.NormalizeForUse()

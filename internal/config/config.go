@@ -41,6 +41,15 @@ func DefaultRoot() Root {
 			MaxParallelTools:  4,
 			MaxIterations:     intPtr(50),
 			InactivityTimeout: "5m",
+			ContextBudget: ContextBudgetConfig{
+				Enabled:                boolPtr(true),
+				SoftRatio:              0.65,
+				HardRatio:              0.90,
+				RecentTurns:            8,
+				ToolResultTargetTokens: 1200,
+				MaxVisibleTools:        8,
+				TraceTelemetry:         boolPtr(true),
+			},
 		},
 		Memory: MemoryConfig{
 			Enabled:           true,
@@ -324,9 +333,69 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelTools  int    `yaml:"max_parallel_tools"`
-	MaxIterations     *int   `yaml:"max_iterations"`
-	InactivityTimeout string `yaml:"inactivity_timeout"`
+	MaxParallelTools  int                 `yaml:"max_parallel_tools"`
+	MaxIterations     *int                `yaml:"max_iterations"`
+	InactivityTimeout string              `yaml:"inactivity_timeout"`
+	ContextBudget     ContextBudgetConfig `yaml:"context_budget"`
+}
+
+type ContextBudgetConfig struct {
+	Enabled                *bool   `yaml:"enabled"`
+	SoftRatio              float64 `yaml:"soft_ratio"`
+	HardRatio              float64 `yaml:"hard_ratio"`
+	RecentTurns            int     `yaml:"recent_turns"`
+	ToolResultTargetTokens int     `yaml:"tool_result_target_tokens"`
+	MaxVisibleTools        int     `yaml:"max_visible_tools"`
+	TraceTelemetry         *bool   `yaml:"trace_telemetry"`
+}
+
+func (c ContextBudgetConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+func (c ContextBudgetConfig) TraceTelemetryValue() bool {
+	if c.TraceTelemetry == nil {
+		return true
+	}
+	return *c.TraceTelemetry
+}
+
+func (c ContextBudgetConfig) SoftRatioValue() float64 {
+	if c.SoftRatio <= 0 || c.SoftRatio > 1 {
+		return 0.65
+	}
+	return c.SoftRatio
+}
+
+func (c ContextBudgetConfig) HardRatioValue() float64 {
+	if c.HardRatio <= 0 || c.HardRatio > 1 {
+		return 0.90
+	}
+	return c.HardRatio
+}
+
+func (c ContextBudgetConfig) RecentTurnsValue() int {
+	if c.RecentTurns <= 0 {
+		return 8
+	}
+	return c.RecentTurns
+}
+
+func (c ContextBudgetConfig) ToolResultTargetTokensValue() int {
+	if c.ToolResultTargetTokens <= 0 {
+		return 1200
+	}
+	return c.ToolResultTargetTokens
+}
+
+func (c ContextBudgetConfig) MaxVisibleToolsValue() int {
+	if c.MaxVisibleTools <= 0 {
+		return 8
+	}
+	return c.MaxVisibleTools
 }
 
 func (c ExecutionConfig) MaxIterationsValue() int {
@@ -711,6 +780,30 @@ func (r *Root) applyDefaults() {
 	}
 	if strings.TrimSpace(r.Execution.InactivityTimeout) == "" {
 		r.Execution.InactivityTimeout = defaults.Execution.InactivityTimeout
+	}
+	if r.Execution.ContextBudget.Enabled == nil {
+		r.Execution.ContextBudget.Enabled = defaults.Execution.ContextBudget.Enabled
+	}
+	if r.Execution.ContextBudget.SoftRatio <= 0 {
+		r.Execution.ContextBudget.SoftRatio = defaults.Execution.ContextBudget.SoftRatio
+	}
+	if r.Execution.ContextBudget.HardRatio <= 0 {
+		r.Execution.ContextBudget.HardRatio = defaults.Execution.ContextBudget.HardRatio
+	}
+	if r.Execution.ContextBudget.HardRatio < r.Execution.ContextBudget.SoftRatio {
+		r.Execution.ContextBudget.HardRatio = defaults.Execution.ContextBudget.HardRatio
+	}
+	if r.Execution.ContextBudget.RecentTurns <= 0 {
+		r.Execution.ContextBudget.RecentTurns = defaults.Execution.ContextBudget.RecentTurns
+	}
+	if r.Execution.ContextBudget.ToolResultTargetTokens <= 0 {
+		r.Execution.ContextBudget.ToolResultTargetTokens = defaults.Execution.ContextBudget.ToolResultTargetTokens
+	}
+	if r.Execution.ContextBudget.MaxVisibleTools <= 0 {
+		r.Execution.ContextBudget.MaxVisibleTools = defaults.Execution.ContextBudget.MaxVisibleTools
+	}
+	if r.Execution.ContextBudget.TraceTelemetry == nil {
+		r.Execution.ContextBudget.TraceTelemetry = defaults.Execution.ContextBudget.TraceTelemetry
 	}
 	if r.Memory.RecentDays <= 0 {
 		r.Memory.RecentDays = defaults.Memory.RecentDays

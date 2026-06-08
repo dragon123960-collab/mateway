@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -139,19 +140,43 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
 	}
 	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
+	contextMessages := rt.Hooks.contextMessages(ctx, ContextHookInput{
+		Message:  msg,
+		State:    *state,
+		TaskID:   task.ID,
+		UserText: userText,
+		Profile:  profile,
+	}, trace)
+	if len(contextMessages) > 0 {
+		messages = append(messages, contextMessages...)
+	}
+	modelCfg := rt.Pool.ModelConfigForMessage(msg)
+	_ = trace.write(map[string]any{
+		"type":                   "model_route_selected",
+		"model":                  modelCfg.Model,
+		"model_name":             modelCfg.Name,
+		"provider":               modelCfg.Provider,
+		"context_window_tokens":  modelCfg.ContextWindow,
+		"max_output_tokens":      modelCfg.MaxTokensValue(),
+		"context_budget_enabled": rt.Config.Execution.ContextBudget.EnabledValue(),
+	})
+	var budgetResults []contextBudgetResult
+	agent.Model = budgetedModel{
+		inner:       agent.Model,
+		config:      rt.Config,
+		modelConfig: modelCfg,
+		trace:       trace,
+		state:       *state,
+		taskID:      task.ID,
+		results:     &budgetResults,
+	}
 	agent.SystemPrompt = systemPrompt
 	agent.Messages = messages
 	agent.MaxParallelTools = maxParallelTools(rt.Config)
 	agent.MaxIterations = maxIterations(rt.Config)
 	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
 	defer stopActivityWatch()
-	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, rt.Hooks.contextMessages(ctx, ContextHookInput{
-		Message:  msg,
-		State:    *state,
-		TaskID:   task.ID,
-		UserText: userText,
-		Profile:  profile,
-	}, trace))
+	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil)
 	agent.Hooks = agentHooks
 	result, err := agent.Continue(runCtx)
 	if err != nil {
@@ -190,6 +215,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	state.Messages = redactMessagesForStorage(result.Messages)
 	finalText := redactSecretString(result.FinalText)
 	usage := usageFromMessages(result.Messages)
+	addUsage(&usage, usageFromBudgetResults(budgetResults))
 	addUsage(&state.Usage, usage)
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
@@ -206,6 +232,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": task.ID, "status": "failed", "missing": contractValidation.Missing})
 		} else if looksLikeInputRequest(finalText) {
 			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
 			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
 		} else if emptyActionPromise {
@@ -214,6 +241,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
 		} else {
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			updateSessionSummary(state, task.ID, finalText, "completed", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
 			taskCompleted = true
 		}
@@ -419,6 +447,13 @@ func usageFromMessages(messages []agentcore.Message) session.Usage {
 		usage.Requests++
 		usage.InputTokens += msg.Usage.InputTokens
 		usage.OutputTokens += msg.Usage.OutputTokens
+		if msg.Usage.CacheHit {
+			usage.CacheHits++
+		}
+		usage.CacheReadTokens += msg.Usage.CacheReadTokens
+		usage.CacheWriteTokens += msg.Usage.CacheWriteTokens
+		usage.CacheInputTokens += msg.Usage.CacheInputTokens
+		usage.CacheOutputTokens += msg.Usage.CacheOutputTokens
 		total := msg.Usage.TotalTokens
 		if total == 0 {
 			total = msg.Usage.InputTokens + msg.Usage.OutputTokens
@@ -436,6 +471,15 @@ func addUsage(total *session.Usage, delta session.Usage) {
 	total.InputTokens += delta.InputTokens
 	total.OutputTokens += delta.OutputTokens
 	total.TotalTokens += delta.TotalTokens
+	total.EstimatedInputTokens += delta.EstimatedInputTokens
+	total.SavedEstimatedTokens += delta.SavedEstimatedTokens
+	total.CompactedMessages += delta.CompactedMessages
+	total.CompactedToolResults += delta.CompactedToolResults
+	total.CacheHits += delta.CacheHits
+	total.CacheReadTokens += delta.CacheReadTokens
+	total.CacheWriteTokens += delta.CacheWriteTokens
+	total.CacheInputTokens += delta.CacheInputTokens
+	total.CacheOutputTokens += delta.CacheOutputTokens
 	total.Cost += delta.Cost
 }
 
@@ -444,11 +488,20 @@ func writeUsageTrace(trace *traceRecorder, usage session.Usage) {
 		return
 	}
 	_ = trace.write(map[string]any{
-		"type":          "model_usage",
-		"requests":      usage.Requests,
-		"input_tokens":  usage.InputTokens,
-		"output_tokens": usage.OutputTokens,
-		"total_tokens":  usage.TotalTokens,
+		"type":                   "model_usage",
+		"requests":               usage.Requests,
+		"input_tokens":           usage.InputTokens,
+		"output_tokens":          usage.OutputTokens,
+		"total_tokens":           usage.TotalTokens,
+		"estimated_input_tokens": usage.EstimatedInputTokens,
+		"saved_estimated_tokens": usage.SavedEstimatedTokens,
+		"compacted_messages":     usage.CompactedMessages,
+		"compacted_tool_results": usage.CompactedToolResults,
+		"cache_hits":             usage.CacheHits,
+		"cache_read_tokens":      usage.CacheReadTokens,
+		"cache_write_tokens":     usage.CacheWriteTokens,
+		"cache_input_tokens":     usage.CacheInputTokens,
+		"cache_output_tokens":    usage.CacheOutputTokens,
 	})
 }
 
@@ -697,6 +750,9 @@ func looksLikeEmptyActionPromise(text string) bool {
 }
 
 func friendlyRuntimeError(cfg *config.Root, msg channel.InboundMessage, err error) string {
+	if errors.Is(err, errContextBudgetHardLimit) {
+		return runtimeText(cfg, msg, "runtime.context_budget_exceeded", nil)
+	}
 	raw := strings.TrimSpace(fmt.Sprint(err))
 	lower := strings.ToLower(raw)
 	switch {

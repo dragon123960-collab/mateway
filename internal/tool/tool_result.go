@@ -59,8 +59,10 @@ func (t ToolResultReadTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	}
 	content := string(data)
 	if query != "" {
-		content, evidence["matches"] = searchToolResultContent(content, query, limit)
+		var ranges []string
+		content, evidence["matches"], ranges = searchToolResultContent(content, query, limit)
 		evidence["query"] = query
+		evidence["line_ranges"] = ranges
 		evidence["partial"] = len([]rune(content)) >= limit
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: content, Evidence: evidence}
 	}
@@ -95,13 +97,17 @@ func toolResultArtifactPath(cfg *config.Root, hash string) string {
 	return filepath.Join(home, "artifacts", "tool-results", hash[:2], hash+".txt")
 }
 
-func searchToolResultContent(content, query string, limit int) (string, int) {
-	queryLower := strings.ToLower(query)
+func searchToolResultContent(content, query string, limit int) (string, int, []string) {
+	terms := queryTerms(query)
+	if len(terms) == 0 {
+		return "no matches", 0, nil
+	}
 	lines := strings.Split(content, "\n")
 	var out []string
+	var ranges []string
 	matches := 0
 	for idx, line := range lines {
-		if !strings.Contains(strings.ToLower(line), queryLower) {
+		if !lineMatchesTerms(line, terms) {
 			continue
 		}
 		matches++
@@ -116,6 +122,7 @@ func searchToolResultContent(content, query string, limit int) (string, int) {
 		if len(out) > 0 {
 			out = append(out, "--")
 		}
+		ranges = append(ranges, fmt.Sprintf("L%d-L%d", start+1, end))
 		for i := start; i < end; i++ {
 			out = append(out, fmt.Sprintf("L%d: %s", i+1, lines[i]))
 		}
@@ -124,12 +131,37 @@ func searchToolResultContent(content, query string, limit int) (string, int) {
 		}
 	}
 	if matches == 0 {
-		return "no matches", 0
+		return "no matches", 0, nil
 	}
 	result := strings.Join(out, "\n")
 	runes := []rune(result)
 	if len(runes) > limit {
 		result = string(runes[:limit])
 	}
-	return result, matches
+	return result, matches, ranges
+}
+
+func queryTerms(query string) []string {
+	fields := strings.Fields(strings.ToLower(query))
+	var terms []string
+	seen := map[string]bool{}
+	for _, field := range fields {
+		field = strings.Trim(field, `"'.,:;()[]{}<>`)
+		if field == "" || seen[field] {
+			continue
+		}
+		seen[field] = true
+		terms = append(terms, field)
+	}
+	return terms
+}
+
+func lineMatchesTerms(line string, terms []string) bool {
+	lower := strings.ToLower(line)
+	for _, term := range terms {
+		if !strings.Contains(lower, term) {
+			return false
+		}
+	}
+	return true
 }

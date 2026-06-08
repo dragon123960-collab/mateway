@@ -24,9 +24,9 @@ func chatHelpSections() []helpSection {
 			{Command: "/exit", What: "leave the interactive client", Example: "/exit"},
 		}},
 		{Title: "Session", Items: []helpItem{
-			{Command: "/sessions", What: "list local sessions from CLI, Feishu, Weixin, and schedules", Example: "/sessions"},
-			{Command: "/session <key>", What: "switch the current CLI session", Example: "/session feishu:oc_xxx"},
-			{Command: "/resume [--attach] <key>", What: "copy or attach another channel session into this client", Example: "/resume feishu:oc_xxx"},
+			{Command: "/sessions", What: "open a selector for CLI, Feishu, Weixin, and scheduled sessions", Example: "/sessions"},
+			{Command: "/session", What: "open the same selector and switch current session", Example: "/session"},
+			{Command: "/resume", What: "open session selector before resuming from another channel", Example: "/resume"},
 			{Command: "/show [key]", What: "show messages, tasks, usage, and active task for a session", Example: "/show cli:default"},
 		}},
 		{Title: "Observe", Items: []helpItem{
@@ -41,16 +41,16 @@ func chatHelpSections() []helpSection {
 			{Command: "/tools enable|disable <tool>", What: "change tool access for an agent profile", Example: "/tools disable terminal.run"},
 		}},
 		{Title: "Channel", Items: []helpItem{
-			{Command: "mateway send --to <target>", What: "send a message from local CLI to Feishu or Weixin", Example: "mateway send --to feishu:oc_xxx done"},
-			{Command: "mateway fetch-history --from <target>", What: "pull recent remote messages into a local session", Example: "mateway fetch-history --from feishu:oc_xxx --limit 20"},
+			{Command: "/sessions", What: "continue from a locally known Feishu or Weixin session", Example: "/sessions"},
+			{Command: "shell: mateway send --to <target>", What: "send a message to Feishu or Weixin", Example: "mateway send --to feishu:oc_xxx done"},
 		}},
 		{Title: "Memory", Items: []helpItem{
-			{Command: "mateway memory search <query>", What: "search local agent memory", Example: "mateway memory search deployment"},
-			{Command: "mateway memory proposal list", What: "review pending memory or learning proposals", Example: "mateway memory proposal list"},
+			{Command: "/memory proposals", What: "show how to review pending memory proposals", Example: "/memory proposals"},
+			{Command: "shell: mateway memory search <query>", What: "search local agent memory", Example: "mateway memory search deployment"},
 		}},
 		{Title: "Local", Items: []helpItem{
-			{Command: "mateway workspace report", What: "inspect workspace, trace, session, and runtime home status", Example: "mateway workspace report"},
-			{Command: "mateway gateway status", What: "check the local gateway LaunchAgent state", Example: "mateway gateway status"},
+			{Command: "/workspace", What: "show local runtime paths and current workspace", Example: "/workspace"},
+			{Command: "/gateway", What: "show gateway status command", Example: "/gateway"},
 		}},
 	}
 }
