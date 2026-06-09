@@ -117,6 +117,7 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
 	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
 	b.WriteString("- A message like \"I will check now\" or \"let me confirm\" is not a final answer. If you say you will check, confirm, create, update, or inspect something, call the required tool in the same turn.\n")
+	b.WriteString("- If file.read or project.index is blocked by path policy while the task still requires local file evidence, try an allowed safe-read terminal.run fallback such as ls, find, cat, sed, or rg. If that fallback is also blocked, state the concrete path-policy blocker instead of inventing content.\n")
 	b.WriteString("- For long tasks, work in verifiable stages, preserve completed stage evidence, and summarize progress between stages when possible.\n")
 	b.WriteString("- If a tool is slow, cancelled, or timed out, name the tool, elapsed time, and fallback action instead of asking the user to keep waiting.\n")
 	b.WriteString("- When creating or updating long-term memory pages under workspace/memory/agents/<agent>/, update that agent's index.md navigation page in the same task.\n")

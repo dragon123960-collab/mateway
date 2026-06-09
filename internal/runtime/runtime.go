@@ -85,6 +85,9 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		return resp, err
 	}
 	userText := strings.TrimSpace(msg.Text)
+	if shouldStartNewTaskInsteadOfSteering(state, userText) {
+		state.ActiveTask = ""
+	}
 	task := state.EnsureTask(msg.Text)
 	if task.Goal != userText && state.ActiveTask == task.ID {
 		userText = mergeTaskAndInstruction(task.Goal, userText)
@@ -669,6 +672,7 @@ func needsAction(text string) bool {
 	lower := strings.ToLower(text)
 	for _, marker := range []string{
 		"read", "check", "inspect", "look at", "review", "fix", "run", "test", "build", "create", "write", "update", "delete", "commit", "trace", "source code", "file", "directory", "repo", "/users/", "~/.mateway",
+		"读", "看", "检查", "查看", "分析", "修", "运行", "测试", "构建", "创建", "写", "更新", "删除", "提交", "记忆", "服务器", "地址",
 	} {
 		if strings.Contains(lower, marker) {
 			return true
@@ -728,7 +732,92 @@ func looksLikeInputRequest(text string) bool {
 	}
 	lower := strings.ToLower(trimmed)
 	return containsAny(lower, runtimeCueList(nil, "router.input_request.contains")) ||
-		containsAny(lower, runtimeCueList(nil, "router.input_request.question"))
+		containsAny(lower, runtimeCueList(nil, "router.input_request.question")) ||
+		looksLikeContinuationOffer(trimmed)
+}
+
+func looksLikeContinuationOffer(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	return containsAny(lower, []string{
+		"if you'd like", "if you would like", "i can ", "i could ", "would you like me to",
+		"reply with", "just reply", "choose one", "tell me which", "告诉我", "你可以回复",
+	})
+}
+
+func shouldStartNewTaskInsteadOfSteering(state session.State, userText string) bool {
+	userText = strings.TrimSpace(userText)
+	if userText == "" || state.ActiveTask == "" {
+		return false
+	}
+	var active *session.TaskNode
+	for i := range state.Tasks {
+		if state.Tasks[i].ID == state.ActiveTask {
+			active = &state.Tasks[i]
+			break
+		}
+	}
+	if active == nil {
+		return false
+	}
+	if active.Status == "failed" {
+		return shouldBreakFailedTaskSteering(active.Goal, userText)
+	}
+	if active.Status != "await_user_input" || !looksLikeContinuationOffer(active.Summary) {
+		return false
+	}
+	lower := strings.ToLower(userText)
+	for _, marker := range []string{"yes", "y", "ok", "okay", "sure", "continue", "go ahead", "1", "2", "3", "4", "继续", "好的", "可以", "行"} {
+		if lower == marker {
+			return false
+		}
+	}
+	if strings.HasPrefix(lower, "now ") || strings.HasPrefix(lower, "new ") || strings.HasPrefix(lower, "另外") || strings.HasPrefix(lower, "还有") {
+		return true
+	}
+	return needsAction(userText) && len(strings.Fields(userText)) >= 4
+}
+
+func shouldBreakFailedTaskSteering(goal, userText string) bool {
+	userText = strings.TrimSpace(userText)
+	if userText == "" {
+		return false
+	}
+	lower := strings.ToLower(userText)
+	for _, marker := range []string{"continue", "继续", "接着", "重试", "retry", "again", "再试"} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	if !needsAction(userText) {
+		return false
+	}
+	goalTerms := significantTerms(goal)
+	userTerms := significantTerms(userText)
+	if len(userTerms) == 0 {
+		return false
+	}
+	overlap := 0
+	for term := range userTerms {
+		if goalTerms[term] {
+			overlap++
+		}
+	}
+	return overlap == 0
+}
+
+func significantTerms(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, field := range strings.Fields(strings.ToLower(text)) {
+		field = strings.Trim(field, ".,;:!?()[]{}\"'`，。！？；：“”‘’")
+		if len([]rune(field)) < 2 {
+			continue
+		}
+		out[field] = true
+	}
+	return out
 }
 
 func looksLikeEmptyActionPromise(text string) bool {

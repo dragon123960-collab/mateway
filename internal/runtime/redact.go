@@ -20,6 +20,7 @@ const (
 var (
 	secretAssignmentPattern = regexp.MustCompile(`(?i)\b([a-z0-9_.-]*(?:secret|token|api[_-]?key|password|passwd|pwd|pass|authorization|auth[_-]?code|smtp[_-]?pass|imap[_-]?pass|pop3[_-]?pass)[a-z0-9_.-]*)(\s*[:=]\s*)(["']?)([^\s"',}#]+)(["']?)`)
 	bearerTokenPattern      = regexp.MustCompile(`(?i)\b(bearer\s+)[a-z0-9._~+/=-]{12,}`)
+	commonSecretPattern     = regexp.MustCompile(`\b(?:ghp_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9_-]{12,}|xox[abp]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16})\b`)
 )
 
 func redactSecrets(value any) any {
@@ -162,6 +163,7 @@ func redactSecretLine(text string) string {
 		return text
 	}
 	text = bearerTokenPattern.ReplaceAllString(text, `${1}`+redactedSecret)
+	text = commonSecretPattern.ReplaceAllString(text, redactedSecret)
 	text = secretAssignmentPattern.ReplaceAllStringFunc(text, func(match string) string {
 		parts := secretAssignmentPattern.FindStringSubmatch(match)
 		if len(parts) != 6 {

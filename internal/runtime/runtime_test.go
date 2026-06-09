@@ -850,6 +850,113 @@ func TestRuntimeInputRequestKeepsTaskActiveForUserContinuation(t *testing.T) {
 	}
 }
 
+func TestRuntimeContinuationOfferKeepsTaskActive(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Found 2 files. If you'd like, I can read either one."}, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "list readmes")); err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 || state.ActiveTask != state.Tasks[0].ID || state.Tasks[0].Status != "await_user_input" {
+		t.Fatalf("expected continuation offer to keep task active, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
+	}
+
+	model := &captureUserModel{text: "reading"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "yes")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(model.lastUser, "list readmes") || !strings.Contains(model.lastUser, "yes") {
+		t.Fatalf("expected short confirmation to steer into offer task, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeIndependentRequestAfterContinuationOfferStartsNewTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("list readmes")
+	state.AwaitUserInputActiveTaskWithSummary("Found files. If you'd like, I can read one.", "trace-one", "/tmp/trace-one.jsonl")
+	if task.Status != "await_user_input" {
+		t.Fatalf("setup failed: %#v", task)
+	}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "new task done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "Now list every yaml file under ~/.mateway/config")); err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "Now list every yaml file under ~/.mateway/config" {
+		t.Fatalf("expected independent request to create new task, got %#v", updated.Tasks)
+	}
+	if strings.Contains(model.lastUser, "Active task:") {
+		t.Fatalf("independent request should not be merged into previous offer, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeIndependentRequestAfterFailedTaskStartsNewTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	state.StartTask("看trace")
+	state.BlockActiveTask("failed")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "memory checked"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "现在检查一下你有哪些记忆，是否记得远程国外服务器地址")); err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "现在检查一下你有哪些记忆，是否记得远程国外服务器地址" {
+		t.Fatalf("expected independent memory request to create new task, got %#v", updated.Tasks)
+	}
+	if strings.Contains(model.lastUser, "看trace") {
+		t.Fatalf("new request should not be steered into failed trace task, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeProgressSinkDoesNotReplayHistoricalTaskEvents(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("inspect memory")
+	state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: "old missing trace"})
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "project.index",
+			Args: map[string]any{"path": rt.home()},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	var updates []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates = append(updates, msg)
+	}
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "continue")); err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) == 0 {
+		t.Fatal("expected progress updates")
+	}
+	for _, update := range updates {
+		for _, step := range update.Progress {
+			if strings.Contains(step.Summary, "old missing trace") || step.Title == "task_contract_unsatisfied" {
+				t.Fatalf("progress replayed historical event: %#v", updates)
+			}
+		}
+	}
+}
+
 func TestRuntimeEmptyActionPromiseDoesNotCompleteTask(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{

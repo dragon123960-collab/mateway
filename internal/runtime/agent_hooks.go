@@ -13,6 +13,7 @@ import (
 
 func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
 	steeringSent := false
+	progressEventOffset := taskExecutionEventCount(*state, taskID)
 	hooks := agentcore.Hooks{
 		Emit: func(ctx context.Context, event agentcore.Event) error {
 			if err := trace.emit(ctx, event); err != nil {
@@ -20,14 +21,14 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 			}
 			switch event.Type {
 			case agentcore.EventModelStart:
-				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
+				rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{
 					Title:   "model",
 					Status:  "thinking",
 					Summary: "waiting for model output",
 				})
 			case agentcore.EventMessageStart:
 				if summary := summarizeAssistantToolActivity(event.Message); summary != "" {
-					rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
+					rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{
 						Title:      "model",
 						Status:     "thinking",
 						Summary:    summary,
@@ -35,7 +36,7 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					})
 				}
 			case agentcore.EventToolExecutionProgress:
-				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{
+				rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{
 					Title:      event.ToolCall.Name,
 					Status:     "running",
 					Tool:       event.ToolCall.Name,
@@ -71,10 +72,10 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					},
 				})
 				_ = trace.write(map[string]any{"type": "tool_blocked", "task_id": taskID, "tool": input.ToolCall.Name, "reason": policy.Reason})
-				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
+				rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
 			}
-			rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
+			rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
 		},
 		AfterToolCall: func(_ context.Context, input agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
@@ -111,7 +112,7 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				case "accepted":
 				case "failed", "suspect":
 				}
-				rt.emitProgress(msg, *state, taskID, progressStepFromExecutionEvent(session.ExecutionEvent{
+				rt.emitProgress(msg, *state, taskID, progressEventOffset, progressStepFromExecutionEvent(session.ExecutionEvent{
 					Type:     "tool_result",
 					Status:   observe.TaskStep.Status,
 					Tool:     input.ToolCall.Name,
@@ -163,6 +164,11 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 		return out, nil
 	}
 	return hooks
+}
+
+func taskExecutionEventCount(state session.State, taskID string) int {
+	task := taskFromState(state, taskID)
+	return len(task.Execution.Events)
 }
 
 var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {

@@ -909,6 +909,54 @@ func TestFileReadRejectsLargeFile(t *testing.T) {
 	}
 }
 
+func TestFileReadAllowsHomeConfigForRemoteDiagnostics(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "config", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("secret: value\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if result.IsError || !strings.Contains(result.Content, "secret: value") {
+		t.Fatalf("expected config read for diagnostics, got %#v", result)
+	}
+}
+
+func TestFileReadRejectsProtectedHomeSecrets(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "secrets", "secrets.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"token":"value"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if !result.IsError || !strings.Contains(result.Content, "refusing to read protected path") {
+		t.Fatalf("expected protected secrets error, got %#v", result)
+	}
+}
+
+func TestFileReadAllowsRuntimeDiagnosticsOutsideSecrets(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "logs", "mateway.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("log line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if result.IsError || !strings.Contains(result.Content, "log line") {
+		t.Fatalf("expected runtime diagnostics read outside secrets, got %#v", result)
+	}
+}
+
 func TestFileReadIndexesDirectory(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, "notes")

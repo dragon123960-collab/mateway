@@ -9,11 +9,11 @@ import (
 	"github.com/dongping/mateway/internal/session"
 )
 
-func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, taskID string, current channel.ProgressStep) {
+func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, taskID string, eventOffset int, current channel.ProgressStep) {
 	if rt.ProgressSink == nil {
 		return
 	}
-	steps := progressStepsForTask(state, taskID)
+	steps := progressStepsForTaskSince(state, taskID, eventOffset)
 	if strings.TrimSpace(current.Title) != "" || strings.TrimSpace(current.Tool) != "" {
 		steps = append(steps, current)
 	}
@@ -52,8 +52,19 @@ func summarizeAssistantToolActivity(message agentcore.Message) string {
 }
 
 func progressStepsForTask(state session.State, taskID string) []channel.ProgressStep {
+	return progressStepsForTaskSince(state, taskID, 0)
+}
+
+func progressStepsForTaskSince(state session.State, taskID string, eventOffset int) []channel.ProgressStep {
 	task := taskFromState(state, taskID)
 	events := task.Execution.Events
+	if eventOffset < 0 {
+		eventOffset = 0
+	}
+	if eventOffset > len(events) {
+		eventOffset = len(events)
+	}
+	events = events[eventOffset:]
 	out := make([]channel.ProgressStep, 0, len(events))
 	for _, event := range events {
 		step := progressStepFromExecutionEvent(event)
