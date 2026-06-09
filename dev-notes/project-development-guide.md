@@ -33,7 +33,7 @@ Runtime 不做语义路由，不做 completion review，不做 chat approval pen
 - `internal/gateway`: 负责 session key、dedupe、异步运行和 channel serving。
 - `internal/runtime`: 负责 setup、system context、task contract、hooks、context budget、memory proposal review、finalize。
 - `internal/agentcore`: transcript-driven model/tool loop。它只知道 model、tools、hooks、messages，不知道具体 channel。
-- `internal/tool`: built-in tool registry 和工具实现，包括 `file.*`、`project.index`、`terminal.run`、`web.*`、`secret.set`、schedule、task recall、`tool_result.read`。
+- `internal/tool`: built-in tool registry 和工具实现，包括 `file.*`、`project.index`、`terminal.run`、`web.*`、`secret.set`、schedule、task recall、`toolresult.read`。
 - `internal/session`: session state、task tree、pending action、task steps、execution events。
 - `internal/model`: provider clients、native tool calling、text tool-call fallback、usage parsing、reasoning cleanup。
 - `internal/memory`: Markdown memory、proposal、lint/index/search、diary/reflection、heartbeat distill、skill learning。
@@ -48,7 +48,7 @@ Runtime 不做语义路由，不做 completion review，不做 chat approval pen
 - `Tool Evidence`: tool result 经过 `observe_hook` 变成 task step，记录 status、risk、mutation、accepted evidence 和 summary。
 - `Context Budget`: 每轮模型调用前估算 token，超 soft budget 时压缩旧 transcript/tool result，超 hard budget 时停止。
 - `Dynamic Visible Tools`: 每轮只向模型暴露相关 tool schemas/contracts，执行层仍保留完整 registry。
-- `Raw Ref Retrieval`: 大型 tool result 压缩后保存 `raw_ref`，模型可用 `tool_result.read` 按 query 回读命中行。
+- `Raw Ref Retrieval`: 大型 tool result 压缩后保存 `raw_ref`，模型可用 `toolresult.read` 按 query 回读命中行。
 - `Skill Guidance`: `SKILL.md` 是 prompt guidance，不是可执行能力；需要动作仍必须走真实 tool。
 - `Multi-Agent Profile Foundation`: `config.agents.profiles[]`、channel bindings、agent-specific skills、agent-scoped memory directories 已存在，当前不做 supervisor。
 

@@ -49,7 +49,7 @@ Session 会持续维护一个 deterministic summary，记录最近任务结果�
 - 超过 soft budget 时压缩旧 transcript 和大型 tool result。
 - 超过 hard budget 后停止，避免无意义的大模型请求。
 - 每轮只向模型暴露相关 tool schemas/contracts，执行层仍保留完整 tool registry。
-- 大型 tool result 的完整内容保存为 `raw_ref`，模型可用 `tool_result.read` 按 query 精确回读。
+- 大型 tool result 的完整内容保存为 `raw_ref`，模型可用 `toolresult.read` 按 query 精确回读。
 
 ## 停止与状态
 

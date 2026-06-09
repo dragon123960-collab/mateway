@@ -65,7 +65,7 @@ func TestContextBudgetSelectsRelevantVisibleTools(t *testing.T) {
 		runtimeNamedTool{name: "web.search"},
 		runtimeNamedTool{name: "terminal.run"},
 		runtimeNamedTool{name: "schedule.create"},
-		runtimeNamedTool{name: "tool_result.read"},
+		runtimeNamedTool{name: "toolresult.read"},
 	}
 	result := packMessagesForContextBudget(contextBudgetInput{
 		Config:      &cfg,
@@ -80,7 +80,7 @@ func TestContextBudgetSelectsRelevantVisibleTools(t *testing.T) {
 		},
 	})
 	names := strings.Join(result.ToolNames, ",")
-	for _, want := range []string{"web.search", "tool_result.read"} {
+	for _, want := range []string{"web.search", "toolresult.read"} {
 		if !strings.Contains(names, want) {
 			t.Fatalf("expected visible tool %s in %q", want, names)
 		}

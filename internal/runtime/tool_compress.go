@@ -32,7 +32,7 @@ func compactToolResultForModel(call agentcore.ToolCall, result agentcore.ToolRes
 	}
 	rawRef, rawPath := storeRawToolResult(home, traceID, call.Name, result)
 	if rawRef != "" {
-		compacted = strings.TrimRight(compacted, "\n") + "\n\n[full original tool output stored as raw_ref=" + rawRef + "; call tool_result.read with raw_ref and optional query if more detail is needed]"
+		compacted = strings.TrimRight(compacted, "\n") + "\n\n[full original tool output stored as raw_ref=" + rawRef + "; call toolresult.read with raw_ref and optional query if more detail is needed]"
 	}
 	result.Content = compacted
 	if result.Evidence == nil {
@@ -44,7 +44,7 @@ func compactToolResultForModel(call agentcore.ToolCall, result agentcore.ToolRes
 	result.Evidence["model_content_compressor"] = compressor
 	if rawRef != "" {
 		result.Evidence["raw_ref"] = rawRef
-		result.Evidence["raw_retrieval_tool"] = "tool_result.read"
+		result.Evidence["raw_retrieval_tool"] = "toolresult.read"
 	}
 	if rawPath != "" {
 		result.Evidence["raw_path"] = rawPath

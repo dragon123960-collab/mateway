@@ -48,7 +48,7 @@
 
 | 工具 | 用途 | 关键边界 |
 | --- | --- | --- |
-| `tool_result.read` | 按 `raw_ref` 回读被压缩的大型工具输出 | 只读取本地 artifact store；可用多关键词 `query` 返回命中行上下文和 line ranges，避免把完整输出重新塞进 prompt。 |
+| `toolresult.read` | 按 `raw_ref` 回读被压缩的大型工具输出 | 只读取本地 artifact store；可用多关键词 `query` 返回命中行上下文和 line ranges，避免把完整输出重新塞进 prompt。 |
 
 ## 非默认工具
 

@@ -238,7 +238,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
 			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
-		} else if emptyActionPromise {
+		} else if emptyActionPromise || looksLikeUnexecutedCommitment(finalText) {
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
 			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})

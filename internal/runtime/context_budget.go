@@ -159,7 +159,7 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		addToolScore(scores, callName, 90)
 	}
 	if strings.Contains(text, "raw_ref") || strings.Contains(text, "tool-result:") {
-		addToolScore(scores, "tool_result.read", 95)
+		addToolScore(scores, "toolresult.read", 95)
 	}
 	scoreToolsFromText(scores, text)
 	for _, tool := range tools {
@@ -169,7 +169,7 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		name := tool.Name()
 		if scores[name] == 0 && tool.Risk() == agentcore.RiskSafeRead {
 			switch name {
-			case "file.read", "project.index", "task.search", "task.resume", "web.search", "web.fetch", "tool_result.read":
+			case "file.read", "project.index", "task.search", "task.resume", "web.search", "web.fetch", "toolresult.read":
 				addToolScore(scores, name, 10)
 			}
 		}
