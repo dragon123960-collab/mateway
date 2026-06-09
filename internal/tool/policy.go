@@ -21,11 +21,10 @@ func IsDangerousCommand(cmd string) bool {
 }
 
 type TerminalDecision struct {
-	Allow          bool
-	Class          string
-	Reason         string
-	RemoteProfile  string
-	RequireConfirm bool
+	Allow         bool
+	Class         string
+	Reason        string
+	RemoteProfile string
 }
 
 func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
@@ -42,7 +41,7 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 	}
 	if looksLikeNetworkCommand(fields[0]) {
 		if profile, ok := matchRemoteProfile(fields, cfg); ok {
-			return TerminalDecision{Allow: true, Class: "remote", RemoteProfile: profile.Alias, RequireConfirm: false}
+			return TerminalDecision{Allow: true, Class: "remote", RemoteProfile: profile.Alias}
 		}
 		return TerminalDecision{Allow: true, Class: "network"}
 	}

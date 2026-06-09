@@ -2,8 +2,6 @@ package tool
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -57,13 +55,6 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"blocked": true, "reason": "secret_literal"}}
 	}
 	decision := CheckTerminalCommand(command, t.Config)
-	approvalToken := firstNonEmptyString(ApprovalTokenFromContext(ctx), strings.TrimSpace(fmt.Sprint(call.Args["_mateway_approval_token"])))
-	approved := terminalRunApprovalToken(command, t.Config) == approvalToken
-	if !decision.Allow && approved && decision.Class != "destructive" && decision.Class != "path_escape" && decision.Class != "network" {
-		decision.Allow = true
-		decision.RequireConfirm = false
-		decision.Reason = "approved by user confirmation"
-	}
 	if !decision.Allow {
 		return agentcore.ToolResult{
 			ToolCallID: call.ID,
@@ -135,15 +126,6 @@ func (t TerminalRunTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: result, IsError: true, Evidence: evidence}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: result, Evidence: evidence}
-}
-
-func TerminalRunApprovalToken(command string, cfg *config.Root) string {
-	return terminalRunApprovalToken(command, cfg)
-}
-
-func terminalRunApprovalToken(command string, cfg *config.Root) string {
-	sum := sha256.Sum256([]byte(configHome(cfg) + "\x00terminal.run\x00" + strings.TrimSpace(command)))
-	return hex.EncodeToString(sum[:12])
 }
 
 func rejectCommandContainingKnownSecret(command string, cfg *config.Root) error {

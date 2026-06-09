@@ -45,9 +45,8 @@ type HookProvider interface {
 }
 
 type RuntimeHooks struct {
-	Providers       []HookProvider
-	Timeout         time.Duration
-	ApproveToolCall func(context.Context, ApprovalRequest) (ApprovalDecision, error)
+	Providers []HookProvider
+	Timeout   time.Duration
 }
 
 type ContextHookProvider interface {
@@ -62,21 +61,8 @@ type ToolPolicyHookInput struct {
 }
 
 type ToolPolicyHookResult struct {
-	Block           bool
-	Reason          string
-	RequireApproval bool
-	ApprovalToken   string
-}
-
-type ApprovalRequest struct {
-	ToolCall agentcore.ToolCall
-	Tool     agentcore.Tool
-	Reason   string
-}
-
-type ApprovalDecision struct {
-	Approved bool
-	Reason   string
+	Block  bool
+	Reason string
 }
 
 type ToolPolicyHookProvider interface {
@@ -187,8 +173,8 @@ func (h RuntimeHooks) toolPolicy(ctx context.Context, input ToolPolicyHookInput,
 			_ = trace.write(map[string]any{"type": "hook_warning", "hook": "tool_policy_hook", "provider": name, "error": err.Error()})
 			continue
 		}
-		_ = trace.write(map[string]any{"type": "hook_event", "hook": "tool_policy_hook", "provider": name, "tool": input.ToolCall.Name, "block": result.Block, "require_approval": result.RequireApproval, "reason": result.Reason})
-		if result.Block || result.RequireApproval {
+		_ = trace.write(map[string]any{"type": "hook_event", "hook": "tool_policy_hook", "provider": name, "tool": input.ToolCall.Name, "block": result.Block, "reason": result.Reason})
+		if result.Block {
 			return result
 		}
 	}

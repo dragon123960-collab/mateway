@@ -11,14 +11,13 @@ The runtime should emit a stable stream of process events:
 - `tool.progress`: a long-running tool is still active, including elapsed time.
 - `tool.completed`: a tool returned, including status, duration, compact summary, and optional `raw_ref`.
 - `tool.blocked`: policy blocked a tool call.
-- `approval.requested`: a guarded or dangerous operation needs user confirmation.
 - `final.completed`: final answer is ready.
 - `final.failed`: the task stopped at a safe point.
 - `context_budget_estimated`: the runtime estimated per-turn input tokens, visible tools, and budget limits.
 - `context_budget_compacted`: the runtime compacted transcript/tool content before a model turn.
 - `session_summary_updated`: the runtime updated the deterministic session summary after a task state transition.
 
-These events are not chain-of-thought. They describe operational state: what is being called, what returned, what is waiting, and what requires approval.
+These events are not chain-of-thought. They describe operational state: what is being called, what returned, what is waiting, and what was blocked by policy.
 
 ## CLI Renderer
 
@@ -45,7 +44,6 @@ Requirements:
 - Support `--quiet` for final-answer-only scripting.
 - Support `--json` / NDJSON for machine-readable automation.
 - Support stdin and stdout piping, for example `cat error.log | mateway ask "analyze this"`.
-- Add approval prompts for guarded and dangerous operations.
 - Allow interruption and correction with Ctrl+C without losing the current task context.
 
 ## Feishu Renderer

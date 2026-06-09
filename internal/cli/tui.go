@@ -91,8 +91,6 @@ type tuiModel struct {
 	lastToolState string
 	currentTask   string
 	liveSteps     []session.TaskStep
-	approval      *tuiApproval
-	pendingAnswer chan runtime.ApprovalDecision
 	errText       string
 
 	commandPanel bool
@@ -102,11 +100,6 @@ type tuiModel struct {
 	historyIndex int
 	autoFollow   bool
 	newEvents    int
-}
-
-type tuiApproval struct {
-	request runtime.ApprovalRequest
-	reply   chan runtime.ApprovalDecision
 }
 
 type tuiPicker struct {
@@ -140,12 +133,6 @@ type tuiResultMsg struct {
 	tracePath string
 	err       error
 }
-
-type tuiApprovalMsg struct {
-	approval *tuiApproval
-}
-
-type tuiApprovalDoneMsg struct{}
 
 func newTUIModel(ctx context.Context, cfg *config.Root, sessionKey string) *tuiModel {
 	agent := cfg.DefaultAgent()
@@ -279,20 +266,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addEvent(msg.line)
 		}
 		return m, nil
-	case tuiApprovalMsg:
-		m.approval = msg.approval
-		m.pendingAnswer = msg.approval.reply
-		m.status = "Approval"
-		m.addEvent("")
-		m.addEvent(colorize("! Approval required", ansiYellow, true))
-		m.addEvent("  tool:   " + friendlyToolName(msg.approval.request.ToolCall.Name))
-		m.addEvent("  detail: " + approvalDetail(msg.approval.request.ToolCall))
-		m.addEvent("  enter y or n")
-		return m, nil
-	case tuiApprovalDoneMsg:
-		m.approval = nil
-		m.pendingAnswer = nil
-		return m, nil
 	case tuiResultMsg:
 		m.running = false
 		m.status = "Idle"
@@ -321,13 +294,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
-	if m.approval == nil || m.pendingAnswer != nil {
-		var inputCmd tea.Cmd
-		m.input, inputCmd = m.input.Update(msg)
-		cmd = tea.Batch(cmd, inputCmd)
-		if m.commandPanel && !strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/") {
-			m.commandPanel = false
-		}
+	var inputCmd tea.Cmd
+	m.input, inputCmd = m.input.Update(msg)
+	cmd = tea.Batch(cmd, inputCmd)
+	if m.commandPanel && !strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/") {
+		m.commandPanel = false
 	}
 	return m, cmd
 }
@@ -393,9 +364,6 @@ func (m *tuiModel) resize() {
 func (m *tuiModel) footerView() string {
 	width := m.contentWidth()
 	var parts []string
-	if m.approval != nil {
-		parts = append(parts, m.approvalPanelView(width))
-	}
 	m.input.SetHeight(m.inputHeight())
 	input := tuiInputStyle(width).Render(m.input.View())
 	status := m.statusLine(width)
@@ -405,9 +373,6 @@ func (m *tuiModel) footerView() string {
 
 func (m *tuiModel) statusLine(width int) string {
 	mode := colorize(firstNonEmpty(m.status, "Idle"), ansiBlue, true)
-	if m.approval != nil {
-		mode = colorize("Approval", ansiYellow, true)
-	}
 	parts := []string{mode, colorize(m.model.Display(), ansiDim, true)}
 	if m.running {
 		parts = append(parts, colorize(m.progressSummary(), ansiDim, true))
@@ -765,18 +730,6 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func (m *tuiModel) approvalPanelView(width int) string {
-	req := m.approval.request
-	lines := []string{
-		colorize("Approval required", ansiYellow, true),
-		"tool:   " + friendlyToolName(req.ToolCall.Name),
-		"detail: " + approvalDetail(req.ToolCall),
-		"reason: " + firstNonEmpty(req.Reason, "requires confirmation"),
-		colorize("reply y or n", ansiDim, true),
-	}
-	return panelStyle(width, "214").Render(strings.Join(lines, "\n"))
 }
 
 func panelStyle(width int, color string) lipgloss.Style {
@@ -1240,9 +1193,6 @@ func recentStepLines(steps []session.TaskStep, limit int) []string {
 }
 
 func (m *tuiModel) toolLines() []string {
-	if m.approval != nil {
-		return []string{"approval required", friendlyToolName(m.approval.request.ToolCall.Name)}
-	}
 	if strings.TrimSpace(m.lastTool) == "" {
 		return []string{"none"}
 	}
@@ -1449,13 +1399,6 @@ func (m *tuiModel) submit() tea.Cmd {
 		return nil
 	}
 	m.commandPanel = false
-	if m.approval != nil && m.pendingAnswer != nil {
-		m.input.SetValue("")
-		m.recordHistory(text)
-		answer := strings.ToLower(text)
-		m.pendingAnswer <- runtime.ApprovalDecision{Approved: answer == "y" || answer == "yes"}
-		return nil
-	}
 	if m.running {
 		m.addEvent(colorize("task is still running; draft kept in input", ansiYellow, true))
 		return nil
@@ -1525,17 +1468,6 @@ func (m *tuiModel) runTask(text string) {
 			summary:   step.Summary,
 			duration:  step.DurationMS,
 		})
-	}
-	rt.Hooks.ApproveToolCall = func(_ context.Context, req runtime.ApprovalRequest) (runtime.ApprovalDecision, error) {
-		approval := &tuiApproval{request: req, reply: make(chan runtime.ApprovalDecision, 1)}
-		if m.program != nil {
-			m.program.Send(tuiApprovalMsg{approval: approval})
-		}
-		decision := <-approval.reply
-		if m.program != nil {
-			m.program.Send(tuiApprovalDoneMsg{})
-		}
-		return decision, nil
 	}
 	resp, err := rt.Handle(m.ctx, inbound(text, m.sessionKey))
 	if m.program != nil {

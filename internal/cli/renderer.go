@@ -131,10 +131,6 @@ func processEventLabelAndDetail(event ProcessEvent) (string, string) {
 		return "✓", friendlyToolName(tool) + durationSuffix(event.DurationMS) + visibleResultSummary(tool, summary)
 	case "tool.blocked":
 		return "✕", friendlyToolName(tool) + suffixSummary(summary)
-	case "approval.requested":
-		return "!", "Approval required for " + friendlyToolName(tool) + suffixSummary(summary)
-	case "approval.completed":
-		return "!", "Approval " + firstNonEmpty(event.Status, summary)
 	case "runtime.completed":
 		return "", ""
 	case "gateway.completed":
@@ -162,8 +158,6 @@ func processEventColor(event ProcessEvent) string {
 		return ansiGreen
 	case "tool.blocked":
 		return ansiRed
-	case "approval.requested", "approval.completed":
-		return ansiYellow
 	case "tool.started", "tool.progress":
 		return ansiBlue
 	default:

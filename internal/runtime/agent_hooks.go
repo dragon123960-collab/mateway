@@ -9,7 +9,6 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/session"
-	"github.com/dongping/mateway/internal/tool"
 )
 
 func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
@@ -74,25 +73,6 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				_ = trace.write(map[string]any{"type": "tool_blocked", "task_id": taskID, "tool": input.ToolCall.Name, "reason": policy.Reason})
 				rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
-			}
-			if policy.RequireApproval {
-				approved, reason := rt.approveToolCall(context.Background(), input, policy, trace)
-				if !approved {
-					state.AddExecutionEvent(taskID, session.ExecutionEvent{
-						Type:    "tool_blocked",
-						Status:  "failed",
-						Tool:    input.ToolCall.Name,
-						Summary: reason,
-						Evidence: map[string]any{
-							"reason": reason,
-						},
-					})
-					_ = trace.write(map[string]any{"type": "approval_rejected", "task_id": taskID, "tool": input.ToolCall.Name, "reason": reason})
-					rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: reason})
-					return agentcore.BeforeToolCallResult{Block: true, Reason: reason}, nil
-				}
-				_ = trace.write(map[string]any{"type": "approval_granted", "task_id": taskID, "tool": input.ToolCall.Name})
-				return agentcore.BeforeToolCallResult{Context: tool.WithApprovalToken(ctx, policy.ApprovalToken)}, nil
 			}
 			rt.emitProgress(msg, *state, taskID, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
@@ -195,28 +175,6 @@ var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {
 	default:
 		return 60 * time.Second
 	}
-}
-
-func (rt Runtime) approveToolCall(ctx context.Context, input agentcore.BeforeToolCallContext, policy ToolPolicyHookResult, trace *traceRecorder) (bool, string) {
-	reason := strings.TrimSpace(policy.Reason)
-	if reason == "" {
-		reason = "tool call requires approval"
-	}
-	if rt.Hooks.ApproveToolCall == nil {
-		return false, reason
-	}
-	_ = trace.write(map[string]any{"type": "approval_requested", "tool": input.ToolCall.Name, "reason": reason})
-	decision, err := rt.Hooks.ApproveToolCall(ctx, ApprovalRequest{ToolCall: input.ToolCall, Tool: input.Tool, Reason: reason})
-	if err != nil {
-		return false, err.Error()
-	}
-	if !decision.Approved {
-		if text := strings.TrimSpace(decision.Reason); text != "" {
-			return false, text
-		}
-		return false, "tool call was rejected"
-	}
-	return true, ""
 }
 
 var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.Duration {

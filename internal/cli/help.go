@@ -31,7 +31,7 @@ func chatHelpSections() []helpSection {
 		}},
 		{Title: "Observe", Items: []helpItem{
 			{Command: "/trace [path|key]", What: "summarize the latest trace for a session or a trace file", Example: "/trace"},
-			{Command: "/events [path|key]", What: "render process events: model, tools, approvals, final reply", Example: "/events --json"},
+			{Command: "/events [path|key]", What: "render process events: model, tools, blocked tools, final reply", Example: "/events --json"},
 		}},
 		{Title: "Agent / Model", Items: []helpItem{
 			{Command: "/model [--agent <agent_id>] [--verbose]", What: "inspect model selection chain and loaded model endpoints", Example: "/model --verbose"},

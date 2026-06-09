@@ -456,7 +456,7 @@ func TestTerminalRunBlocksEvenWhenApprovalDisabled(t *testing.T) {
 	}
 }
 
-func TestTerminalRunExecutesConfirmedNonDestructiveCommand(t *testing.T) {
+func TestTerminalRunIgnoresLegacyApprovalTokenForNonDestructiveCommand(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
 	if err := os.MkdirAll(filepath.Join(home, "workspace", "skills"), 0o755); err != nil {
@@ -467,24 +467,24 @@ func TestTerminalRunExecutesConfirmedNonDestructiveCommand(t *testing.T) {
 		Name: "terminal.run",
 		Args: map[string]any{
 			"command":                 "ls " + filepath.Join(home, "workspace", "skills") + " 2>/dev/null && echo ok",
-			"_mateway_approval_token": TerminalRunApprovalToken("ls "+filepath.Join(home, "workspace", "skills")+" 2>/dev/null && echo ok", cfg),
+			"_mateway_approval_token": "legacy-token",
 		},
 	})
 	if result.IsError || !strings.Contains(result.Content, "ok") {
-		t.Fatalf("expected confirmed command to execute, got %#v", result)
+		t.Fatalf("expected non-destructive command to execute directly, got %#v", result)
 	}
 	if result.Evidence["decision"] != "allowed" {
 		t.Fatalf("expected allowed evidence, got %#v", result.Evidence)
 	}
 }
 
-func TestTerminalRunStillBlocksConfirmedDestructiveCommand(t *testing.T) {
+func TestTerminalRunStillBlocksLegacyTokenDestructiveCommand(t *testing.T) {
 	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
 		ID:   "1",
 		Name: "terminal.run",
 		Args: map[string]any{
 			"command":                 "rm -rf /tmp/mateway-blocked-test",
-			"_mateway_approval_token": TerminalRunApprovalToken("rm -rf /tmp/mateway-blocked-test", &config.Root{}),
+			"_mateway_approval_token": "legacy-token",
 		},
 	})
 	if !result.IsError || result.Evidence["policy_classification"] != "destructive" {

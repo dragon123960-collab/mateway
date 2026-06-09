@@ -274,18 +274,10 @@ func TestRuntimeTerminalShellCommandRunsWithoutApproval(t *testing.T) {
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "approved"},
 	}}, rt.Tools)
-	approvalCalled := false
-	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		approvalCalled = true
-		return ApprovalDecision{Approved: true}, nil
-	}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command"))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if approvalCalled {
-		t.Fatal("terminal shell command should not request approval")
 	}
 	if resp.Failed {
 		t.Fatalf("expected shell command task to complete, got %#v", resp)

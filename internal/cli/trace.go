@@ -133,12 +133,6 @@ func processEventFromTrace(event map[string]any) (ProcessEvent, bool) {
 		return processToolEndEvent(event, duration, eventTime)
 	case "tool_blocked":
 		return ProcessEvent{Type: "tool.blocked", Status: "failed", Tool: firstNonEmpty(traceString(event["tool"]), traceToolName(event)), Summary: compactInline(traceString(event["reason"]), 240), Time: eventTime}, true
-	case "approval_requested":
-		return ProcessEvent{Type: "approval.requested", Status: "pending", Tool: traceString(event["tool"]), Summary: compactInline(traceString(event["reason"]), 240), Time: eventTime}, true
-	case "approval_granted":
-		return ProcessEvent{Type: "approval.completed", Status: "approved", Tool: traceString(event["tool"]), Time: eventTime}, true
-	case "approval_rejected":
-		return ProcessEvent{Type: "approval.completed", Status: "rejected", Tool: traceString(event["tool"]), Summary: compactInline(traceString(event["reason"]), 240), Time: eventTime}, true
 	case "reply":
 		eventType := "final.completed"
 		if strings.TrimSpace(traceString(event["style"])) == "error" {
