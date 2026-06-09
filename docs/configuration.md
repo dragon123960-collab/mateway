@@ -16,6 +16,7 @@ Mateway 从 `~/.mateway/config/` 读取本地配置。配置目标是保持小�
 - `execution.max_parallel_tools`
 - `execution.max_iterations`
 - `execution.inactivity_timeout`
+- `execution.context_budget`
 - `memory.enabled`
 - `memory.root`
 - `memory.recent_days`
@@ -29,6 +30,20 @@ Mateway 从 `~/.mateway/config/` 读取本地配置。配置目标是保持小�
 - `security.accessible_paths`
 - `security.terminal_sandbox`
 - search、provider、channel、model-specific configs
+
+## Context Budget
+
+`execution.context_budget` controls invisible token-saving behavior before each model turn:
+
+- `enabled`: enable per-turn budget packing.
+- `soft_ratio`: fraction of available input window where compaction starts.
+- `hard_ratio`: fraction of available input window that cannot be exceeded after compaction.
+- `recent_turns`: recent transcript turns to preserve before older messages are summarized or dropped.
+- `tool_result_target_tokens`: target size for compacted tool result content.
+- `max_visible_tools`: maximum tool schemas/contracts exposed to one model turn.
+- `trace_telemetry`: write budget diagnostics such as `context_budget_estimated`, `context_budget_compacted`, visible tools, hidden tools, and estimated token savings.
+
+The selected model's `context_window` and `max_tokens` come from `~/.mateway/config/models/*.yaml`. Runtime uses them to estimate input headroom; exact provider tokenizers are not required for the local estimate.
 
 已经删除或不应再出现在默认配置中的键：
 

@@ -14,6 +14,9 @@ The runtime should emit a stable stream of process events:
 - `approval.requested`: a guarded or dangerous operation needs user confirmation.
 - `final.completed`: final answer is ready.
 - `final.failed`: the task stopped at a safe point.
+- `context_budget_estimated`: the runtime estimated per-turn input tokens, visible tools, and budget limits.
+- `context_budget_compacted`: the runtime compacted transcript/tool content before a model turn.
+- `session_summary_updated`: the runtime updated the deterministic session summary after a task state transition.
 
 These events are not chain-of-thought. They describe operational state: what is being called, what returned, what is waiting, and what requires approval.
 
@@ -38,6 +41,7 @@ Requirements:
 - Do not render final answer text inside progress events; final content belongs in the final renderer.
 - Use color and symbols for status in TTY mode.
 - Collapse long tool results by default; expose details through verbose mode, `raw_ref`, or an explicit expand command.
+- Show debug-only usage diagnostics in the sidebar when available: estimated input tokens, saved estimated tokens, compacted message/tool counts, cache hits, and cache read/write tokens.
 - Support `--quiet` for final-answer-only scripting.
 - Support `--json` / NDJSON for machine-readable automation.
 - Support stdin and stdout piping, for example `cat error.log | mateway ask "analyze this"`.
@@ -76,6 +80,7 @@ P1:
 
 - Emit NDJSON process events from CLI.
 - Make `/trace` and `/events` show detailed tool call arguments, result outcomes, duration, and compact result summaries.
+- Include context budget and cache telemetry in trace summaries when present.
 - Prevent final answer text from being edited into Feishu progress messages.
 
 P2:

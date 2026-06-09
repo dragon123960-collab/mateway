@@ -89,7 +89,7 @@ mateway memory proposal reject <proposal_id>
 
 - request 和 channel
 - model turns
-- provider 返回时的模型请求数和 token usage
+- provider 返回时的模型请求数、token usage、cache usage 和 context budget telemetry
 - tool calls 和 tool results
 - hook events
 - final reply
@@ -105,10 +105,13 @@ Session 是运行时状态，不是无限增长的原始聊天记录。每次调
 - 当前 agent profile 的 Markdown 文件
 - 已发现 skill 的精简 guidance
 - `memory_safe_read` 命中时的相关长期记忆片段
+- deterministic session summary，包括最近结果、open items 和已接受 evidence
 - 压缩后的最近 session transcript
 - 当前用户消息
 
 System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、trace id 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。
+
+Mateway 还会在每次模型调用前运行一层无感的 context economy。它会根据当前模型的 `context_window` 和 `max_tokens` 估算 input tokens，超过 soft budget 时自动压缩旧 transcript 和 tool content，只有超过 hard budget 才停止，并把估算节省量写入 trace/TUI diagnostics。Tool schema 也会动态暴露：每一轮模型只看到相关 tool contract，但执行层仍保留完整 registry。被压缩的大型 tool output 会保存为 `raw_ref`；`tool_result.read` 可以按 `raw_ref` 和可选多关键词 `query` 精确回读原始输出，返回命中行片段和 line ranges，而不是把大块原文重新塞回 prompt。
 
 飞书图片消息会下载到 `~/.mateway/media`；微信 channel 如果收到带 URL 或本地路径的媒体 item，也会归一化到同一套 message part。Session transcript 只保存媒体引用，不内联图片字节。模型详情、启用开关、`context_window` 和 `max_tokens` 放在 `~/.mateway/config/models/*.yaml`；`config.yaml` 只选择默认模型、fallback 和角色。如果当前模型声明了 `modalities: [text, image]`，用户文字和图片会作为同一个 user turn 一起发送给多模态模型；否则 Mateway 会优先使用 `model.roles.vision`，它可以是单个模型，也可以是 `vision: [glm-4.6v-flash, minimax]` 这样的有序列表，然后再尝试其他支持图片的 fallback 模型。音频、视频和文件 part 已在消息结构中预留，后续再接渠道下载和模型发送。
 
@@ -146,6 +149,8 @@ Mateway 目前支持：
 - 内置工具：`file.read`、`file.write`、`file.delete`、`project.index`、`terminal.run`、`web.search`、`web.fetch`、`secret.set`、定时任务管理工具，以及 `task.search` / `task.resume`
 - Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
 - 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
+- 无感 token economy：per-turn context budget、session summary、动态 visible tools、压缩 tool result 和 `raw_ref` query 回读
+- usage diagnostics：provider tokens、cache read/write tokens、estimated input tokens 和估算压缩节省量
 - 本地 secret store：`mateway secret set/get/list/delete`
 - trace 中可见 hook events
 - workspace profile 注入
@@ -374,9 +379,10 @@ Mateway 现在优先使用大模型原生 tool/function calling，不再把手�
 Trace 可用于检查：
 
 - model/tool/runtime latency
-- 模型请求数和 input/output/total tokens
+- 模型请求数、input/output/total tokens、cache read/write tokens、estimated input tokens 和 context compaction savings
 - hook decisions
 - tool calls 和 acceptance evidence
+- context budget decisions、visible/hidden tool counts 和 session summary updates
 - memory proposal generation
 - Feishu gateway timing
 
@@ -550,6 +556,7 @@ Mateway 不会把这些能力伪装成已经完成：
 - Hook pipeline
 - Tool policy 和破坏性命令阻拦
 - JSONL traces
+- Per-turn context budget、动态 visible tools、cache usage telemetry 和 deterministic session summary
 - Skill discovery 和 context injection
 - 本地 secret store 和 skill secret 扫描
 - Markdown memory lint/search/index

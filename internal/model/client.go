@@ -1086,6 +1086,7 @@ func parseOpenAIResult(data []byte) (GenerateResult, error) {
 			Message struct {
 				Role      string `json:"role"`
 				Content   any    `json:"content"`
+				Reasoning string `json:"reasoning"`
 				ToolCalls []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
@@ -1139,6 +1140,9 @@ func parseOpenAIResult(data []byte) (GenerateResult, error) {
 					}
 				}
 			}
+		}
+		if strings.TrimSpace(choice.Message.Reasoning) != "" {
+			parts = append(parts, choice.Message.Reasoning)
 		}
 		for _, rawCall := range choice.Message.ToolCalls {
 			name := strings.TrimSpace(rawCall.Function.Name)
