@@ -550,20 +550,8 @@ func (defaultToolPolicyHookProvider) ToolPolicyHook(_ context.Context, input Too
 		if decision.Class == "destructive" {
 			return ToolPolicyHookResult{Block: true, Reason: decision.Reason}, nil
 		}
-		if terminalCommandNeedsApproval(decision.Class) {
-			return ToolPolicyHookResult{RequireApproval: true, Reason: "terminal command requires approval: " + decision.Class, ApprovalToken: tool.TerminalRunApprovalToken(command, input.Config)}, nil
-		}
 	}
 	return ToolPolicyHookResult{}, nil
-}
-
-func terminalCommandNeedsApproval(class string) bool {
-	switch strings.TrimSpace(class) {
-	case "shell", "guarded_mutation", "unknown":
-		return true
-	default:
-		return false
-	}
 }
 
 type defaultObserveHookProvider struct{}

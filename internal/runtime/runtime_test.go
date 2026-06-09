@@ -264,7 +264,7 @@ func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 	}
 }
 
-func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
+func TestRuntimeTerminalShellCommandRunsWithoutApproval(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
@@ -274,9 +274,9 @@ func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "approved"},
 	}}, rt.Tools)
-	asked := false
+	approvalCalled := false
 	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		asked = true
+		approvalCalled = true
 		return ApprovalDecision{Approved: true}, nil
 	}
 
@@ -284,77 +284,11 @@ func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !asked {
-		t.Fatal("expected approval request")
+	if approvalCalled {
+		t.Fatal("terminal shell command should not request approval")
 	}
 	if resp.Failed {
-		t.Fatalf("expected approved task, got %#v", resp)
-	}
-}
-
-func TestRuntimeTerminalApprovalUsesContextWithoutMutatingArgs(t *testing.T) {
-	rt := newTestRuntime(t)
-	capture := &captureApprovalTool{}
-	registry := agentcore.NewToolRegistry()
-	registry.Register(capture)
-	rt.Tools = registry
-	args := map[string]any{"command": "echo approved; echo done"}
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
-			ID:   "call_1",
-			Name: "terminal.run",
-			Args: args,
-		}}},
-		{Role: agentcore.RoleAssistant, Content: "approved"},
-	}}, rt.Tools)
-	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		return ApprovalDecision{Approved: true}, nil
-	}
-
-	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Failed {
-		t.Fatalf("expected approved task, got %#v", resp)
-	}
-	if capture.approvalToken == "" {
-		t.Fatal("expected approval token in tool context")
-	}
-	if _, ok := capture.args["_mateway_approval_token"]; ok {
-		t.Fatalf("approval token should not be injected into tool args: %#v", capture.args)
-	}
-	if _, ok := args["_mateway_approval_token"]; ok {
-		t.Fatalf("approval token should not mutate model tool args: %#v", args)
-	}
-}
-
-func TestRuntimeTerminalApprovalRejectsCommand(t *testing.T) {
-	rt := newTestRuntime(t)
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
-			ID:   "call_1",
-			Name: "terminal.run",
-			Args: map[string]any{"command": "echo rejected; echo done"},
-		}}},
-		{Role: agentcore.RoleAssistant, Content: "blocked"},
-	}}, rt.Tools)
-	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		return ApprovalDecision{Approved: false, Reason: "user rejected"}, nil
-	}
-
-	if _, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command")); err != nil {
-		t.Fatal(err)
-	}
-	state := loadState(t, rt, "cli:test")
-	found := false
-	for _, event := range state.Tasks[0].Execution.Events {
-		if event.Type == "tool_blocked" && event.Tool == "terminal.run" && event.Summary == "user rejected" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected rejected approval event, got %#v", state.Tasks[0].Execution.Events)
+		t.Fatalf("expected shell command task to complete, got %#v", resp)
 	}
 }
 
@@ -1233,26 +1167,6 @@ func (m *sequenceModel) Next(context.Context, agentcore.Context) (agentcore.Mess
 	}
 	m.index++
 	return m.messages[index], nil
-}
-
-type captureApprovalTool struct {
-	args          map[string]any
-	approvalToken string
-}
-
-func (t *captureApprovalTool) Name() string        { return "terminal.run" }
-func (t *captureApprovalTool) Description() string { return "capture terminal approval context" }
-func (t *captureApprovalTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"command"}}
-}
-func (t *captureApprovalTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t *captureApprovalTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{ParallelMode: "forbid"}
-}
-func (t *captureApprovalTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	t.args = call.Args
-	t.approvalToken = tool.ApprovalTokenFromContext(ctx)
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: "ok", Evidence: map[string]any{"decision": "allowed"}}
 }
 
 type runtimeSlowTool struct {
