@@ -182,6 +182,7 @@ func run(args []string) error {
 	case "trace":
 		fs := flag.NewFlagSet("mateway trace", flag.ContinueOnError)
 		events := fs.Bool("events", false, "print process events")
+		report := fs.Bool("report", false, "print a human-readable execution report")
 		jsonEvents := fs.Bool("json", false, "print process events as NDJSON; requires --events")
 		if err := fs.Parse(args[1:]); err != nil {
 			if err == flag.ErrHelp {
@@ -190,10 +191,16 @@ func run(args []string) error {
 			return err
 		}
 		if len(fs.Args()) != 1 {
-			return fmt.Errorf("usage: mateway trace [--events] <trace-jsonl-path>")
+			return fmt.Errorf("usage: mateway trace [--events|--report] <trace-jsonl-path>")
+		}
+		if *report && *events {
+			return fmt.Errorf("--report cannot be combined with --events")
 		}
 		if *events {
 			return cli.PrintTraceEventsWithOptions(os.Stdout, fs.Args()[0], cli.TraceEventsOptions{JSON: *jsonEvents})
+		}
+		if *report {
+			return cli.PrintTraceReport(os.Stdout, fs.Args()[0])
 		}
 		if *jsonEvents {
 			return fmt.Errorf("--json requires --events")

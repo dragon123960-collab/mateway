@@ -17,6 +17,7 @@ const taskContractSystemPrompt = `You create a lightweight completion contract f
 Return only one JSON object. Do not execute tools. Do not write a plan.
 The contract states what evidence is required before the task may be marked complete.
 Use English JSON keys and concise English values.
+Preserve the user's target exactly. Do not reinterpret a server/service/process status request as a software release or project status request.
 
 Schema:
 {
@@ -68,6 +69,7 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 	if strings.TrimSpace(contract.Summary) == "" {
 		contract.Summary = summarize(firstNonEmpty(userText, task.Goal))
 	}
+	contract = strengthenTaskContract(contract, task.Goal, userText)
 	state.SetTaskContract(task.ID, contract)
 	_ = trace.write(map[string]any{
 		"type":              "task_contract_created",
@@ -137,6 +139,7 @@ func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegist
 		b.WriteString(strings.TrimSpace(userText))
 	}
 	b.WriteString("\n\nRuntime freshness policy:\nUse tools for weather, news, prices, schedules, software versions, laws, APIs, local files, commands, or anything likely to have changed or requiring verification.\n")
+	b.WriteString("If the user asks to inspect a local or remote machine, service, process, daemon, port, plist, systemctl unit, SSH host, or current configuration, require terminal.run evidence. Running a single command through terminal.run is not the same as writing a script file.\n")
 	b.WriteString("\nAvailable tools:\n")
 	for _, tool := range toolsForContract(tools) {
 		contract := agentcore.ContractFor(tool)
@@ -229,13 +232,65 @@ func cleanEvidenceContracts(values []session.TaskEvidenceContract) []session.Tas
 
 func fallbackTaskContract(goal, userText string) session.TaskContract {
 	text := firstNonEmpty(userText, goal)
-	return session.TaskContract{
+	return strengthenTaskContract(session.TaskContract{
 		Summary:          summarize(text),
 		RequiresTools:    false,
 		ExpectedOutcome:  "answer the user task directly from available context",
 		CompletionPolicy: "final answer should address the user task or ask for required input",
 		CreatedAt:        time.Now(),
+	}, goal, userText)
+}
+
+func strengthenTaskContract(contract session.TaskContract, goal, userText string) session.TaskContract {
+	text := strings.ToLower(strings.TrimSpace(firstNonEmpty(userText, goal)))
+	if text == "" || !looksLikeCommandInspectionTask(text) {
+		return contract
 	}
+	contract.RequiresTools = true
+	contract.RequiredTools = cleanStringList(append(contract.RequiredTools, "terminal.run"))
+	if strings.TrimSpace(contract.Summary) == "" || looksLikeProjectStatusSummary(contract.Summary) {
+		contract.Summary = summarize(firstNonEmpty(userText, goal))
+	}
+	contract.RequiredEvidence = append(contract.RequiredEvidence, session.TaskEvidenceContract{
+		Kind:        "local_or_remote_runtime_state",
+		Tool:        "terminal.run",
+		Description: "command output proving the requested machine/service/process/configuration status, or a concrete terminal blocker",
+	})
+	contract.RequiredEvidence = cleanEvidenceContracts(contract.RequiredEvidence)
+	if strings.TrimSpace(contract.ExpectedOutcome) == "" || looksLikeProjectStatusSummary(contract.ExpectedOutcome) {
+		contract.ExpectedOutcome = "status report based on terminal command evidence, or a concrete blocker"
+	}
+	if strings.TrimSpace(contract.CompletionPolicy) == "" {
+		contract.CompletionPolicy = "run the smallest safe terminal command before final answer, unless a concrete blocker prevents it"
+	}
+	return contract
+}
+
+func looksLikeCommandInspectionTask(lower string) bool {
+	action := containsAnyLiteral(lower,
+		"status", "check", "inspect", "verify", "run ", "terminal", "ssh", "systemctl", "service ",
+		"ps ", "ss ", "netstat", "launchctl", "plist", "port", "process", "daemon", "server", "config",
+		"状态", "查看", "检查", "访问", "服务器", "服务", "进程", "端口", "配置", "重启",
+	)
+	target := containsAnyLiteral(lower,
+		"ssh", "systemctl", "service ", "singbox", "sing-box", "server", "overseas", "plist", "launchctl",
+		"terminal.run", "terminal", "端口", "进程", "服务", "服务器", "国外服务器", "海外服务器",
+	)
+	return action && target
+}
+
+func looksLikeProjectStatusSummary(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "project") || strings.Contains(lower, "release") || strings.Contains(lower, "github") || strings.Contains(lower, "version")
+}
+
+func containsAnyLiteral(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func renderTaskContractContext(contract session.TaskContract) string {

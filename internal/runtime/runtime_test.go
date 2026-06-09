@@ -352,6 +352,39 @@ func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "sing-box.service active"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I cannot access the server directly."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "ssh overseas 'systemctl status sing-box --no-pager'"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "sing-box is active."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"Check the status of the sing-box project (current releases/repo state)","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"latest sing-box release"}],"expected_outcome":"latest version status","completion_policy":"use web evidence before final answer"}`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "不用脚本，你也可以直接访问国外服务器吧，给我去看看singbox状态"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "active") {
+		t.Fatalf("expected terminal-backed repair to complete, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:test")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil || !containsString(contract.RequiredTools, "terminal.run") {
+		t.Fatalf("expected terminal.run in strengthened contract, got %#v", contract)
+	}
+	if strings.Contains(strings.ToLower(contract.Summary), "github") || strings.Contains(strings.ToLower(contract.Summary), "release") {
+		t.Fatalf("contract summary should keep user target, got %#v", contract)
+	}
+}
+
 func TestRuntimeTaskContractAllowsNoToolTask(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Mateway is a local agent runtime."}, rt.Tools)
