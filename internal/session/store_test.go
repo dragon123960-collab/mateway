@@ -29,3 +29,20 @@ func TestEnsureExecutionFrameBackfillsOldTask(t *testing.T) {
 		t.Fatalf("unexpected backfilled frame: %#v", frame)
 	}
 }
+
+func TestAddTraceRefUpdatesLatestTraceAndDedupes(t *testing.T) {
+	state := State{Key: "cli:test"}
+	task := state.StartTask("search")
+	state.AddTraceRef(task.ID, TraceRef{TraceID: "trace-1", TracePath: "/tmp/one.jsonl", Phase: "plan_review", MessageID: "msg-1"})
+	state.AddTraceRef(task.ID, TraceRef{TraceID: "trace-1", TracePath: "/tmp/one.jsonl", Phase: "execute", MessageID: "msg-2"})
+	updated := state.TaskByID(task.ID)
+	if updated == nil {
+		t.Fatal("expected task")
+	}
+	if updated.TraceID != "trace-1" || updated.TracePath != "/tmp/one.jsonl" {
+		t.Fatalf("expected latest trace on task, got %#v", updated)
+	}
+	if len(updated.Execution.TraceRefs) != 1 || updated.Execution.TraceRefs[0].Phase != "execute" || updated.Execution.TraceRefs[0].MessageID != "msg-2" {
+		t.Fatalf("expected deduped trace ref update, got %#v", updated.Execution.TraceRefs)
+	}
+}

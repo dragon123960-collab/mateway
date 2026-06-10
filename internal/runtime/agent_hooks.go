@@ -71,10 +71,12 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 						"reason": policy.Reason,
 					},
 				})
+				updatePlanItemsForToolResult(state, taskID, input.ToolCall.Name, "blocked", policy.Reason)
 				_ = trace.write(map[string]any{"type": "tool_blocked", "task_id": taskID, "tool": input.ToolCall.Name, "reason": policy.Reason})
 				rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
 			}
+			markPlanItemRunning(state, taskID, input.ToolCall.Name)
 			rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
 		},
@@ -108,6 +110,7 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					Summary:  observe.TaskStep.Summary,
 					Evidence: evidence,
 				})
+				updatePlanItemsForToolResult(state, taskID, input.ToolCall.Name, observe.TaskStep.Status, observe.TaskStep.Summary)
 				switch observe.TaskStep.Status {
 				case "accepted":
 				case "failed", "suspect":
@@ -126,16 +129,20 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 	}
 	var followUps []agentcore.Message
 	followupSent := false
+	lastContractMissing := ""
+	contractFollowups := 0
 	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
 		contract := taskContractFromState(*state, taskID)
 		currentTask := taskFromState(*state, taskID)
 		validation := validateTaskContract(contract, currentTask)
 		if contract.RequiresTools && !validation.Satisfied {
 			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": taskID, "missing": validation.Missing})
-			if followupSent {
+			missingKey := strings.Join(validation.Missing, "\n")
+			if contractFollowups >= 4 || (contractFollowups > 0 && missingKey == lastContractMissing) {
 				return true, nil
 			}
-			followupSent = true
+			contractFollowups++
+			lastContractMissing = missingKey
 			followUps = append(followUps, agentcore.Message{
 				Role:    agentcore.RoleUser,
 				Content: taskContractFollowup(validation.Missing),

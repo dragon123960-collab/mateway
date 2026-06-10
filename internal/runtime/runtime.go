@@ -69,7 +69,6 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		return Response{}, err
 	}
 	trace.setIdentity(traceIdentityForMessage(msg))
-	_ = trace.write(map[string]any{"type": "request", "text": msg.Text})
 	defer func() {
 		_ = trace.write(map[string]any{"type": "runtime_done", "duration_ms": time.Since(start).Milliseconds()})
 	}()
@@ -85,6 +84,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		return resp, err
 	}
 	userText := strings.TrimSpace(msg.Text)
+	continuity := judgeTaskContinuity(state, userText)
+	if continuity.Continue && continuity.TaskID != "" {
+		state.ActivateTask(continuity.TaskID)
+		_ = trace.write(map[string]any{"type": "task_continuity", "task_id": continuity.TaskID, "reason": continuity.Reason})
+	}
 	if shouldStartNewTaskInsteadOfSteering(state, userText) {
 		state.ActiveTask = ""
 	}
@@ -92,10 +96,17 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	if task.Goal != userText && state.ActiveTask == task.ID {
 		userText = mergeTaskAndInstruction(task.Goal, userText)
 	}
-	return rt.runTask(ctx, msg, &state, task, userText, trace)
+	phase := tracePhaseExecute
+	if continuity.IsFollowup {
+		phase = tracePhaseFollowupExecute
+	}
+	trace.setIdentity(map[string]any{"task_id": task.ID})
+	_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "effective_text": userText})
+	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})
+	return rt.runTask(ctx, msg, &state, task, userText, phase, trace)
 }
 
-func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, trace *traceRecorder) (Response, error) {
+func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, phase string, trace *traceRecorder) (Response, error) {
 	messages, compactStats, err := prepareMessagesForModel(state.Messages)
 	if err != nil {
 		_ = trace.write(map[string]any{
@@ -137,10 +148,39 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		"task_id":  task.ID,
 	})
 	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
+	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract) {
+		state.Pending = &session.PendingAction{
+			Kind:     session.PendingKindTaskPlanConfirm,
+			TaskID:   task.ID,
+			Question: "1 execute, 2 replan",
+		}
+		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhasePlanReview, MessageID: msg.ID})
+		if err := rt.saveState(state, trace); err != nil {
+			return Response{}, err
+		}
+		_ = trace.write(map[string]any{"type": "task_plan_review", "task_id": task.ID})
+		return Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     renderTaskPlanForReview(contract, userText),
+				Style:    channel.StyleInputRequired,
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+		}, nil
+	}
 	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
 	if contractContext := renderTaskContractContext(contract); contractContext != "" {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
+	}
+	if phase != tracePhasePlanReview && len(contract.PlanItems) > 0 {
+		rt.emitProgress(msg, *state, task.ID, taskExecutionEventCount(*state, task.ID), channel.ProgressStep{
+			Title:   "plan",
+			Status:  "running",
+			Summary: renderTaskPlanForExecution(contract, userText),
+		})
 	}
 	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
 	contextMessages := rt.Hooks.contextMessages(ctx, ContextHookInput{
@@ -243,6 +283,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
 			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
 		} else {
+			completeNoToolPlanItems(state, task.ID, finalText)
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
 			updateSessionSummary(state, task.ID, finalText, "completed", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})

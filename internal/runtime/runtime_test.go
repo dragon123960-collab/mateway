@@ -216,6 +216,102 @@ func TestRuntimeTraceIncludesIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeActionTaskPausesForPlanReview(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "release found"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "release"}}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"search task","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"search evidence"}],"plan_items":[{"id":"plan-1","title":"search evidence","status":"pending","tool":"web.search","criteria":"collect evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
+	resp, err := rt.Handle(context.Background(), inbound("cli:plan-review", "search latest release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired || !strings.Contains(resp.Reply.Text, "Reply 1 to execute") {
+		t.Fatalf("expected plan review reply, got %#v", resp.Reply)
+	}
+	if strings.Contains(resp.Reply.Text, "search evidence") {
+		t.Fatalf("plan review should not show detailed execution steps, got %q", resp.Reply.Text)
+	}
+	state := loadState(t, rt, "cli:plan-review")
+	if state.Pending == nil || state.Pending.Kind != session.PendingKindTaskPlanConfirm {
+		t.Fatalf("expected task plan pending, got %#v", state.Pending)
+	}
+	if len(state.Tasks) != 1 || len(state.Tasks[0].Execution.TraceRefs) == 0 || state.Tasks[0].Execution.TraceRefs[len(state.Tasks[0].Execution.TraceRefs)-1].Phase != tracePhasePlanReview {
+		t.Fatalf("expected plan_review trace ref, got %#v", state.Tasks)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:plan-review", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	if !strings.Contains(trace, `"control_text":"1"`) || !strings.Contains(trace, `"effective_task_goal":"search latest release"`) {
+		t.Fatalf("expected control and effective goal in execute trace, got:\n%s", trace)
+	}
+	state = loadState(t, rt, "cli:plan-review")
+	if refs := state.Tasks[0].Execution.TraceRefs; len(refs) < 2 || refs[len(refs)-1].Phase != tracePhaseExecute {
+		t.Fatalf("expected execute trace ref, got %#v", refs)
+	}
+}
+
+func TestRuntimeShowsPlanItemsDuringExecutionProgress(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "release found"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"搜索任务","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"搜索证据"}],"plan_items":[{"id":"plan-1","title":"搜索模型列表","status":"pending","tool":"web.search","criteria":"收集候选模型"}],"expected_outcome":"回答","completion_policy":"使用证据"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "release"}}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	var progress []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		progress = append(progress, msg)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:plan-progress", "国内编程模型哪个可以")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:plan-progress", "1")); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, msg := range progress {
+		for _, step := range msg.Progress {
+			if step.Title == "搜索模型列表" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected plan item in execution progress, got %#v", progress)
+	}
+}
+
+func TestRuntimePlanReviewUsesUserLanguage(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"检查 singbox 状态","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"kind":"runtime_state","tool":"terminal.run","description":"服务状态"}],"plan_items":[{"id":"plan-1","title":"检查服务状态","status":"pending","tool":"terminal.run","criteria":"获取服务状态"}],"expected_outcome":"状态报告","completion_policy":"使用终端证据"}`}
+	resp, err := rt.Handle(context.Background(), inbound("cli:plan-lang", "帮我检查 singbox 状态"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "任务计划") || !strings.Contains(resp.Reply.Text, "回复 1 执行") {
+		t.Fatalf("expected Chinese plan review, got %q", resp.Reply.Text)
+	}
+	if strings.Contains(resp.Reply.Text, "Task plan") || strings.Contains(resp.Reply.Text, "Reply 1") {
+		t.Fatalf("plan review should not use English chrome for Chinese request, got %q", resp.Reply.Text)
+	}
+	if strings.Contains(resp.Reply.Text, "检查服务状态") {
+		t.Fatalf("plan review should keep detailed steps for execution progress, got %q", resp.Reply.Text)
+	}
+}
+
 func TestTraceSummaryReportsIdentityAndIncomplete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl")
 	if err := os.WriteFile(path, []byte(
@@ -335,6 +431,13 @@ func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review before execution, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.Failed || !strings.Contains(resp.Reply.Text, "Weather checked") {
 		t.Fatalf("expected contract repair to complete with tool evidence, got %#v", resp)
 	}
@@ -343,12 +446,28 @@ func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	trace := string(data)
-	if !strings.Contains(trace, "task_contract_created") || !strings.Contains(trace, "task_contract_unsatisfied") || !strings.Contains(trace, "task_contract_satisfied") {
+	if !strings.Contains(trace, "task_contract_unsatisfied") || !strings.Contains(trace, "task_contract_satisfied") {
 		t.Fatalf("expected contract lifecycle trace, got:\n%s", trace)
 	}
 	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks[0].Execution.TraceRefs) == 0 {
+		t.Fatalf("expected trace refs, got %#v", state.Tasks[0].Execution.TraceRefs)
+	}
+	firstTrace, err := os.ReadFile(state.Tasks[0].Execution.TraceRefs[0].TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(firstTrace), "task_contract_created") {
+		t.Fatalf("expected contract creation in plan review trace, got:\n%s", string(firstTrace))
+	}
 	if state.Tasks[0].Execution.Contract == nil || !state.Tasks[0].Execution.Contract.RequiresTools {
 		t.Fatalf("expected stored task contract, got %#v", state.Tasks[0].Execution.Contract)
+	}
+	if len(state.Tasks[0].Execution.TraceRefs) < 2 {
+		t.Fatalf("expected plan and execute trace refs, got %#v", state.Tasks[0].Execution.TraceRefs)
+	}
+	if got := state.Tasks[0].Execution.Contract.PlanItems[0].Status; got != "completed" {
+		t.Fatalf("expected plan item completed, got %q contract=%#v", got, state.Tasks[0].Execution.Contract)
 	}
 }
 
@@ -372,6 +491,13 @@ func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review before execution, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.Failed || !strings.Contains(resp.Reply.Text, "active") {
 		t.Fatalf("expected terminal-backed repair to complete, got %#v", resp)
 	}
@@ -382,6 +508,96 @@ func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(contract.Summary), "github") || strings.Contains(strings.ToLower(contract.Summary), "release") {
 		t.Fatalf("contract summary should keep user target, got %#v", contract)
+	}
+}
+
+func TestRuntimeToolBlockedMarksPlanItemBlocked(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"delete tmp","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"kind":"mutation","tool":"terminal.run","description":"delete command"}],"plan_items":[{"id":"plan-1","title":"delete tmp","status":"pending","tool":"terminal.run","criteria":"run delete command"}],"expected_outcome":"deleted","completion_policy":"use terminal evidence"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": "rm -rf /tmp/mateway-danger-test"}}}},
+		{Role: agentcore.RoleAssistant, Content: "blocked by policy"},
+	}}, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:blocked-plan", "delete tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:blocked-plan", "1")); err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:blocked-plan")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil || len(contract.PlanItems) == 0 || contract.PlanItems[0].Status != "blocked" {
+		t.Fatalf("expected blocked plan item, got %#v", contract)
+	}
+}
+
+func TestRuntimeCompletesMultiplePlanItemsWithSameTool(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "search evidence"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"compare coding models","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"current coding model evidence"}],"plan_items":[{"id":"plan-1","title":"search domestic models","status":"pending","tool":"web.search","criteria":"collect candidates"},{"id":"plan-2","title":"search benchmarks","status":"pending","tool":"web.search","criteria":"collect benchmark data"},{"id":"plan-3","title":"compare access","status":"pending","tool":"web.search","criteria":"collect availability info"}],"expected_outcome":"recommendation","completion_policy":"use evidence"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "domestic coding models"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "web.search", Args: map[string]any{"query": "coding model benchmarks"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_3", Name: "web.search", Args: map[string]any{"query": "coding model access pricing"}}}},
+		{Role: agentcore.RoleAssistant, Content: "推荐 Qwen Coder、DeepSeek Coder 和 Doubao Seed Code。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), inbound("cli:multi-plan", "国内编程模型哪个可以"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:multi-plan", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == channel.StylePartial {
+		t.Fatalf("expected completion, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:multi-plan")
+	for _, item := range state.Tasks[0].Execution.Contract.PlanItems {
+		if item.Status != "completed" {
+			t.Fatalf("expected all plan items completed, got %#v", state.Tasks[0].Execution.Contract.PlanItems)
+		}
+	}
+}
+
+func TestRuntimeCompletesNoToolPlanItemOnFinalAnswer(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "北京晴，义乌小雨"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"规划北京到义乌出行","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"天气和交通信息"}],"plan_items":[{"id":"plan-1","title":"查询天气和交通","status":"pending","tool":"web.search","criteria":"收集当前信息"},{"id":"plan-2","title":"输出完整出行规划","status":"pending","criteria":"汇总证据并给出建议"}],"expected_outcome":"完整出行规划","completion_policy":"使用证据后回答"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "北京 到 义乌 天气 交通"}}}},
+		{Role: agentcore.RoleAssistant, Content: "建议明天出行，带伞并预留换乘时间。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), inbound("cli:no-tool-plan", "帮我规划明天北京到义乌的行程"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:no-tool-plan", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected completion, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:no-tool-plan")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil || len(contract.PlanItems) != 2 {
+		t.Fatalf("expected stored plan items, got %#v", contract)
+	}
+	for _, item := range contract.PlanItems {
+		if item.Status != "completed" {
+			t.Fatalf("expected all plan items completed, got %#v", contract.PlanItems)
+		}
 	}
 }
 
@@ -1084,16 +1300,35 @@ func TestRuntimeNewTaskReceivesPreviousTaskContinuityContext(t *testing.T) {
 	if _, err := rt.Handle(context.Background(), inbound("cli:test", "ok")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(model.systemPrompt, "Continuity judgment:") {
-		t.Fatalf("expected continuity judgment in system prompt, got %q", model.systemPrompt)
-	}
 	if !strings.Contains(model.systemPrompt, "create a Lark document from /tmp/source.md") ||
 		!strings.Contains(model.systemPrompt, "Waiting for authorization.") {
 		t.Fatalf("expected previous task context in system prompt, got %q", model.systemPrompt)
 	}
 	updated := loadState(t, rt, "cli:test")
 	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "ok" {
-		t.Fatalf("expected soft continuation to create a new task, got %#v", updated.Tasks)
+		t.Fatalf("expected completed previous task to create a new task, got %#v", updated.Tasks)
+	}
+}
+
+func TestRuntimeFollowupReusesAwaitingTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:followup"}
+	task := state.StartTask("create a Lark document from /tmp/source.md")
+	state.AwaitUserInputActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "continued"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:followup", "ok")); err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:followup")
+	if len(updated.Tasks) != 1 || updated.Tasks[0].ID != task.ID {
+		t.Fatalf("expected followup to reuse awaiting task, got %#v", updated.Tasks)
+	}
+	if !strings.Contains(model.lastUser, "create a Lark document") || !strings.Contains(model.lastUser, "ok") {
+		t.Fatalf("expected merged followup input, got %q", model.lastUser)
 	}
 }
 

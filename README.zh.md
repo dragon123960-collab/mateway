@@ -109,7 +109,7 @@ Session 是运行时状态，不是无限增长的原始聊天记录。每次调
 - 压缩后的最近 session transcript
 - 当前用户消息
 
-System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、trace id 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。
+System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、task contract、trace refs 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。对于动作型任务，task contract 可以包含轻量 `plan_items`；Mateway 会在首次执行前请求确认，随后根据 tool result 更新 item 状态，同时保持每次 run 独立 trace 文件。
 
 Mateway 还会在每次模型调用前运行一层无感的 context economy。它会根据当前模型的 `context_window` 和 `max_tokens` 估算 input tokens，超过 soft budget 时自动压缩旧 transcript 和 tool content，只有超过 hard budget 才停止，并把估算节省量写入 trace/TUI diagnostics。Tool schema 也会动态暴露：每一轮模型只看到相关 tool contract，但执行层仍保留完整 registry。被压缩的大型 tool output 会保存为 `raw_ref`；`toolresult.read` 可以按 `raw_ref` 和可选多关键词 `query` 精确回读原始输出，返回命中行片段和 line ranges，而不是把大块原文重新塞回 prompt。
 

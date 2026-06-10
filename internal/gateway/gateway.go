@@ -17,6 +17,7 @@ import (
 	"github.com/dongping/mateway/internal/memory"
 	"github.com/dongping/mateway/internal/model"
 	"github.com/dongping/mateway/internal/runtime"
+	"github.com/dongping/mateway/internal/session"
 )
 
 type Config struct {
@@ -465,10 +466,16 @@ func feishuProgressStatus(status string) string {
 
 func compactProgressLineText(text string, limit int) string {
 	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit <= 0 || len(text) <= limit {
+	runes := []rune(text)
+	if limit <= 0 || len(runes) <= limit {
 		return text
 	}
-	return text[:limit] + "..."
+	suffix := "..."
+	suffixLen := len([]rune(suffix))
+	if limit <= suffixLen {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-suffixLen]) + suffix
 }
 
 func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) bool {
@@ -477,7 +484,7 @@ func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) boo
 	}
 	state, err := rt.Store.Load(msg.SessionKey)
 	if err == nil && state.Pending != nil {
-		return false
+		return state.Pending.Kind == session.PendingKindTaskPlanConfirm && strings.TrimSpace(msg.Text) == "1"
 	}
 	return !isSlashCommand(msg.Text)
 }

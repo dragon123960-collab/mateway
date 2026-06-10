@@ -65,7 +65,7 @@ func progressStepsForTaskSince(state session.State, taskID string, eventOffset i
 		eventOffset = len(events)
 	}
 	events = events[eventOffset:]
-	out := make([]channel.ProgressStep, 0, len(events))
+	out := planProgressSteps(task.Execution.Contract)
 	for _, event := range events {
 		step := progressStepFromExecutionEvent(event)
 		if strings.TrimSpace(step.Title) == "" {
@@ -76,6 +76,32 @@ func progressStepsForTaskSince(state session.State, taskID string, eventOffset i
 	const limit = 8
 	if len(out) > limit {
 		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+func planProgressSteps(contract *session.TaskContract) []channel.ProgressStep {
+	if contract == nil || len(contract.PlanItems) == 0 {
+		return nil
+	}
+	out := make([]channel.ProgressStep, 0, len(contract.PlanItems))
+	for _, item := range contract.PlanItems {
+		title := strings.TrimSpace(item.Title)
+		if title == "" {
+			title = strings.TrimSpace(item.ID)
+		}
+		if title == "" {
+			continue
+		}
+		summary := compactProgressSummary(item.Criteria)
+		if strings.TrimSpace(item.Tool) != "" {
+			summary = compactProgressSummary(strings.TrimSpace(item.Tool) + " / " + item.Criteria)
+		}
+		out = append(out, channel.ProgressStep{
+			Title:   title,
+			Status:  strings.TrimSpace(item.Status),
+			Summary: summary,
+		})
 	}
 	return out
 }

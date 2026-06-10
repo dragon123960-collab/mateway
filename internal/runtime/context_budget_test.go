@@ -163,6 +163,13 @@ func TestRuntimeBudgetsEveryModelTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.Reply.Style != "input_required" {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:budget-turns", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.Failed {
 		t.Fatalf("unexpected failure %#v", resp)
 	}
@@ -188,6 +195,13 @@ func TestRuntimeModelSeesFilteredTools(t *testing.T) {
 	rt.Pool.agents["main"] = agentcore.NewAgent(capture, rt.Tools)
 	rt.ContractModel = contractJSONModel{json: `{"summary":"search","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"search evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
 	resp, err := rt.Handle(context.Background(), inbound("cli:filtered-tools", "search latest release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "input_required" {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:filtered-tools", "1"))
 	if err != nil {
 		t.Fatal(err)
 	}
