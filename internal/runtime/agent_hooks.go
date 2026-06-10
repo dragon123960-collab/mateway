@@ -94,6 +94,13 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
+				stepID := observe.TaskStep.ID
+				if stepID == "" {
+					ct := taskFromState(*state, taskID)
+					if len(ct.Steps) > 0 {
+						stepID = ct.Steps[len(ct.Steps)-1].ID
+					}
+				}
 				evidence := map[string]any{
 					"accepted": observe.TaskStep.Accepted,
 					"mutation": observe.TaskStep.Mutation,
@@ -109,7 +116,7 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					Type:     "tool_result",
 					Status:   observe.TaskStep.Status,
 					Tool:     input.ToolCall.Name,
-					StepID:   observe.TaskStep.ID,
+					StepID:   stepID,
 					Summary:  observe.TaskStep.Summary,
 					Evidence: evidence,
 				})

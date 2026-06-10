@@ -548,6 +548,7 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 	switch input.Kind {
 	case "tool_result":
 		status, evidence := acceptToolResult(input.Tool, input.ToolCall, input.ToolResult)
+		evidence = redactMapEvidence(evidence)
 		risk := ""
 		acceptanceCriteria := ""
 		evidenceContract := ""

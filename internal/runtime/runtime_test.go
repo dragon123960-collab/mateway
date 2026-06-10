@@ -1629,8 +1629,9 @@ func (t runtimeSlowTool) Run(ctx context.Context, call agentcore.ToolCall) agent
 }
 
 type runtimeNamedTool struct {
-	name    string
-	content string
+	name     string
+	content  string
+	evidence map[string]any
 }
 
 func (t runtimeNamedTool) Name() string      { return t.name }
@@ -1643,7 +1644,11 @@ func (runtimeNamedTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{ParallelMode: "read_only_ok", Evidence: "test evidence", Acceptance: "accepted when content is returned"}
 }
 func (t runtimeNamedTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: map[string]any{"test": true}}
+	ev := t.evidence
+	if ev == nil {
+		ev = map[string]any{"test": true}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: ev}
 }
 
 type runtimeFailingTool struct {
@@ -2021,7 +2026,6 @@ func TestMissingContractToolProducesBlocker(t *testing.T) {
 		t.Fatalf("expected 'tool not registered' in reply, got: %q", resp.Reply.Text)
 	}
 
-
 	trace, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
@@ -2167,5 +2171,367 @@ func TestUnexecutedPromiseDoesNotCompleteTask(t *testing.T) {
 	traceStr := string(trace)
 	if !strings.Contains(traceStr, "deliverable_gate_followup") {
 		t.Fatal("expected deliverable_gate_followup trace for unexecuted promise")
+	}
+}
+
+func TestScheduleManageEffectiveRiskMatchesTaskStepEvidence(t *testing.T) {
+	actions := map[string]struct {
+		risk     string
+		mutation bool
+	}{
+		"list":   {risk: "safe_read", mutation: false},
+		"delete": {risk: "dangerous", mutation: true},
+		"create": {risk: "guarded_mutation", mutation: true},
+	}
+	for action, want := range actions {
+		t.Run(action, func(t *testing.T) {
+			rt := newTestRuntime(t)
+			registry := agentcore.NewToolRegistry()
+			registry.Register(runtimeNamedTool{name: "schedule.manage", content: "ok"})
+			rt.Tools = registry
+			rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+				{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+					ID:   "call_1",
+					Name: "schedule.manage",
+					Args: map[string]any{"action": action},
+				}}},
+				{Role: agentcore.RoleAssistant, Content: "done"},
+			}}, rt.Tools)
+			rt.ContractModel = contractJSONModel{json: `{"summary":"manage schedule","requires_tools":true,"required_tools":["schedule.manage"],"expected_outcome":"action completed"}`}
+
+			planResp, err := rt.Handle(context.Background(), inbound("cli:test", "schedule "+action))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if planResp.Reply.Style != channel.StyleInputRequired {
+				t.Fatalf("expected plan review, got %#v", planResp)
+			}
+			resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp
+			state := loadState(t, rt, "cli:test")
+			task := findTaskByGoal(state, "schedule "+action)
+			if len(task.Steps) == 0 {
+				t.Fatal("expected at least one task step")
+			}
+			step := task.Steps[len(task.Steps)-1]
+			if step.Risk != want.risk {
+				t.Fatalf("schedule.manage action=%s: expected Risk=%q, got %q", action, want.risk, step.Risk)
+			}
+			if step.Mutation != want.mutation {
+				t.Fatalf("schedule.manage action=%s: expected Mutation=%v, got %v", action, want.mutation, step.Mutation)
+			}
+			evidenceRisk, _ := step.Evidence["risk"].(string)
+			if evidenceRisk != want.risk {
+				t.Fatalf("schedule.manage action=%s: expected Evidence[risk]=%q, got %q", action, want.risk, evidenceRisk)
+			}
+			evidenceMutation, _ := step.Evidence["mutation"].(bool)
+			if evidenceMutation != want.mutation {
+				t.Fatalf("schedule.manage action=%s: expected Evidence[mutation]=%v, got %v", action, want.mutation, evidenceMutation)
+			}
+		})
+	}
+}
+
+func TestToolStepEvidenceSchemaForSuccessAndFailure(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "content"})
+	registry.Register(&runtimeFailingTool{
+		name:      "file.edit",
+		errorText: "old_string not found in file",
+		isError:   true,
+		evidence:  map[string]any{"path": "/tmp/f.txt"},
+	})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will read the file."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.read",
+			Args: map[string]any{"path": "/tmp/f.txt"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_2",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "x", "new_string": "y"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"read and edit","requires_tools":true,"required_tools":["file.read","file.edit"],"expected_outcome":"both attempted"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "read and edit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "read and edit")
+	if len(task.Steps) < 2 {
+		t.Fatalf("expected at least 2 task steps, got %d", len(task.Steps))
+	}
+	for _, step := range task.Steps {
+		if step.Tool == "" {
+			t.Fatal("expected Tool field in task step")
+		}
+		if step.Status == "" {
+			t.Fatalf("expected Status field in task step for %s", step.Tool)
+		}
+		if step.Evidence == nil {
+			t.Fatalf("expected non-nil Evidence in task step for %s", step.Tool)
+		}
+		if step.Risk == "" {
+			t.Fatalf("expected Risk field in task step for %s", step.Tool)
+		}
+		if step.Accepted && step.Status != "accepted" {
+			t.Fatalf("Accepted=true but Status=%q for %s", step.Status, step.Tool)
+		}
+		if step.Status == "accepted" {
+			if !step.Accepted {
+				t.Fatalf("Status=accepted but Accepted=false for %s", step.Tool)
+			}
+			if step.Evidence["acceptance"] != "accepted" {
+				t.Fatalf("expected Evidence[acceptance]=accepted for %s, got %v", step.Tool, step.Evidence["acceptance"])
+			}
+		}
+		if step.Status == "failed" {
+			if step.Evidence["acceptance"] != "failed" {
+				t.Fatalf("expected Evidence[acceptance]=failed for %s, got %v", step.Tool, step.Evidence["acceptance"])
+			}
+		}
+	}
+	successStep := task.Steps[0]
+	if successStep.Tool != "file.read" || successStep.Status != "accepted" {
+		t.Fatalf("expected file.read accepted, got tool=%s status=%s", successStep.Tool, successStep.Status)
+	}
+	failedStep := task.Steps[1]
+	if failedStep.Tool != "file.edit" || failedStep.Status != "failed" {
+		t.Fatalf("expected file.edit failed, got tool=%s status=%s", failedStep.Tool, failedStep.Status)
+	}
+	if failedStep.Evidence["path"] != "/tmp/f.txt" {
+		t.Fatalf("expected evidence path preserved for failed step, got %v", failedStep.Evidence["path"])
+	}
+}
+
+func TestProfileProposalRecordsRequiresReviewEvidence(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{
+		name:    "file.edit",
+		content: "profile proposal created",
+		evidence: map[string]any{
+			"path":            ".mateway/agents/main.yaml",
+			"requires_review": true,
+			"proposal_id":     "proposal-1",
+		},
+	})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.edit",
+			Args: map[string]any{"path": ".mateway/agents/main.yaml", "old_string": "old", "new_string": "new"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"edit profile","requires_tools":true,"required_tools":["file.edit"],"expected_outcome":"profile updated"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "edit agent profile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "edit agent profile")
+	if len(task.Steps) == 0 {
+		t.Fatal("expected at least one task step")
+	}
+	step := task.Steps[len(task.Steps)-1]
+	if v, ok := step.Evidence["requires_review"]; !ok || v != true {
+		t.Fatalf("expected requires_review=true for profile edit, got evidence=%v", step.Evidence)
+	}
+}
+
+func TestTraceAndTaskStepShareToolResultFacts(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "service is running"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will check the service."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "systemctl status"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "service is running."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"check service","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"status confirmed"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "check service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "check service")
+	if len(task.Steps) == 0 || len(task.Execution.Events) == 0 {
+		t.Fatal("expected task step and execution event")
+	}
+	step := task.Steps[len(task.Steps)-1]
+	var toolResultEvent *session.ExecutionEvent
+	for i := range task.Execution.Events {
+		if task.Execution.Events[i].Type == "tool_result" && task.Execution.Events[i].StepID == step.ID {
+			toolResultEvent = &task.Execution.Events[i]
+			break
+		}
+	}
+	if toolResultEvent == nil {
+		t.Fatalf("expected tool_result execution event matching step %s", step.ID)
+	}
+	if toolResultEvent.Status != step.Status {
+		t.Fatalf("execution event status %q != task step status %q", toolResultEvent.Status, step.Status)
+	}
+	if toolResultEvent.Tool != step.Tool {
+		t.Fatalf("execution event tool %q != task step tool %q", toolResultEvent.Tool, step.Tool)
+	}
+	if toolResultEvent.Summary != step.Summary {
+		t.Fatalf("execution event summary %q != task step summary %q", toolResultEvent.Summary, step.Summary)
+	}
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "tool_execution_end") {
+		t.Fatal("expected tool_execution_end in trace")
+	}
+	if !strings.Contains(traceStr, "service is running") {
+		t.Fatal("expected tool result content in trace")
+	}
+}
+
+func TestSecretLikeEvidenceIsRedactedEverywhere(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App: config.AppConfig{Home: home},
+		Execution: config.ExecutionConfig{
+			MaxIterations:     intPtrTest(8),
+			InactivityTimeout: "0s",
+		},
+		Agents: config.AgentsConfig{
+			Default:  "main",
+			Profiles: []config.AgentProfileConfig{{ID: "main"}},
+		},
+	}
+	rt := New(cfg)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{
+		name:    "terminal.run",
+		content: "command completed",
+		evidence: map[string]any{
+			"command": "echo hello",
+			"secret":  "sk-1234567890abcdef",
+		},
+	})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "echo hello"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"done"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "test")
+	if len(task.Steps) == 0 {
+		t.Fatal("expected at least one task step")
+	}
+	step := task.Steps[0]
+	if strings.Contains(step.Summary, "sk-1234567890abcdef") {
+		t.Fatalf("secret not redacted in task step summary: %q", step.Summary)
+	}
+	if step.Evidence != nil {
+		if v, ok := step.Evidence["secret"]; ok && v == "sk-1234567890abcdef" {
+			t.Fatalf("secret not redacted in task step evidence: %v", step.Evidence)
+		}
+	}
+	for _, ev := range task.Execution.Events {
+		if ev.Summary != "" && strings.Contains(ev.Summary, "sk-1234567890abcdef") {
+			t.Fatalf("secret not redacted in execution event summary: %q", ev.Summary)
+		}
+	}
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if strings.Contains(traceStr, "sk-1234567890abcdef") {
+		t.Fatal("secret not redacted in trace")
+	}
+	if strings.Contains(resp.Reply.Text, "sk-1234567890abcdef") {
+		t.Fatal("secret not redacted in final reply")
+	}
+}
+
+func TestCLITUIRenderTaskStepWithoutRiskRecalculation(t *testing.T) {
+	schTool := runtimeNamedTool{name: "schedule.manage", content: "listed 3 items"}
+	call := agentcore.ToolCall{ID: "call_1", Name: "schedule.manage", Args: map[string]any{"action": "list"}}
+	result := schTool.Run(context.Background(), call)
+	if result.IsError {
+		t.Fatal("expected successful schedule.manage list")
+	}
+	status, evidence := acceptToolResult(schTool, call, result)
+	risk := string(tool.EffectiveRisk(schTool, call))
+
+	if status != "accepted" {
+		t.Fatalf("expected accepted, got %q", status)
+	}
+	if evidence["risk"] != risk {
+		t.Fatalf("evidence[risk]=%q != EffectiveRisk=%q", evidence["risk"], risk)
+	}
+	if evidence["mutation"] != false {
+		t.Fatal("expected mutation=false for schedule.manage list")
+	}
+	if risk != "safe_read" {
+		t.Fatalf("expected safe_read risk for schedule.manage list, got %q", risk)
 	}
 }

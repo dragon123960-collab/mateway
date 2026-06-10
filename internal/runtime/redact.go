@@ -247,6 +247,17 @@ func redactedSummary(text string) string {
 	return summarize(redactSecretString(fmt.Sprint(text)))
 }
 
+func redactMapEvidence(evidence map[string]any) map[string]any {
+	if evidence == nil {
+		return nil
+	}
+	out, ok := redactSecrets(evidence).(map[string]any)
+	if !ok || out == nil {
+		out = make(map[string]any)
+	}
+	return out
+}
+
 func redactMessagesForStorage(messages []agentcore.Message) []agentcore.Message {
 	if len(messages) == 0 {
 		return messages

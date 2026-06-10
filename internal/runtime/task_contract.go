@@ -413,10 +413,11 @@ func checkContractToolAvailability(agentRegistry, fullRegistry *agentcore.ToolRe
 }
 
 func availabilityReason(toolName string, agentRegistry, fullRegistry *agentcore.ToolRegistry) string {
-	if fullRegistry != nil {
-		if _, ok := fullRegistry.Get(toolName); ok {
-			return "denied by profile"
-		}
+	if fullRegistry == nil {
+		return "tool not registered"
+	}
+	if _, ok := fullRegistry.Get(toolName); ok {
+		return "denied by profile"
 	}
 	return "tool not registered"
 }
@@ -429,6 +430,9 @@ func contractBlockerText(contract session.TaskContract, validation taskContractV
 	agentRegistry := rt.Tools
 	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
 		agentRegistry = agent.Tools
+	}
+	if agentRegistry == nil {
+		return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", strings.Join(validation.Missing, "; "))
 	}
 	var parts []string
 	for _, m := range validation.Missing {
