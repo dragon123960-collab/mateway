@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -130,23 +131,48 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 	}
 	var followUps []agentcore.Message
 	followupSent := false
-	lastContractMissing := ""
 	contractFollowups := 0
 	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
 		contract := taskContractFromState(*state, taskID)
 		currentTask := taskFromState(*state, taskID)
 		validation := validateTaskContract(contract, currentTask)
 		if contract.RequiresTools && !validation.Satisfied {
-			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": taskID, "missing": validation.Missing})
-			missingKey := strings.Join(validation.Missing, "\n")
-			if contractFollowups >= 4 || (contractFollowups > 0 && missingKey == lastContractMissing) {
+			failures := classifyTurnFailures(turn.ToolResults, turn.Message.ToolCalls)
+			_ = trace.write(map[string]any{
+				"type":    "task_contract_unsatisfied",
+				"task_id": taskID,
+				"missing": validation.Missing,
+			})
+			if len(failures) > 0 {
+				_ = trace.write(map[string]any{
+					"type":               "tool_failures_classified",
+					"task_id":            taskID,
+					"failure_categories": failureCategories(failures),
+				})
+			}
+			maxFollowups := rt.Config.Execution.MaxContractFollowupsValue()
+			if contractFollowups >= maxFollowups {
+				reason := fmt.Sprintf("task contract could not be satisfied after %d attempts; missing: %s", contractFollowups, strings.Join(validation.Missing, ", "))
+				_ = trace.write(map[string]any{
+					"type":           "task_contract_followup_limit",
+					"task_id":        taskID,
+					"attempts_total": contractFollowups,
+					"missing":        validation.Missing,
+					"blocker_text":   reason,
+				})
 				return true, nil
 			}
 			contractFollowups++
-			lastContractMissing = missingKey
+			content := taskContractFollowupWithGuidance(validation.Missing, failures)
 			followUps = append(followUps, agentcore.Message{
 				Role:    agentcore.RoleUser,
-				Content: taskContractFollowup(validation.Missing),
+				Content: content,
+			})
+			_ = trace.write(map[string]any{
+				"type":    "contract_followup_sent",
+				"task_id": taskID,
+				"attempt": contractFollowups,
+				"missing": validation.Missing,
 			})
 			return false, nil
 		}

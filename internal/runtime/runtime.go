@@ -264,13 +264,16 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
 	emptyActionPromise := looksLikeEmptyActionPromise(finalText)
+	contractUnsatisfied := false
+	var contractValidation taskContractValidation
 	if state.Pending == nil {
-		contractValidation := validateTaskContract(taskContractFromState(*state, task.ID), taskFromState(*state, task.ID))
+		contractValidation = validateTaskContract(taskContractFromState(*state, task.ID), taskFromState(*state, task.ID))
 		if result.StopReason != "" {
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
 			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
 		} else if !contractValidation.Satisfied {
+			contractUnsatisfied = true
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: strings.Join(contractValidation.Missing, "; "), Evidence: map[string]any{"missing": contractValidation.Missing}})
 			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": task.ID, "status": "failed", "missing": contractValidation.Missing})
@@ -289,6 +292,15 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			updateSessionSummary(state, task.ID, finalText, "completed", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
 			taskCompleted = true
+		}
+	}
+	if contractUnsatisfied {
+		blocker := fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", strings.Join(contractValidation.Missing, "; "))
+		finalText = strings.TrimSpace(finalText)
+		if finalText != "" {
+			finalText = finalText + blocker
+		} else {
+			finalText = blocker
 		}
 	}
 	if err := rt.saveState(state, trace); err != nil {
@@ -348,7 +360,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	style := channel.MessageStyle("")
-	failed := result.StopReason != "" || emptyActionPromise
+	failed := result.StopReason != "" || emptyActionPromise || contractUnsatisfied
 	if failed && style == "" {
 		style = channel.StylePartial
 	}

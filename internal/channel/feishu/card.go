@@ -163,6 +163,8 @@ func cardFooterNote(reply channel.OutboundMessage) string {
 		return "Please reply directly with the missing information."
 	case channel.StyleError:
 		return "The task stopped at a safe point. You can add more information and retry."
+	case "failed":
+		return "Status: failed"
 	default:
 		return "Status: " + firstNonEmpty(strings.TrimSpace(string(reply.Style)), string(channel.StyleCompleted))
 	}

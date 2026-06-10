@@ -70,7 +70,8 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 	if rt.ContractModel != nil {
 		contractModel = rt.ContractModel
 	}
-	contract, err := rt.generateTaskContract(ctx, task, userText, contractModel)
+	profile := rt.Pool.ProfileForMessage(msg)
+	contract, err := rt.generateTaskContract(ctx, task, userText, contractModel, discoverSkillsForAgent(rt.Config, profile.ID, 12))
 	if err != nil {
 		_ = trace.write(map[string]any{"type": "task_contract_parse_failed", "task_id": task.ID, "error": err.Error()})
 		contract = fallbackTaskContract(task.Goal, userText)
@@ -122,11 +123,11 @@ func shouldSkipTaskContractModel(goal, userText string) bool {
 	return false
 }
 
-func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNode, userText string, model agentcore.Model) (session.TaskContract, error) {
+func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNode, userText string, model agentcore.Model, skills []discoveredSkill) (session.TaskContract, error) {
 	if model == nil {
 		return fallbackTaskContract(task.Goal, userText), nil
 	}
-	prompt := renderTaskContractPrompt(task.Goal, userText, rt.Tools)
+	prompt := renderTaskContractPrompt(task.Goal, userText, rt.Tools, skills)
 	contractCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	reply, err := model.Next(contractCtx, agentcore.Context{
@@ -139,7 +140,7 @@ func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNo
 	return parseTaskContract(reply.Content)
 }
 
-func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegistry) string {
+func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegistry, skills []discoveredSkill) string {
 	var b strings.Builder
 	b.WriteString("Original user task:\n")
 	b.WriteString(strings.TrimSpace(goal))
@@ -149,6 +150,12 @@ func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegist
 	}
 	b.WriteString("\n\nRuntime freshness policy:\nUse tools for weather, news, prices, schedules, software versions, laws, APIs, local files, commands, or anything likely to have changed or requiring verification.\n")
 	b.WriteString("If the user asks to inspect a local or remote machine, service, process, daemon, port, plist, systemctl unit, SSH host, or current configuration, require terminal.run evidence. Running a single command through terminal.run is not the same as writing a script file.\n")
+	if skills := skillsPrompt(skills); skills != "" {
+		b.WriteString("\nAvailable skills:\n")
+		b.WriteString(skills)
+		b.WriteString("\n")
+		b.WriteString("If the task matches an available skill, require file.read evidence for that SKILL.md and require the execution tool named by the skill workflow, usually terminal.run for CLI/helper-script skills.\n")
+	}
 	b.WriteString("\nAvailable tools:\n")
 	for _, tool := range toolsForContract(tools) {
 		contract := agentcore.ContractFor(tool)
@@ -400,6 +407,37 @@ func taskContractFollowup(missing []string) string {
 		return "The task contract is not satisfied yet. Use the smallest appropriate tool call now, or state the concrete blocker."
 	}
 	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(missing, "; "))
+}
+
+func taskContractFollowupWithGuidance(missing []string, failures map[string]FailureInfo) string {
+	if len(missing) == 0 {
+		return "The task contract is not satisfied yet. Use the smallest appropriate tool call now, or state the concrete blocker."
+	}
+	var parts []string
+	for _, m := range missing {
+		info, ok := lookupFailureGuidance(m, failures)
+		if ok && info.Guidance != "" {
+			parts = append(parts, m+" — "+info.Guidance)
+		} else {
+			parts = append(parts, m)
+		}
+	}
+	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(parts, "; "))
+}
+
+const toolMissingPrefix = "tool:"
+
+func lookupFailureGuidance(missing string, failures map[string]FailureInfo) (FailureInfo, bool) {
+	if strings.HasPrefix(missing, toolMissingPrefix) {
+		toolName := strings.TrimPrefix(missing, toolMissingPrefix)
+		if info, ok := failures[toolName]; ok {
+			return info, true
+		}
+	}
+	if info, ok := failures[missing]; ok {
+		return info, true
+	}
+	return FailureInfo{}, false
 }
 
 func normalizePlanItems(items []session.TaskPlanItem) []session.TaskPlanItem {

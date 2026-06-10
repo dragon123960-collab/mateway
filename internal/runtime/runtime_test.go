@@ -471,10 +471,73 @@ func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestRuntimeUnsatisfiedContractReplyIsPartial(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "partial market evidence"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "web.search",
+			Args: map[string]any{"query": "Nasdaq last three days"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "I have the key data. I will write the document next."},
+	}}, rt.Tools)
+	rt.Config.Execution.MaxContractFollowups = 1
+	rt.ContractModel = contractJSONModel{json: `{"summary":"write market document","requires_tools":true,"required_tools":["web.search","file.write"],"required_evidence":[{"kind":"local_file","tool":"file.write","description":"markdown document"}],"plan_items":[{"id":"plan-1","title":"search market data","status":"pending","tool":"web.search","criteria":"collect data"},{"id":"plan-2","title":"write markdown document","status":"pending","tool":"file.write","criteria":"save markdown document"}],"expected_outcome":"written document","completion_policy":"must write the file before final answer"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "整理纳指近三天走势并写成文档"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed || resp.Reply.Style != channel.StylePartial {
+		t.Fatalf("expected unsatisfied contract to return partial failure, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:test")
+	if state.Tasks[0].Status != "failed" {
+		t.Fatalf("expected task failed, got %#v", state.Tasks[0])
+	}
+	if strings.TrimSpace(resp.Reply.Text) == "" {
+		t.Fatal("expected partial reply text")
+	}
+}
+
+func TestTaskContractPromptIncludesDiscoveredSkills(t *testing.T) {
+	skills := []discoveredSkill{{
+		Name:        "feishu-notify",
+		Description: "Use when creating a Feishu/Lark cloud document.",
+		Stage:       "execution",
+		Priority:    "80",
+		Path:        "/tmp/workspace/skills/feishu-notify/SKILL.md",
+	}}
+	prompt := renderTaskContractPrompt("整理成文档，发到我的飞书云文档", "", agentcore.NewToolRegistry(), skills)
+	for _, want := range []string{"feishu-notify", "file.read evidence", "terminal.run"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected contract prompt to mention %q, got:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestTaskContractPromptDoesNotHardCodeFeishuSkill(t *testing.T) {
+	prompt := renderTaskContractPrompt("整理成文档，发到我的飞书云文档", "", agentcore.NewToolRegistry(), nil)
+	if strings.Contains(prompt, "feishu-notify") {
+		t.Fatalf("contract prompt should only mention discovered skills, got:\n%s", prompt)
+	}
+}
+
 func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "terminal.run", content: "sing-box.service active"})
+	registry.Register(runtimeNamedTool{name: "web.search", content: "latest sing-box release v0.6.0"})
 	rt.Tools = registry
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, Content: "I cannot access the server directly."},
@@ -482,6 +545,11 @@ func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
 			ID:   "call_1",
 			Name: "terminal.run",
 			Args: map[string]any{"command": "ssh overseas 'systemctl status sing-box --no-pager'"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_2",
+			Name: "web.search",
+			Args: map[string]any{"query": "sing-box release"},
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "sing-box is active."},
 	}}, rt.Tools)
@@ -1576,4 +1644,317 @@ func (runtimeNamedTool) ToolContract() agentcore.ToolContract {
 }
 func (t runtimeNamedTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: map[string]any{"test": true}}
+}
+
+type runtimeFailingTool struct {
+	name      string
+	errorText string
+	isError   bool
+	evidence  map[string]any
+	failCount int
+	calls     int
+}
+
+func (t runtimeFailingTool) Name() string      { return t.name }
+func (runtimeFailingTool) Description() string { return "test failing tool" }
+func (runtimeFailingTool) Schema() agentcore.Schema {
+	return agentcore.Schema{}
+}
+func (t runtimeFailingTool) Risk() agentcore.Risk {
+	if t.isError {
+		return agentcore.RiskGuardedMutation
+	}
+	return agentcore.RiskSafeRead
+}
+func (runtimeFailingTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{ParallelMode: "read_only_ok"}
+}
+func (t *runtimeFailingTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	t.calls++
+	if t.failCount > 0 && t.calls > t.failCount {
+		content := "success after retry"
+		if call.Args != nil {
+			if path, ok := call.Args["path"].(string); ok {
+				content = fmt.Sprintf("edited %s", path)
+			}
+		}
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: content, Evidence: t.evidence}
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.errorText, IsError: t.isError, Evidence: t.evidence}
+}
+
+func TestFileEditMultiMatchRetryNotFinal(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "line one\nline two"})
+	registry.Register(&runtimeFailingTool{
+		name:      "file.edit",
+		errorText: "old_string found 2 times in file; use replace_all=true to replace all, or provide more surrounding context in old_string to make it unique",
+		isError:   true,
+		evidence:  map[string]any{"path": "/tmp/f.txt", "matches": 2},
+		failCount: 1,
+	})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "line", "new_string": "replaced"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_2",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "line", "new_string": "replaced one\nline two", "replace_all": true},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"edit file","requires_tools":true,"required_tools":["file.edit"],"expected_outcome":"file edited"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "edit /tmp/f.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected retry success, got failed: %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "done") {
+		t.Fatalf("expected final done, got %q", resp.Reply.Text)
+	}
+
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "edit /tmp/f.txt")
+	accepted := acceptedTools(task)
+	if !accepted["file.edit"] {
+		t.Fatal("expected file.edit to be accepted after retry")
+	}
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "contract_followup_sent") {
+		t.Fatal("expected contract_followup_sent trace")
+	}
+	if !strings.Contains(traceStr, "task_contract_satisfied") {
+		t.Fatal("expected task_contract_satisfied trace")
+	}
+}
+
+func TestFileEditEmptyOldStringFailsWithGuidance(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "content"})
+	registry.Register(&runtimeFailingTool{
+		name:      "file.edit",
+		errorText: "old_string must not be empty",
+		isError:   true,
+		evidence:  map[string]any{"path": "/tmp/f.txt"},
+		failCount: 1,
+	})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will edit the file."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "", "new_string": "x"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_2",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "content", "new_string": "fixed"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "fixed"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"edit file","requires_tools":true,"required_tools":["file.edit"],"expected_outcome":"file edited"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "edit /tmp/f.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected retry success, got failed: %#v", resp)
+	}
+
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "edit /tmp/f.txt")
+	accepted := acceptedTools(task)
+	if !accepted["file.edit"] {
+		t.Fatal("expected file.edit to be accepted after retry with correct old_string")
+	}
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "contract_followup_sent") {
+		t.Fatal("expected contract_followup_sent trace for missing evidence follow-up")
+	}
+	if !strings.Contains(traceStr, "task_contract_satisfied") {
+		t.Fatal("expected task_contract_satisfied trace after retry")
+	}
+}
+
+func TestFileEditBinaryRejectsWithFallbackGuidance(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(&runtimeFailingTool{
+		name:      "file.edit",
+		errorText: "file appears to be binary",
+		isError:   true,
+		evidence:  map[string]any{"path": "/tmp/f.bin", "bytes": 4},
+	})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "binary: application/octet-stream"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will check the file."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.bin", "old_string": "x", "new_string": "y"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_2",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "file /tmp/f.bin"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "binary inspected"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"inspect binary","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"binary inspected"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "check /tmp/f.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected fallback success, got failed: %#v", resp)
+	}
+	if !strings.Contains(resp.Reply.Text, "binary inspected") {
+		t.Fatalf("expected binary inspected in final reply, got %q", resp.Reply.Text)
+	}
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "tool_failures_classified") {
+		t.Fatal("expected tool_failures_classified trace for binary file.edit failure")
+	}
+	if !strings.Contains(traceStr, "task_contract_satisfied") {
+		t.Fatal("expected task_contract_satisfied trace after terminal.run fallback")
+	}
+}
+
+func TestContractFollowupLimitProducesBlockedTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.MaxContractFollowups = 2
+	registry := agentcore.NewToolRegistry()
+	registry.Register(&runtimeFailingTool{
+		name:      "file.edit",
+		errorText: "old_string not found in file",
+		isError:   true,
+		evidence:  map[string]any{"path": "/tmp/f.txt", "matches": 0},
+	})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "old", "new_string": "new"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_2",
+			Name: "file.edit",
+			Args: map[string]any{"path": "/tmp/f.txt", "old_string": "old", "new_string": "new"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "I give up."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"edit non-existent text","requires_tools":true,"required_tools":["file.edit"],"expected_outcome":"file edited"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "edit /tmp/f.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	if state.ActiveTask == "" {
+		t.Fatalf("expected active task to remain")
+	}
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "task_contract_followup_limit") {
+		t.Fatalf("expected followup limit trace, got:\n%s", traceStr)
+	}
+	if !strings.Contains(traceStr, "file.edit") {
+		t.Fatalf("expected file.edit in trace, got:\n%s", traceStr)
+	}
+	if !strings.Contains(traceStr, "attempts_total") {
+		t.Fatalf("expected attempts_total in followup limit trace, got:\n%s", traceStr)
+	}
+	attemptsCount := countTraceAttempts(traceStr)
+	if attemptsCount < 2 {
+		t.Fatalf("expected at least 2 followup attempts (MaxContractFollowups=2), got %d attempts", attemptsCount)
+	}
+	if !strings.Contains(traceStr, "blocker_text") {
+		t.Fatalf("expected blocker_text in trace, trace:\n%s", traceStr)
+	}
+	if !resp.Failed {
+		t.Fatal("expected resp.Failed=true when contract followup limit is reached")
+	}
+	if !strings.Contains(resp.Reply.Text, "blocked") {
+		t.Fatalf("expected blocker in reply text, got: %q", resp.Reply.Text)
+	}
+}
+
+func countTraceAttempts(traceStr string) int {
+	count := 0
+	for _, line := range strings.Split(traceStr, "\n") {
+		if strings.Contains(line, "contract_followup_sent") {
+			count++
+		}
+	}
+	return count
+}
+
+func findTaskByGoal(state session.State, goal string) session.TaskNode {
+	for _, task := range state.Tasks {
+		if task.Goal == goal {
+			return task
+		}
+	}
+	return session.TaskNode{}
 }

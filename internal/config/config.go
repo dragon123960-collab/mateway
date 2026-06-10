@@ -38,9 +38,10 @@ func DefaultRoot() Root {
 			Fallbacks: []string{},
 		},
 		Execution: ExecutionConfig{
-			MaxParallelTools:  4,
-			MaxIterations:     intPtr(50),
-			InactivityTimeout: "5m",
+			MaxParallelTools:     4,
+			MaxIterations:        intPtr(50),
+			InactivityTimeout:    "5m",
+			MaxContractFollowups: 4,
 			ContextBudget: ContextBudgetConfig{
 				Enabled:                boolPtr(true),
 				SoftRatio:              0.65,
@@ -342,10 +343,11 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelTools  int                 `yaml:"max_parallel_tools"`
-	MaxIterations     *int                `yaml:"max_iterations"`
-	InactivityTimeout string              `yaml:"inactivity_timeout"`
-	ContextBudget     ContextBudgetConfig `yaml:"context_budget"`
+	MaxParallelTools     int                 `yaml:"max_parallel_tools"`
+	MaxIterations        *int                `yaml:"max_iterations"`
+	InactivityTimeout    string              `yaml:"inactivity_timeout"`
+	MaxContractFollowups int                 `yaml:"max_contract_followups"`
+	ContextBudget        ContextBudgetConfig `yaml:"context_budget"`
 }
 
 type ContextBudgetConfig struct {
@@ -454,6 +456,13 @@ func (c ExecutionConfig) InactivityTimeoutDuration() time.Duration {
 		return 0
 	}
 	return timeout
+}
+
+func (c ExecutionConfig) MaxContractFollowupsValue() int {
+	if c.MaxContractFollowups <= 0 {
+		return 4
+	}
+	return c.MaxContractFollowups
 }
 
 type MemoryConfig struct {

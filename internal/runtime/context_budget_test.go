@@ -238,10 +238,19 @@ type countingModel struct {
 type captureToolsModel struct {
 	text      string
 	toolNames []string
+	calls     int
+	toolSent  bool
 }
 
 func (m *captureToolsModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
-	m.toolNames = toolNames(ctx.Tools)
+	m.calls++
+	if m.toolNames == nil {
+		m.toolNames = toolNames(ctx.Tools)
+	}
+	if ctx.Tools != nil && len(ctx.Tools) > 0 && !m.toolSent {
+		m.toolSent = true
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_web", Name: "web.search", Args: map[string]any{"query": "test"}}}}, nil
+	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
 }
 
