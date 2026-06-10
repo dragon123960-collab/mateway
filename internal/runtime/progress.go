@@ -9,11 +9,11 @@ import (
 	"github.com/dongping/mateway/internal/session"
 )
 
-func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, taskID string, current channel.ProgressStep) {
+func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, taskID string, eventOffset int, current channel.ProgressStep) {
 	if rt.ProgressSink == nil {
 		return
 	}
-	steps := progressStepsForTask(state, taskID)
+	steps := progressStepsForTaskSince(state, taskID, eventOffset)
 	if strings.TrimSpace(current.Title) != "" || strings.TrimSpace(current.Tool) != "" {
 		steps = append(steps, current)
 	}
@@ -52,9 +52,20 @@ func summarizeAssistantToolActivity(message agentcore.Message) string {
 }
 
 func progressStepsForTask(state session.State, taskID string) []channel.ProgressStep {
+	return progressStepsForTaskSince(state, taskID, 0)
+}
+
+func progressStepsForTaskSince(state session.State, taskID string, eventOffset int) []channel.ProgressStep {
 	task := taskFromState(state, taskID)
 	events := task.Execution.Events
-	out := make([]channel.ProgressStep, 0, len(events))
+	if eventOffset < 0 {
+		eventOffset = 0
+	}
+	if eventOffset > len(events) {
+		eventOffset = len(events)
+	}
+	events = events[eventOffset:]
+	out := planProgressSteps(task.Execution.Contract)
 	for _, event := range events {
 		step := progressStepFromExecutionEvent(event)
 		if strings.TrimSpace(step.Title) == "" {
@@ -65,6 +76,32 @@ func progressStepsForTask(state session.State, taskID string) []channel.Progress
 	const limit = 8
 	if len(out) > limit {
 		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+func planProgressSteps(contract *session.TaskContract) []channel.ProgressStep {
+	if contract == nil || len(contract.PlanItems) == 0 {
+		return nil
+	}
+	out := make([]channel.ProgressStep, 0, len(contract.PlanItems))
+	for _, item := range contract.PlanItems {
+		title := strings.TrimSpace(item.Title)
+		if title == "" {
+			title = strings.TrimSpace(item.ID)
+		}
+		if title == "" {
+			continue
+		}
+		summary := compactProgressSummary(item.Criteria)
+		if strings.TrimSpace(item.Tool) != "" {
+			summary = compactProgressSummary(strings.TrimSpace(item.Tool) + " / " + item.Criteria)
+		}
+		out = append(out, channel.ProgressStep{
+			Title:   title,
+			Status:  strings.TrimSpace(item.Status),
+			Summary: summary,
+		})
 	}
 	return out
 }

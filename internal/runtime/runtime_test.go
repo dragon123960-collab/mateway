@@ -216,6 +216,102 @@ func TestRuntimeTraceIncludesIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeActionTaskPausesForPlanReview(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "release found"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "release"}}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"search task","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"search evidence"}],"plan_items":[{"id":"plan-1","title":"search evidence","status":"pending","tool":"web.search","criteria":"collect evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
+	resp, err := rt.Handle(context.Background(), inbound("cli:plan-review", "search latest release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired || !strings.Contains(resp.Reply.Text, "Reply 1 to execute") {
+		t.Fatalf("expected plan review reply, got %#v", resp.Reply)
+	}
+	if strings.Contains(resp.Reply.Text, "search evidence") {
+		t.Fatalf("plan review should not show detailed execution steps, got %q", resp.Reply.Text)
+	}
+	state := loadState(t, rt, "cli:plan-review")
+	if state.Pending == nil || state.Pending.Kind != session.PendingKindTaskPlanConfirm {
+		t.Fatalf("expected task plan pending, got %#v", state.Pending)
+	}
+	if len(state.Tasks) != 1 || len(state.Tasks[0].Execution.TraceRefs) == 0 || state.Tasks[0].Execution.TraceRefs[len(state.Tasks[0].Execution.TraceRefs)-1].Phase != tracePhasePlanReview {
+		t.Fatalf("expected plan_review trace ref, got %#v", state.Tasks)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:plan-review", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	if !strings.Contains(trace, `"control_text":"1"`) || !strings.Contains(trace, `"effective_task_goal":"search latest release"`) {
+		t.Fatalf("expected control and effective goal in execute trace, got:\n%s", trace)
+	}
+	state = loadState(t, rt, "cli:plan-review")
+	if refs := state.Tasks[0].Execution.TraceRefs; len(refs) < 2 || refs[len(refs)-1].Phase != tracePhaseExecute {
+		t.Fatalf("expected execute trace ref, got %#v", refs)
+	}
+}
+
+func TestRuntimeShowsPlanItemsDuringExecutionProgress(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "release found"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"搜索任务","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"搜索证据"}],"plan_items":[{"id":"plan-1","title":"搜索模型列表","status":"pending","tool":"web.search","criteria":"收集候选模型"}],"expected_outcome":"回答","completion_policy":"使用证据"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "release"}}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	var progress []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		progress = append(progress, msg)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:plan-progress", "国内编程模型哪个可以")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:plan-progress", "1")); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, msg := range progress {
+		for _, step := range msg.Progress {
+			if step.Title == "搜索模型列表" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected plan item in execution progress, got %#v", progress)
+	}
+}
+
+func TestRuntimePlanReviewUsesUserLanguage(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"检查 singbox 状态","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"kind":"runtime_state","tool":"terminal.run","description":"服务状态"}],"plan_items":[{"id":"plan-1","title":"检查服务状态","status":"pending","tool":"terminal.run","criteria":"获取服务状态"}],"expected_outcome":"状态报告","completion_policy":"使用终端证据"}`}
+	resp, err := rt.Handle(context.Background(), inbound("cli:plan-lang", "帮我检查 singbox 状态"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Reply.Text, "任务计划") || !strings.Contains(resp.Reply.Text, "回复 1 执行") {
+		t.Fatalf("expected Chinese plan review, got %q", resp.Reply.Text)
+	}
+	if strings.Contains(resp.Reply.Text, "Task plan") || strings.Contains(resp.Reply.Text, "Reply 1") {
+		t.Fatalf("plan review should not use English chrome for Chinese request, got %q", resp.Reply.Text)
+	}
+	if strings.Contains(resp.Reply.Text, "检查服务状态") {
+		t.Fatalf("plan review should keep detailed steps for execution progress, got %q", resp.Reply.Text)
+	}
+}
+
 func TestTraceSummaryReportsIdentityAndIncomplete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl")
 	if err := os.WriteFile(path, []byte(
@@ -264,7 +360,7 @@ func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 	}
 }
 
-func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
+func TestRuntimeTerminalShellCommandRunsWithoutApproval(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
@@ -274,87 +370,13 @@ func TestRuntimeTerminalApprovalAllowsCommand(t *testing.T) {
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "approved"},
 	}}, rt.Tools)
-	asked := false
-	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		asked = true
-		return ApprovalDecision{Approved: true}, nil
-	}
-
-	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !asked {
-		t.Fatal("expected approval request")
-	}
-	if resp.Failed {
-		t.Fatalf("expected approved task, got %#v", resp)
-	}
-}
-
-func TestRuntimeTerminalApprovalUsesContextWithoutMutatingArgs(t *testing.T) {
-	rt := newTestRuntime(t)
-	capture := &captureApprovalTool{}
-	registry := agentcore.NewToolRegistry()
-	registry.Register(capture)
-	rt.Tools = registry
-	args := map[string]any{"command": "echo approved; echo done"}
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
-			ID:   "call_1",
-			Name: "terminal.run",
-			Args: args,
-		}}},
-		{Role: agentcore.RoleAssistant, Content: "approved"},
-	}}, rt.Tools)
-	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		return ApprovalDecision{Approved: true}, nil
-	}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.Failed {
-		t.Fatalf("expected approved task, got %#v", resp)
-	}
-	if capture.approvalToken == "" {
-		t.Fatal("expected approval token in tool context")
-	}
-	if _, ok := capture.args["_mateway_approval_token"]; ok {
-		t.Fatalf("approval token should not be injected into tool args: %#v", capture.args)
-	}
-	if _, ok := args["_mateway_approval_token"]; ok {
-		t.Fatalf("approval token should not mutate model tool args: %#v", args)
-	}
-}
-
-func TestRuntimeTerminalApprovalRejectsCommand(t *testing.T) {
-	rt := newTestRuntime(t)
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
-			ID:   "call_1",
-			Name: "terminal.run",
-			Args: map[string]any{"command": "echo rejected; echo done"},
-		}}},
-		{Role: agentcore.RoleAssistant, Content: "blocked"},
-	}}, rt.Tools)
-	rt.Hooks.ApproveToolCall = func(context.Context, ApprovalRequest) (ApprovalDecision, error) {
-		return ApprovalDecision{Approved: false, Reason: "user rejected"}, nil
-	}
-
-	if _, err := rt.Handle(context.Background(), inbound("cli:test", "run shell command")); err != nil {
-		t.Fatal(err)
-	}
-	state := loadState(t, rt, "cli:test")
-	found := false
-	for _, event := range state.Tasks[0].Execution.Events {
-		if event.Type == "tool_blocked" && event.Tool == "terminal.run" && event.Summary == "user rejected" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected rejected approval event, got %#v", state.Tasks[0].Execution.Events)
+		t.Fatalf("expected shell command task to complete, got %#v", resp)
 	}
 }
 
@@ -409,6 +431,13 @@ func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review before execution, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.Failed || !strings.Contains(resp.Reply.Text, "Weather checked") {
 		t.Fatalf("expected contract repair to complete with tool evidence, got %#v", resp)
 	}
@@ -417,12 +446,158 @@ func TestRuntimeTaskContractForcesToolEvidenceBeforeCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	trace := string(data)
-	if !strings.Contains(trace, "task_contract_created") || !strings.Contains(trace, "task_contract_unsatisfied") || !strings.Contains(trace, "task_contract_satisfied") {
+	if !strings.Contains(trace, "task_contract_unsatisfied") || !strings.Contains(trace, "task_contract_satisfied") {
 		t.Fatalf("expected contract lifecycle trace, got:\n%s", trace)
 	}
 	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks[0].Execution.TraceRefs) == 0 {
+		t.Fatalf("expected trace refs, got %#v", state.Tasks[0].Execution.TraceRefs)
+	}
+	firstTrace, err := os.ReadFile(state.Tasks[0].Execution.TraceRefs[0].TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(firstTrace), "task_contract_created") {
+		t.Fatalf("expected contract creation in plan review trace, got:\n%s", string(firstTrace))
+	}
 	if state.Tasks[0].Execution.Contract == nil || !state.Tasks[0].Execution.Contract.RequiresTools {
 		t.Fatalf("expected stored task contract, got %#v", state.Tasks[0].Execution.Contract)
+	}
+	if len(state.Tasks[0].Execution.TraceRefs) < 2 {
+		t.Fatalf("expected plan and execute trace refs, got %#v", state.Tasks[0].Execution.TraceRefs)
+	}
+	if got := state.Tasks[0].Execution.Contract.PlanItems[0].Status; got != "completed" {
+		t.Fatalf("expected plan item completed, got %q contract=%#v", got, state.Tasks[0].Execution.Contract)
+	}
+}
+
+func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "sing-box.service active"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I cannot access the server directly."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "ssh overseas 'systemctl status sing-box --no-pager'"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "sing-box is active."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"Check the status of the sing-box project (current releases/repo state)","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"latest sing-box release"}],"expected_outcome":"latest version status","completion_policy":"use web evidence before final answer"}`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "不用脚本，你也可以直接访问国外服务器吧，给我去看看singbox状态"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review before execution, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || !strings.Contains(resp.Reply.Text, "active") {
+		t.Fatalf("expected terminal-backed repair to complete, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:test")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil || !containsString(contract.RequiredTools, "terminal.run") {
+		t.Fatalf("expected terminal.run in strengthened contract, got %#v", contract)
+	}
+	if strings.Contains(strings.ToLower(contract.Summary), "github") || strings.Contains(strings.ToLower(contract.Summary), "release") {
+		t.Fatalf("contract summary should keep user target, got %#v", contract)
+	}
+}
+
+func TestRuntimeToolBlockedMarksPlanItemBlocked(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"delete tmp","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"kind":"mutation","tool":"terminal.run","description":"delete command"}],"plan_items":[{"id":"plan-1","title":"delete tmp","status":"pending","tool":"terminal.run","criteria":"run delete command"}],"expected_outcome":"deleted","completion_policy":"use terminal evidence"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": "rm -rf /tmp/mateway-danger-test"}}}},
+		{Role: agentcore.RoleAssistant, Content: "blocked by policy"},
+	}}, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:blocked-plan", "delete tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:blocked-plan", "1")); err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:blocked-plan")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil || len(contract.PlanItems) == 0 || contract.PlanItems[0].Status != "blocked" {
+		t.Fatalf("expected blocked plan item, got %#v", contract)
+	}
+}
+
+func TestRuntimeCompletesMultiplePlanItemsWithSameTool(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "search evidence"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"compare coding models","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"current coding model evidence"}],"plan_items":[{"id":"plan-1","title":"search domestic models","status":"pending","tool":"web.search","criteria":"collect candidates"},{"id":"plan-2","title":"search benchmarks","status":"pending","tool":"web.search","criteria":"collect benchmark data"},{"id":"plan-3","title":"compare access","status":"pending","tool":"web.search","criteria":"collect availability info"}],"expected_outcome":"recommendation","completion_policy":"use evidence"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "domestic coding models"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "web.search", Args: map[string]any{"query": "coding model benchmarks"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_3", Name: "web.search", Args: map[string]any{"query": "coding model access pricing"}}}},
+		{Role: agentcore.RoleAssistant, Content: "推荐 Qwen Coder、DeepSeek Coder 和 Doubao Seed Code。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), inbound("cli:multi-plan", "国内编程模型哪个可以"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:multi-plan", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed || resp.Reply.Style == channel.StylePartial {
+		t.Fatalf("expected completion, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:multi-plan")
+	for _, item := range state.Tasks[0].Execution.Contract.PlanItems {
+		if item.Status != "completed" {
+			t.Fatalf("expected all plan items completed, got %#v", state.Tasks[0].Execution.Contract.PlanItems)
+		}
+	}
+}
+
+func TestRuntimeCompletesNoToolPlanItemOnFinalAnswer(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "北京晴，义乌小雨"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"规划北京到义乌出行","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"天气和交通信息"}],"plan_items":[{"id":"plan-1","title":"查询天气和交通","status":"pending","tool":"web.search","criteria":"收集当前信息"},{"id":"plan-2","title":"输出完整出行规划","status":"pending","criteria":"汇总证据并给出建议"}],"expected_outcome":"完整出行规划","completion_policy":"使用证据后回答"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "北京 到 义乌 天气 交通"}}}},
+		{Role: agentcore.RoleAssistant, Content: "建议明天出行，带伞并预留换乘时间。"},
+	}}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), inbound("cli:no-tool-plan", "帮我规划明天北京到义乌的行程"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:no-tool-plan", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected completion, got %#v", resp)
+	}
+	state := loadState(t, rt, "cli:no-tool-plan")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil || len(contract.PlanItems) != 2 {
+		t.Fatalf("expected stored plan items, got %#v", contract)
+	}
+	for _, item := range contract.PlanItems {
+		if item.Status != "completed" {
+			t.Fatalf("expected all plan items completed, got %#v", contract.PlanItems)
+		}
 	}
 }
 
@@ -924,6 +1099,113 @@ func TestRuntimeInputRequestKeepsTaskActiveForUserContinuation(t *testing.T) {
 	}
 }
 
+func TestRuntimeContinuationOfferKeepsTaskActive(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Found 2 files. If you'd like, I can read either one."}, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "list readmes")); err != nil {
+		t.Fatal(err)
+	}
+	state := loadState(t, rt, "cli:test")
+	if len(state.Tasks) != 1 || state.ActiveTask != state.Tasks[0].ID || state.Tasks[0].Status != "await_user_input" {
+		t.Fatalf("expected continuation offer to keep task active, active=%q tasks=%#v", state.ActiveTask, state.Tasks)
+	}
+
+	model := &captureUserModel{text: "reading"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "yes")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(model.lastUser, "list readmes") || !strings.Contains(model.lastUser, "yes") {
+		t.Fatalf("expected short confirmation to steer into offer task, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeIndependentRequestAfterContinuationOfferStartsNewTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("list readmes")
+	state.AwaitUserInputActiveTaskWithSummary("Found files. If you'd like, I can read one.", "trace-one", "/tmp/trace-one.jsonl")
+	if task.Status != "await_user_input" {
+		t.Fatalf("setup failed: %#v", task)
+	}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "new task done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "Now list every yaml file under ~/.mateway/config")); err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "Now list every yaml file under ~/.mateway/config" {
+		t.Fatalf("expected independent request to create new task, got %#v", updated.Tasks)
+	}
+	if strings.Contains(model.lastUser, "Active task:") {
+		t.Fatalf("independent request should not be merged into previous offer, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeIndependentRequestAfterFailedTaskStartsNewTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	state.StartTask("看trace")
+	state.BlockActiveTask("failed")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "memory checked"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "现在检查一下你有哪些记忆，是否记得远程国外服务器地址")); err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "现在检查一下你有哪些记忆，是否记得远程国外服务器地址" {
+		t.Fatalf("expected independent memory request to create new task, got %#v", updated.Tasks)
+	}
+	if strings.Contains(model.lastUser, "看trace") {
+		t.Fatalf("new request should not be steered into failed trace task, got %q", model.lastUser)
+	}
+}
+
+func TestRuntimeProgressSinkDoesNotReplayHistoricalTaskEvents(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("inspect memory")
+	state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: "old missing trace"})
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "project.index",
+			Args: map[string]any{"path": rt.home()},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+	var updates []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates = append(updates, msg)
+	}
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "continue")); err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) == 0 {
+		t.Fatal("expected progress updates")
+	}
+	for _, update := range updates {
+		for _, step := range update.Progress {
+			if strings.Contains(step.Summary, "old missing trace") || step.Title == "task_contract_unsatisfied" {
+				t.Fatalf("progress replayed historical event: %#v", updates)
+			}
+		}
+	}
+}
+
 func TestRuntimeEmptyActionPromiseDoesNotCompleteTask(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
@@ -1018,16 +1300,35 @@ func TestRuntimeNewTaskReceivesPreviousTaskContinuityContext(t *testing.T) {
 	if _, err := rt.Handle(context.Background(), inbound("cli:test", "ok")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(model.systemPrompt, "Continuity judgment:") {
-		t.Fatalf("expected continuity judgment in system prompt, got %q", model.systemPrompt)
-	}
 	if !strings.Contains(model.systemPrompt, "create a Lark document from /tmp/source.md") ||
 		!strings.Contains(model.systemPrompt, "Waiting for authorization.") {
 		t.Fatalf("expected previous task context in system prompt, got %q", model.systemPrompt)
 	}
 	updated := loadState(t, rt, "cli:test")
 	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "ok" {
-		t.Fatalf("expected soft continuation to create a new task, got %#v", updated.Tasks)
+		t.Fatalf("expected completed previous task to create a new task, got %#v", updated.Tasks)
+	}
+}
+
+func TestRuntimeFollowupReusesAwaitingTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:followup"}
+	task := state.StartTask("create a Lark document from /tmp/source.md")
+	state.AwaitUserInputActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "continued"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+	if _, err := rt.Handle(context.Background(), inbound("cli:followup", "ok")); err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:followup")
+	if len(updated.Tasks) != 1 || updated.Tasks[0].ID != task.ID {
+		t.Fatalf("expected followup to reuse awaiting task, got %#v", updated.Tasks)
+	}
+	if !strings.Contains(model.lastUser, "create a Lark document") || !strings.Contains(model.lastUser, "ok") {
+		t.Fatalf("expected merged followup input, got %q", model.lastUser)
 	}
 }
 
@@ -1233,26 +1534,6 @@ func (m *sequenceModel) Next(context.Context, agentcore.Context) (agentcore.Mess
 	}
 	m.index++
 	return m.messages[index], nil
-}
-
-type captureApprovalTool struct {
-	args          map[string]any
-	approvalToken string
-}
-
-func (t *captureApprovalTool) Name() string        { return "terminal.run" }
-func (t *captureApprovalTool) Description() string { return "capture terminal approval context" }
-func (t *captureApprovalTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"command"}}
-}
-func (t *captureApprovalTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t *captureApprovalTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{ParallelMode: "forbid"}
-}
-func (t *captureApprovalTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	t.args = call.Args
-	t.approvalToken = tool.ApprovalTokenFromContext(ctx)
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: "ok", Evidence: map[string]any{"decision": "allowed"}}
 }
 
 type runtimeSlowTool struct {

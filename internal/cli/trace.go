@@ -62,6 +62,125 @@ type TraceEventsOptions struct {
 	JSON bool
 }
 
+func PrintTraceReport(out io.Writer, path string) error {
+	report, err := buildTraceReport(path)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Trace Report")
+	fmt.Fprintln(out, "trace:", path)
+	if report.TraceID != "" {
+		fmt.Fprintln(out, "trace_id:", report.TraceID)
+	}
+	if report.SessionKey != "" {
+		fmt.Fprintln(out, "session_key:", report.SessionKey)
+	}
+	if report.TaskID != "" {
+		fmt.Fprintln(out, "task_id:", report.TaskID)
+	}
+	if report.AgentID != "" {
+		fmt.Fprintln(out, "agent_id:", report.AgentID)
+	}
+	if report.Request != "" {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Request")
+		fmt.Fprintln(out, "- "+compactBlock(report.Request, 600))
+	}
+	if report.Contract.Summary != "" || len(report.Contract.RequiredTools) > 0 || len(report.Contract.RequiredEvidence) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Task Contract")
+		if report.Contract.Summary != "" {
+			fmt.Fprintln(out, "- summary:", report.Contract.Summary)
+		}
+		if report.Contract.Known {
+			fmt.Fprintf(out, "- requires_tools: %t\n", report.Contract.RequiresTools)
+		}
+		if len(report.Contract.RequiredTools) > 0 {
+			fmt.Fprintln(out, "- required_tools:", strings.Join(report.Contract.RequiredTools, ", "))
+		}
+		for _, evidence := range report.Contract.RequiredEvidence {
+			fmt.Fprintf(out, "- evidence: %s via %s\n", compactInline(evidence.Description, 180), firstNonEmpty(evidence.Tool, "unspecified"))
+		}
+		if report.Contract.ExpectedOutcome != "" {
+			fmt.Fprintln(out, "- expected:", report.Contract.ExpectedOutcome)
+		}
+	}
+	if len(report.Models) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Models")
+		for _, model := range report.Models {
+			fmt.Fprintf(out, "- %s/%s", firstNonEmpty(model.Provider, "provider"), firstNonEmpty(model.Model, "model"))
+			if model.InputTokens > 0 || model.OutputTokens > 0 {
+				fmt.Fprintf(out, " tokens=%d/%d", model.InputTokens, model.OutputTokens)
+			}
+			if model.DurationMS > 0 {
+				fmt.Fprintf(out, " duration=%dms", model.DurationMS)
+			}
+			fmt.Fprintln(out)
+		}
+	}
+	if len(report.VisibleTools) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Visible Tools")
+		fmt.Fprintln(out, "- "+strings.Join(report.VisibleTools, ", "))
+		if report.HiddenTools > 0 {
+			fmt.Fprintf(out, "- hidden_tools: %d\n", report.HiddenTools)
+		}
+	}
+	if len(report.ToolPolicies) > 0 || len(report.Tools) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Tool Process")
+		for _, policy := range report.ToolPolicies {
+			status := "allowed"
+			if policy.Blocked {
+				status = "blocked"
+			}
+			fmt.Fprintf(out, "- policy %s: %s", status, policy.Tool)
+			if policy.Reason != "" {
+				fmt.Fprintf(out, " - %s", compactInline(policy.Reason, 180))
+			}
+			fmt.Fprintln(out)
+		}
+		for _, tool := range report.Tools {
+			status := "ok"
+			if tool.Error {
+				status = "error"
+			}
+			fmt.Fprintf(out, "- %s %s", status, tool.Name)
+			if tool.Args != "" {
+				fmt.Fprintf(out, " %s", tool.Args)
+			}
+			if tool.DurationMS > 0 {
+				fmt.Fprintf(out, " (%dms)", tool.DurationMS)
+			}
+			if tool.Summary != "" {
+				fmt.Fprintf(out, " - %s", compactInline(tool.Summary, 180))
+			}
+			fmt.Fprintln(out)
+		}
+	}
+	if len(report.Judgments) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Result Judgment")
+		for _, judgment := range report.Judgments {
+			line := "- " + judgment.Type
+			if judgment.Status != "" {
+				line += " status=" + judgment.Status
+			}
+			if len(judgment.Missing) > 0 {
+				line += " missing=" + strings.Join(judgment.Missing, "; ")
+			}
+			fmt.Fprintln(out, line)
+		}
+	}
+	if report.FinalReply != "" {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Final Reply")
+		fmt.Fprintln(out, compactBlock(report.FinalReply, 1200))
+	}
+	return nil
+}
+
 func PrintTraceEventsWithOptions(out io.Writer, path string, opts TraceEventsOptions) error {
 	return printTraceEventsWithOptions(out, path, opts)
 }
@@ -133,12 +252,6 @@ func processEventFromTrace(event map[string]any) (ProcessEvent, bool) {
 		return processToolEndEvent(event, duration, eventTime)
 	case "tool_blocked":
 		return ProcessEvent{Type: "tool.blocked", Status: "failed", Tool: firstNonEmpty(traceString(event["tool"]), traceToolName(event)), Summary: compactInline(traceString(event["reason"]), 240), Time: eventTime}, true
-	case "approval_requested":
-		return ProcessEvent{Type: "approval.requested", Status: "pending", Tool: traceString(event["tool"]), Summary: compactInline(traceString(event["reason"]), 240), Time: eventTime}, true
-	case "approval_granted":
-		return ProcessEvent{Type: "approval.completed", Status: "approved", Tool: traceString(event["tool"]), Time: eventTime}, true
-	case "approval_rejected":
-		return ProcessEvent{Type: "approval.completed", Status: "rejected", Tool: traceString(event["tool"]), Summary: compactInline(traceString(event["reason"]), 240), Time: eventTime}, true
 	case "reply":
 		eventType := "final.completed"
 		if strings.TrimSpace(traceString(event["style"])) == "error" {
@@ -177,6 +290,200 @@ func processToolEndEvent(event map[string]any, duration int64, eventTime string)
 	}
 	content := compactInline(traceString(result["Content"]), 160)
 	return ProcessEvent{Type: eventType, Status: status, Tool: traceToolName(event), Summary: content, DurationMS: duration, Time: eventTime}, true
+}
+
+type traceReport struct {
+	TraceID      string
+	SessionKey   string
+	TaskID       string
+	AgentID      string
+	Request      string
+	Contract     traceReportContract
+	Models       []traceReportModel
+	VisibleTools []string
+	HiddenTools  int
+	ToolPolicies []traceReportToolPolicy
+	Tools        []traceReportTool
+	Judgments    []traceReportJudgment
+	FinalReply   string
+}
+
+type traceReportContract struct {
+	Summary          string
+	Known            bool
+	RequiresTools    bool
+	RequiredTools    []string
+	RequiredEvidence []traceReportEvidence
+	ExpectedOutcome  string
+}
+
+type traceReportEvidence struct {
+	Tool        string
+	Description string
+}
+
+type traceReportModel struct {
+	Provider     string
+	Model        string
+	InputTokens  int
+	OutputTokens int
+	DurationMS   int64
+}
+
+type traceReportToolPolicy struct {
+	Tool    string
+	Blocked bool
+	Reason  string
+}
+
+type traceReportTool struct {
+	Name       string
+	Args       string
+	DurationMS int64
+	Summary    string
+	Error      bool
+}
+
+type traceReportJudgment struct {
+	Type    string
+	Status  string
+	Missing []string
+}
+
+func buildTraceReport(path string) (traceReport, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return traceReport{}, err
+	}
+	defer file.Close()
+	var report traceReport
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		var event map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			continue
+		}
+		if report.TraceID == "" {
+			report.TraceID = traceString(event["trace_id"])
+		}
+		if report.SessionKey == "" {
+			report.SessionKey = traceString(event["session_key"])
+		}
+		if report.TaskID == "" {
+			report.TaskID = traceString(event["task_id"])
+		}
+		if report.AgentID == "" {
+			report.AgentID = traceString(event["agent_id"])
+		}
+		switch traceString(event["type"]) {
+		case "request":
+			report.Request = traceString(event["text"])
+		case "task_contract_created":
+			report.Contract = traceContractFromEvent(event)
+		case "task_contract_reused":
+			if report.Contract.Summary == "" {
+				report.Contract.Summary = "reused existing task contract"
+			}
+		case "model_route_selected":
+			report.Models = append(report.Models, traceReportModel{
+				Provider: traceString(event["provider"]),
+				Model:    firstNonEmpty(traceString(event["model"]), traceString(event["model_name"])),
+			})
+		case "message_start":
+			if len(report.Models) > 0 {
+				model := &report.Models[len(report.Models)-1]
+				model.DurationMS += int64Number(event["duration_ms"])
+				if message, _ := event["message"].(map[string]any); message != nil {
+					if usage, _ := message["usage"].(map[string]any); usage != nil {
+						model.Provider = firstNonEmpty(model.Provider, traceString(usage["provider"]))
+						model.Model = firstNonEmpty(model.Model, traceString(usage["model"]))
+						model.InputTokens += int(int64Number(usage["input_tokens"]))
+						model.OutputTokens += int(int64Number(usage["output_tokens"]))
+					}
+				}
+			}
+		case "context_budget_estimated":
+			if tools := stringListFromAny(event["tools"]); len(tools) > 0 {
+				report.VisibleTools = tools
+			}
+			if hidden := int(int64Number(event["hidden_tools"])); hidden > 0 {
+				report.HiddenTools = hidden
+			}
+		case "hook_event":
+			if traceString(event["hook"]) == "tool_policy_hook" {
+				report.ToolPolicies = append(report.ToolPolicies, traceReportToolPolicy{
+					Tool:    traceString(event["tool"]),
+					Blocked: boolValue(event["block"]),
+					Reason:  traceString(event["reason"]),
+				})
+			}
+		case "tool_execution_end":
+			result, _ := event["tool_result"].(map[string]any)
+			report.Tools = append(report.Tools, traceReportTool{
+				Name:       traceToolName(event),
+				Args:       traceArgsValue(event),
+				DurationMS: int64Number(event["duration_ms"]),
+				Summary:    traceString(result["Content"]),
+				Error:      boolValue(result["IsError"]),
+			})
+		case "task_contract_unsatisfied", "task_contract_satisfied", "await_user_input", "empty_action_promise":
+			report.Judgments = append(report.Judgments, traceReportJudgment{
+				Type:    traceString(event["type"]),
+				Status:  traceString(event["status"]),
+				Missing: stringListFromAny(event["missing"]),
+			})
+		case "reply":
+			report.FinalReply = traceString(event["text"])
+		}
+	}
+	return report, scanner.Err()
+}
+
+func traceContractFromEvent(event map[string]any) traceReportContract {
+	return traceReportContract{
+		Summary:          traceString(event["summary"]),
+		Known:            true,
+		RequiresTools:    boolValue(event["requires_tools"]),
+		RequiredTools:    stringListFromAny(event["required_tools"]),
+		RequiredEvidence: traceEvidenceList(event["required_evidence"]),
+		ExpectedOutcome:  traceString(event["expected_outcome"]),
+	}
+}
+
+func traceEvidenceList(value any) []traceReportEvidence {
+	items, _ := value.([]any)
+	out := make([]traceReportEvidence, 0, len(items))
+	for _, item := range items {
+		obj, _ := item.(map[string]any)
+		if obj == nil {
+			continue
+		}
+		evidence := traceReportEvidence{
+			Tool:        traceString(obj["tool"]),
+			Description: traceString(obj["description"]),
+		}
+		if evidence.Tool != "" || evidence.Description != "" {
+			out = append(out, evidence)
+		}
+	}
+	return out
+}
+
+func stringListFromAny(value any) []string {
+	items, _ := value.([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if text := traceString(item); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func boolValue(value any) bool {
+	v, _ := value.(bool)
+	return v
 }
 
 func traceToolName(event map[string]any) string {

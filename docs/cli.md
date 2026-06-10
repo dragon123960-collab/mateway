@@ -59,7 +59,6 @@ P1/P2 通用控制台命令：
 - `/fetch-history --from <channel:target> [--limit <n>]`：从远端 channel 主动拉历史并导入当前 session。
 - `/memory search <query>`：搜索当前 agent 可用记忆。
 - `/memory proposals`：查看待确认的记忆/经验沉淀。
-- `/approvals`：查看当前或最近的人工审批记录。
 - `/config`：查看当前配置摘要，不输出 secret。
 - `/workspace`：查看本地工作目录、可访问路径和 sandbox 状态。
 
@@ -129,10 +128,9 @@ mateway tui --session cli:review
 - `Ctrl+C`：退出。
 - `↑/↓`：滚动过程历史。
 - `PageUp/PageDown`：大步滚动过程历史。
-- 审批时在底部输入 `y` 或 `n` 后回车。
 - 支持基础 slash command：`/help`、`/exit`、`/new`、`/session`、`/sessions`、`/resume`、`/show`、`/trace`、`/events`。
 
-当前 TUI 已采用 Bubble Tea / Bubbles / Lip Gloss 作为成熟 Go TUI 框架，不再扩展手写 ANSI/raw input 实现。界面参考 opencode 的 split-footer 思路：上方过程区追加 transcript / tool event，底部 footer 负责输入、状态和命令入口，宽屏时右侧常驻 Mateway 状态栏。Todo、工具详情、审批和问题不应照搬为编程任务侧栏，而应作为过程区的结构化 entry、右侧状态摘要或底部临时 panel 展示。
+当前 TUI 已采用 Bubble Tea / Bubbles / Lip Gloss 作为成熟 Go TUI 框架，不再扩展手写 ANSI/raw input 实现。界面参考 opencode 的 split-footer 思路：上方过程区追加 transcript / tool event，底部 footer 负责输入、状态和命令入口，宽屏时右侧常驻 Mateway 状态栏。Todo、工具详情和问题不应照搬为编程任务侧栏，而应作为过程区的结构化 entry、右侧状态摘要或底部临时 panel 展示。
 
 opencode 的 TUI 使用 `@opentui/core`、`@opentui/solid` 和 `@opentui/keymap`，输入由 textarea 组件处理，宽度使用成熟 string-width 能力，scrollback 与 footer 分离。Mateway 对应采用 Bubbles `viewport` 承载过程区、`textarea` 承载底部输入、Lip Gloss 负责状态行和样式、`go-runewidth` 处理中文宽度。后续 TUI 改进必须优先落在这些组件之上，避免重新引入自维护终端渲染逻辑。
 
@@ -140,7 +138,7 @@ opencode 的 TUI 使用 `@opentui/core`、`@opentui/solid` 和 `@opentui/keymap`
 
 - 鼠标滚动和右侧滚动条来自 renderer 的 mouse support 与独立 `scrollbox`，不是业务层判断鼠标在左侧还是右侧。
 - 光标闪烁由 textarea/cursor 组件负责；TUI 应使用终端真实 cursor，不要用文本字符模拟。
-- 底部状态应显示 Mateway 自己的状态，例如 `Idle`、`Thinking`、`Acting`、`Approval`，不要照搬 `Build` 等 opencode agent 标签。
+- 底部状态应显示 Mateway 自己的状态，例如 `Idle`、`Thinking`、`Acting`，不要照搬 `Build` 等 opencode agent 标签。
 - 模型名称应来自 Mateway 配置里的实际 model，不附加模仿式 provider 文案。
 
 右侧常驻状态栏应优先展示 Mateway 的网关信息：
@@ -149,7 +147,7 @@ opencode 的 TUI 使用 `@opentui/core`、`@opentui/solid` 和 `@opentui/keymap`
 - 当前任务状态、过程事件数量、最新 trace。
 - 本地上下文，例如 cwd、workspace、可访问路径和 sandbox 状态。
 - channel bridge 状态，例如 CLI、飞书、微信账号是否启用。
-- 工具/审批状态，例如启用工具数量、是否等待确认。
+- 工具状态，例如启用工具数量、最近工具执行结果和 blocked tool。
 - 关键 slash 命令提示。
 
 ## 差异化
@@ -157,23 +155,10 @@ opencode 的 TUI 使用 `@opentui/core`、`@opentui/solid` 和 `@opentui/keymap`
 Mateway CLI 可以学习 opencode / Claude Code 的交互清晰度，但定位不同：
 
 - 编程 CLI 的中心是代码仓库、diff、LSP、测试和 Todo；Mateway 的中心是跨 channel session、agent profile、tool contract、trace、memory 和本地控制。
-- 编程 CLI 的右侧栏适合显示 Todo / LSP / cost；Mateway 的右侧栏应显示 gateway、channel、session、agent、model、tool 和 approval 状态。
+- 编程 CLI 的右侧栏适合显示 Todo / LSP / cost；Mateway 的右侧栏应显示 gateway、channel、session、agent、model 和 tool 状态。
 - 编程 CLI 的 `/init`、`/diff`、`/commit` 是高频；Mateway 的高频是 `/resume`、`/sessions`、`/trace`、`/events`、`/tools`、`/model`、`/send`、`/fetch-history`。
 - 编程 CLI 主要接管本地项目；Mateway 要能把飞书/微信里的任务拉回本地继续，也要能从本地把消息、结果、提醒发回远端 channel。
 - 编程 CLI 的可观测性服务于代码变更；Mateway 的可观测性服务于 agent 网关调试，必须能回答“哪个 agent、哪个 channel、哪个 session、调用了什么工具、成功还是失败、trace 在哪”。
-
-## 审批
-
-交互式 `mateway chat` 会对需要人工确认的高风险本地操作暂停并提示：
-
-```text
-[approval] terminal command requires approval: shell
-tool: terminal.run
-detail: npm install
-allow? [y/N]:
-```
-
-当前 P1 先覆盖 `terminal.run` 中无法判定为只读的 shell / unknown / guarded mutation 命令。Destructive 命令仍然由工具策略硬阻止，不进入审批。
 
 ## 工具清单
 
@@ -186,7 +171,7 @@ mateway tools disable terminal.run --agent main
 mateway tools enable terminal.run --agent main
 ```
 
-这个命令用于调试 agent 当前能调用哪些工具，以及哪些工具会触发审批或硬阻止。启停状态写入 `agents.profiles[].tools.allow/deny`：默认没有 allow list 时，除 deny 之外的内置工具都可用；如果配置了 allow list，则只有 allow 中的工具可用。
+这个命令用于调试 agent 当前能调用哪些工具，以及哪些工具有 hard boundary 或会被策略阻止。启停状态写入 `agents.profiles[].tools.allow/deny`：默认没有 allow list 时，除 deny 之外的内置工具都可用；如果配置了 allow list，则只有 allow 中的工具可用。
 
 ## 模型诊断
 
@@ -230,9 +215,9 @@ Assistant
 最终回复文本
 ```
 
-在 TTY 中，过程符号会用低对比或状态色区分：thought 黄色、调用蓝色、成功绿色、失败红色、approval 黄色。`waiting for model output` 这类高频空转事件默认不显示；`file.read`、`project.index` 这类读操作的结果内容默认折叠，只显示成功和耗时，详细内容留给 trace / NDJSON 事件。管道和测试输出不带 ANSI 颜色；需要机器可读事件时使用 `--events` 或 `/events --json`。
+在 TTY 中，过程符号会用低对比或状态色区分：thought 黄色、调用蓝色、成功绿色、失败红色。`waiting for model output` 这类高频空转事件默认不显示；`file.read`、`project.index` 这类读操作的结果内容默认折叠，只显示成功和耗时，详细内容留给 trace / NDJSON 事件。管道和测试输出不带 ANSI 颜色；需要机器可读事件时使用 `--events` 或 `/events --json`。
 
-这些是操作状态，不是 chain-of-thought。CLI 只展示“正在调用什么、返回了什么、等待什么、需要什么权限”。
+这些是操作状态，不是 chain-of-thought。CLI 只展示“正在调用什么、返回了什么、等待什么、被什么策略阻止”。
 
 ## 后续优先级
 

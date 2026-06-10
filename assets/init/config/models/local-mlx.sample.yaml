@@ -1,0 +1,16 @@
+# Copy this file to local-mlx.yaml.
+# Start mlx_lm.server locally before enabling this model.
+
+name: local-mlx
+provider: mlx_lm
+api: openai
+model: Qwen2.5-14B-Instruct-4bit
+api_base: http://127.0.0.1:8080/v1
+api_key: local
+api_key_env: ""
+modalities: [text]
+context_window: 32768
+max_tokens: 4096
+strip_reasoning: false
+enabled: false
+description: "Local mlx_lm.server model on 127.0.0.1:8080. Set enabled: true after the server is running."

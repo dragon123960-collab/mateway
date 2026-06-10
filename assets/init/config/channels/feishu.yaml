@@ -1,0 +1,31 @@
+feishu:
+  enabled: false
+  default_account: default
+  app_id: ""
+  app_id_env: MATEWAY_FEISHU_APP_ID
+  app_secret: ""
+  app_secret_env: MATEWAY_FEISHU_APP_SECRET
+  verification_token: ""
+  verification_token_env: MATEWAY_FEISHU_VERIFICATION_TOKEN
+  encrypt_key: ""
+  encrypt_key_env: MATEWAY_FEISHU_ENCRYPT_KEY
+  base_url: https://open.feishu.cn
+  bot_name: mateway
+  auto_reply: true
+  mention_required_in_group: true
+  webhook:
+    enabled: false
+    addr: 127.0.0.1:8788
+    path: /feishu/events
+  websocket:
+    enabled: true
+  accounts: []
+  # Multiple Feishu bots can share channel: feishu. Each enabled account starts a
+  # WebSocket client and sets metadata.account_id for agent bindings.
+  # accounts:
+  #   - id: ops-bot
+  #     app_id_env: MATEWAY_FEISHU_OPS_APP_ID
+  #     app_secret_env: MATEWAY_FEISHU_OPS_APP_SECRET
+  #   - id: local-bot
+  #     app_id_env: MATEWAY_FEISHU_LOCAL_APP_ID
+  #     app_secret_env: MATEWAY_FEISHU_LOCAL_APP_SECRET

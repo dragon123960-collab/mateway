@@ -12,7 +12,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/runtime"
@@ -182,7 +181,6 @@ func (s *chatState) ask(ctx context.Context, text string) error {
 	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	rt := runtime.New(s.cfg)
-	rt.Hooks.ApproveToolCall = s.approveToolCall
 	renderer := &Renderer{Out: s.out}
 	rt.ProgressSink = renderer.Progress
 	renderer.User(text)
@@ -195,33 +193,6 @@ func (s *chatState) ask(ctx context.Context, text string) error {
 		fmt.Fprintln(s.out, "trace:", resp.TracePath)
 	}
 	return nil
-}
-
-func (s *chatState) approveToolCall(_ context.Context, req runtime.ApprovalRequest) (runtime.ApprovalDecision, error) {
-	color := outputColorEnabled(s.out)
-	fmt.Fprintln(s.out)
-	fmt.Fprintln(s.out, colorize("! Approval required", ansiYellow, color))
-	fmt.Fprintln(s.out, "  reason:", req.Reason)
-	fmt.Fprintln(s.out, "  tool:  ", friendlyToolName(req.ToolCall.Name))
-	if detail := approvalDetail(req.ToolCall); detail != "" {
-		fmt.Fprintln(s.out, "  detail:", detail)
-	}
-	fmt.Fprint(s.out, "allow? [y/N]: ")
-	line, err := s.readLine()
-	if err != nil && strings.TrimSpace(line) == "" {
-		return runtime.ApprovalDecision{Approved: false, Reason: "approval input failed"}, nil
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return runtime.ApprovalDecision{Approved: answer == "y" || answer == "yes"}, nil
-}
-
-func approvalDetail(call agentcore.ToolCall) string {
-	switch call.Name {
-	case "terminal.run":
-		return compactInline(fmt.Sprint(call.Args["command"]), 240)
-	default:
-		return compactInline(fmt.Sprint(call.Args), 240)
-	}
 }
 
 func (s *chatState) handleSlash(ctx context.Context, cmd SlashCommand) (bool, error) {

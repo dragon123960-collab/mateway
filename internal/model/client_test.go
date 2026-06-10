@@ -76,6 +76,27 @@ func TestParseOpenAIChatResultToolCalls(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIChatResultReasoningContent(t *testing.T) {
+	result, err := parseOpenAIResult([]byte(`{
+		"choices":[{
+			"message":{
+				"role":"assistant",
+				"reasoning":"hello from mlx"
+			}
+		}],
+		"usage":{"prompt_tokens":17,"completion_tokens":16,"total_tokens":33}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "hello from mlx" {
+		t.Fatalf("unexpected text %q", result.Text)
+	}
+	if result.Usage.InputTokens != 17 || result.Usage.OutputTokens != 16 || result.Usage.TotalTokens != 33 {
+		t.Fatalf("unexpected usage %#v", result.Usage)
+	}
+}
+
 func TestToolParametersIncludesOptionalProperties(t *testing.T) {
 	params := toolParameters(fakeTool{
 		name:     "terminal.run",

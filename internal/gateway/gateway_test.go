@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
@@ -171,6 +172,16 @@ func TestFeishuProgressTextCompactsLongSummary(t *testing.T) {
 	}
 }
 
+func TestCompactProgressLineTextKeepsUTF8(t *testing.T) {
+	got := compactProgressLineText("汇总完整出行规划并给出可执行建议", 9)
+	if !utf8.ValidString(got) {
+		t.Fatalf("compact progress text returned invalid UTF-8: %q", got)
+	}
+	if !strings.Contains(got, "...") {
+		t.Fatalf("expected truncated text with suffix, got %q", got)
+	}
+}
+
 func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
 	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	state, err := rt.Store.Load("cli:test")
@@ -178,12 +189,31 @@ func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	task := state.StartTask("review memory proposal")
-	state.Pending = &session.PendingAction{Kind: "memory_proposal_review", TaskID: task.ID, ProposalID: "prop_test"}
+	state.Pending = &session.PendingAction{Kind: session.PendingKindMemoryProposalReview, TaskID: task.ID, ProposalID: "prop_test"}
 	if err := rt.Store.Save(state); err != nil {
 		t.Fatal(err)
 	}
 	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "1"}) {
 		t.Fatal("expected pending session to skip processing ack")
+	}
+}
+
+func TestShouldSendProcessingAckAllowsTaskPlanExecute(t *testing.T) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := state.StartTask("execute plan")
+	state.Pending = &session.PendingAction{Kind: session.PendingKindTaskPlanConfirm, TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "1"}) {
+		t.Fatal("expected task plan execution to send processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "2"}) {
+		t.Fatal("expected replan control to skip processing ack")
 	}
 }
 

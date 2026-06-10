@@ -11,7 +11,7 @@ import (
 	"github.com/dongping/mateway/internal/config"
 )
 
-func (ToolResultReadTool) Name() string { return "tool_result.read" }
+func (ToolResultReadTool) Name() string { return "toolresult.read" }
 func (ToolResultReadTool) Description() string {
 	return "retrieve original tool output by raw_ref from a compacted tool result"
 }
@@ -68,7 +68,7 @@ func (t ToolResultReadTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	}
 	runes := []rune(content)
 	if len(runes) > limit {
-		content = string(runes[:limit]) + fmt.Sprintf("\n...[truncated %d chars; call tool_result.read with a query or higher limit for more]...", len(runes)-limit)
+		content = string(runes[:limit]) + fmt.Sprintf("\n...[truncated %d chars; call toolresult.read with a query or higher limit for more]...", len(runes)-limit)
 		evidence["partial"] = true
 	} else {
 		evidence["partial"] = false

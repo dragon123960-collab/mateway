@@ -44,6 +44,12 @@
 | `task.search` | 搜索当前和 archived session tasks | 找旧任务时先搜索；候选多个时让用户选择。 |
 | `task.resume` | 加载历史 task context | 只读历史上下文，不修改 archive。 |
 
+## 压缩结果回读
+
+| 工具 | 用途 | 关键边界 |
+| --- | --- | --- |
+| `toolresult.read` | 按 `raw_ref` 回读被压缩的大型工具输出 | 只读取本地 artifact store；可用多关键词 `query` 返回命中行上下文和 line ranges，避免把完整输出重新塞进 prompt。 |
+
 ## 非默认工具
 
 以下能力不在默认 registry 中：

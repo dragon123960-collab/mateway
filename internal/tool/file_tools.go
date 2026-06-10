@@ -569,6 +569,9 @@ func (t FileReadTool) Run(ctx context.Context, call agentcore.ToolCall) agentcor
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
 	}
+	if err := rejectProtectedReadPath(path, t.Config); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
@@ -607,4 +610,25 @@ func isLikelyBinary(data []byte) bool {
 		}
 	}
 	return !utf8.Valid(data)
+}
+
+func rejectProtectedReadPath(path string, cfg *config.Root) error {
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	home := configHome(cfg)
+	protected := []string{
+		filepath.Join(home, "secrets"),
+	}
+	for _, root := range protected {
+		rootAbs, err := filepath.Abs(filepath.Clean(root))
+		if err != nil || rootAbs == "" {
+			continue
+		}
+		if clean == rootAbs || strings.HasPrefix(clean, rootAbs+string(filepath.Separator)) {
+			return fmt.Errorf("refusing to read protected path %s", clean)
+		}
+	}
+	return nil
 }

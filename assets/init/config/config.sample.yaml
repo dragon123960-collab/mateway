@@ -1,0 +1,151 @@
+# Copy this file to config.yaml, then adjust model defaults, agents, and bindings.
+# Model endpoint details live in models/*.yaml.
+app:
+  name: mateway
+  home: ""
+  workspace: ""
+
+model:
+  default: glm-4.7-flash
+  fallbacks:
+    - minimax
+  roles:
+    vision:
+      - glm-4.6v-flash
+      - minimax
+    strong: minimax
+
+execution:
+  max_parallel_tools: 4
+  max_iterations: 50
+  inactivity_timeout: 5m
+  context_budget:
+    enabled: true
+    soft_ratio: 0.65
+    hard_ratio: 0.90
+    recent_turns: 8
+    tool_result_target_tokens: 1200
+    max_visible_tools: 8
+    trace_telemetry: true
+
+memory:
+  enabled: true
+  root: ""
+  recent_days: 3
+  auto_propose: true
+  auto_commit_low_risk: false
+  proposal_nudge:
+    enabled: true
+    interval: 24h
+    channels:
+      - cli
+    max_proposals: 3
+
+learning:
+  enabled: true
+  skill_crystallization:
+    enabled: true
+    success_threshold: 3
+    min_confidence: medium
+
+skills:
+  catalogs:
+    - name: skills.sh
+      enabled: true
+      base_url: https://skills.sh
+      search_url: "https://skills.sh/?q={query}"
+      install_url: ""
+      trust_level: high
+    - name: skillhub.cn
+      enabled: false
+      base_url: https://skillhub.cn
+      search_url: "https://skillhub.cn/search?q={query}"
+      install_url: ""
+      trust_level: unknown
+    - name: clawhub.ai
+      enabled: false
+      base_url: https://clawhub.ai
+      search_url: "https://clawhub.ai/search?q={query}"
+      install_url: ""
+      trust_level: medium
+
+remote:
+  profiles: []
+
+scheduler:
+  enabled: false
+  timezone: Asia/Shanghai
+  state_dir: ""
+  interval: 30s
+
+agents:
+  default: main
+  profiles:
+    - id: main
+      name: Main Assistant
+      default: true
+      session_namespace: main
+      heartbeat:
+        enabled: false
+        interval: 30m
+        schedule:
+          daily_at: "03:30"
+        jobs:
+          - memory_lint
+          - memory_index_rebuild
+          - memory_distill
+          - learning_distill
+          - skill_learning
+        auto_send_summary: false
+        quiet_hours:
+          start: "23:00"
+          end: "08:00"
+      skills:
+        allow: []
+        deny: []
+      tools:
+        allow: []
+        deny: []
+  bindings:
+    - channel: cli
+      agent_id: main
+    - channel: feishu
+      agent_id: main
+
+security:
+  enforce_workspace_paths: true
+  accessible_paths: []
+  terminal_sandbox:
+    enabled: false
+    mode: restricted
+    workdir: ""
+    timeout_seconds: 20
+    command_prefix: []
+
+search:
+  default_tool: tavily
+  provider_order: [tavily, searxng, duckduckgo]
+  cache_enabled: true
+  cache_ttl_hours: 168
+  fresh_cache_ttl_hours: 6
+  providers:
+    tavily:
+      enabled: false
+      base_url: https://api.tavily.com/search
+      api_key_env: TAVILY_API_KEY
+      timeout_seconds: 8
+      max_results: 5
+      daily_budget: 20
+      monthly_budget: 900
+      search_depth: basic
+      topic: general
+    searxng:
+      enabled: false
+      base_url: http://127.0.0.1:8088
+      timeout_seconds: 8
+      max_results: 5
+    duckduckgo:
+      enabled: true
+      timeout_seconds: 4
+      max_results: 5
+      region: cn-zh

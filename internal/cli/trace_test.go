@@ -86,6 +86,49 @@ func TestPrintTraceEventsJSONRendersNormalizedEvents(t *testing.T) {
 	}
 }
 
+func TestPrintTraceReportShowsContractToolsAndJudgment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.jsonl")
+	lines := []string{
+		`{"type":"request","trace_id":"trace-1","session_key":"cli:test","task_id":"task-1","agent_id":"main","text":"check singbox status"}`,
+		`{"type":"task_contract_created","summary":"check singbox status","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"tool":"terminal.run","description":"systemctl status output"}],"expected_outcome":"status report"}`,
+		`{"type":"model_route_selected","provider":"minimax","model":"MiniMax-M3"}`,
+		`{"type":"context_budget_estimated","tools":["web.search","terminal.run"],"hidden_tools":2}`,
+		`{"type":"hook_event","hook":"tool_policy_hook","tool":"terminal.run","block":false}`,
+		`{"type":"tool_execution_end","duration_ms":34,"tool_call":{"Name":"terminal.run","Args":{"command":"ssh overseas 'systemctl status sing-box --no-pager'"}},"tool_result":{"Content":"active","IsError":false}}`,
+		`{"type":"task_contract_satisfied","status":"completed"}`,
+		`{"type":"reply","text":"sing-box is active"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := PrintTraceReport(&out, path); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{
+		"Trace Report",
+		"Request",
+		"Task Contract",
+		"required_tools: terminal.run",
+		"Models",
+		"minimax/MiniMax-M3",
+		"Visible Tools",
+		"web.search, terminal.run",
+		"Tool Process",
+		"policy allowed: terminal.run",
+		"ok terminal.run",
+		"Result Judgment",
+		"task_contract_satisfied status=completed",
+		"Final Reply",
+		"sing-box is active",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in:\n%s", want, text)
+		}
+	}
+}
+
 func TestPrintTraceEventsDoesNotRenderFinalMessageStartAsThinking(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl")
 	if err := os.WriteFile(path, []byte(`{"type":"message_start","message":{"Content":"final answer"}}`+"\n"+`{"type":"reply","text":"final answer"}`+"\n"), 0o644); err != nil {

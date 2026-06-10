@@ -62,6 +62,7 @@ type ExecutionFrame struct {
 	Status        string           `json:"status,omitempty"`
 	OriginalTask  string           `json:"original_task,omitempty"`
 	Contract      *TaskContract    `json:"contract,omitempty"`
+	TraceRefs     []TraceRef       `json:"trace_refs,omitempty"`
 	CurrentStepID string           `json:"current_step_id,omitempty"`
 	CurrentNodeID string           `json:"current_node_id,omitempty"`
 	Events        []ExecutionEvent `json:"events,omitempty"`
@@ -73,9 +74,20 @@ type TaskContract struct {
 	RequiresTools    bool                   `json:"requires_tools,omitempty"`
 	RequiredTools    []string               `json:"required_tools,omitempty"`
 	RequiredEvidence []TaskEvidenceContract `json:"required_evidence,omitempty"`
+	PlanItems        []TaskPlanItem         `json:"plan_items,omitempty"`
 	ExpectedOutcome  string                 `json:"expected_outcome,omitempty"`
 	CompletionPolicy string                 `json:"completion_policy,omitempty"`
 	CreatedAt        time.Time              `json:"created_at,omitempty"`
+}
+
+type TaskPlanItem struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Status    string    `json:"status"`
+	Tool      string    `json:"tool,omitempty"`
+	Criteria  string    `json:"criteria,omitempty"`
+	Evidence  string    `json:"evidence,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 type TaskEvidenceContract struct {
@@ -83,6 +95,19 @@ type TaskEvidenceContract struct {
 	Tool        string `json:"tool,omitempty"`
 	Description string `json:"description,omitempty"`
 }
+
+type TraceRef struct {
+	TraceID   string    `json:"trace_id,omitempty"`
+	TracePath string    `json:"trace_path,omitempty"`
+	Phase     string    `json:"phase,omitempty"`
+	MessageID string    `json:"message_id,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+}
+
+const (
+	PendingKindMemoryProposalReview = "memory_proposal_review"
+	PendingKindTaskPlanConfirm      = "task_plan_confirm"
+)
 
 type ExecutionEvent struct {
 	ID        string         `json:"id,omitempty"`
@@ -96,10 +121,12 @@ type ExecutionEvent struct {
 }
 
 type PendingAction struct {
-	Kind       string `json:"kind"`
-	TaskID     string `json:"task_id"`
-	ProposalID string `json:"proposal_id,omitempty"`
-	Question   string `json:"question,omitempty"`
+	Kind        string `json:"kind"`
+	TaskID      string `json:"task_id"`
+	ProposalID  string `json:"proposal_id,omitempty"`
+	Question    string `json:"question,omitempty"`
+	Feedback    string `json:"feedback,omitempty"`
+	ReplanCount int    `json:"replan_count,omitempty"`
 }
 
 type Usage struct {
@@ -360,6 +387,20 @@ func (s *State) AwaitUserInputActiveTaskWithSummary(summary, traceID, tracePath 
 	}
 }
 
+func (s *State) SetTaskTrace(taskID, traceID, tracePath string) {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			s.Tasks[i].TraceID = strings.TrimSpace(traceID)
+			s.Tasks[i].TracePath = strings.TrimSpace(tracePath)
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
 func (s *State) BlockActiveTask(kind string) {
 	for i := range s.Tasks {
 		if s.Tasks[i].ID == s.ActiveTask {
@@ -411,6 +452,51 @@ func (s *State) AddExecutionEvent(taskID string, event ExecutionEvent) {
 				event.CreatedAt = now
 			}
 			s.Tasks[i].Execution.Events = append(s.Tasks[i].Execution.Events, event)
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func (s *State) AddTraceRef(taskID string, ref TraceRef) {
+	now := time.Now()
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			if ref.CreatedAt.IsZero() {
+				ref.CreatedAt = now
+			}
+			ref.TraceID = strings.TrimSpace(ref.TraceID)
+			ref.TracePath = strings.TrimSpace(ref.TracePath)
+			ref.Phase = strings.TrimSpace(ref.Phase)
+			ref.MessageID = strings.TrimSpace(ref.MessageID)
+			for j := range s.Tasks[i].Execution.TraceRefs {
+				existing := &s.Tasks[i].Execution.TraceRefs[j]
+				if existing.TraceID != "" && existing.TraceID == ref.TraceID {
+					if ref.TracePath != "" {
+						existing.TracePath = ref.TracePath
+					}
+					if ref.Phase != "" {
+						existing.Phase = ref.Phase
+					}
+					if ref.MessageID != "" {
+						existing.MessageID = ref.MessageID
+					}
+					s.Tasks[i].TraceID = ref.TraceID
+					s.Tasks[i].TracePath = ref.TracePath
+					s.Tasks[i].Execution.UpdatedAt = now
+					s.Tasks[i].UpdatedAt = now
+					return
+				}
+			}
+			s.Tasks[i].Execution.TraceRefs = append(s.Tasks[i].Execution.TraceRefs, ref)
+			if ref.TraceID != "" {
+				s.Tasks[i].TraceID = ref.TraceID
+			}
+			if ref.TracePath != "" {
+				s.Tasks[i].TracePath = ref.TracePath
+			}
 			s.Tasks[i].Execution.UpdatedAt = now
 			s.Tasks[i].UpdatedAt = now
 			return

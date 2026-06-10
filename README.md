@@ -84,7 +84,7 @@ Every run writes a JSONL trace:
 
 - request and channel
 - model turns
-- model request count and token usage when the provider returns usage metadata
+- model request count, token usage, cache usage, and context-budget telemetry when available
 - tool calls and tool results
 - hook events
 - final reply
@@ -99,10 +99,13 @@ Sessions are runtime state, not an ever-growing raw chat log. Before each model 
 - the current agent profile Markdown files
 - discovered skill guidance
 - relevant long-term memory snippets when `memory_safe_read` triggers
+- the deterministic session summary, including recent outcomes, open items, and accepted evidence
 - the compacted recent session transcript
 - the current user message
 
-System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, trace ids, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt.
+System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, task contracts, trace refs, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt. For action-oriented tasks, the task contract can include lightweight `plan_items`; Mateway asks for confirmation before executing the first plan, then updates item status from tool results while preserving per-run trace files.
+
+Mateway also runs an invisible context economy before every model turn. It estimates input tokens against the selected model's `context_window` and `max_tokens`, automatically compacts old transcript/tool content over a soft budget, stops only at a hard budget, and records estimated savings in trace/TUI diagnostics. Tool schemas are exposed dynamically: each model turn sees only relevant tool contracts, while the full registry remains available for execution. Full compacted tool output is stored as `raw_ref`; `toolresult.read` can retrieve the original output by `raw_ref` and optional multi-term `query`, returning matching line snippets and line ranges instead of feeding large outputs back into the prompt.
 
 Feishu image messages are downloaded under `~/.mateway/media`, and Weixin media items are normalized into the same message part schema when the channel provides a URL or local path. Transcripts store media references, not inline image bytes. Model details, enable switches, `context_window`, and `max_tokens` live in `~/.mateway/config/models/*.yaml`; `config.yaml` only selects defaults, fallbacks, and roles. If the selected model declares `modalities: [text, image]`, the user text and image parts are sent together in the same user turn. Otherwise Mateway can use `model.roles.vision` as a single model or ordered list such as `vision: [glm-4.6v-flash, minimax]` before falling back to other image-capable models. Audio, video, and file parts are reserved in the message schema for future channel support.
 
@@ -143,6 +146,8 @@ Mateway currently supports:
 - built-in tools: `file.read`, `file.write`, `file.delete`, `project.index`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, schedule management tools, and `task.search` / `task.resume`
 - native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
 - parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
+- invisible token economy: per-turn context budgets, session summaries, dynamic visible tools, compacted tool results, and `raw_ref` query retrieval
+- usage diagnostics for provider tokens, cache read/write tokens, estimated input tokens, and estimated compaction savings
 - local secret store: `mateway secret set/get/list/delete`
 - hook events in trace
 - workspace profile injection
@@ -175,6 +180,8 @@ go build -o build/mateway ./cmd/mateway
 ```bash
 ./build/mateway init
 ```
+
+`mateway init` reads default config, model/channel samples, shared skills, and memory templates from `assets/init`. When using a release download, keep the `assets/` directory next to the `mateway` binary, or pass `--assets-dir /path/to/assets/init`. `MATEWAY_ASSETS_DIR` provides the same override for scripts and packaging.
 
 This creates:
 
@@ -365,9 +372,10 @@ All runtime entrypoints share the same AgentCore loop, so CLI, Feishu, Weixin, a
 Use traces to inspect:
 
 - model/tool/runtime latency
-- model request count and input/output/total tokens
+- model request count, input/output/total tokens, cache read/write tokens, estimated input tokens, and context compaction savings
 - hook decisions
 - tool calls and acceptance evidence
+- context budget decisions, visible tool counts, hidden tool counts, and session summary updates
 - memory proposal generation
 - Feishu gateway timing
 
@@ -384,6 +392,15 @@ Use traces to inspect:
   indexes/       # rebuildable memory indexes
   run/           # runtime files such as gateway locks
 ```
+
+For fresh runtime testing without losing configuration, secrets, profiles, or skills:
+
+```bash
+./build/mateway home reset-runtime        # dry-run
+./build/mateway home reset-runtime --apply
+```
+
+This removes generated runtime state such as sessions, traces, observe data, indexes, schedules, logs, tmp files, and raw tool-result artifacts. It preserves `config/`, `secrets/`, `workspace/`, and saved connector credentials such as `run/weixin/accounts/`.
 
 Workspace:
 
@@ -540,6 +557,7 @@ The current usable release is focused on: a stable small-core runtime, multi-age
 - Hook pipeline
 - Tool policy with destructive command blocking
 - JSONL traces
+- Per-turn context budget, dynamic visible tools, cache usage telemetry, and deterministic session summary
 - Skill discovery and context injection
 - Local secret store and skill secret scanning
 - Markdown memory lint/search/index

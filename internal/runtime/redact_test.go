@@ -137,6 +137,17 @@ func TestRuntimeFinalReplyRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestRedactSecretStringRedactsCommonTokenPrefixes(t *testing.T) {
+	text := `token ghp_FAKE_FAKE_FAKE_0123456789abcdef and sk-abcdefghijklmnopqrstuvwxyz`
+	got := redactSecretString(text)
+	if strings.Contains(got, "ghp_FAKE") || strings.Contains(got, "sk-abcdefghijklmnopqrstuvwxyz") {
+		t.Fatalf("expected common token prefixes to be redacted, got %q", got)
+	}
+	if strings.Count(got, redactedSecret) != 2 {
+		t.Fatalf("expected two redacted markers, got %q", got)
+	}
+}
+
 func TestFileReadTraceRedactsSkillSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}

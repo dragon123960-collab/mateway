@@ -1,0 +1,13 @@
+name: agnes-2-flash
+provider: agnes
+api: openai_chat
+model: agnes-2.0-flash
+api_base: https://apihub.agnes-ai.com/v1
+api_key: ""
+api_key_env: AGNES_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 8192
+strip_reasoning: false
+enabled: true
+description: agnes-2.0-flash OpenAI-compatible fast agent model for tool workflows, coding, reasoning, and multi-turn production tasks.

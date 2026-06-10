@@ -79,6 +79,7 @@ func run(args []string) error {
 	case "init":
 		fs := flag.NewFlagSet("mateway init", flag.ContinueOnError)
 		homeFlag := fs.String("home", "", "override MATEWAY_HOME for initialization")
+		assetsDirFlag := fs.String("assets-dir", "", "override init assets directory")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -86,7 +87,7 @@ func run(args []string) error {
 		if home == "" {
 			home = config.DefaultHome()
 		}
-		if err := config.EnsureDefaultConfigFiles(home); err != nil {
+		if err := config.EnsureDefaultConfigFilesWithAssets(home, *assetsDirFlag); err != nil {
 			return err
 		}
 		fmt.Println("initialized", home)
@@ -182,6 +183,7 @@ func run(args []string) error {
 	case "trace":
 		fs := flag.NewFlagSet("mateway trace", flag.ContinueOnError)
 		events := fs.Bool("events", false, "print process events")
+		report := fs.Bool("report", false, "print a human-readable execution report")
 		jsonEvents := fs.Bool("json", false, "print process events as NDJSON; requires --events")
 		if err := fs.Parse(args[1:]); err != nil {
 			if err == flag.ErrHelp {
@@ -190,10 +192,16 @@ func run(args []string) error {
 			return err
 		}
 		if len(fs.Args()) != 1 {
-			return fmt.Errorf("usage: mateway trace [--events] <trace-jsonl-path>")
+			return fmt.Errorf("usage: mateway trace [--events|--report] <trace-jsonl-path>")
+		}
+		if *report && *events {
+			return fmt.Errorf("--report cannot be combined with --events")
 		}
 		if *events {
 			return cli.PrintTraceEventsWithOptions(os.Stdout, fs.Args()[0], cli.TraceEventsOptions{JSON: *jsonEvents})
+		}
+		if *report {
+			return cli.PrintTraceReport(os.Stdout, fs.Args()[0])
 		}
 		if *jsonEvents {
 			return fmt.Errorf("--json requires --events")
@@ -461,6 +469,7 @@ Usage:
   mateway schedule serve
   mateway sandbox report
   mateway home report
+  mateway home reset-runtime [--apply]
   mateway skill list
   mateway skill catalog report
   mateway skill search [--all] <query>

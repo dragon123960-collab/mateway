@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -186,7 +187,7 @@ func printSessionState(state session.State, path string) {
 
 func runHome(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway home <report>")
+		return fmt.Errorf("usage: mateway home <report|reset-runtime>")
 	}
 	switch args[0] {
 	case "report":
@@ -216,9 +217,136 @@ func runHome(args []string) error {
 			fmt.Printf("- %s: %s\n", item.Name, item.Kind)
 		}
 		return nil
+	case "reset-runtime":
+		fs := flag.NewFlagSet("mateway home reset-runtime", flag.ContinueOnError)
+		apply := fs.Bool("apply", false, "actually remove generated runtime state")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("usage: mateway home reset-runtime [--apply]")
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		result, err := resetRuntimeHome(cfg.App.Home, *apply)
+		if err != nil {
+			return err
+		}
+		fmt.Println("home:", result.Home)
+		fmt.Println("mode:", result.Mode)
+		fmt.Println("preserved:")
+		for _, path := range result.Preserved {
+			fmt.Println("-", path)
+		}
+		fmt.Println("targets:")
+		for _, target := range result.Targets {
+			fmt.Printf("- %s: %s\n", target.RelPath, target.Status)
+		}
+		if !*apply {
+			fmt.Println("apply: false")
+			fmt.Println("hint: rerun with --apply to remove generated runtime state")
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: mateway home <report>")
+		return fmt.Errorf("usage: mateway home <report|reset-runtime>")
 	}
+}
+
+type runtimeResetResult struct {
+	Home      string
+	Mode      string
+	Preserved []string
+	Targets   []runtimeResetTarget
+}
+
+type runtimeResetTarget struct {
+	RelPath string
+	Status  string
+}
+
+func resetRuntimeHome(home string, apply bool) (runtimeResetResult, error) {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return runtimeResetResult{}, fmt.Errorf("home is required")
+	}
+	homeAbs, err := filepath.Abs(filepath.Clean(home))
+	if err != nil {
+		return runtimeResetResult{}, err
+	}
+	info, err := os.Stat(homeAbs)
+	if err != nil {
+		return runtimeResetResult{}, err
+	}
+	if !info.IsDir() {
+		return runtimeResetResult{}, fmt.Errorf("home is not a directory: %s", homeAbs)
+	}
+	result := runtimeResetResult{
+		Home:      homeAbs,
+		Mode:      mapBool(apply, "apply", "dry-run"),
+		Preserved: []string{"config", "secrets", "workspace", "scripts", "docker", "docker-compose", filepath.Join("run", "weixin")},
+	}
+	targets := runtimeResetTargets()
+	for _, rel := range targets {
+		status, err := resetRuntimePath(homeAbs, rel, apply)
+		if err != nil {
+			return result, err
+		}
+		result.Targets = append(result.Targets, runtimeResetTarget{RelPath: rel, Status: status})
+	}
+	return result, nil
+}
+
+func runtimeResetTargets() []string {
+	return []string{
+		"sessions",
+		"trace",
+		"observe",
+		"indexes",
+		"schedules",
+		filepath.Join("artifacts", "tool-results"),
+		"logs",
+		"tmp",
+		filepath.Join("run", "mateway.lock"),
+		filepath.Join("run", "gateway.lock"),
+	}
+}
+
+func resetRuntimePath(homeAbs, rel string, apply bool) (string, error) {
+	if strings.TrimSpace(rel) == "" || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("invalid reset path %q", rel)
+	}
+	path := filepath.Join(homeAbs, rel)
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	if clean != homeAbs && !strings.HasPrefix(clean, homeAbs+string(filepath.Separator)) {
+		return "", fmt.Errorf("refusing to reset path outside home: %s", clean)
+	}
+	if clean == homeAbs {
+		return "", fmt.Errorf("refusing to reset home root")
+	}
+	if _, err := os.Lstat(clean); os.IsNotExist(err) {
+		return "missing", nil
+	} else if err != nil {
+		return "", err
+	}
+	if !apply {
+		return "would_remove", nil
+	}
+	if err := os.RemoveAll(clean); err != nil {
+		return "", err
+	}
+	return "removed", nil
+}
+
+func mapBool(value bool, trueValue, falseValue string) string {
+	if value {
+		return trueValue
+	}
+	return falseValue
 }
 
 func runWorkspace(args []string) error {

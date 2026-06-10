@@ -456,7 +456,7 @@ func TestTerminalRunBlocksEvenWhenApprovalDisabled(t *testing.T) {
 	}
 }
 
-func TestTerminalRunExecutesConfirmedNonDestructiveCommand(t *testing.T) {
+func TestTerminalRunIgnoresLegacyApprovalTokenForNonDestructiveCommand(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
 	if err := os.MkdirAll(filepath.Join(home, "workspace", "skills"), 0o755); err != nil {
@@ -467,24 +467,24 @@ func TestTerminalRunExecutesConfirmedNonDestructiveCommand(t *testing.T) {
 		Name: "terminal.run",
 		Args: map[string]any{
 			"command":                 "ls " + filepath.Join(home, "workspace", "skills") + " 2>/dev/null && echo ok",
-			"_mateway_approval_token": TerminalRunApprovalToken("ls "+filepath.Join(home, "workspace", "skills")+" 2>/dev/null && echo ok", cfg),
+			"_mateway_approval_token": "legacy-token",
 		},
 	})
 	if result.IsError || !strings.Contains(result.Content, "ok") {
-		t.Fatalf("expected confirmed command to execute, got %#v", result)
+		t.Fatalf("expected non-destructive command to execute directly, got %#v", result)
 	}
 	if result.Evidence["decision"] != "allowed" {
 		t.Fatalf("expected allowed evidence, got %#v", result.Evidence)
 	}
 }
 
-func TestTerminalRunStillBlocksConfirmedDestructiveCommand(t *testing.T) {
+func TestTerminalRunStillBlocksLegacyTokenDestructiveCommand(t *testing.T) {
 	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
 		ID:   "1",
 		Name: "terminal.run",
 		Args: map[string]any{
 			"command":                 "rm -rf /tmp/mateway-blocked-test",
-			"_mateway_approval_token": TerminalRunApprovalToken("rm -rf /tmp/mateway-blocked-test", &config.Root{}),
+			"_mateway_approval_token": "legacy-token",
 		},
 	})
 	if !result.IsError || result.Evidence["policy_classification"] != "destructive" {
@@ -906,6 +906,54 @@ func TestFileReadRejectsLargeFile(t *testing.T) {
 	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
 	if !result.IsError || !strings.Contains(result.Content, "file too large") {
 		t.Fatalf("expected large file error, got %#v", result)
+	}
+}
+
+func TestFileReadAllowsHomeConfigForRemoteDiagnostics(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "config", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("secret: value\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if result.IsError || !strings.Contains(result.Content, "secret: value") {
+		t.Fatalf("expected config read for diagnostics, got %#v", result)
+	}
+}
+
+func TestFileReadRejectsProtectedHomeSecrets(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "secrets", "secrets.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"token":"value"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if !result.IsError || !strings.Contains(result.Content, "refusing to read protected path") {
+		t.Fatalf("expected protected secrets error, got %#v", result)
+	}
+}
+
+func TestFileReadAllowsRuntimeDiagnosticsOutsideSecrets(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "logs", "mateway.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("log line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := FileReadTool{Config: &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
+	if result.IsError || !strings.Contains(result.Content, "log line") {
+		t.Fatalf("expected runtime diagnostics read outside secrets, got %#v", result)
 	}
 }
 

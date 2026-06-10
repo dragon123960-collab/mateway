@@ -14,7 +14,6 @@ import (
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/runtime"
 	"github.com/dongping/mateway/internal/session"
 )
 
@@ -757,21 +756,6 @@ func TestTUIScrollStopsAutoFollowAndReportsNewEvents(t *testing.T) {
 	line := app.statusLine(100)
 	if !strings.Contains(line, "new events") {
 		t.Fatalf("status line should mention new events: %q", line)
-	}
-}
-
-func TestTUIApprovalPanelShowsDecisionContext(t *testing.T) {
-	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
-	app.width = 100
-	app.approval = &tuiApproval{request: runtime.ApprovalRequest{
-		ToolCall: agentcore.ToolCall{Name: "terminal.run", Args: map[string]any{"command": "rm file"}},
-		Reason:   "destructive action",
-	}}
-	view := app.footerView()
-	for _, want := range []string{"Approval required", "Run", "destructive action", "reply y or n"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("approval panel missing %q:\n%s", want, view)
-		}
 	}
 }
 

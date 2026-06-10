@@ -1,6 +1,7 @@
 package config
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -357,6 +358,35 @@ func TestEnsureDefaultConfigFilesMergesMissingConfigKeys(t *testing.T) {
 	}
 }
 
+func TestEnsureDefaultConfigFilesUsesCustomAssetsDir(t *testing.T) {
+	assets := copyInitAssetsForTest(t)
+	customReadme := filepath.Join(assets, "config", "README.md")
+	if err := os.WriteFile(customReadme, []byte("# Custom Init Assets\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	if err := EnsureDefaultConfigFilesWithAssets(home, assets); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "# Custom Init Assets\n" {
+		t.Fatalf("expected custom asset content, got %q", string(data))
+	}
+}
+
+func TestEnsureDefaultConfigFilesReportsMissingAssets(t *testing.T) {
+	err := EnsureDefaultConfigFilesWithAssets(t.TempDir(), t.TempDir())
+	if err == nil {
+		t.Fatal("expected missing assets error")
+	}
+	if !strings.Contains(err.Error(), "mateway init assets not found") || !strings.Contains(err.Error(), "MATEWAY_ASSETS_DIR") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDefaultConfigIncludesSearXNGProvider(t *testing.T) {
 	home := t.TempDir()
 	if err := EnsureDefaultConfigFiles(home); err != nil {
@@ -426,6 +456,39 @@ func writeFile(t *testing.T, path string, text string) {
 	if err := os.WriteFile(path, []byte(strings.TrimSpace(text)+"\n"), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+func copyInitAssetsForTest(t *testing.T) string {
+	t.Helper()
+	source := filepath.Join("..", "..", "assets", "init")
+	target := filepath.Join(t.TempDir(), "init")
+	if err := filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		dst := filepath.Join(target, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(dst, data, 0o644)
+	}); err != nil {
+		t.Fatalf("copy init assets: %v", err)
+	}
+	return target
 }
 
 func assertPromptTemplate(t *testing.T, path string, want []string) {

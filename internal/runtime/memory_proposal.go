@@ -92,11 +92,14 @@ func proposalSummary(proposal memory.Proposal) string {
 	return ""
 }
 
-func (rt Runtime) handlePending(_ context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
+func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
 	if state.Pending == nil {
 		return Response{}, false, nil
 	}
-	if state.Pending.Kind != "memory_proposal_review" {
+	if state.Pending.Kind == session.PendingKindTaskPlanConfirm {
+		return rt.handleTaskPlanConfirm(ctx, state, msg, trace)
+	}
+	if state.Pending.Kind != session.PendingKindMemoryProposalReview {
 		_ = trace.write(map[string]any{"type": "pending_discarded", "pending_kind": state.Pending.Kind, "task_id": state.Pending.TaskID})
 		state.Pending = nil
 		if err := rt.saveState(state, trace); err != nil {
