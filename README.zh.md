@@ -186,6 +186,8 @@ go build -o build/mateway ./cmd/mateway
 ./build/mateway init
 ```
 
+`mateway init` 会从 `assets/init` 读取默认配置、模型/渠道样例、shared skills 和 memory 模板。使用 release 下载时，需要保留 binary 旁边的 `assets/` 目录；也可以传 `--assets-dir /path/to/assets/init`。脚本或打包环境可用 `MATEWAY_ASSETS_DIR` 提供同样的覆盖。
+
 会创建：
 
 ```text
@@ -399,6 +401,15 @@ Trace 可用于检查：
   indexes/       # rebuildable memory indexes
   run/           # runtime files such as gateway locks
 ```
+
+如果要在全新 runtime 状态测试，同时保留配置、密钥、agent profiles 和 skills：
+
+```bash
+./build/mateway home reset-runtime        # dry-run
+./build/mateway home reset-runtime --apply
+```
+
+这个命令会清理生成态 runtime 数据，例如 sessions、trace、observe、indexes、schedules、logs、tmp 和 raw tool-result artifacts；会保留 `config/`、`secrets/`、`workspace/`，以及 `run/weixin/accounts/` 这类已保存连接器凭据。
 
 Workspace：
 

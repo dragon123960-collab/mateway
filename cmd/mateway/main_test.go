@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,6 +91,24 @@ func TestInitSupportsHomeFlag(t *testing.T) {
 	}
 }
 
+func TestInitSupportsAssetsDirFlag(t *testing.T) {
+	assets := copyMainTestInitAssets(t)
+	if err := os.WriteFile(filepath.Join(assets, "config", "README.md"), []byte("# CLI Custom Assets\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	if err := run([]string{"init", "--home", home, "--assets-dir", assets}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "# CLI Custom Assets\n" {
+		t.Fatalf("expected custom asset content, got %q", string(data))
+	}
+}
+
 func TestToolsDisableAcceptsAgentFlagAfterToolName(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)
@@ -106,6 +125,39 @@ func TestToolsDisableAcceptsAgentFlagAfterToolName(t *testing.T) {
 	if !strings.Contains(string(data), "terminal.run") {
 		t.Fatalf("expected config to include disabled tool:\n%s", data)
 	}
+}
+
+func copyMainTestInitAssets(t *testing.T) string {
+	t.Helper()
+	source := filepath.Join("..", "..", "assets", "init")
+	target := filepath.Join(t.TempDir(), "init")
+	if err := filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		dst := filepath.Join(target, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(dst, data, 0o644)
+	}); err != nil {
+		t.Fatalf("copy init assets: %v", err)
+	}
+	return target
 }
 
 func TestHelpIncludesSend(t *testing.T) {
@@ -788,6 +840,78 @@ func TestHomeReportCommandClassifiesDirectories(t *testing.T) {
 	}
 	if !strings.Contains(out, "- mystery: not recognized by current clean layout") {
 		t.Fatalf("missing unknown dir:\n%s", out)
+	}
+}
+
+func TestHomeResetRuntimeDryRunPreservesFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	writeMainTestFile(t, filepath.Join(home, "sessions", "one.json"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "trace", "one.jsonl"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "secrets", "secrets.json"), "{}")
+	out := captureStdout(t, func() error { return run([]string{"home", "reset-runtime"}) })
+	if !strings.Contains(out, "mode: dry-run") || !strings.Contains(out, "sessions: would_remove") {
+		t.Fatalf("unexpected dry-run output:\n%s", out)
+	}
+	for _, rel := range []string{
+		filepath.Join("sessions", "one.json"),
+		filepath.Join("trace", "one.jsonl"),
+		filepath.Join("secrets", "secrets.json"),
+	} {
+		if _, err := os.Stat(filepath.Join(home, rel)); err != nil {
+			t.Fatalf("dry-run should preserve %s: %v", rel, err)
+		}
+	}
+}
+
+func TestHomeResetRuntimeApplyRemovesGeneratedStateOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	writeMainTestFile(t, filepath.Join(home, "sessions", "one.json"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "trace", "one.jsonl"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "observe", "audit", "memory.jsonl"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "indexes", "memory_index.json"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "schedules", "task.json"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "artifacts", "tool-results", "aa", "raw.txt"), "raw")
+	writeMainTestFile(t, filepath.Join(home, "logs", "service.log"), "log")
+	writeMainTestFile(t, filepath.Join(home, "tmp", "scratch.txt"), "tmp")
+	writeMainTestFile(t, filepath.Join(home, "run", "mateway.lock"), "lock")
+	writeMainTestFile(t, filepath.Join(home, "run", "weixin", "accounts", "acct.json"), "{}")
+	writeMainTestFile(t, filepath.Join(home, "secrets", "secrets.json"), "{}")
+	out := captureStdout(t, func() error { return run([]string{"home", "reset-runtime", "--apply"}) })
+	if !strings.Contains(out, "mode: apply") || !strings.Contains(out, "sessions: removed") {
+		t.Fatalf("unexpected apply output:\n%s", out)
+	}
+	for _, rel := range []string{
+		"sessions",
+		"trace",
+		"observe",
+		"indexes",
+		"schedules",
+		filepath.Join("artifacts", "tool-results"),
+		"logs",
+		"tmp",
+		filepath.Join("run", "mateway.lock"),
+	} {
+		if _, err := os.Stat(filepath.Join(home, rel)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s removed, err=%v", rel, err)
+		}
+	}
+	for _, rel := range []string{
+		filepath.Join("config", "config.yaml"),
+		filepath.Join("workspace", "skills", "software-install", "SKILL.md"),
+		filepath.Join("secrets", "secrets.json"),
+		filepath.Join("run", "weixin", "accounts", "acct.json"),
+	} {
+		if _, err := os.Stat(filepath.Join(home, rel)); err != nil {
+			t.Fatalf("expected %s preserved: %v", rel, err)
+		}
 	}
 }
 

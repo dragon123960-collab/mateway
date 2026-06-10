@@ -1,0 +1,14 @@
+weixin:
+  enabled: false
+  base_url: ""
+  base_url_env: MATEWAY_WEIXIN_BASE_URL
+  account_id: ""
+  account_id_env: MATEWAY_WEIXIN_ACCOUNT_ID
+  token: ""
+  token_env: MATEWAY_WEIXIN_TOKEN
+  account_dir: ""
+  media_dir: ""
+  bot_agent: Mateway/0.1
+  poll_timeout_ms: 35000
+  retry_interval: 3s
+  mention_required_in_group: true

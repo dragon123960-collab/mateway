@@ -66,6 +66,8 @@ Runtime 不再使用本地化短语 alias 来触发 action。尤其不要通过�
 
 `mateway init` 会补齐缺失的默认文件，但不会覆盖已有 workspace skills 或用户编辑过的文件。已经存在的 `~/.mateway` 在 runtime 精简后可能仍保留旧 skill guidance、旧配置片段或旧 trace，需要显式检查和同步。
 
+初始化默认资源来自外置 `assets/init` 目录，而不是编译进二进制的大段模板。查找顺序是：`mateway init --assets-dir <dir>`、`MATEWAY_ASSETS_DIR`、binary 同级的 `assets/init`、当前工作目录下的 `assets/init`。release 包需要保留 `assets/` 目录；如果只复制裸 binary，`init` 会报错并提示设置 assets 路径。
+
 `mateway doctor` 会报告：
 
 - 默认工具 registry 是否仍包含已删除工具。

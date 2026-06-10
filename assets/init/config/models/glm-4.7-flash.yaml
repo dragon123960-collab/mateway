@@ -1,0 +1,13 @@
+name: glm-4.7-flash
+provider: glm
+api: openai_chat
+model: GLM-4.7-Flash
+api_base: https://open.bigmodel.cn/api/paas/v4
+api_key: ""
+api_key_env: GLM_API_KEY
+modalities: [text]
+context_window: 128000
+max_tokens: 4096
+strip_reasoning: false
+enabled: false
+description: GLM free/flash text model for low-cost reasoning tasks.

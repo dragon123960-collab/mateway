@@ -18,8 +18,18 @@ build_one() {
   local goarch="$2"
   local ext="$3"
   local name="mateway_${goos}_${goarch}${ext}"
-  echo "[mateway] building ${name}"
-  GOOS="${goos}" GOARCH="${goarch}" go build -o "${OUT_DIR}/${name}" ./cmd/mateway
+  local package_name="mateway_${goos}_${goarch}"
+  local staging="${OUT_DIR}/${package_name}"
+  echo "[mateway] building ${package_name}"
+  mkdir -p "${staging}"
+  GOOS="${goos}" GOARCH="${goarch}" go build -o "${staging}/mateway${ext}" ./cmd/mateway
+  cp -R assets "${staging}/assets"
+  if [[ "${goos}" == "windows" ]]; then
+    (cd "${OUT_DIR}" && zip -qr "${package_name}.zip" "${package_name}")
+  else
+    (cd "${OUT_DIR}" && tar -czf "${package_name}.tar.gz" "${package_name}")
+  fi
+  rm -rf "${staging}"
 }
 
 cd "${ROOT_DIR}"

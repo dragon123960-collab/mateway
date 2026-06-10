@@ -79,6 +79,7 @@ func run(args []string) error {
 	case "init":
 		fs := flag.NewFlagSet("mateway init", flag.ContinueOnError)
 		homeFlag := fs.String("home", "", "override MATEWAY_HOME for initialization")
+		assetsDirFlag := fs.String("assets-dir", "", "override init assets directory")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -86,7 +87,7 @@ func run(args []string) error {
 		if home == "" {
 			home = config.DefaultHome()
 		}
-		if err := config.EnsureDefaultConfigFiles(home); err != nil {
+		if err := config.EnsureDefaultConfigFilesWithAssets(home, *assetsDirFlag); err != nil {
 			return err
 		}
 		fmt.Println("initialized", home)
@@ -468,6 +469,7 @@ Usage:
   mateway schedule serve
   mateway sandbox report
   mateway home report
+  mateway home reset-runtime [--apply]
   mateway skill list
   mateway skill catalog report
   mateway skill search [--all] <query>

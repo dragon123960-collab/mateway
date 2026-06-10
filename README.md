@@ -181,6 +181,8 @@ go build -o build/mateway ./cmd/mateway
 ./build/mateway init
 ```
 
+`mateway init` reads default config, model/channel samples, shared skills, and memory templates from `assets/init`. When using a release download, keep the `assets/` directory next to the `mateway` binary, or pass `--assets-dir /path/to/assets/init`. `MATEWAY_ASSETS_DIR` provides the same override for scripts and packaging.
+
 This creates:
 
 ```text
@@ -390,6 +392,15 @@ Use traces to inspect:
   indexes/       # rebuildable memory indexes
   run/           # runtime files such as gateway locks
 ```
+
+For fresh runtime testing without losing configuration, secrets, profiles, or skills:
+
+```bash
+./build/mateway home reset-runtime        # dry-run
+./build/mateway home reset-runtime --apply
+```
+
+This removes generated runtime state such as sessions, traces, observe data, indexes, schedules, logs, tmp files, and raw tool-result artifacts. It preserves `config/`, `secrets/`, `workspace/`, and saved connector credentials such as `run/weixin/accounts/`.
 
 Workspace:
 
