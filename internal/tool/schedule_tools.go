@@ -11,26 +11,62 @@ import (
 	"github.com/dongping/mateway/internal/schedule"
 )
 
-func (ScheduleCreateTool) Name() string        { return "schedule.create" }
-func (ScheduleCreateTool) Description() string { return "create a local scheduled task" }
-func (ScheduleCreateTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"text", "run_at"}}
+func (ScheduleManageTool) Name() string { return "schedule.manage" }
+func (ScheduleManageTool) Description() string {
+	return "manage local scheduled tasks: create, list, update, pause, resume, delete, run_now"
 }
-func (ScheduleCreateTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to run a task later. Scheduled tasks are channel-neutral and are created directly without chat approval.",
-		WhenNotToUse:         "Do not use for immediate tasks; execute those directly.",
-		OutputContract:       "Return scheduled task id, status, run time, and interval when any.",
-		Evidence:             "Return id, status, run_at, interval, session_key.",
-		Acceptance:           "Accepted when the task is persisted under the local schedule store.",
-		SoftFailureSignals:   []string{"invalid run_at", "missing text"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; destructive schedule operations are enforced by tool policy, not chat approval.",
+func (ScheduleManageTool) Schema() agentcore.Schema {
+	return agentcore.Schema{
+		Required: []string{"action"},
+		Properties: map[string]any{
+			"action":       map[string]any{"type": "string", "enum": []string{"create", "list", "update", "pause", "resume", "delete", "run_now"}},
+			"id":           map[string]any{"type": "string", "description": "Required for update, pause, resume, delete, run_now"},
+			"text":         map[string]any{"type": "string", "description": "Task text. Required for create, optional for update."},
+			"run_at":       map[string]any{"type": "string", "description": "RFC3339 time. Required for create, optional for update."},
+			"interval":     map[string]any{"type": "string", "description": "Go duration: 30m, 24h. Optional for create/update."},
+			"session_key":  map[string]any{"type": "string", "description": "Optional session key for the scheduled task."},
+			"require_test": map[string]any{"type": "boolean", "description": "If true, create as paused pending test. Default false."},
+			"status":       map[string]any{"type": "string", "description": "For update: active, paused, done."},
+		},
 	}
 }
-func (ScheduleCreateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func (ScheduleManageTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Manage local scheduled tasks. action=list is a safe read. action=delete permanently removes a task. action=create/update/pause/resume/run_now are guarded mutations that change schedule state. Use action=create when the user asks to run a task later. Scheduled tasks are channel-neutral: the scheduler does not automatically send results back to channels.",
+		WhenNotToUse:         "Do not use for immediate tasks; execute those directly. Do not use action=delete when the user only wants to temporarily stop a task; use action=pause instead.",
+		OutputContract:       "Return schedule id, status, run time, and interval. action=delete returns deleted=true/false. action=list returns one line per task.",
+		Evidence:             "Return id, status, run_at, interval, session_key. action=delete returns id and deleted boolean. action=list returns count.",
+		Acceptance:           "Accepted when the schedule store completes the requested action.",
+		SoftFailureSignals:   []string{"schedule not found", "invalid run_at", "missing text", "unknown action"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "risks vary by action: list is safe read, delete is dangerous, others are guarded mutation. Tool policy enforces destructive boundaries.",
+	}
+}
+func (ScheduleManageTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t ScheduleManageTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	action := toolArgString(call.Args, "action")
+	switch action {
+	case "create":
+		return scheduleActionCreate(t.Config, call)
+	case "list":
+		return scheduleActionList(t.Config, call)
+	case "update":
+		return scheduleActionUpdate(t.Config, call)
+	case "pause":
+		return scheduleActionPause(t.Config, call)
+	case "resume":
+		return scheduleActionResume(t.Config, call)
+	case "delete":
+		return scheduleActionDelete(t.Config, call)
+	case "run_now":
+		return scheduleActionRunNow(t.Config, call)
+	default:
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "unknown action: " + action, IsError: true}
+	}
+}
+
+func scheduleActionCreate(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
 	runAt, err := time.Parse(time.RFC3339, toolArgString(call.Args, "run_at"))
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: "run_at must be RFC3339", IsError: true}
@@ -48,11 +84,7 @@ func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	} else if raw == "true" || raw == "yes" {
 		requireTest = true
 	}
-	store := schedule.Store{Home: config.DefaultHome()}
-	if t.Config != nil && strings.TrimSpace(t.Config.App.Home) != "" {
-		store.Home = t.Config.App.Home
-	}
-	task, err := store.Create(schedule.CreateInput{
+	task, err := scheduleStore(cfg).Create(schedule.CreateInput{
 		SessionKey:  toolArgString(call.Args, "session_key"),
 		Text:        toolArgString(call.Args, "text"),
 		RunAt:       runAt,
@@ -76,30 +108,8 @@ func (t ScheduleCreateTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	}
 }
 
-func (ScheduleListTool) Name() string        { return "schedule.list" }
-func (ScheduleListTool) Description() string { return "list local scheduled tasks" }
-func (ScheduleListTool) Schema() agentcore.Schema {
-	return agentcore.Schema{}
-}
-func (ScheduleListTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks what scheduled tasks exist.",
-		WhenNotToUse:         "Do not use for creating a new scheduled task.",
-		OutputContract:       "Return one line per scheduled task.",
-		Evidence:             "Return scheduled task count.",
-		Acceptance:           "Accepted when the schedule store is read successfully.",
-		ParallelMode:         "read_only_ok",
-		ReusePolicy:          "stable_read",
-		ConfirmationBoundary: "safe read; no confirmation.",
-	}
-}
-func (ScheduleListTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
-func (t ScheduleListTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	store := schedule.Store{Home: config.DefaultHome()}
-	if t.Config != nil && strings.TrimSpace(t.Config.App.Home) != "" {
-		store.Home = t.Config.App.Home
-	}
-	tasks, err := store.List()
+func scheduleActionList(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
+	tasks, err := scheduleStore(cfg).List()
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
@@ -110,26 +120,7 @@ func (t ScheduleListTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(lines, "\n"), Evidence: map[string]any{"count": len(tasks)}}
 }
 
-func (ScheduleUpdateTool) Name() string        { return "schedule.update" }
-func (ScheduleUpdateTool) Description() string { return "update a local scheduled task" }
-func (ScheduleUpdateTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"id"}}
-}
-func (ScheduleUpdateTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to change an existing scheduled task's text, run time, interval, or status.",
-		WhenNotToUse:         "Do not use to create a new schedule or to run a task immediately.",
-		OutputContract:       "Return updated schedule id, status, run time, interval, and session key evidence.",
-		Evidence:             "Return id, status, run_at, interval, and session_key.",
-		Acceptance:           "Accepted when the schedule store updates the requested task.",
-		SoftFailureSignals:   []string{"schedule not found", "run_at must be RFC3339", "interval must be a Go duration"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; schedule changes are direct and do not create chat approval pending.",
-	}
-}
-func (ScheduleUpdateTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t ScheduleUpdateTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func scheduleActionUpdate(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
 	input := schedule.UpdateInput{ID: toolArgString(call.Args, "id")}
 	if raw := toolArgString(call.Args, "text"); raw != "" {
 		input.Text = &raw
@@ -151,89 +142,32 @@ func (t ScheduleUpdateTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	if raw := toolArgString(call.Args, "status"); raw != "" {
 		input.Status = &raw
 	}
-	task, err := scheduleStore(t.Config).Update(input)
+	task, err := scheduleStore(cfg).Update(input)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return scheduleToolResult(call.ID, "updated", task)
 }
 
-func (SchedulePauseTool) Name() string        { return "schedule.pause" }
-func (SchedulePauseTool) Description() string { return "pause a local scheduled task" }
-func (SchedulePauseTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"id"}}
-}
-func (SchedulePauseTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to temporarily stop an existing scheduled task.",
-		WhenNotToUse:         "Do not use to permanently remove a schedule; use schedule.delete only when deletion is explicitly requested.",
-		OutputContract:       "Return paused schedule id, status, run time, interval, and session key evidence.",
-		Evidence:             "Return id, status, run_at, interval, and session_key.",
-		Acceptance:           "Accepted when the target schedule status becomes paused.",
-		SoftFailureSignals:   []string{"schedule not found"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; pause is reversible and does not create chat approval pending.",
-	}
-}
-func (SchedulePauseTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t SchedulePauseTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	task, err := scheduleStore(t.Config).Pause(toolArgString(call.Args, "id"))
+func scheduleActionPause(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
+	task, err := scheduleStore(cfg).Pause(toolArgString(call.Args, "id"))
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return scheduleToolResult(call.ID, "paused", task)
 }
 
-func (ScheduleResumeTool) Name() string        { return "schedule.resume" }
-func (ScheduleResumeTool) Description() string { return "resume a local scheduled task" }
-func (ScheduleResumeTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"id"}}
-}
-func (ScheduleResumeTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to reactivate a paused or inactive scheduled task.",
-		WhenNotToUse:         "Do not use to create a new schedule or change its timing unless the user asked for that too.",
-		OutputContract:       "Return resumed schedule id, status, run time, interval, and session key evidence.",
-		Evidence:             "Return id, status, run_at, interval, and session_key.",
-		Acceptance:           "Accepted when the target schedule status becomes active.",
-		SoftFailureSignals:   []string{"schedule not found"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; resume is direct and does not create chat approval pending.",
-	}
-}
-func (ScheduleResumeTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t ScheduleResumeTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	task, err := scheduleStore(t.Config).Activate(toolArgString(call.Args, "id"))
+func scheduleActionResume(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
+	task, err := scheduleStore(cfg).Activate(toolArgString(call.Args, "id"))
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
 	return scheduleToolResult(call.ID, "resumed", task)
 }
 
-func (ScheduleDeleteTool) Name() string        { return "schedule.delete" }
-func (ScheduleDeleteTool) Description() string { return "delete a local scheduled task" }
-func (ScheduleDeleteTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"id"}}
-}
-func (ScheduleDeleteTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use only when the user explicitly asks to delete an existing scheduled task.",
-		WhenNotToUse:         "Do not use for temporary stopping; use schedule.pause when the user asks to pause.",
-		OutputContract:       "Return deleted schedule id and deleted=true evidence.",
-		Evidence:             "Return id and deleted boolean.",
-		Acceptance:           "Accepted when the schedule store deletes the requested task.",
-		SoftFailureSignals:   []string{"schedule not found"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "dangerous mutation; deletion is handled by hard tool boundaries, not chat approval pending.",
-	}
-}
-func (ScheduleDeleteTool) Risk() agentcore.Risk { return agentcore.RiskDangerous }
-func (t ScheduleDeleteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func scheduleActionDelete(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
 	id := toolArgString(call.Args, "id")
-	deleted, err := scheduleStore(t.Config).Delete(id)
+	deleted, err := scheduleStore(cfg).Delete(id)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
@@ -243,31 +177,12 @@ func (t ScheduleDeleteTool) Run(_ context.Context, call agentcore.ToolCall) agen
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: "deleted schedule " + id, Evidence: map[string]any{"id": id, "deleted": true}}
 }
 
-func (ScheduleRunNowTool) Name() string        { return "schedule.run_now" }
-func (ScheduleRunNowTool) Description() string { return "mark a local scheduled task due now" }
-func (ScheduleRunNowTool) Schema() agentcore.Schema {
-	return agentcore.Schema{Required: []string{"id"}}
-}
-func (ScheduleRunNowTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use when the user asks to trigger an existing scheduled task immediately.",
-		WhenNotToUse:         "Do not use for ordinary immediate tasks that should be handled directly in the current conversation.",
-		OutputContract:       "Return schedule id, active status, updated run time, interval, and session key evidence.",
-		Evidence:             "Return id, status, run_at, interval, and session_key.",
-		Acceptance:           "Accepted when the schedule is marked due now.",
-		SoftFailureSignals:   []string{"schedule not found"},
-		ParallelMode:         "forbid",
-		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; run-now only changes scheduler state and does not create chat approval pending.",
-	}
-}
-func (ScheduleRunNowTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
-func (t ScheduleRunNowTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+func scheduleActionRunNow(cfg *config.Root, call agentcore.ToolCall) agentcore.ToolResult {
 	now := time.Now()
 	input := schedule.UpdateInput{ID: toolArgString(call.Args, "id"), RunAt: &now}
 	status := "active"
 	input.Status = &status
-	task, err := scheduleStore(t.Config).Update(input)
+	task, err := scheduleStore(cfg).Update(input)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}

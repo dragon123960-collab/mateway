@@ -48,7 +48,16 @@ func DefaultRoot() Root {
 				RecentTurns:            8,
 				ToolResultTargetTokens: 1200,
 				MaxVisibleTools:        8,
-				TraceTelemetry:         boolPtr(true),
+				DefaultVisible: []string{
+					"file.read",
+					"file.write",
+					"file.edit",
+					"terminal.run",
+					"web.search",
+					"web.fetch",
+					"toolresult.read",
+				},
+				TraceTelemetry: boolPtr(true),
 			},
 		},
 		Memory: MemoryConfig{
@@ -340,13 +349,14 @@ type ExecutionConfig struct {
 }
 
 type ContextBudgetConfig struct {
-	Enabled                *bool   `yaml:"enabled"`
-	SoftRatio              float64 `yaml:"soft_ratio"`
-	HardRatio              float64 `yaml:"hard_ratio"`
-	RecentTurns            int     `yaml:"recent_turns"`
-	ToolResultTargetTokens int     `yaml:"tool_result_target_tokens"`
-	MaxVisibleTools        int     `yaml:"max_visible_tools"`
-	TraceTelemetry         *bool   `yaml:"trace_telemetry"`
+	Enabled                *bool    `yaml:"enabled"`
+	SoftRatio              float64  `yaml:"soft_ratio"`
+	HardRatio              float64  `yaml:"hard_ratio"`
+	RecentTurns            int      `yaml:"recent_turns"`
+	ToolResultTargetTokens int      `yaml:"tool_result_target_tokens"`
+	MaxVisibleTools        int      `yaml:"max_visible_tools"`
+	DefaultVisible         []string `yaml:"default_visible"`
+	TraceTelemetry         *bool    `yaml:"trace_telemetry"`
 }
 
 func (c ContextBudgetConfig) EnabledValue() bool {
@@ -396,6 +406,36 @@ func (c ContextBudgetConfig) MaxVisibleToolsValue() int {
 		return 8
 	}
 	return c.MaxVisibleTools
+}
+
+var defaultVisibleTools = []string{
+	"file.read",
+	"file.write",
+	"file.edit",
+	"terminal.run",
+	"web.search",
+	"web.fetch",
+	"toolresult.read",
+}
+
+func (c ContextBudgetConfig) DefaultVisibleValue() []string {
+	if len(c.DefaultVisible) == 0 {
+		return append([]string(nil), defaultVisibleTools...)
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(c.DefaultVisible))
+	for _, name := range c.DefaultVisible {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return append([]string(nil), defaultVisibleTools...)
+	}
+	return out
 }
 
 func (c ExecutionConfig) MaxIterationsValue() int {

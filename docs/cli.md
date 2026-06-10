@@ -22,9 +22,9 @@ mateway chat session=cli:default
 type /help for commands, /exit to quit
 cli:default> 检查这个项目最近失败的 trace
 [thinking] waiting for model output
-[thinking] prepared tool call project.index
-[tool] project.index - /Users/dongping/project/mateway
-[result] project.index - found recent trace files
+[thinking] prepared tool call file.read
+[tool] file.read - /Users/dongping/project/mateway
+[result] file.read - found recent trace files
 [thinking] prepared tool call file.read
 [tool] file.read - /Users/dongping/.mateway/trace/...
 [result] file.read - timeout happened before first tool call
@@ -203,7 +203,7 @@ CLI 消费 runtime 的过程事件，默认渲染为接近 opencode 的轻量过
 User
 │ review project
 
-+ Thought: prepared tool call project.index
++ Thought: prepared tool call file.read
 → Index /Users/dongping/project/mateway
 ✓ Index (34ms)
 → Read README.md
@@ -215,7 +215,7 @@ Assistant
 最终回复文本
 ```
 
-在 TTY 中，过程符号会用低对比或状态色区分：thought 黄色、调用蓝色、成功绿色、失败红色。`waiting for model output` 这类高频空转事件默认不显示；`file.read`、`project.index` 这类读操作的结果内容默认折叠，只显示成功和耗时，详细内容留给 trace / NDJSON 事件。管道和测试输出不带 ANSI 颜色；需要机器可读事件时使用 `--events` 或 `/events --json`。
+在 TTY 中，过程符号会用低对比或状态色区分：thought 黄色、调用蓝色、成功绿色、失败红色。`waiting for model output` 这类高频空转事件默认不显示；`file.read` 这类读操作的结果内容默认折叠，只显示成功和耗时，详细内容留给 trace / NDJSON 事件。管道和测试输出不带 ANSI 颜色；需要机器可读事件时使用 `--events` 或 `/events --json`。
 
 这些是操作状态，不是 chain-of-thought。CLI 只展示“正在调用什么、返回了什么、等待什么、被什么策略阻止”。
 

@@ -205,13 +205,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	})
 	var budgetResults []contextBudgetResult
 	agent.Model = budgetedModel{
-		inner:       agent.Model,
-		config:      rt.Config,
-		modelConfig: modelCfg,
-		trace:       trace,
-		state:       *state,
-		taskID:      task.ID,
-		results:     &budgetResults,
+		inner:          agent.Model,
+		config:         rt.Config,
+		modelConfig:    modelCfg,
+		trace:          trace,
+		state:          *state,
+		taskID:         task.ID,
+		results:        &budgetResults,
+		defaultVisible: rt.Config.Execution.ContextBudget.DefaultVisibleValue(),
 	}
 	agent.SystemPrompt = systemPrompt
 	agent.Messages = messages

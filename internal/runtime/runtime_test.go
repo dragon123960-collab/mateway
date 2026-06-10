@@ -386,7 +386,7 @@ func TestRuntimeContinuesWhenAssistantPromisesActionWithoutTool(t *testing.T) {
 		{Role: agentcore.RoleAssistant, Content: "I will check now."},
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
-			Name: "project.index",
+			Name: "file.read",
 			Args: map[string]any{"path": rt.Config.App.Home},
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "checked"},
@@ -641,7 +641,7 @@ func TestRuntimeProgressSinkEmitsToolStartAndEnd(t *testing.T) {
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
-			Name: "project.index",
+			Name: "file.read",
 			Args: map[string]any{"path": rt.Config.App.Home},
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "checked"},
@@ -663,12 +663,12 @@ func TestRuntimeProgressSinkEmitsToolStartAndEnd(t *testing.T) {
 			continue
 		}
 		step := update.Progress[len(update.Progress)-1]
-		if step.Tool == "project.index" && step.Status == "running" {
+		if step.Tool == "file.read" && step.Status == "running" {
 			foundRunning = true
 		}
 	}
 	if !foundRunning {
-		t.Fatalf("expected running project.index progress update, got %#v", updates)
+		t.Fatalf("expected running file.read progress update, got %#v", updates)
 	}
 	foundAccepted := false
 	for _, update := range updates {
@@ -676,12 +676,12 @@ func TestRuntimeProgressSinkEmitsToolStartAndEnd(t *testing.T) {
 			continue
 		}
 		step := update.Progress[len(update.Progress)-1]
-		if step.Tool == "project.index" && step.Status == "accepted" {
+		if step.Tool == "file.read" && step.Status == "accepted" {
 			foundAccepted = true
 		}
 	}
 	if !foundAccepted {
-		t.Fatalf("expected accepted project.index progress, got %#v", updates)
+		t.Fatalf("expected accepted file.read progress, got %#v", updates)
 	}
 }
 
@@ -828,8 +828,8 @@ func TestRuntimeCancelledContextReturnsInterruptedReply(t *testing.T) {
 func TestDefaultRegistryContainsPiStyleTools(t *testing.T) {
 	registry := tool.NewRegistry(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	for _, name := range []string{
-		"file.read", "file.write", "file.delete", "project.index", "terminal.run", "web.search", "web.fetch", "secret.set",
-		"schedule.create", "schedule.list", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run_now",
+		"file.read", "file.write", "file.delete", "file.read", "terminal.run", "web.search", "web.fetch", "secret.set",
+		"schedule.manage", "schedule.manage", "schedule.manage", "schedule.manage", "schedule.manage", "schedule.manage", "schedule.manage",
 		"task.search", "task.resume",
 	} {
 		if _, ok := registry.Get(name); !ok {
@@ -922,8 +922,8 @@ func TestScheduleToolsManageTasksWithoutPendingReview(t *testing.T) {
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
-			Name: "schedule.create",
-			Args: map[string]any{"run_at": runAt, "text": "say hello", "session_key": "cli:scheduled"},
+			Name: "schedule.manage",
+			Args: map[string]any{"action": "create", "run_at": runAt, "text": "say hello", "session_key": "cli:scheduled"},
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "scheduled"},
 	}}, rt.Tools)
@@ -944,11 +944,11 @@ func TestScheduleToolsManageTasksWithoutPendingReview(t *testing.T) {
 	}
 	id := tasks[0].ID
 	for _, call := range []agentcore.ToolCall{
-		{ID: "pause", Name: "schedule.pause", Args: map[string]any{"id": id}},
-		{ID: "resume", Name: "schedule.resume", Args: map[string]any{"id": id}},
-		{ID: "run", Name: "schedule.run_now", Args: map[string]any{"id": id}},
-		{ID: "update", Name: "schedule.update", Args: map[string]any{"id": id, "text": "say updated"}},
-		{ID: "delete", Name: "schedule.delete", Args: map[string]any{"id": id}},
+		{ID: "pause", Name: "schedule.manage", Args: map[string]any{"action": "pause", "id": id}},
+		{ID: "resume", Name: "schedule.manage", Args: map[string]any{"action": "resume", "id": id}},
+		{ID: "run", Name: "schedule.manage", Args: map[string]any{"action": "run_now", "id": id}},
+		{ID: "update", Name: "schedule.manage", Args: map[string]any{"action": "update", "id": id, "text": "say updated"}},
+		{ID: "delete", Name: "schedule.manage", Args: map[string]any{"action": "delete", "id": id}},
 	} {
 		toolDef, ok := rt.Tools.Get(call.Name)
 		if !ok {
@@ -1046,7 +1046,7 @@ func TestRuntimeFailedIterationLimitCanContinueActiveTask(t *testing.T) {
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
-			Name: "project.index",
+			Name: "file.read",
 			Args: map[string]any{"path": "."},
 		}}},
 	}}, rt.Tools)
@@ -1181,7 +1181,7 @@ func TestRuntimeProgressSinkDoesNotReplayHistoricalTaskEvents(t *testing.T) {
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
-			Name: "project.index",
+			Name: "file.read",
 			Args: map[string]any{"path": rt.home()},
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "done"},
@@ -1212,7 +1212,7 @@ func TestRuntimeEmptyActionPromiseDoesNotCompleteTask(t *testing.T) {
 		{Role: agentcore.RoleAssistant, Content: "Confirming authorization:"},
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
 			ID:   "call_1",
-			Name: "project.index",
+			Name: "file.read",
 			Args: map[string]any{"path": rt.Config.App.Home},
 		}}},
 		{Role: agentcore.RoleAssistant, Content: "authorization checked"},

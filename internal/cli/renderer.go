@@ -145,7 +145,7 @@ func visibleResultSummary(tool, summary string) string {
 		return ""
 	}
 	switch strings.TrimSpace(tool) {
-	case "terminal.run", "web.search", "web.fetch", "schedule.create", "schedule.update", "task.search", "task.resume":
+	case "terminal.run", "web.search", "web.fetch", "schedule.manage", "task.search", "task.resume":
 		return suffixSummary(summary)
 	default:
 		return ""
@@ -181,18 +181,14 @@ func friendlyToolName(tool string) string {
 		return "Write"
 	case "file.delete":
 		return "Delete"
-	case "project.index":
-		return "Index"
 	case "terminal.run":
 		return "Run"
 	case "web.search":
 		return "Search"
 	case "web.fetch":
 		return "Fetch"
-	case "schedule.create":
+	case "schedule.manage":
 		return "Schedule"
-	case "schedule.list":
-		return "List schedules"
 	case "task.search":
 		return "Search tasks"
 	case "task.resume":

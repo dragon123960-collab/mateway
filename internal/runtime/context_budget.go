@@ -19,14 +19,15 @@ const (
 )
 
 type contextBudgetInput struct {
-	Config       *config.Root
-	ModelConfig  config.ModelConfig
-	SystemPrompt string
-	Messages     []agentcore.Message
-	Tools        []agentcore.Tool
-	Contract     session.TaskContract
-	State        session.State
-	TaskID       string
+	Config         *config.Root
+	ModelConfig    config.ModelConfig
+	SystemPrompt   string
+	Messages       []agentcore.Message
+	Tools          []agentcore.Tool
+	Contract       session.TaskContract
+	State          session.State
+	TaskID         string
+	DefaultVisible []string
 }
 
 type contextBudgetResult struct {
@@ -44,6 +45,7 @@ type contextBudgetResult struct {
 	HiddenTools           int
 	ToolNames             []string
 	RawRefs               []string
+	MissingContractTools  []string
 	ContextWindowTokens   int
 	MaxOutputTokens       int
 	Compacted             bool
@@ -52,25 +54,27 @@ type contextBudgetResult struct {
 }
 
 type budgetedModel struct {
-	inner       agentcore.Model
-	config      *config.Root
-	modelConfig config.ModelConfig
-	trace       *traceRecorder
-	state       session.State
-	taskID      string
-	results     *[]contextBudgetResult
+	inner          agentcore.Model
+	config         *config.Root
+	modelConfig    config.ModelConfig
+	trace          *traceRecorder
+	state          session.State
+	taskID         string
+	results        *[]contextBudgetResult
+	defaultVisible []string
 }
 
 func (m budgetedModel) Next(ctx context.Context, agentCtx agentcore.Context) (agentcore.Message, error) {
 	result := packMessagesForContextBudget(contextBudgetInput{
-		Config:       m.config,
-		ModelConfig:  m.modelConfig,
-		SystemPrompt: agentCtx.SystemPrompt,
-		Messages:     agentCtx.Messages,
-		Tools:        agentCtx.Tools,
-		Contract:     taskContractFromState(m.state, m.taskID),
-		State:        m.state,
-		TaskID:       m.taskID,
+		Config:         m.config,
+		ModelConfig:    m.modelConfig,
+		SystemPrompt:   agentCtx.SystemPrompt,
+		Messages:       agentCtx.Messages,
+		Tools:          agentCtx.Tools,
+		Contract:       taskContractFromState(m.state, m.taskID),
+		State:          m.state,
+		TaskID:         m.taskID,
+		DefaultVisible: m.defaultVisible,
 	})
 	writeContextBudgetTrace(m.trace, contextBudgetConfig(m.config), result)
 	if m.results != nil {
@@ -109,12 +113,13 @@ func packMessagesForContextBudget(input contextBudgetInput) contextBudgetResult 
 		softLimit = hardLimit
 	}
 	result := contextBudgetResult{
-		Messages:            append([]agentcore.Message(nil), input.Messages...),
-		Tools:               selectVisibleTools(input.Tools, input.Messages, input.Contract, cfg),
-		SoftLimitTokens:     softLimit,
-		HardLimitTokens:     hardLimit,
-		ContextWindowTokens: window,
-		MaxOutputTokens:     maxOutput,
+		Messages:             append([]agentcore.Message(nil), input.Messages...),
+		Tools:                selectVisibleTools(input.Tools, input.Messages, input.Contract, cfg, input.DefaultVisible),
+		SoftLimitTokens:      softLimit,
+		HardLimitTokens:      hardLimit,
+		ContextWindowTokens:  window,
+		MaxOutputTokens:      maxOutput,
+		MissingContractTools: missingContractTools(input.Tools, input.Contract),
 	}
 	result.VisibleTools = len(result.Tools)
 	result.HiddenTools = maxInt(0, len(input.Tools)-len(result.Tools))
@@ -142,7 +147,7 @@ func contextBudgetConfig(root *config.Root) config.ContextBudgetConfig {
 	return root.Execution.ContextBudget
 }
 
-func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, contract session.TaskContract, cfg config.ContextBudgetConfig) []agentcore.Tool {
+func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, contract session.TaskContract, cfg config.ContextBudgetConfig, defaultVisible []string) []agentcore.Tool {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -150,9 +155,23 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 	if limit >= len(tools) {
 		return append([]agentcore.Tool(nil), tools...)
 	}
-	scores := map[string]int{}
+	if len(defaultVisible) == 0 {
+		defaultVisible = cfg.DefaultVisibleValue()
+	}
+
+	contractSet := map[string]bool{}
 	for _, name := range contract.RequiredTools {
-		addToolScore(scores, name, 100)
+		contractSet[name] = true
+	}
+	for _, item := range contract.PlanItems {
+		if name := strings.TrimSpace(item.Tool); name != "" {
+			contractSet[name] = true
+		}
+	}
+
+	scores := map[string]int{}
+	for _, name := range defaultVisible {
+		addToolScore(scores, name, 50)
 	}
 	text := strings.ToLower(messagesText(messages))
 	for _, callName := range recentToolCallNames(messages) {
@@ -161,21 +180,37 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 	if strings.Contains(text, "raw_ref") || strings.Contains(text, "tool-result:") {
 		addToolScore(scores, "toolresult.read", 95)
 	}
-	scoreToolsFromText(scores, text)
-	for _, tool := range tools {
-		if tool == nil {
+
+	out := make([]agentcore.Tool, 0, limit)
+	used := map[string]bool{}
+
+	for _, name := range contract.RequiredTools {
+		if used[name] {
 			continue
 		}
-		name := tool.Name()
-		if scores[name] == 0 && tool.Risk() == agentcore.RiskSafeRead {
-			switch name {
-			case "file.read", "project.index", "task.search", "task.resume", "web.search", "web.fetch", "toolresult.read":
-				addToolScore(scores, name, 10)
-			}
+		if found := findToolByName(tools, name); found != nil {
+			used[name] = true
+			out = append(out, found)
 		}
 	}
-	out := make([]agentcore.Tool, 0, minInt(limit, len(tools)))
-	used := map[string]bool{}
+	for _, item := range contract.PlanItems {
+		name := strings.TrimSpace(item.Tool)
+		if name == "" || used[name] {
+			continue
+		}
+		if found := findToolByName(tools, name); found != nil {
+			used[name] = true
+			out = append(out, found)
+		}
+	}
+
+	if len(out) >= limit {
+		if len(out) == 0 {
+			return append([]agentcore.Tool(nil), tools...)
+		}
+		return out
+	}
+
 	for len(out) < limit {
 		bestIndex := -1
 		bestScore := 0
@@ -189,6 +224,9 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 				continue
 			}
 			name := tool.Name()
+			if contractSet[name] {
+				continue
+			}
 			if bestIndex < 0 || score > bestScore || score == bestScore && name < bestName {
 				bestIndex = i
 				bestScore = score
@@ -202,55 +240,26 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		used[tool.Name()] = true
 		out = append(out, tool)
 	}
-	for _, fallback := range []string{"file.read", "project.index", "terminal.run", "web.search"} {
-		if len(out) >= limit {
-			break
-		}
-		if used[fallback] {
-			continue
-		}
-		if tool := findToolByName(tools, fallback); tool != nil {
-			used[fallback] = true
-			out = append(out, tool)
-		}
-	}
 	if len(out) == 0 {
 		return append([]agentcore.Tool(nil), tools...)
 	}
 	return out
 }
 
-func scoreToolsFromText(scores map[string]int, text string) {
-	for _, item := range []struct {
-		tool    string
-		markers []string
-		score   int
-	}{
-		{"file.read", []string{"read", "open", "inspect", "show", "file", "doc", ".go", ".md", ".yaml", ".json"}, 80},
-		{"file.write", []string{"write", "edit", "update", "create file", "patch", "implement", "change"}, 75},
-		{"file.delete", []string{"delete", "remove"}, 75},
-		{"project.index", []string{"project", "repo", "directory", "tree", "list files", "find file"}, 80},
-		{"terminal.run", []string{"run", "test", "build", "command", "shell", "grep", "rg", "git", "go test"}, 80},
-		{"web.search", []string{"search", "lookup", "latest", "today", "news", "price", "weather", "current", "verify"}, 80},
-		{"web.fetch", []string{"http://", "https://", "url", "web page", "fetch"}, 80},
-		{"task.search", []string{"previous task", "old task", "history", "task"}, 70},
-		{"task.resume", []string{"resume", "continue task", "previous context"}, 70},
-		{"secret.set", []string{"secret", "api key", "token", "password"}, 70},
-		{"schedule.create", []string{"schedule", "remind", "automation", "cron", "every day", "weekly"}, 70},
-		{"schedule.list", []string{"list schedules", "show schedules", "automations"}, 65},
-		{"schedule.update", []string{"update schedule", "change schedule"}, 65},
-		{"schedule.pause", []string{"pause schedule", "disable schedule"}, 65},
-		{"schedule.resume", []string{"resume schedule", "enable schedule"}, 65},
-		{"schedule.delete", []string{"delete schedule", "remove schedule"}, 65},
-		{"schedule.run_now", []string{"run schedule now", "run now"}, 65},
-	} {
-		for _, marker := range item.markers {
-			if strings.Contains(text, marker) {
-				addToolScore(scores, item.tool, item.score)
-				break
-			}
+func missingContractTools(tools []agentcore.Tool, contract session.TaskContract) []string {
+	var missing []string
+	for _, name := range contract.RequiredTools {
+		if findToolByName(tools, name) == nil {
+			missing = append(missing, name)
 		}
 	}
+	for _, item := range contract.PlanItems {
+		name := strings.TrimSpace(item.Tool)
+		if name != "" && findToolByName(tools, name) == nil {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 func messagesText(messages []agentcore.Message) string {
@@ -482,6 +491,12 @@ func writeContextBudgetTrace(trace *traceRecorder, cfg config.ContextBudgetConfi
 		"hidden_tools":           result.HiddenTools,
 		"tools":                  result.ToolNames,
 	})
+	if len(result.MissingContractTools) > 0 {
+		_ = trace.write(map[string]any{
+			"type":                   "context_budget_missing_contract_tools",
+			"missing_contract_tools": result.MissingContractTools,
+		})
+	}
 	if result.Compacted {
 		_ = trace.write(map[string]any{
 			"type":                   "context_budget_compacted",

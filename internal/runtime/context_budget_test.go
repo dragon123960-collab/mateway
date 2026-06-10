@@ -64,7 +64,7 @@ func TestContextBudgetSelectsRelevantVisibleTools(t *testing.T) {
 		runtimeNamedTool{name: "file.read"},
 		runtimeNamedTool{name: "web.search"},
 		runtimeNamedTool{name: "terminal.run"},
-		runtimeNamedTool{name: "schedule.create"},
+		runtimeNamedTool{name: "schedule.manage"},
 		runtimeNamedTool{name: "toolresult.read"},
 	}
 	result := packMessagesForContextBudget(contextBudgetInput{
@@ -90,16 +90,11 @@ func TestContextBudgetSelectsRelevantVisibleTools(t *testing.T) {
 	}
 }
 
-func TestToolCompactionSpecializesFileAndProjectIndex(t *testing.T) {
+func TestToolCompactionSpecializesFileContent(t *testing.T) {
 	fileContent := strings.Repeat("package main\n", 400) + "error: important failure\n" + strings.Repeat("tail\n", 400)
 	compacted, compressor := compactToolContent("file.read", fileContent, 1200)
 	if compressor != "file_read" || !strings.Contains(compacted, "[model compacted file content]") || !strings.Contains(compacted, "important failure") {
 		t.Fatalf("unexpected file compaction compressor=%q content=%q", compressor, compacted)
-	}
-	indexContent := strings.Repeat("FILE: internal/runtime/runtime.go\n", 400)
-	compacted, compressor = compactToolContent("project.index", indexContent, 1000)
-	if compressor != "project_index" || !strings.Contains(compacted, "[model compacted project index]") {
-		t.Fatalf("unexpected index compaction compressor=%q content=%q", compressor, compacted)
 	}
 }
 
@@ -187,7 +182,7 @@ func TestRuntimeModelSeesFilteredTools(t *testing.T) {
 	cfg := rt.Config
 	cfg.Execution.ContextBudget.MaxVisibleTools = 2
 	registry := agentcore.NewToolRegistry()
-	for _, name := range []string{"file.read", "web.search", "terminal.run", "schedule.create", "task.search"} {
+	for _, name := range []string{"file.read", "web.search", "terminal.run", "schedule.manage", "task.search"} {
 		registry.Register(runtimeNamedTool{name: name, content: "ok"})
 	}
 	rt.Tools = registry
@@ -218,7 +213,7 @@ func TestRuntimeModelSeesFilteredTools(t *testing.T) {
 
 func TestRawToolResultStillStoredOutsidePrompt(t *testing.T) {
 	home := t.TempDir()
-	result := compactToolResultForModel(agentcore.ToolCall{ID: "call_1", Name: "project.index"}, agentcore.ToolResult{
+	result := compactToolResultForModel(agentcore.ToolCall{ID: "call_1", Name: "web.search"}, agentcore.ToolResult{
 		ToolCallID: "call_1",
 		Content:    strings.Repeat("FILE: README.md\n", modelToolContentLimit),
 	}, home, "trace-raw")
@@ -269,5 +264,67 @@ func TestShouldSkipTaskContractModelKeepsToolTasks(t *testing.T) {
 		if shouldSkipTaskContractModel(text, text) {
 			t.Fatalf("expected tool-like task not to skip: %q", text)
 		}
+	}
+}
+
+func TestContextBudgetPreservesAllContractToolsOverLimit(t *testing.T) {
+	cfg := config.DefaultRoot()
+	cfg.Execution.ContextBudget.MaxVisibleTools = 2
+	tools := []agentcore.Tool{
+		runtimeNamedTool{name: "file.read"},
+		runtimeNamedTool{name: "terminal.run"},
+		runtimeNamedTool{name: "web.search"},
+		runtimeNamedTool{name: "schedule.manage"},
+		runtimeNamedTool{name: "toolresult.read"},
+	}
+	result := packMessagesForContextBudget(contextBudgetInput{
+		Config:      &cfg,
+		ModelConfig: config.ModelConfig{ContextWindow: 32000, MaxTokens: 1000},
+		Messages:    []agentcore.Message{{Role: agentcore.RoleUser, Content: "check service and search web"}},
+		Tools:       tools,
+		Contract: session.TaskContract{
+			RequiresTools: true,
+			RequiredTools: []string{"terminal.run", "web.search", "schedule.manage"},
+		},
+	})
+	for _, want := range []string{"terminal.run", "web.search", "schedule.manage"} {
+		found := false
+		for _, name := range result.ToolNames {
+			if name == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("contract tool %s missing from visible tools %v", want, result.ToolNames)
+		}
+	}
+}
+
+func TestAcceptToolResultUsesEffectiveRiskForScheduleManage(t *testing.T) {
+	scheduleTool := runtimeNamedTool{name: "schedule.manage"}
+
+	callList := agentcore.ToolCall{Name: "schedule.manage", Args: map[string]any{"action": "list", "id": "sch_1"}}
+	_, evidence := acceptToolResult(scheduleTool, callList, agentcore.ToolResult{Content: "ok", Evidence: map[string]any{"count": 0}})
+	if risk, _ := evidence["risk"].(string); risk != string(agentcore.RiskSafeRead) {
+		t.Fatalf("action=list expected risk=safe_read, got %q in evidence %#v", risk, evidence)
+	}
+	if evidence["mutation"] != false {
+		t.Fatalf("action=list expected mutation=false, got evidence %#v", evidence)
+	}
+
+	callDelete := agentcore.ToolCall{Name: "schedule.manage", Args: map[string]any{"action": "delete", "id": "sch_1"}}
+	_, evidence = acceptToolResult(scheduleTool, callDelete, agentcore.ToolResult{Content: "deleted", Evidence: map[string]any{"deleted": true}})
+	if risk, _ := evidence["risk"].(string); risk != string(agentcore.RiskDangerous) {
+		t.Fatalf("action=delete expected risk=dangerous, got %q in evidence %#v", risk, evidence)
+	}
+	if evidence["mutation"] != true {
+		t.Fatalf("action=delete expected mutation=true, got evidence %#v", evidence)
+	}
+
+	callCreate := agentcore.ToolCall{Name: "schedule.manage", Args: map[string]any{"action": "create", "text": "x", "run_at": "2026-06-15T10:00:00Z"}}
+	_, evidence = acceptToolResult(scheduleTool, callCreate, agentcore.ToolResult{Content: "scheduled", Evidence: map[string]any{"id": "sch_x", "status": "active"}})
+	if risk, _ := evidence["risk"].(string); risk != string(agentcore.RiskGuardedMutation) {
+		t.Fatalf("action=create expected risk=guarded_mutation, got %q in evidence %#v", risk, evidence)
 	}
 }

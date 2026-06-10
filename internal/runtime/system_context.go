@@ -86,7 +86,7 @@ func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentP
 	writeContextLine(&b, "- thread_id: ", msg.ThreadID)
 	writeContextLine(&b, "- user_id: ", msg.UserID)
 	writeContextLine(&b, "- session_key: ", msg.SessionKey)
-	b.WriteString("- Scheduled tasks are channel-neutral: schedule.create stores the task for later execution, but the scheduler does not automatically send results back to Feishu, email, or other channels.\n")
+	b.WriteString("- Scheduled tasks are channel-neutral: schedule.manage stores the task for later execution, but the scheduler does not automatically send results back to Feishu, email, or other channels.\n")
 	b.WriteString("- If a scheduled task must notify someone, make notification part of the scheduled task itself through an available tool, script, connector, or skill. If no notification channel is configured, explain the gap and ask whether to create a script or skill.\n")
 	return strings.TrimSpace(b.String())
 }
@@ -121,7 +121,7 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
 	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
 	b.WriteString("- A message like \"I will check now\" or \"let me confirm\" is not a final answer. If you say you will check, confirm, create, update, or inspect something, call the required tool in the same turn.\n")
-	b.WriteString("- If file.read or project.index is blocked by path policy while the task still requires local file evidence, try an allowed safe-read terminal.run fallback such as ls, find, cat, sed, or rg. If that fallback is also blocked, state the concrete path-policy blocker instead of inventing content.\n")
+	b.WriteString("- If file.read is blocked by path policy while the task still requires local file evidence, try an allowed safe-read terminal.run fallback such as ls, find, cat, sed, or rg. If that fallback is also blocked, state the concrete path-policy blocker instead of inventing content.\n")
 	b.WriteString("- Do not replace server/service/process status requests with software release or project status research unless the user explicitly asks for versions or releases.\n")
 	b.WriteString("- For long tasks, work in verifiable stages, preserve completed stage evidence, and summarize progress between stages when possible.\n")
 	b.WriteString("- If a tool is slow, cancelled, or timed out, name the tool, elapsed time, and fallback action instead of asking the user to keep waiting.\n")

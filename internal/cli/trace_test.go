@@ -27,9 +27,9 @@ func TestPrintTraceEventsRendersProcessLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl")
 	lines := []string{
 		`{"type":"model_start"}`,
-		`{"type":"message_start","duration_ms":12,"message":{"ToolCalls":[{"Name":"project.index"}]}}`,
-		`{"type":"tool_execution_start","tool_call":{"Name":"project.index","Args":{"path":"/tmp/project"}}}`,
-		`{"type":"tool_execution_end","duration_ms":34,"tool_call":{"Name":"project.index"},"tool_result":{"Content":"found files"}}`,
+		`{"type":"message_start","duration_ms":12,"message":{"ToolCalls":[{"Name":"file.read"}]}}`,
+		`{"type":"tool_execution_start","tool_call":{"Name":"file.read","Args":{"path":"/tmp/project"}}}`,
+		`{"type":"tool_execution_end","duration_ms":34,"tool_call":{"Name":"file.read"},"tool_result":{"Content":"found files"}}`,
 		`{"type":"reply","text":"done"}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
@@ -42,9 +42,9 @@ func TestPrintTraceEventsRendersProcessLines(t *testing.T) {
 	text := out.String()
 	for _, want := range []string{
 		"+ Thought:",
-		"prepared tool call project.index",
-		"→ Index /tmp/project",
-		"✓ Index (34ms)",
+		"prepared tool call file.read",
+		"→ Read /tmp/project",
+		"✓ Read (34ms)",
 		"Assistant\ndone",
 	} {
 		if !strings.Contains(text, want) {

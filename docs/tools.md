@@ -9,7 +9,6 @@
 | `file.read` | 读取本地文本文件 | 受 allowed roots 限制；拒绝目录、大文件和二进制文件。 |
 | `file.write` | 创建或替换本地文本文件 | 受 allowed roots 限制；写 core agent profile 时走 proposal；不用于回答问题。 |
 | `file.delete` | 删除本地文件或目录 | 删除工具单独强校验 allowed roots 和真实路径；目录必须 `recursive=true`；拒绝 runtime state、secret、trace、allowed root 和 VCS 目录。 |
-| `project.index` | 列出项目目录下文件 | 只做目录索引；跳过常见依赖、构建产物、VCS、缓存和大型二进制目录。 |
 
 ## 命令与 Secret
 
@@ -29,13 +28,7 @@
 
 | 工具 | 用途 | 关键边界 |
 | --- | --- | --- |
-| `schedule.create` | 创建本地定时任务 | 直接创建，不产生聊天审批 pending。 |
-| `schedule.list` | 列出本地定时任务 | 只读。 |
-| `schedule.update` | 更新任务文本、时间、间隔或状态 | 直接修改 scheduler state。 |
-| `schedule.pause` | 暂停定时任务 | 可逆 mutation。 |
-| `schedule.resume` | 恢复定时任务 | 可逆 mutation。 |
-| `schedule.delete` | 删除定时任务 | 仅在用户明确要求删除时使用。 |
-| `schedule.run_now` | 将任务标记为立即运行 | 只更新 scheduler due time，不代表当前对话直接执行任务内容。 |
+| `schedule.manage` | 管理本地定时任务 | 统一入口，覆盖创建、列出、更新、暂停、恢复、删除和立即运行；直接修改 scheduler state。 |
 
 ## 任务找回
 

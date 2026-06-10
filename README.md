@@ -143,7 +143,7 @@ Mateway currently supports:
 - session inspect/archive commands: `mateway session list`, `mateway session show`, `mateway session archive list/show`
 - task tree with active-task steering
 - direct tool execution by default, with destructive terminal commands blocked
-- built-in tools: `file.read`, `file.write`, `file.delete`, `project.index`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, schedule management tools, and `task.search` / `task.resume`
+- built-in tools: `file.read`, `file.write`, `file.edit`, `file.delete`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, `schedule.manage`, and `task.search` / `task.resume`
 - native model tool calling for Anthropic-compatible and OpenAI Chat-compatible models, with text protocol fallback only for unsupported APIs
 - parallel execution for same-turn safe-read tool batches, controlled by `execution.max_parallel_tools`
 - invisible token economy: per-turn context budgets, session summaries, dynamic visible tools, compacted tool results, and `raw_ref` query retrieval

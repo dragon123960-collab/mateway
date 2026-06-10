@@ -27,7 +27,7 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 		}, nil
 	}
 	if path, ok := strings.CutPrefix(text, "/index "); ok {
-		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "project.index", Args: map[string]any{"path": strings.TrimSpace(path)}}}}, nil
+		return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "file.read", Args: map[string]any{"path": strings.TrimSpace(path)}}}}, nil
 	}
 	if rest, ok := strings.CutPrefix(text, "/write "); ok {
 		path, content, _ := strings.Cut(rest, " ")
@@ -42,7 +42,7 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 	if rest, ok := strings.CutPrefix(text, "/schedule "); ok {
 		parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
 		if len(parts) == 2 {
-			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.create", Args: map[string]any{"run_at": parts[0], "text": parts[1], "session_key": "cli:scheduled"}}}}, nil
+			return agentcore.Message{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "schedule.manage", Args: map[string]any{"action": "create", "run_at": parts[0], "text": parts[1], "session_key": "cli:scheduled"}}}}, nil
 		}
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: runtimeText(nil, channel.InboundMessage{}, "runtime.heuristic.echo", textValues("text", text))}, nil

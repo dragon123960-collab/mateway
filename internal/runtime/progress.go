@@ -30,7 +30,7 @@ func summarizeToolCall(call agentcore.ToolCall) string {
 	switch call.Name {
 	case "terminal.run":
 		return compactProgressSummary(fmt.Sprint(call.Args["command"]))
-	case "project.index", "file.read", "file.write", "file.delete":
+	case "file.read", "file.write", "file.delete":
 		return compactProgressSummary(fmt.Sprint(call.Args["path"]))
 	case "web.search":
 		return compactProgressSummary(fmt.Sprint(call.Args["query"]))

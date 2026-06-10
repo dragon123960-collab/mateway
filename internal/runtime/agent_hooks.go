@@ -9,6 +9,7 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/session"
+	toolpkg "github.com/dongping/mateway/internal/tool"
 )
 
 func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
@@ -181,7 +182,7 @@ func taskExecutionEventCount(state session.State, taskID string) int {
 var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {
 	_ = cfg
 	switch strings.TrimSpace(toolName) {
-	case "project.index", "file.read":
+	case "file.read":
 		return 30 * time.Second
 	case "terminal.run":
 		return 120 * time.Second
@@ -198,14 +199,14 @@ var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.D
 	return 30 * time.Second
 }
 
-func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string, map[string]any) {
+func acceptToolResult(tool agentcore.Tool, call agentcore.ToolCall, result agentcore.ToolResult) (string, map[string]any) {
 	evidence := map[string]any{}
 	for key, value := range result.Evidence {
 		evidence[key] = value
 	}
 	if tool != nil {
 		contract := agentcore.ContractFor(tool)
-		risk := tool.Risk()
+		risk := toolpkg.EffectiveRisk(tool, call)
 		evidence["risk"] = string(risk)
 		evidence["mutation"] = risk == agentcore.RiskGuardedMutation || risk == agentcore.RiskDangerous
 		if contract.Acceptance != "" {

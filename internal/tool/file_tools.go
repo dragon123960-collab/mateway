@@ -66,6 +66,115 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: "wrote " + path, Evidence: map[string]any{"path": path, "bytes": len(content)}}
 }
 
+func (FileEditTool) Name() string        { return "file.edit" }
+func (FileEditTool) Description() string { return "replace text in a local file by exact string match" }
+func (FileEditTool) Schema() agentcore.Schema {
+	return agentcore.Schema{
+		Required: []string{"path", "old_string", "new_string"},
+		Properties: map[string]any{
+			"path":        map[string]any{"type": "string", "description": "Absolute or workspace-relative path."},
+			"old_string":  map[string]any{"type": "string", "description": "Exact text to find and replace. Must match precisely including whitespace and indentation."},
+			"new_string":  map[string]any{"type": "string", "description": "Replacement text. Use empty string to delete the matched text."},
+			"replace_all": map[string]any{"type": "boolean", "description": "Replace all occurrences. Default false (replace only first match)."},
+		},
+	}
+}
+func (FileEditTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{
+		WhenToUse:            "Use for targeted text replacements inside a file. Prefer over file.write when you only need to change a few lines or fix specific text. Read enough context lines with file.read first to construct an exact old_string.",
+		WhenNotToUse:         "Do not use when replacing the entire file content; use file.write instead. Do not use when the old_string cannot be found — if the file has changed since your last read, use file.read again to get current content.",
+		OutputContract:       "Return a short confirmation with path, replaced count, and replace_all flag.",
+		Evidence:             "Return path, replaced, replace_all, matches count.",
+		Acceptance:           "Accepted when old_string is found in the file and the replacement is written.",
+		SoftFailureSignals:   []string{"old_string not found in file", "multiple matches found", "old_string must not be empty", "file appears to be binary", "permission denied", "outside allowed roots"},
+		ParallelMode:         "forbid",
+		ReusePolicy:          "never",
+		ConfirmationBoundary: "guarded mutation; path policy enforced before writing. Uses same security path as file.write.",
+	}
+}
+func (FileEditTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t FileEditTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	path, err := ResolveAllowedPath(fmt.Sprint(call.Args["path"]), t.Config)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
+	}
+	oldStr := fmt.Sprint(call.Args["old_string"])
+	if oldStr == "" {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "old_string must not be empty", IsError: true, Evidence: map[string]any{"path": path}}
+	}
+	newStr := fmt.Sprint(call.Args["new_string"])
+	replaceAll := boolArg(call.Args["replace_all"])
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+	}
+	if info.IsDir() {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "path is a directory, not a file", IsError: true, Evidence: map[string]any{"path": path}}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+	}
+	if isLikelyBinary(data) {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "file appears to be binary", IsError: true, Evidence: map[string]any{"path": path, "bytes": len(data)}}
+	}
+
+	content := string(data)
+	count := strings.Count(content, oldStr)
+	if count == 0 {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: "old_string not found in file", IsError: true, Evidence: map[string]any{"path": path, "matches": 0}}
+	}
+	if count > 1 && !replaceAll {
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    fmt.Sprintf("old_string found %d times in file; use replace_all=true to replace all, or provide more surrounding context in old_string to make it unique", count),
+			IsError:    true,
+			Evidence:   map[string]any{"path": path, "matches": count},
+		}
+	}
+
+	var result string
+	if replaceAll {
+		result = strings.ReplaceAll(content, oldStr, newStr)
+	} else {
+		result = strings.Replace(content, oldStr, newStr, 1)
+	}
+
+	profileStore := agentprofile.NewStore(t.Config)
+	if _, ok := profileStore.CoreTargetAgent(path); ok {
+		proposal, err := profileStore.Create(agentprofile.CreateInput{TargetPath: path, NewContent: result})
+		if err != nil {
+			return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+		}
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    "profile proposal " + proposal.ID + " created for " + proposal.TargetPath + "; promote with mateway agent-profile proposal promote " + proposal.ID,
+			Evidence: map[string]any{
+				"proposal_id":     proposal.ID,
+				"target_path":     proposal.TargetPath,
+				"requires_review": true,
+			},
+		}
+	}
+
+	perm := info.Mode().Perm()
+	if err := os.WriteFile(path, []byte(result), perm); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+	}
+
+	replaced := 1
+	if replaceAll {
+		replaced = count
+	}
+	return agentcore.ToolResult{
+		ToolCallID: call.ID,
+		Content:    fmt.Sprintf("replaced %d occurrence(s) in %s", replaced, path),
+		Evidence:   map[string]any{"path": path, "replaced": true, "replace_all": replaceAll, "matches": replaced},
+	}
+}
+
 func (FileDeleteTool) Name() string { return "file.delete" }
 func (FileDeleteTool) Description() string {
 	return "delete a local file or directory inside allowed roots"
@@ -271,182 +380,6 @@ func countDirectoryEntries(root string) (int, error) {
 	return count, err
 }
 
-func (ProjectIndexTool) Name() string { return "project.index" }
-func (ProjectIndexTool) Description() string {
-	return "list files and directories under a path with bounded depth and common heavy directories skipped"
-}
-func (ProjectIndexTool) Schema() agentcore.Schema {
-	return agentcore.Schema{
-		Required: []string{"path"},
-		Properties: map[string]any{
-			"path":      map[string]any{"type": "string"},
-			"limit":     map[string]any{"type": "integer", "description": "Maximum entries to return. Defaults to 200 and is capped at 5000."},
-			"max_depth": map[string]any{"type": "integer", "description": "Maximum directory depth below path. Defaults to 4 and is capped at 8."},
-			"skip_dirs": map[string]any{"type": "array", "description": "Directory names to list with [skip] and not descend into."},
-		},
-	}
-}
-func (ProjectIndexTool) ToolContract() agentcore.ToolContract {
-	return agentcore.ToolContract{
-		WhenToUse:            "Use before reading a project when you need a bounded overview of the directory structure. Keep max_depth and limit small unless the user explicitly asks for a broader scan.",
-		WhenNotToUse:         "Do not use as a replacement for reading a specific file whose path is already known.",
-		OutputContract:       "Return relative directory entries with DIR: and FILE: prefixes. Common generated/cache/vendor directories are listed with [skip] guidance instead of hidden.",
-		Evidence:             "Return scanned root path, entry count, skipped entry count, limit, max_depth, partial, and elapsed time.",
-		Acceptance:           "Accepted when the directory scan succeeds and returns entry count evidence.",
-		SoftFailureSignals:   []string{"path is not a directory", "permission denied", "outside allowed roots"},
-		ParallelMode:         "read_only_ok",
-		ReusePolicy:          "stable_read",
-		ConfirmationBoundary: "safe read; no confirmation.",
-	}
-}
-func (ProjectIndexTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
-func (t ProjectIndexTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	start := time.Now()
-	root, err := ResolveAllowedPath(fmt.Sprint(call.Args["path"]), t.Config)
-	if err != nil {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
-	}
-	info, err := os.Stat(root)
-	if err != nil {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": root}}
-	}
-	if !info.IsDir() {
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: "path is not a directory", IsError: true, Evidence: map[string]any{"path": root}}
-	}
-	limit := boundedIntArg(call.Args["limit"], 200, 1, 5000)
-	maxDepth := boundedIntArg(call.Args["max_depth"], 4, 1, 8)
-	skipDirs := projectIndexSkipDirs(call.Args["skip_dirs"])
-	entries, partial, skipped, err := readProjectIndexEntries(ctx, root, limit, maxDepth, skipDirs)
-	evidence := map[string]any{
-		"path":       root,
-		"entries":    len(entries),
-		"limit":      limit,
-		"max_depth":  maxDepth,
-		"partial":    partial,
-		"skipped":    skipped,
-		"elapsed_ms": time.Since(start).Milliseconds(),
-	}
-	if err != nil {
-		evidence["partial"] = len(entries) > 0
-		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: evidence}
-	}
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: strings.Join(projectIndexEntryLines(entries), "\n"), Evidence: evidence}
-}
-
-type projectIndexEntry struct {
-	Path    string
-	IsDir   bool
-	Skipped bool
-}
-
-func readProjectIndexEntries(ctx context.Context, root string, limit, maxDepth int, skipDirs map[string]bool) ([]projectIndexEntry, bool, int, error) {
-	root = filepath.Clean(root)
-	entries := make([]projectIndexEntry, 0, limit)
-	skipped := 0
-	partial := false
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			partial = len(entries) > 0
-			return ctx.Err()
-		default:
-		}
-		if path == root {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		depth := pathDepth(rel)
-		if depth > maxDepth {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		skip := d.IsDir() && skipDirs[strings.ToLower(d.Name())]
-		if len(entries) >= limit {
-			partial = true
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return filepath.SkipAll
-		}
-		entries = append(entries, projectIndexEntry{Path: filepath.ToSlash(rel), IsDir: d.IsDir(), Skipped: skip})
-		if skip {
-			skipped++
-			return filepath.SkipDir
-		}
-		return nil
-	})
-	if err == filepath.SkipAll {
-		err = nil
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].IsDir != entries[j].IsDir {
-			return entries[i].IsDir
-		}
-		return entries[i].Path < entries[j].Path
-	})
-	return entries, partial, skipped, err
-}
-
-func pathDepth(rel string) int {
-	rel = filepath.Clean(rel)
-	if rel == "." || rel == "" {
-		return 0
-	}
-	return strings.Count(rel, string(filepath.Separator)) + 1
-}
-
-func projectIndexEntryLines(entries []projectIndexEntry) []string {
-	lines := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir {
-			suffix := "/"
-			if entry.Skipped {
-				suffix += " [skip]"
-			}
-			lines = append(lines, "DIR:  "+entry.Path+suffix)
-		} else {
-			lines = append(lines, "FILE: "+entry.Path)
-		}
-	}
-	return lines
-}
-
-func projectIndexSkipDirs(value any) map[string]bool {
-	out := defaultProjectIndexSkipDirs()
-	for _, item := range stringSliceArg(value) {
-		name := strings.ToLower(strings.TrimSpace(item))
-		if name != "" {
-			out[name] = true
-		}
-	}
-	return out
-}
-
-func defaultProjectIndexSkipDirs() map[string]bool {
-	out := map[string]bool{}
-	for _, name := range []string{
-		".git", ".hg", ".svn",
-		"node_modules", "bower_components", "vendor",
-		"dist", "build", "out", "target", "bin", "obj", "coverage",
-		".next", ".nuxt", ".svelte-kit", ".astro", ".vite", ".parcel-cache", ".turbo", ".docusaurus",
-		".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox",
-		"__pycache__", ".venv", "venv", "env", ".env", "site-packages",
-		"Pods", "DerivedData", ".gradle", ".idea", ".vscode",
-		"tmp", "temp", ".tmp", "logs",
-	} {
-		out[strings.ToLower(name)] = true
-	}
-	return out
-}
-
 func indexDirectoryToolResult(ctx context.Context, callID, path string, limit int) agentcore.ToolResult {
 	start := time.Now()
 	entries, partial, err := readDirEntriesLimited(ctx, path, limit)
@@ -553,8 +486,8 @@ func (FileReadTool) Schema() agentcore.Schema {
 func (FileReadTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
 		WhenToUse:            "Use when the task requires reading a known local text file.",
-		WhenNotToUse:         "Do not use when the file path is unknown; inspect the project first with project.index.",
-		OutputContract:       "Return file text content for files. For directories, return the same non-recursive index format as project.index.",
+		WhenNotToUse:         "Do not use when the file path is unknown; inspect the project first with terminal.run find, rg, or ls.",
+		OutputContract:       "Return file text content for files. For directories, return a non-recursive index with DIR: and FILE: prefixes.",
 		Evidence:             "Return read path and byte count for files; return path, entries, limit, partial, and directory=true for directories.",
 		Acceptance:           "Accepted when the file or directory exists, is readable, and evidence describes what was read.",
 		SoftFailureSignals:   []string{"no such file or directory", "permission denied", "outside allowed roots"},

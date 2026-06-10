@@ -547,14 +547,15 @@ func (defaultObserveHookProvider) Name() string { return "default_observe" }
 func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHookInput) (ObserveHookResult, error) {
 	switch input.Kind {
 	case "tool_result":
-		status, evidence := acceptToolResult(input.Tool, input.ToolResult)
+		status, evidence := acceptToolResult(input.Tool, input.ToolCall, input.ToolResult)
 		risk := ""
 		acceptanceCriteria := ""
 		evidenceContract := ""
 		mutation := false
 		if input.Tool != nil {
-			risk = string(input.Tool.Risk())
-			mutation = input.Tool.Risk() == agentcore.RiskGuardedMutation || input.Tool.Risk() == agentcore.RiskDangerous
+			effectiveRisk := tool.EffectiveRisk(input.Tool, input.ToolCall)
+			risk = string(effectiveRisk)
+			mutation = effectiveRisk == agentcore.RiskGuardedMutation || effectiveRisk == agentcore.RiskDangerous
 			contract := agentcore.ContractFor(input.Tool)
 			acceptanceCriteria = contract.Acceptance
 			evidenceContract = contract.Evidence

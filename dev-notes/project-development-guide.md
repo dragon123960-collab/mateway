@@ -33,7 +33,7 @@ Runtime 不做语义路由，不做 completion review，不做 chat approval pen
 - `internal/gateway`: 负责 session key、dedupe、异步运行和 channel serving。
 - `internal/runtime`: 负责 setup、system context、task contract、hooks、context budget、memory proposal review、finalize。
 - `internal/agentcore`: transcript-driven model/tool loop。它只知道 model、tools、hooks、messages，不知道具体 channel。
-- `internal/tool`: built-in tool registry 和工具实现，包括 `file.*`、`project.index`、`terminal.run`、`web.*`、`secret.set`、schedule、task recall、`toolresult.read`。
+- `internal/tool`: built-in tool registry 和工具实现，包括 `file.*`、`file.edit`、`terminal.run`、`web.*`、`secret.set`、`schedule.manage`、task recall、`toolresult.read`。
 - `internal/session`: session state、task tree、pending action、task steps、execution events。
 - `internal/model`: provider clients、native tool calling、text tool-call fallback、usage parsing、reasoning cleanup。
 - `internal/memory`: Markdown memory、proposal、lint/index/search、diary/reflection、heartbeat distill、skill learning。

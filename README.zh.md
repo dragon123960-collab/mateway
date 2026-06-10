@@ -146,7 +146,7 @@ Mateway 目前支持：
 - session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
 - task tree 和 active-task steering
 - 工具默认直接执行，删除/破坏类 terminal 命令硬阻拦
-- 内置工具：`file.read`、`file.write`、`file.delete`、`project.index`、`terminal.run`、`web.search`、`web.fetch`、`secret.set`、定时任务管理工具，以及 `task.search` / `task.resume`
+- 内置工具：`file.read`、`file.write`、`file.edit`、`file.delete`、`terminal.run`、`web.search`、`web.fetch`、`secret.set`、`schedule.manage`，以及 `task.search` / `task.resume`
 - Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
 - 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
 - 无感 token economy：per-turn context budget、session summary、动态 visible tools、压缩 tool result 和 `raw_ref` query 回读

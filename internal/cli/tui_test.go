@@ -307,13 +307,13 @@ func TestTUISidebarShowsTaskContractAndSteps(t *testing.T) {
 			Status: "running",
 			Execution: session.ExecutionFrame{Contract: &session.TaskContract{
 				Summary:          "inspect the knowledge base safely",
-				RequiredTools:    []string{"project.index", "file.read"},
-				RequiredEvidence: []session.TaskEvidenceContract{{Tool: "project.index", Description: "directory index"}},
+				RequiredTools:    []string{"terminal.run", "file.read"},
+				RequiredEvidence: []session.TaskEvidenceContract{{Tool: "terminal.run", Description: "directory index"}},
 				ExpectedOutcome:  "find timeout cause",
 				CompletionPolicy: "finish after required evidence is accepted",
 			}},
 			Steps: []session.TaskStep{{
-				Tool:     "project.index",
+				Tool:     "terminal.run",
 				Status:   "accepted",
 				Summary:  "indexed top-level files",
 				Accepted: true,
@@ -325,7 +325,7 @@ func TestTUISidebarShowsTaskContractAndSteps(t *testing.T) {
 		}},
 	}
 	lines := strings.Join(taskLines(state), "\n")
-	for _, want := range []string{"▾ Contract running", "[✓] inspect", "[ ] find timeout cause", "[ ] finish after required evidence is accepted", "[✓] Index", "[•] Read", "running", "[✓] directory index"} {
+	for _, want := range []string{"▾ Contract running", "[✓] inspect", "[ ] find timeout cause", "[ ] finish after required evidence is accepted", "[✓] Run", "[•] Read", "running", "[✓] directory index"} {
 		if !strings.Contains(lines, want) {
 			t.Fatalf("task lines missing %q:\n%s", want, lines)
 		}
@@ -341,19 +341,19 @@ func TestTUISidebarSummarizesCompletedTask(t *testing.T) {
 		Status: "completed",
 		Execution: session.ExecutionFrame{Contract: &session.TaskContract{
 			Summary:          "inspect completed task",
-			RequiredTools:    []string{"project.index"},
-			RequiredEvidence: []session.TaskEvidenceContract{{Tool: "project.index", Description: "directory index"}},
+			RequiredTools:    []string{"file.read"},
+			RequiredEvidence: []session.TaskEvidenceContract{{Tool: "file.read", Description: "directory index"}},
 			ExpectedOutcome:  "answer",
 		}},
 		Steps: []session.TaskStep{{
-			Tool:     "project.index",
+			Tool:     "file.read",
 			Status:   "accepted",
 			Summary:  "indexed files",
 			Accepted: true,
 		}},
 	}
 	lines := strings.Join(taskSidebarLines(task), "\n")
-	for _, want := range []string{"▾ Contract completed", "[✓] inspect completed task", "[ ] answer", "[✓] Index", "[✓] directory index"} {
+	for _, want := range []string{"▾ Contract completed", "[✓] inspect completed task", "[ ] answer", "[✓] Read", "[✓] directory index"} {
 		if !strings.Contains(lines, want) {
 			t.Fatalf("completed task summary missing %q:\n%s", want, lines)
 		}
