@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -150,6 +151,26 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					"failure_categories": failureCategories(failures),
 				})
 			}
+			if unavailable := checkUnavailableContractTools(rt, msg, contract); len(unavailable) > 0 {
+				names := make([]string, 0, len(unavailable))
+				for name := range unavailable {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				unavailableReasons := make(map[string]string, len(unavailable))
+				for name, reason := range unavailable {
+					unavailableReasons[name] = reason
+				}
+				reason := fmt.Sprintf("required tools not available: %s", strings.Join(names, ", "))
+				_ = trace.write(map[string]any{
+					"type":                "contract_tool_unavailable",
+					"task_id":             taskID,
+					"unavailable":         names,
+					"unavailable_reasons": unavailableReasons,
+					"blocker_text":        reason,
+				})
+				return true, nil
+			}
 			maxFollowups := rt.Config.Execution.MaxContractFollowupsValue()
 			if contractFollowups >= maxFollowups {
 				reason := fmt.Sprintf("task contract could not be satisfied after %d attempts; missing: %s", contractFollowups, strings.Join(validation.Missing, ", "))
@@ -252,4 +273,13 @@ func acceptToolResult(tool agentcore.Tool, call agentcore.ToolCall, result agent
 	}
 	evidence["acceptance"] = "accepted"
 	return "accepted", evidence
+}
+
+func checkUnavailableContractTools(rt Runtime, msg channel.InboundMessage, contract session.TaskContract) map[string]string {
+	fullRegistry := rt.Tools
+	agentRegistry := rt.Tools
+	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
+		agentRegistry = agent.Tools
+	}
+	return checkContractToolAvailability(agentRegistry, fullRegistry, contract)
 }

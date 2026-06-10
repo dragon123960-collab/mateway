@@ -374,6 +374,83 @@ func validateTaskContract(contract session.TaskContract, task session.TaskNode) 
 	return taskContractValidation{Satisfied: len(missing) == 0, Missing: missing}
 }
 
+func checkContractToolAvailability(agentRegistry, fullRegistry *agentcore.ToolRegistry, contract session.TaskContract) map[string]string {
+	if agentRegistry == nil {
+		agentRegistry = fullRegistry
+	}
+	if agentRegistry == nil {
+		unavailable := map[string]string{}
+		for _, name := range contract.RequiredTools {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				unavailable[name] = "tool registry unavailable"
+			}
+		}
+		return unavailable
+	}
+	unavailable := map[string]string{}
+	for _, name := range contract.RequiredTools {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := agentRegistry.Get(name); !ok {
+			unavailable[name] = availabilityReason(name, agentRegistry, fullRegistry)
+		}
+	}
+	for _, item := range contract.PlanItems {
+		name := strings.TrimSpace(item.Tool)
+		if name == "" {
+			continue
+		}
+		if _, ok := agentRegistry.Get(name); !ok {
+			if _, exists := unavailable[name]; !exists {
+				unavailable[name] = availabilityReason(name, agentRegistry, fullRegistry)
+			}
+		}
+	}
+	return unavailable
+}
+
+func availabilityReason(toolName string, agentRegistry, fullRegistry *agentcore.ToolRegistry) string {
+	if fullRegistry != nil {
+		if _, ok := fullRegistry.Get(toolName); ok {
+			return "denied by profile"
+		}
+	}
+	return "tool not registered"
+}
+
+func contractBlockerText(contract session.TaskContract, validation taskContractValidation, rt Runtime, msg channel.InboundMessage) string {
+	if len(validation.Missing) == 0 {
+		return "\n\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new."
+	}
+	fullRegistry := rt.Tools
+	agentRegistry := rt.Tools
+	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
+		agentRegistry = agent.Tools
+	}
+	var parts []string
+	for _, m := range validation.Missing {
+		label := m
+		if toolName := toolNameFromMissing(m); toolName != "" {
+			if _, ok := agentRegistry.Get(toolName); !ok {
+				reason := availabilityReason(toolName, agentRegistry, fullRegistry)
+				label = m + " (" + reason + ")"
+			}
+		}
+		parts = append(parts, label)
+	}
+	return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", strings.Join(parts, "; "))
+}
+
+func toolNameFromMissing(missing string) string {
+	if strings.HasPrefix(missing, toolMissingPrefix) {
+		return strings.TrimPrefix(missing, toolMissingPrefix)
+	}
+	return ""
+}
+
 func taskContractFromState(state session.State, taskID string) session.TaskContract {
 	task := taskFromState(state, taskID)
 	if task.Execution.Contract == nil {

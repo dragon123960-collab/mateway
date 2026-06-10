@@ -1958,3 +1958,214 @@ func findTaskByGoal(state session.State, goal string) session.TaskNode {
 	}
 	return session.TaskNode{}
 }
+
+func TestContractToolsBypassVisibleToolBudget(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.ContextBudget.MaxVisibleTools = 2
+	registry := agentcore.NewToolRegistry()
+	for _, name := range []string{"file.read", "web.search", "terminal.run", "schedule.manage", "task.search"} {
+		registry.Register(runtimeNamedTool{name: name, content: "ok"})
+	}
+	rt.Tools = registry
+	capture := &captureToolsModel{text: "done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(capture, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"multi-tool task","requires_tools":true,"required_tools":["file.read","terminal.run","web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"search"}],"expected_outcome":"answer"}`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "multi tool search"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != "input_required" {
+		t.Fatalf("expected plan review, got %#v", resp)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capture.toolNames) < 3 {
+		t.Fatalf("expected at least 3 contract tools visible (max=2), got %d: %v", len(capture.toolNames), capture.toolNames)
+	}
+	for _, want := range []string{"file.read", "terminal.run", "web.search"} {
+		if !containsString(capture.toolNames, want) {
+			t.Fatalf("expected %s in visible tools, got %v", want, capture.toolNames)
+		}
+	}
+}
+
+func TestMissingContractToolProducesBlocker(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "content"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I cannot complete this task."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":true,"required_tools":["file.read","nonexistent.tool"],"expected_outcome":"done"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "use nonexistent tool"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed {
+		t.Fatal("expected resp.Failed=true for unavailable contract tool")
+	}
+	if !strings.Contains(resp.Reply.Text, "tool not registered") {
+		t.Fatalf("expected 'tool not registered' in reply, got: %q", resp.Reply.Text)
+	}
+
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "contract_tool_unavailable") {
+		t.Fatalf("expected contract_tool_unavailable trace, got:\n%s", traceStr)
+	}
+	if strings.Contains(traceStr, "contract_followup_sent") {
+		t.Fatal("expected no follow-up loop for unavailable tool")
+	}
+}
+
+func TestProfileDeniedContractToolProducesBlocker(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App: config.AppConfig{Home: home},
+		Execution: config.ExecutionConfig{
+			MaxIterations:        intPtrTest(8),
+			InactivityTimeout:    "0s",
+			MaxContractFollowups: 2,
+		},
+		Agents: config.AgentsConfig{
+			Default: "main",
+			Profiles: []config.AgentProfileConfig{{
+				ID: "main",
+				Tools: config.AccessListConfig{
+					Deny: []string{"terminal.run"},
+				},
+			}},
+		},
+	}
+	rt := New(cfg)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+	rt.Tools = registry
+	rt.Pool = NewAgentPool(cfg)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Pool.agents["main"].Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"check status","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"status"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "check server status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed {
+		t.Fatal("expected resp.Failed=true for profile-denied contract tool")
+	}
+	if !strings.Contains(resp.Reply.Text, "denied by profile") {
+		t.Fatalf("expected 'denied by profile' in reply, got: %q", resp.Reply.Text)
+	}
+	if !strings.Contains(resp.Reply.Text, "terminal.run") {
+		t.Fatalf("expected denied tool name in reply, got: %q", resp.Reply.Text)
+	}
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "contract_tool_unavailable") {
+		t.Fatalf("expected contract_tool_unavailable trace, got:\n%s", traceStr)
+	}
+}
+
+func TestCompletedTaskClearsActiveState(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "service is running"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will check the service."},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "systemctl status"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "service is running."},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"check service","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"status confirmed"}`}
+
+	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "check if service is running"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planResp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", planResp)
+	}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected completed task, got failed: %#v", resp)
+	}
+
+	state := loadState(t, rt, "cli:test")
+	if state.ActiveTask != "" {
+		t.Fatalf("expected ActiveTask to be empty after completion, got %q", state.ActiveTask)
+	}
+	task := findTaskByGoal(state, "check if service is running")
+	if task.Status != "completed" {
+		t.Fatalf("expected task status completed, got %q", task.Status)
+	}
+}
+
+func TestUnexecutedPromiseDoesNotCompleteTask(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "I will check the status."},
+		{Role: agentcore.RoleAssistant, Content: "Let me look into that."},
+	}}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "check the status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed {
+		t.Fatal("expected unexecuted promise to fail, not complete")
+	}
+
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "check the status")
+	if task.Status == "completed" {
+		t.Fatal("expected task NOT to be completed on unexecuted promise")
+	}
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "deliverable_gate_followup") {
+		t.Fatal("expected deliverable_gate_followup trace for unexecuted promise")
+	}
+}

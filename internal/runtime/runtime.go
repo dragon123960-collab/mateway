@@ -283,6 +283,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
 			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
 		} else if emptyActionPromise || looksLikeUnexecutedCommitment(finalText) {
+			contractUnsatisfied = true
 			state.BlockActiveTask("failed")
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
 			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
@@ -295,7 +296,8 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	if contractUnsatisfied {
-		blocker := fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", strings.Join(contractValidation.Missing, "; "))
+		contract := taskContractFromState(*state, task.ID)
+		blocker := contractBlockerText(contract, contractValidation, rt, msg)
 		finalText = strings.TrimSpace(finalText)
 		if finalText != "" {
 			finalText = finalText + blocker
