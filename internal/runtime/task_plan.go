@@ -185,11 +185,7 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 		return resp, true, err
 	case "replan":
 		if pending.ReplanCount >= 5 {
-			text := "Replan limit reached. Reply 1 to execute the current plan or /new to start over."
-			if prefersChinese(msg.Text, task.Goal) {
-				text = "已达到重新规划次数上限。回复 1 执行当前计划，或发送 /new 开始新任务。"
-			}
-			resp := rt.reply(msg, text, channel.StyleInputRequired)
+			resp := rt.reply(msg, "Replan limit reached. Reply 1 to execute the current plan or /new to start over.", channel.StyleInputRequired)
 			resp.TraceID = trace.id
 			resp.TracePath = trace.path
 			return resp, true, nil

@@ -302,46 +302,69 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	addUsage(&state.Usage, usage)
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
-	emptyActionPromise := looksLikeEmptyActionPromise(finalText)
 	contractUnsatisfied := false
-	var contractValidation taskContractValidation
+	var classification FinalClassification
 	if state.Pending == nil {
-		contractValidation = validateTaskContract(taskContractFromState(*state, task.ID), taskFromState(*state, task.ID))
-		if result.StopReason != "" {
-			state.BlockActiveTask("failed")
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
-			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
-		} else if !contractValidation.Satisfied {
-			contractUnsatisfied = true
-			state.BlockActiveTask("failed")
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: strings.Join(contractValidation.Missing, "; "), Evidence: map[string]any{"missing": contractValidation.Missing}})
-			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": task.ID, "status": "failed", "missing": contractValidation.Missing})
-		} else if looksLikeInputRequest(finalText) {
-			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
-			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
-			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
-		} else if emptyActionPromise || looksLikeUnexecutedCommitment(finalText) {
-			contractUnsatisfied = true
-			state.BlockActiveTask("failed")
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
-			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
-		} else {
+		contract := taskContractFromState(*state, task.ID)
+		currentTask := taskFromState(*state, task.ID)
+		// Re-derive the unavailable tool check and followup count from the
+		// task itself, so the post-loop classification does not depend on
+		// any state the hook passed back through a pointer.
+		unavailable := checkUnavailableContractTools(rt, msg, contract)
+		classification = EvaluateFinal(FinalInput{
+			Contract:         contract,
+			Task:             currentTask,
+			FinalText:        finalText,
+			StopReason:       result.StopReason,
+			UnavailableTools: unavailable,
+			AgentRegistry:    agentToolsForMessage(rt, msg),
+			FullRegistry:     rt.Tools,
+			FollowupCount:    countContractFollowupEvents(currentTask),
+			MaxFollowups:     rt.Config.Execution.MaxContractFollowupsValue(),
+		})
+		switch classification.State {
+		case "completed":
 			completeNoToolPlanItems(state, task.ID, finalText)
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
 			updateSessionSummary(state, task.ID, finalText, "completed", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
 			taskCompleted = true
+		case "await_user_input":
+			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
+			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
+		case "failed":
+			switch classification.BlockerKind {
+			case completionBlockerStopReason:
+				state.BlockActiveTask("failed")
+				state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
+				_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
+			default:
+				contractUnsatisfied = true
+				state.BlockActiveTask("failed")
+				followupAttempts := countContractFollowupEvents(currentTask)
+				evidence := buildBlockedTaskEvidence(classification, followupAttempts)
+				state.AddExecutionEvent(task.ID, session.ExecutionEvent{
+					Type:     "task_contract_unsatisfied",
+					Status:   "failed",
+					Summary:  classification.BlockerReason,
+					Evidence: evidence,
+				})
+				// The hook already wrote contract_tool_unavailable or
+				// task_contract_followup_limit to the trace when it forced
+				// the loop to stop. The post-loop only records the task
+				// state change as a single task_contract_unsatisfied
+				// execution event; no parallel _post trace event.
+			}
 		}
 	}
-	if contractUnsatisfied {
-		contract := taskContractFromState(*state, task.ID)
-		blocker := contractBlockerText(contract, contractValidation, rt, msg)
+	if contractUnsatisfied && classification.BlockerText != "" {
 		finalText = strings.TrimSpace(finalText)
 		if finalText != "" {
-			finalText = finalText + blocker
+			finalText = finalText + classification.BlockerText
 		} else {
-			finalText = blocker
+			finalText = classification.BlockerText
 		}
 	}
 	if err := rt.saveState(state, trace); err != nil {
@@ -401,7 +424,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	style := channel.MessageStyle("")
-	failed := result.StopReason != "" || emptyActionPromise || contractUnsatisfied
+	failed := result.StopReason != "" || (state.Pending == nil && classification.State == "failed")
 	if failed && style == "" {
 		style = channel.StylePartial
 	}

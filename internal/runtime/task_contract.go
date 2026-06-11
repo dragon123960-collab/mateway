@@ -668,23 +668,25 @@ func availabilityReason(toolName string, agentRegistry, fullRegistry *agentcore.
 }
 
 func contractBlockerText(contract session.TaskContract, validation taskContractValidation, rt Runtime, msg channel.InboundMessage) string {
-	isChinese := prefersChinese(msg.Text, contract.Summary)
-	if len(validation.Missing) == 0 {
-		if isChinese {
-			return "\n\n任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。"
-		}
-		return "\n\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new."
-	}
 	fullRegistry := rt.Tools
 	agentRegistry := rt.Tools
 	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
 		agentRegistry = agent.Tools
 	}
+	return renderContractBlockerText(contract, validation, agentRegistry, fullRegistry)
+}
+
+// renderContractBlockerText formats the user-facing blocker text for a
+// contract that could not be satisfied. It uses structured English with
+// per-tool reason annotations and intentionally avoids runtime language
+// detection; the model can localize the eventual final reply via the
+// system prompt.
+func renderContractBlockerText(contract session.TaskContract, validation taskContractValidation, agentRegistry, fullRegistry *agentcore.ToolRegistry) string {
+	if len(validation.Missing) == 0 {
+		return "\n\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new."
+	}
 	if agentRegistry == nil {
 		missing := strings.Join(validation.Missing, "; ")
-		if isChinese {
-			return fmt.Sprintf("\n\n任务未能满足 contract。缺失证据：%s。\n任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。", missing)
-		}
 		return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", missing)
 	}
 	var parts []string
@@ -699,9 +701,6 @@ func contractBlockerText(contract session.TaskContract, validation taskContractV
 		parts = append(parts, label)
 	}
 	missing := strings.Join(parts, "; ")
-	if isChinese {
-		return fmt.Sprintf("\n\n任务未能满足 contract。缺失证据：%s。\n任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。", missing)
-	}
 	return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", missing)
 }
 
@@ -893,16 +892,10 @@ func missingPlanItems(contract session.TaskContract) []string {
 }
 
 func renderTaskPlanForReview(contract session.TaskContract, userText string) string {
-	if prefersChinese(userText, contract.Summary) {
-		return renderTaskPlanForReviewZH(contract, false)
-	}
 	return renderTaskPlanForReviewEN(contract, false)
 }
 
 func renderTaskPlanForExecution(contract session.TaskContract, userText string) string {
-	if prefersChinese(userText, contract.Summary) {
-		return renderTaskPlanForReviewZH(contract, true)
-	}
 	return renderTaskPlanForReviewEN(contract, true)
 }
 
@@ -958,71 +951,6 @@ func renderTaskPlanForReviewEN(contract session.TaskContract, includeItems bool)
 	}
 	b.WriteString("\nReply 1 to execute, 2 to replan, or describe what to change.")
 	return strings.TrimSpace(b.String())
-}
-
-func renderTaskPlanForReviewZH(contract session.TaskContract, includeItems bool) string {
-	var b strings.Builder
-	b.WriteString("任务计划：\n")
-	if strings.TrimSpace(contract.Summary) != "" {
-		b.WriteString("- 摘要：")
-		b.WriteString(contract.Summary)
-		b.WriteString("\n")
-	}
-	if strings.TrimSpace(contract.ExpectedOutcome) != "" {
-		b.WriteString("- 预期结果：")
-		b.WriteString(contract.ExpectedOutcome)
-		b.WriteString("\n")
-	}
-	if len(contract.RequiredTools) > 0 {
-		b.WriteString("- 需要工具：")
-		b.WriteString(strings.Join(contract.RequiredTools, ", "))
-		b.WriteString("\n")
-	}
-	if len(contract.RequiredSkills) > 0 {
-		b.WriteString("- 需要技能：")
-		for i, s := range contract.RequiredSkills {
-			if i > 0 {
-				b.WriteString("、")
-			}
-			b.WriteString(strings.TrimSpace(s.Name))
-			if strings.TrimSpace(s.Reason) != "" {
-				b.WriteString("（")
-				b.WriteString(strings.TrimSpace(s.Reason))
-				b.WriteString("）")
-			}
-		}
-		b.WriteString("\n")
-	}
-	if includeItems && len(contract.PlanItems) > 0 {
-		b.WriteString("\n计划：\n")
-		for _, item := range contract.PlanItems {
-			b.WriteString("- ")
-			b.WriteString(item.Title)
-			if strings.TrimSpace(item.Tool) != "" {
-				b.WriteString(" [")
-				b.WriteString(strings.TrimSpace(item.Tool))
-				b.WriteString("]")
-			}
-			if strings.TrimSpace(item.Criteria) != "" {
-				b.WriteString("：")
-				b.WriteString(item.Criteria)
-			}
-			b.WriteString("\n")
-		}
-	}
-	b.WriteString("\n回复 1 执行，回复 2 重新规划，或直接说明你想调整的地方。")
-	return strings.TrimSpace(b.String())
-}
-
-func prefersChinese(values ...string) bool {
-	for _, value := range values {
-		for _, r := range value {
-			if r >= '\u4e00' && r <= '\u9fff' {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 type contractToolValidation struct {
@@ -1212,10 +1140,6 @@ func contractReplanFeedback(v contractToolValidation, contract session.TaskContr
 }
 
 func invalidContractBlockerText(contract session.TaskContract, v contractToolValidation, msg channel.InboundMessage) string {
-	isChinese := prefersChinese(msg.Text, contract.Summary)
-	if isChinese {
-		return invalidContractBlockerZH(contract, v)
-	}
 	return invalidContractBlockerEN(contract, v)
 }
 
@@ -1249,37 +1173,5 @@ func invalidContractBlockerEN(contract session.TaskContract, v contractToolValid
 	}
 
 	b.WriteString("The task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.")
-	return b.String()
-}
-
-func invalidContractBlockerZH(contract session.TaskContract, v contractToolValidation) string {
-	var b strings.Builder
-	b.WriteString("\n\n任务无法继续执行。")
-
-	hasTools := len(v.InvalidTools) > 0
-	hasSkills := len(v.InvalidSkills) > 0
-
-	if hasTools {
-		if v.HasSkillNameMismatch {
-			b.WriteString("以下名称疑似为 skill 而非已注册的工具：")
-		} else {
-			b.WriteString("以下工具未注册：")
-		}
-		b.WriteString(strings.Join(v.InvalidTools, "、"))
-		b.WriteString("。\n")
-		if v.HasSkillNameMismatch {
-			b.WriteString("skill 名称应放在 required_skills 中，而非 required_tools 或 plan_items[].tool。")
-			b.WriteString("如需使用 skill，请添加 file.read evidence 和 file.read plan item 读取对应 SKILL.md 文件。\n")
-		}
-	}
-
-	if hasSkills {
-		b.WriteString("缺少读取技能文件的 file.read 证据和/或 file.read plan item：")
-		b.WriteString(strings.Join(v.InvalidSkills, "；"))
-		b.WriteString("。\n")
-		b.WriteString("每个 required skill 必须有对应的 file.read evidence 和 plan_items 条目用于读取其 SKILL.md。\n")
-	}
-
-	b.WriteString("任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。")
 	return b.String()
 }

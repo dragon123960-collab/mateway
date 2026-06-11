@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -143,80 +142,98 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
 		contract := taskContractFromState(*state, taskID)
 		currentTask := taskFromState(*state, taskID)
-		validation := validateTaskContract(contract, currentTask)
-		if contract.RequiresTools && !validation.Satisfied {
-			failures := classifyTurnFailures(turn.ToolResults, turn.Message.ToolCalls)
+		unavailable := checkUnavailableContractTools(rt, msg, contract)
+		decision := EvaluateLoopEnd(LoopEndInput{
+			Contract:         contract,
+			Task:             currentTask,
+			UserText:         userText,
+			TurnMessage:      turn.Message,
+			TurnToolResults:  turn.ToolResults,
+			TurnToolCalls:    turn.Message.ToolCalls,
+			UnavailableTools: unavailable,
+			FollowupCount:    contractFollowups,
+			MaxFollowups:     rt.Config.Execution.MaxContractFollowupsValue(),
+			DeliveryGateSent: followupSent,
+			AgentRegistry:    agentToolsForMessage(rt, msg),
+			FullRegistry:     rt.Tools,
+		})
+		if contract.RequiresTools && !decision.ContractSatisfied {
 			_ = trace.write(map[string]any{
 				"type":    "task_contract_unsatisfied",
 				"task_id": taskID,
-				"missing": validation.Missing,
+				"missing": decision.MissingEvidence,
 			})
-			if len(failures) > 0 {
+			if len(decision.FailureCategories) > 0 {
 				_ = trace.write(map[string]any{
 					"type":               "tool_failures_classified",
 					"task_id":            taskID,
-					"failure_categories": failureCategories(failures),
+					"failure_categories": decision.FailureCategories,
 				})
 			}
-			if unavailable := checkUnavailableContractTools(rt, msg, contract); len(unavailable) > 0 {
+		}
+		if decision.StopLoopNow {
+			switch decision.BlockerKind {
+			case completionBlockerUnavailableTool:
 				names := make([]string, 0, len(unavailable))
 				for name := range unavailable {
 					names = append(names, name)
 				}
 				sort.Strings(names)
-				unavailableReasons := make(map[string]string, len(unavailable))
+				traceReasons := make(map[string]string, len(unavailable))
 				for name, reason := range unavailable {
-					unavailableReasons[name] = reason
+					traceReasons[name] = reason
 				}
-				reason := fmt.Sprintf("required tools not available: %s", strings.Join(names, ", "))
 				_ = trace.write(map[string]any{
 					"type":                "contract_tool_unavailable",
 					"task_id":             taskID,
 					"unavailable":         names,
-					"unavailable_reasons": unavailableReasons,
-					"blocker_text":        reason,
+					"unavailable_reasons": traceReasons,
+					"blocker_text":        decision.BlockerReason,
 				})
-				return true, nil
-			}
-			maxFollowups := rt.Config.Execution.MaxContractFollowupsValue()
-			if contractFollowups >= maxFollowups {
-				reason := fmt.Sprintf("task contract could not be satisfied after %d attempts; missing: %s", contractFollowups, strings.Join(validation.Missing, ", "))
+			case completionBlockerFollowupLimit:
 				_ = trace.write(map[string]any{
 					"type":           "task_contract_followup_limit",
 					"task_id":        taskID,
-					"attempts_total": contractFollowups,
-					"missing":        validation.Missing,
-					"blocker_text":   reason,
+					"attempts_total": decision.FollowupAttempts,
+					"missing":        decision.MissingEvidence,
+					"blocker_text":   decision.BlockerReason,
 				})
-				return true, nil
 			}
+			return true, nil
+		}
+		if decision.ShouldFollowUp {
 			contractFollowups++
-			content := taskContractFollowupWithGuidance(validation.Missing, failures, contract, acceptedTools(currentTask))
 			followUps = append(followUps, agentcore.Message{
 				Role:    agentcore.RoleUser,
-				Content: content,
+				Content: decision.FollowupMessage,
 			})
-			_ = trace.write(map[string]any{
-				"type":    "contract_followup_sent",
-				"task_id": taskID,
-				"attempt": contractFollowups,
-				"missing": validation.Missing,
-			})
+			if decision.FollowupReason == "unexecuted_commitment" {
+				followupSent = true
+				_ = trace.write(map[string]any{
+					"type":    "deliverable_gate_followup",
+					"task_id": taskID,
+					"reason":  decision.FollowupReason,
+				})
+			} else {
+				_ = trace.write(map[string]any{
+					"type":    "contract_followup_sent",
+					"task_id": taskID,
+					"attempt": contractFollowups,
+					"missing": decision.MissingEvidence,
+				})
+				// Record a task execution event so the runtime can re-derive
+				// followupCount post-loop without consulting the hook.
+				state.AddExecutionEvent(taskID, session.ExecutionEvent{
+					Type:     "contract_followup",
+					Status:   "running",
+					Summary:  decision.FollowupReason,
+					Evidence: map[string]any{"attempt": contractFollowups, "missing": decision.MissingEvidence},
+				})
+			}
 			return false, nil
 		}
 		if contract.RequiresTools {
 			_ = trace.write(map[string]any{"type": "task_contract_satisfied", "task_id": taskID})
-		}
-		if followupSent || turnHasToolEvidence(turn) || !needsAction(userText) || !looksLikeUnexecutedAction(turn.Message.Content) {
-			return false, nil
-		}
-		followupSent = true
-		if len(followUps) == 0 {
-			followUps = append(followUps, agentcore.Message{
-				Role:    agentcore.RoleUser,
-				Content: "You promised an action but did not execute any tool. Continue now with the smallest safe tool call, or state the concrete blocker that prevents execution.",
-			})
-			_ = trace.write(map[string]any{"type": "deliverable_gate_followup", "task_id": taskID, "reason": "unexecuted_commitment"})
 		}
 		return false, nil
 	}
@@ -289,4 +306,11 @@ func checkUnavailableContractTools(rt Runtime, msg channel.InboundMessage, contr
 		agentRegistry = agent.Tools
 	}
 	return checkContractToolAvailability(agentRegistry, fullRegistry, contract)
+}
+
+func agentToolsForMessage(rt Runtime, msg channel.InboundMessage) *agentcore.ToolRegistry {
+	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
+		return agent.Tools
+	}
+	return rt.Tools
 }

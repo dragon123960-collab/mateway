@@ -67,6 +67,9 @@ func progressStepsForTaskSince(state session.State, taskID string, eventOffset i
 	events = events[eventOffset:]
 	out := planProgressSteps(task.Execution.Contract)
 	for _, event := range events {
+		if isRuntimeInternalEvent(event.Type) {
+			continue
+		}
 		step := progressStepFromExecutionEvent(event)
 		if strings.TrimSpace(step.Title) == "" {
 			continue
@@ -78,6 +81,15 @@ func progressStepsForTaskSince(state session.State, taskID string, eventOffset i
 		out = out[len(out)-limit:]
 	}
 	return out
+}
+
+// isRuntimeInternalEvent returns true for execution event types that exist
+// for runtime bookkeeping and should not be surfaced as user-facing progress
+// steps. The event itself is preserved on the task for runtime use
+// (e.g. contract_followup is counted by the post-loop classifier); only the
+// progress rendering skips it.
+func isRuntimeInternalEvent(eventType string) bool {
+	return eventType == "contract_followup"
 }
 
 func planProgressSteps(contract *session.TaskContract) []channel.ProgressStep {
