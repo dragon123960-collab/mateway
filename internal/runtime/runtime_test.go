@@ -534,6 +534,103 @@ func TestTaskContractPromptDoesNotHardCodeFeishuSkill(t *testing.T) {
 	}
 }
 
+func TestFallbackContractForActionTaskRequiresTools(t *testing.T) {
+	contract := fallbackTaskContract("查看纳斯达克指数情况，近三天的走势，将其整理成文档，发到我的飞书云文档", "")
+	if !contract.RequiresTools {
+		t.Fatalf("expected action fallback contract to require tools, got %#v", contract)
+	}
+	for _, want := range []string{"web.search", "file.write", "terminal.run"} {
+		found := false
+		for _, got := range contract.RequiredTools {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected fallback contract to require %s, got %v", want, contract.RequiredTools)
+		}
+	}
+	if len(contract.PlanItems) < 3 {
+		t.Fatalf("expected fallback contract plan items for search/write/publish, got %#v", contract.PlanItems)
+	}
+	if !shouldPauseForTaskPlan(contract) {
+		t.Fatalf("expected fallback action contract to pause for plan review, got %#v", contract)
+	}
+}
+
+func TestRuntimeContextIncludesSkillsBeyondOldLimit(t *testing.T) {
+	rt := newTestRuntime(t)
+	ws := t.TempDir()
+	rt.Config.App.Workspace = ws
+	for i := 0; i < 13; i++ {
+		dir := filepath.Join(ws, "skills", fmt.Sprintf("high-%02d", i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		content := fmt.Sprintf("---\nname: high-%02d\ndescription: High priority skill.\npriority: 90\n---\n", i)
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	feishuDir := filepath.Join(ws, "skills", "feishu-notify")
+	if err := os.MkdirAll(feishuDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(feishuDir, "SKILL.md"), []byte("---\nname: feishu-notify\ndescription: Create Feishu/Lark cloud documents.\npriority: 80\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	text := skillsPrompt(skillsForRuntimeContext(rt.Config, "main"))
+	if !strings.Contains(text, "feishu-notify") {
+		t.Fatalf("expected runtime context skills to include feishu-notify beyond old 12-skill limit, got:\n%s", text)
+	}
+}
+
+func TestSkillValidationUsesRuntimeContextSkillSet(t *testing.T) {
+	rt := newTestRuntime(t)
+	ws := t.TempDir()
+	rt.Config.App.Workspace = ws
+	for i := 0; i < 13; i++ {
+		dir := filepath.Join(ws, "skills", fmt.Sprintf("high-%02d", i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		content := fmt.Sprintf("---\nname: high-%02d\ndescription: High priority skill.\npriority: 90\n---\n", i)
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	feishuPath := filepath.Join(ws, "skills", "feishu-notify", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(feishuPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(feishuPath, []byte("---\nname: feishu-notify\ndescription: Create Feishu/Lark cloud documents.\npriority: 80\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+	contract := session.TaskContract{
+		RequiresTools: true,
+		RequiredTools: []string{"file.read", "terminal.run"},
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Path: feishuPath, Reason: "create Feishu cloud doc"},
+		},
+		RequiredEvidence: []session.TaskEvidenceContract{
+			{Kind: "local_file", Tool: "file.read", Description: "read " + feishuPath},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "read feishu-notify SKILL.md", Status: "pending", Tool: "file.read", Criteria: "read " + feishuPath},
+			{ID: "plan-2", Title: "create Feishu doc", Status: "pending", Tool: "terminal.run", Criteria: "run helper from feishu-notify skill"},
+		},
+	}
+	validation := validateContractTools(contract, registry, skillsForRuntimeContext(rt.Config, "main"))
+	if !validation.IsValid() {
+		t.Fatalf("expected feishu-notify beyond old limit to validate, got invalid tools=%v skills=%v", validation.InvalidTools, validation.InvalidSkills)
+	}
+}
+
 func TestRuntimeTaskContractStrengthensServerStatusToTerminalRun(t *testing.T) {
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
@@ -2978,6 +3075,46 @@ func TestContractValidationRejectsSkillNameAsTool(t *testing.T) {
 	}
 }
 
+func TestRepairContractSkillUsageRemovesSkillToolsAndAddsReadItems(t *testing.T) {
+	contract := session.TaskContract{
+		RequiresTools: true,
+		RequiredTools: []string{"web.search", "agent-browser", "terminal.run"},
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "fresh-search", Path: "/tmp/skills/fresh-search/SKILL.md"},
+			{Name: "agent-browser", Path: "/tmp/skills/agent-browser/SKILL.md"},
+		},
+		RequiredEvidence: []session.TaskEvidenceContract{
+			{Kind: "current_external_fact", Tool: "web.search", Description: "market data"},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "browse", Status: "pending", Tool: "agent-browser", Criteria: "use browser skill"},
+		},
+	}
+	repaired := repairContractSkillUsage(contract, []discoveredSkill{
+		{Name: "fresh-search", Path: "/tmp/skills/fresh-search/SKILL.md"},
+		{Name: "agent-browser", Path: "/tmp/skills/agent-browser/SKILL.md"},
+	})
+	for _, tool := range repaired.RequiredTools {
+		if tool == "agent-browser" {
+			t.Fatalf("expected skill name removed from required tools, got %v", repaired.RequiredTools)
+		}
+	}
+	if !contractHasFileReadPlanItemForSkill(repaired, "fresh-search", "/tmp/skills/fresh-search/SKILL.md") {
+		t.Fatalf("expected file.read plan item for fresh-search, got %#v", repaired.PlanItems)
+	}
+	if !contractHasFileReadPlanItemForSkill(repaired, "agent-browser", "/tmp/skills/agent-browser/SKILL.md") {
+		t.Fatalf("expected file.read plan item for agent-browser, got %#v", repaired.PlanItems)
+	}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+	validation := validateContractTools(repaired, registry, nil)
+	if len(validation.InvalidTools) != 0 || validation.HasSkillNameMismatch {
+		t.Fatalf("expected repaired contract to avoid skill/tool mismatch, got %#v", validation)
+	}
+}
+
 func TestContractReplanMapsSkillToRealTools(t *testing.T) {
 	rt := newTestRuntime(t)
 	cfg := rt.Config
@@ -3430,6 +3567,24 @@ func TestFeishuNotifyIsDiscoveredWhenInstalled(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected feishu-notify in discovered skills, got %v", skillNames(skills))
+	}
+}
+
+func TestSkillDiscoveryUsesHeaderEvenWhenBodyMentionsToken(t *testing.T) {
+	ws := t.TempDir()
+	cfg := config.DefaultRoot()
+	cfg.App.Workspace = ws
+	skillDir := filepath.Join(ws, "skills", "feishu-notify")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\nname: feishu-notify\ndescription: Create Feishu/Lark cloud documents.\npriority: 80\n---\n\nUse --parent-token when needed.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skills := discoverSkillsForAgent(&cfg, "main", 24)
+	if len(skills) != 1 || skills[0].Name != "feishu-notify" {
+		t.Fatalf("expected skill discovery to parse safe header despite token in body, got %#v", skills)
 	}
 }
 

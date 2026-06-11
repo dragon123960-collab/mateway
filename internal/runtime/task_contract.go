@@ -111,6 +111,7 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		contract.Summary = summarize(firstNonEmpty(userText, task.Goal))
 	}
 	contract = strengthenTaskContract(contract, task.Goal, userText)
+	contract = repairContractSkillUsage(contract, skills)
 	validation := validateContractTools(contract, rt.Tools, skills)
 	replanAttempted := false
 	if !validation.IsValid() && !replanAttempted {
@@ -128,6 +129,7 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 				replanContract.Summary = summarize(firstNonEmpty(userText, task.Goal))
 			}
 			replanContract = strengthenTaskContract(replanContract, task.Goal, userText)
+			replanContract = repairContractSkillUsage(replanContract, skills)
 			contract = replanContract
 			replanAttempted = true
 			validation = validateContractTools(contract, rt.Tools, skills)
@@ -227,7 +229,10 @@ func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegist
 	if len(skills) > 0 {
 		b.WriteString("\nAvailable skills:\n")
 		b.WriteString("- Skill names are instructional references, NOT executable tools. Do NOT put skill names in required_tools or plan_items[].tool.\n")
-		b.WriteString("- To use a skill, read its SKILL.md with file.read, then follow its workflow using real runtime tools listed under Available tools below.\n")
+		b.WriteString("- Put a skill in required_skills only when reading and following that specific SKILL.md is required to finish the task.\n")
+		b.WriteString("- Do not put planning/synthesis guidance skills in required_skills merely because they are relevant; use their descriptions as guidance instead.\n")
+		b.WriteString("- For every required_skills entry, add both required_evidence tool=file.read and a plan_items entry tool=file.read that references the skill name or SKILL.md path.\n")
+		b.WriteString("- After reading a skill, follow its workflow using real runtime tools listed under Available tools below.\n")
 		for _, skill := range skills {
 			b.WriteString("- name: ")
 			b.WriteString(skill.Name)
@@ -343,14 +348,16 @@ func cleanEvidenceContracts(values []session.TaskEvidenceContract) []session.Tas
 
 func fallbackTaskContract(goal, userText string) session.TaskContract {
 	text := firstNonEmpty(userText, goal)
-	return strengthenTaskContract(session.TaskContract{
+	contract := session.TaskContract{
 		Summary:          summarize(text),
 		RequiresTools:    false,
 		PlanItems:        fallbackPlanItems(text, false, nil),
 		ExpectedOutcome:  "answer the user task directly from available context",
 		CompletionPolicy: "final answer should address the user task or ask for required input",
 		CreatedAt:        time.Now(),
-	}, goal, userText)
+	}
+	contract = strengthenActionTaskContract(contract, strings.ToLower(strings.TrimSpace(text)))
+	return strengthenTaskContract(contract, goal, userText)
 }
 
 func strengthenTaskContract(contract session.TaskContract, goal, userText string) session.TaskContract {
@@ -383,6 +390,153 @@ func strengthenTaskContract(contract session.TaskContract, goal, userText string
 		contract.CompletionPolicy = "run the smallest safe terminal command before final answer, unless a concrete blocker prevents it"
 	}
 	return contract
+}
+
+func strengthenActionTaskContract(contract session.TaskContract, lower string) session.TaskContract {
+	if lower == "" {
+		return contract
+	}
+	needsFreshInfo := containsAnyLiteral(lower,
+		"today", "latest", "current", "recent", "price", "market", "stock", "index", "weather", "news", "schedule",
+		"今天", "最新", "当前", "最近", "近三天", "近3天", "走势", "行情", "指数", "天气", "新闻",
+	)
+	needsLocalWrite := containsAnyLiteral(lower,
+		"write", "document", "markdown", "report", "file", "整理成文档", "文档", "报告", "写入",
+	)
+	needsExternalPublish := containsAnyLiteral(lower,
+		"feishu", "lark", "cloud doc", "send to", "publish", "飞书", "云文档", "发送", "发到",
+	)
+	if !needsFreshInfo && !needsLocalWrite && !needsExternalPublish {
+		return contract
+	}
+	contract.RequiresTools = true
+	if needsFreshInfo {
+		contract.RequiredTools = cleanStringList(append(contract.RequiredTools, "web.search"))
+		contract.RequiredEvidence = append(contract.RequiredEvidence, session.TaskEvidenceContract{
+			Kind:        "current_external_fact",
+			Tool:        "web.search",
+			Description: "current external data with source/date, or a concrete search blocker",
+		})
+		contract.PlanItems = ensurePlanItem(contract.PlanItems, session.TaskPlanItem{
+			ID:       "plan-1",
+			Title:    "collect current information",
+			Status:   "pending",
+			Tool:     "web.search",
+			Criteria: "collect current data with source/date, or record a concrete blocker",
+		})
+	}
+	if needsLocalWrite || needsExternalPublish {
+		contract.RequiredTools = cleanStringList(append(contract.RequiredTools, "file.write"))
+		contract.RequiredEvidence = append(contract.RequiredEvidence, session.TaskEvidenceContract{
+			Kind:        "local_file",
+			Tool:        "file.write",
+			Description: "local markdown/report file written before publishing, or a concrete file blocker",
+		})
+		contract.PlanItems = ensurePlanItem(contract.PlanItems, session.TaskPlanItem{
+			ID:       "plan-2",
+			Title:    "write local document",
+			Status:   "pending",
+			Tool:     "file.write",
+			Criteria: "write the report to a local file, or record a concrete blocker",
+		})
+	}
+	if needsExternalPublish {
+		contract.RequiredTools = cleanStringList(append(contract.RequiredTools, "terminal.run"))
+		contract.RequiredEvidence = append(contract.RequiredEvidence, session.TaskEvidenceContract{
+			Kind:        "remote_publish",
+			Tool:        "terminal.run",
+			Description: "publish or send the document through the configured CLI/helper, or a concrete connector blocker",
+		})
+		contract.PlanItems = ensurePlanItem(contract.PlanItems, session.TaskPlanItem{
+			ID:       "plan-3",
+			Title:    "publish document",
+			Status:   "pending",
+			Tool:     "terminal.run",
+			Criteria: "publish/send the document through the configured CLI/helper, or record a concrete blocker",
+		})
+	}
+	contract.RequiredEvidence = cleanEvidenceContracts(contract.RequiredEvidence)
+	if strings.TrimSpace(contract.ExpectedOutcome) == "" || strings.Contains(strings.ToLower(contract.ExpectedOutcome), "directly from available context") {
+		contract.ExpectedOutcome = "complete the requested action with tool evidence, or state a concrete blocker"
+	}
+	if strings.TrimSpace(contract.CompletionPolicy) == "" || strings.Contains(strings.ToLower(contract.CompletionPolicy), "answer directly") {
+		contract.CompletionPolicy = "use required tool evidence before final answer, unless a concrete blocker prevents it"
+	}
+	return contract
+}
+
+func repairContractSkillUsage(contract session.TaskContract, skills []discoveredSkill) session.TaskContract {
+	if len(skills) == 0 {
+		return contract
+	}
+	byName := map[string]discoveredSkill{}
+	for _, skill := range skills {
+		name := strings.ToLower(strings.TrimSpace(skill.Name))
+		if name != "" {
+			byName[name] = skill
+		}
+	}
+	if len(byName) == 0 {
+		return contract
+	}
+	var tools []string
+	for _, tool := range contract.RequiredTools {
+		name := strings.ToLower(strings.TrimSpace(tool))
+		if name == "" {
+			continue
+		}
+		if _, isSkill := byName[name]; isSkill {
+			continue
+		}
+		tools = append(tools, tool)
+	}
+	contract.RequiredTools = cleanStringList(tools)
+	for i := range contract.PlanItems {
+		name := strings.ToLower(strings.TrimSpace(contract.PlanItems[i].Tool))
+		if _, isSkill := byName[name]; isSkill {
+			contract.PlanItems[i].Tool = ""
+		}
+	}
+	for _, req := range contract.RequiredSkills {
+		name := strings.ToLower(strings.TrimSpace(req.Name))
+		skill, ok := byName[name]
+		if !ok {
+			continue
+		}
+		path := firstNonEmpty(req.Path, skill.Path)
+		if !contractHasFileReadEvidenceForSkill(contract, req.Name, path) {
+			contract.RequiredEvidence = append(contract.RequiredEvidence, session.TaskEvidenceContract{
+				Kind:        "local_file",
+				Tool:        "file.read",
+				Description: "read " + path,
+			})
+		}
+		if !contractHasFileReadPlanItemForSkill(contract, req.Name, path) {
+			contract.RequiredTools = cleanStringList(append(contract.RequiredTools, "file.read"))
+			contract.PlanItems = appendSkillReadPlanItem(contract.PlanItems, req.Name, path)
+		}
+	}
+	contract.RequiredEvidence = cleanEvidenceContracts(contract.RequiredEvidence)
+	contract.PlanItems = normalizePlanItems(contract.PlanItems)
+	return contract
+}
+
+func appendSkillReadPlanItem(items []session.TaskPlanItem, skillName, skillPath string) []session.TaskPlanItem {
+	id := fmt.Sprintf("plan-%d", len(items)+1)
+	used := map[string]bool{}
+	for _, item := range items {
+		used[strings.ToLower(strings.TrimSpace(item.ID))] = true
+	}
+	for used[strings.ToLower(id)] {
+		id = fmt.Sprintf("plan-%d", len(used)+1)
+	}
+	return append(items, session.TaskPlanItem{
+		ID:       id,
+		Title:    "read " + strings.TrimSpace(skillName) + " SKILL.md",
+		Status:   "pending",
+		Tool:     "file.read",
+		Criteria: "read " + strings.TrimSpace(skillPath),
+	})
 }
 
 func looksLikeCommandInspectionTask(lower string) bool {
@@ -1083,15 +1237,15 @@ func invalidContractBlockerEN(contract session.TaskContract, v contractToolValid
 		b.WriteString(".\n")
 		if v.HasSkillNameMismatch {
 			b.WriteString("Skill names belong in required_skills, not in required_tools or plan_items[].tool. ")
-			b.WriteString("For each required skill, add file.read evidence for the SKILL.md file.\n")
+			b.WriteString("For each required skill, add file.read evidence and a file.read plan item for the SKILL.md file.\n")
 		}
 	}
 
 	if hasSkills {
-		b.WriteString(" Required skills lack file.read evidence: ")
+		b.WriteString(" Required skills lack file.read evidence and/or file.read plan items: ")
 		b.WriteString(strings.Join(v.InvalidSkills, "; "))
 		b.WriteString(".\n")
-		b.WriteString("Each required skill must have a corresponding file.read evidence for its SKILL.md.\n")
+		b.WriteString("Each required skill must have corresponding file.read evidence and a plan_items entry for its SKILL.md.\n")
 	}
 
 	b.WriteString("The task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.")
@@ -1115,15 +1269,15 @@ func invalidContractBlockerZH(contract session.TaskContract, v contractToolValid
 		b.WriteString("。\n")
 		if v.HasSkillNameMismatch {
 			b.WriteString("skill 名称应放在 required_skills 中，而非 required_tools 或 plan_items[].tool。")
-			b.WriteString("如需使用 skill，请添加 file.read evidence 读取对应 SKILL.md 文件。\n")
+			b.WriteString("如需使用 skill，请添加 file.read evidence 和 file.read plan item 读取对应 SKILL.md 文件。\n")
 		}
 	}
 
 	if hasSkills {
-		b.WriteString("缺少读取技能文件的 file.read 证据：")
+		b.WriteString("缺少读取技能文件的 file.read 证据和/或 file.read plan item：")
 		b.WriteString(strings.Join(v.InvalidSkills, "；"))
 		b.WriteString("。\n")
-		b.WriteString("每个 required skill 必须有对应的 file.read evidence 用于读取其 SKILL.md。\n")
+		b.WriteString("每个 required skill 必须有对应的 file.read evidence 和 plan_items 条目用于读取其 SKILL.md。\n")
 	}
 
 	b.WriteString("任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。")

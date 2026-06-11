@@ -69,11 +69,20 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 		b.WriteString("\nWorkspace profile context:\n")
 		b.WriteString(workspace)
 	}
-	if skills := skillsPrompt(discoverSkillsForAgent(cfg, profile.ID, 12)); skills != "" {
+	if skills := skillsPrompt(skillsForRuntimeContext(cfg, profile.ID)); skills != "" {
 		b.WriteString("\n\n")
 		b.WriteString(skills)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func skillsForRuntimeContext(cfg *config.Root, agentID string) []discoveredSkill {
+	const runtimeSkillsLimit = 24
+	skills := discoverSkillsForAgent(cfg, agentID, 0)
+	if len(skills) > runtimeSkillsLimit {
+		return skills[:runtimeSkillsLimit]
+	}
+	return skills
 }
 
 func buildRuntimeSystemContextForMessage(cfg *config.Root, profile config.AgentProfileConfig, msg channel.InboundMessage) string {

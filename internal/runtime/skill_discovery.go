@@ -89,7 +89,7 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 			continue
 		}
 		path := filepath.Join(root, entry.Name(), "SKILL.md")
-		text := readPromptContextHead(path, 8192)
+		text := readSkillHeader(path)
 		if text == "" {
 			continue
 		}
@@ -102,6 +102,29 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 		out = append(out, skill)
 	}
 	return out
+}
+
+func readSkillHeader(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && strings.TrimSpace(lines[0]) == "---" {
+		for i := 1; i < len(lines) && i < 80; i++ {
+			if strings.TrimSpace(lines[i]) == "---" {
+				return strings.Join(lines[:i+1], "\n")
+			}
+		}
+	}
+	if len(lines) > 40 {
+		lines = lines[:40]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func parseSkillHeader(text string) discoveredSkill {

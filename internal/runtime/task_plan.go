@@ -208,7 +208,7 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 			userText = strings.TrimSpace(task.Goal + "\nPlan feedback: " + feedback)
 		}
 		contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
-		if invalid := validateContractTools(contract, rt.Tools, discoverSkillsForAgent(rt.Config, rt.Pool.ProfileForMessage(msg).ID, 12)); !invalid.IsValid() {
+		if invalid := validateContractTools(contract, rt.Tools, skillsForRuntimeContext(rt.Config, rt.Pool.ProfileForMessage(msg).ID)); !invalid.IsValid() {
 			blocker := invalidContractBlockerText(contract, invalid, msg)
 			_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
 			state.BlockActiveTask("failed")

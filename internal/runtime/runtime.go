@@ -154,7 +154,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		"task_id":  task.ID,
 	})
 	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
-	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
+	discoveredSkills := skillsForRuntimeContext(rt.Config, profile.ID)
 	if invalid := validateContractTools(contract, rt.Tools, discoveredSkills); !invalid.IsValid() {
 		blocker := invalidContractBlockerText(contract, invalid, msg)
 		_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
