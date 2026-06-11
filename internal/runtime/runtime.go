@@ -88,13 +88,19 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	if continuity.Continue && continuity.TaskID != "" {
 		state.ActivateTask(continuity.TaskID)
 		_ = trace.write(map[string]any{"type": "task_continuity", "task_id": continuity.TaskID, "reason": continuity.Reason})
+		_ = trace.write(map[string]any{"type": "task_recall_selected", "task_id": continuity.TaskID, "reason": continuity.Reason})
 	}
+	hadOpenTask := latestOpenTask(state) != nil
 	if shouldStartNewTaskInsteadOfSteering(state, userText) {
 		state.ActiveTask = ""
 	}
 	task := state.EnsureTask(msg.Text)
+	isNewTask := task.Goal == userText
 	if task.Goal != userText && state.ActiveTask == task.ID {
 		userText = mergeTaskAndInstruction(task.Goal, userText)
+	}
+	if !continuity.Continue && isNewTask && hadOpenTask {
+		_ = trace.write(map[string]any{"type": "task_continuity_not_selected", "text": msg.Text, "reason": "open task not matched"})
 	}
 	phase := tracePhaseExecute
 	if continuity.IsFollowup {
@@ -183,6 +189,18 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		})
 	}
 	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
+	if strings.Contains(systemPrompt, "Continuity judgment:") {
+		tasks := recentPreviousTasks(*state, task.ID, 3)
+		var taskIDs []string
+		for _, t := range tasks {
+			taskIDs = append(taskIDs, t.ID)
+		}
+		_ = trace.write(map[string]any{
+			"type":             "task_recall_context_injected",
+			"prior_task_count": len(tasks),
+			"prior_task_ids":   taskIDs,
+		})
+	}
 	contextMessages := rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,

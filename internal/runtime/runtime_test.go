@@ -1964,6 +1964,20 @@ func findTaskByGoal(state session.State, goal string) session.TaskNode {
 	return session.TaskNode{}
 }
 
+func evidenceCount(evidence map[string]any) int {
+	if evidence == nil {
+		return 0
+	}
+	switch v := evidence["count"].(type) {
+	case int:
+		return v
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
 func TestContractToolsBypassVisibleToolBudget(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Config.Execution.ContextBudget.MaxVisibleTools = 2
@@ -2533,5 +2547,292 @@ func TestCLITUIRenderTaskStepWithoutRiskRecalculation(t *testing.T) {
 	}
 	if risk != "safe_read" {
 		t.Fatalf("expected safe_read risk for schedule.manage list, got %q", risk)
+	}
+}
+
+func TestOpenTaskReceivesNextMessageAsSteering(t *testing.T) {
+	for _, status := range []string{"running", "await_user_input", "failed", "resuming"} {
+		t.Run(status, func(t *testing.T) {
+			rt := newTestRuntime(t)
+			state := session.State{Key: "cli:test"}
+			task := state.StartTask("original analysis goal")
+			task.Status = status
+			state.ActiveTask = task.ID
+			if err := rt.Store.Save(state); err != nil {
+				t.Fatal(err)
+			}
+			model := &captureUserModel{text: "steered"}
+			rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+			if _, err := rt.Handle(context.Background(), inbound("cli:test", "add more detail")); err != nil {
+				t.Fatal(err)
+			}
+			updated := loadState(t, rt, "cli:test")
+			if len(updated.Tasks) != 1 || updated.Tasks[0].ID != task.ID {
+				t.Fatalf("status=%s: expected steering to reuse existing task, got %d tasks", status, len(updated.Tasks))
+			}
+			if !strings.Contains(model.lastUser, task.Goal) {
+				t.Fatalf("status=%s: expected steering merge, got %q", status, model.lastUser)
+			}
+		})
+	}
+}
+
+func TestCompletedTaskClearsActiveAndDoesNotImplicitlyResume(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	state.StartTask("check system status")
+	state.CompleteActiveTaskWithSummary("system is running", "trace-one", "/tmp/trace-one.jsonl")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "new task result"}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "list running processes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("new task should not fail: %#v", resp)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 {
+		t.Fatalf("expected two tasks, got %d: %#v", len(updated.Tasks), updated.Tasks)
+	}
+	if updated.Tasks[1].ID == updated.Tasks[0].ID {
+		t.Fatal("new message should create new task, not resume completed one")
+	}
+	if updated.ActiveTask != "" {
+		t.Fatalf("ActiveTask should be empty after completed task + new task with single-turn model, got %q", updated.ActiveTask)
+	}
+}
+
+func TestNewCommandResetsTaskContext(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("old analysis")
+	task.Summary = "partial analysis done."
+	state.Messages = []agentcore.Message{{Role: agentcore.RoleUser, Content: "old"}}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	newResp, err := rt.Handle(context.Background(), inbound("cli:test", "/new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newResp.Reply.Style != "session_reset" {
+		t.Fatalf("expected session_reset, got %#v", newResp.Reply)
+	}
+	resetTrace, err := os.ReadFile(newResp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(resetTrace), "session_reset") {
+		t.Fatalf("trace should contain session_reset after /new, got:\n%s", string(resetTrace))
+	}
+
+	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "fresh start"}, rt.Tools)
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "new task description"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 1 || updated.Tasks[0].Goal != "new task description" {
+		t.Fatalf("expected fresh task after /new, got %#v", updated.Tasks)
+	}
+	if updated.Tasks[0].ID == task.ID {
+		t.Fatalf("new task should not reuse archived task ID")
+	}
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(trace), "partial analysis done") {
+		t.Fatalf("trace should not contain old task summary after /new")
+	}
+}
+
+func TestPreviousTaskWeakContextDoesNotAutoResume(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	first := state.StartTask("create a Lark document from /tmp/source.md")
+	state.CompleteActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &captureUserModel{text: "started fresh"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "list my workspace files"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(model.lastUser, "list my workspace files") {
+		t.Fatalf("expected new task's user text standalone, got %q", model.lastUser)
+	}
+	if strings.Contains(model.lastUser, "Active task:") || strings.Contains(model.lastUser, first.Goal) {
+		t.Fatalf("weak context should not merge previous task goal, got %q", model.lastUser)
+	}
+	updated := loadState(t, rt, "cli:test")
+	if len(updated.Tasks) != 2 {
+		t.Fatalf("expected new separate task, got %d: %#v", len(updated.Tasks), updated.Tasks)
+	}
+	if updated.ActiveTask == first.ID {
+		t.Fatalf("weak context should NOT auto-resume completed task %s, got ActiveTask=%q", first.ID, updated.ActiveTask)
+	}
+	if updated.Tasks[1].ID == first.ID {
+		t.Fatalf("new message should create new task, not resume completed one")
+	}
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(trace), "task_recall_context_injected") {
+		t.Fatalf("expected task_recall_context_injected trace for previous task context:\n%s", string(trace))
+	}
+}
+
+func TestExplicitResumeReturnsEvidence(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("deploy checklist")
+	task.Summary = "deployed API."
+	task.Status = "completed"
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	searchTool, ok := rt.Tools.Get("task.search")
+	if !ok {
+		t.Fatal("task.search not registered")
+	}
+	searchResult := searchTool.Run(context.Background(), agentcore.ToolCall{
+		ID: "search_1", Name: "task.search",
+		Args: map[string]any{"query": "deploy", "session_key": "cli:test"},
+	})
+	if searchResult.IsError {
+		t.Fatalf("task.search failed: %s", searchResult.Content)
+	}
+	candidates, _ := searchResult.Evidence["candidates"].([]map[string]any)
+	if len(candidates) == 0 {
+		t.Fatal("expected at least one candidate")
+	}
+	archiveID, _ := candidates[0]["archive_id"].(string)
+
+	resumeTool, ok := rt.Tools.Get("task.resume")
+	if !ok {
+		t.Fatal("task.resume not registered")
+	}
+	resumeResult := resumeTool.Run(context.Background(), agentcore.ToolCall{
+		ID: "resume_1", Name: "task.resume",
+		Args: map[string]any{
+			"session_key": "cli:test",
+			"archive_id":  archiveID,
+			"task_id":     task.ID,
+		},
+	})
+	if resumeResult.IsError {
+		t.Fatalf("task.resume failed: %s", resumeResult.Content)
+	}
+	if resumeResult.Evidence == nil {
+		t.Fatal("task.resume result missing evidence")
+	}
+	if tid, _ := resumeResult.Evidence["task_id"].(string); tid != task.ID {
+		t.Fatalf("resume evidence: expected task_id=%q, got %q", task.ID, tid)
+	}
+	if goal, _ := resumeResult.Evidence["goal"].(string); !strings.Contains(strings.ToLower(goal), "deploy") {
+		t.Fatalf("resume evidence: expected goal containing 'deploy', got %q", goal)
+	}
+	if sid, _ := resumeResult.Evidence["session_key"].(string); sid == "" {
+		t.Fatal("resume evidence: session_key should not be empty")
+	}
+	if !strings.Contains(resumeResult.Content, task.Summary) {
+		t.Fatalf("resume content should contain task summary, got: %s", resumeResult.Content)
+	}
+}
+
+func TestTaskSearchResumeEvidenceForArchivedAndCurrentSessions(t *testing.T) {
+	rt := newTestRuntime(t)
+
+	state := session.State{Key: "cli:test"}
+	current := state.StartTask("current deployment checklist")
+	current.Summary = "Deploy API and worker."
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	archived := session.State{Key: "cli:test"}
+	old := archived.StartTask("archived README summary")
+	old.Status = "completed"
+	old.Summary = "README summarized."
+	if _, err := rt.Store.Archive(archived); err != nil {
+		t.Fatal(err)
+	}
+
+	searchTool, _ := rt.Tools.Get("task.search")
+	resumeTool, _ := rt.Tools.Get("task.resume")
+
+	archivedResult := searchTool.Run(context.Background(), agentcore.ToolCall{
+		ID: "search_archived", Name: "task.search",
+		Args: map[string]any{"query": "README", "session_key": "cli:test"},
+	})
+	if archivedResult.IsError || !strings.Contains(archivedResult.Content, "archived README summary") {
+		t.Fatalf("expected archived task in search, got %#v", archivedResult)
+	}
+	count := evidenceCount(archivedResult.Evidence)
+	if count == 0 {
+		t.Fatal("expected count > 0 for archived search")
+	}
+
+	currentResult := searchTool.Run(context.Background(), agentcore.ToolCall{
+		ID: "search_current", Name: "task.search",
+		Args: map[string]any{"query": "deployment", "session_key": "cli:test"},
+	})
+	if currentResult.IsError || !strings.Contains(currentResult.Content, current.ID) {
+		t.Fatalf("expected current task in search, got %#v", currentResult)
+	}
+	count2 := evidenceCount(currentResult.Evidence)
+	if count2 == 0 {
+		t.Fatal("expected count > 0 for current search")
+	}
+
+	candidates, _ := archivedResult.Evidence["candidates"].([]map[string]any)
+	if len(candidates) == 0 {
+		t.Fatal("expected archived candidates")
+	}
+	candidate := candidates[0]
+	resumeResult := resumeTool.Run(context.Background(), agentcore.ToolCall{
+		ID: "resume_archived", Name: "task.resume",
+		Args: map[string]any{
+			"session_key": candidate["session_key"],
+			"archive_id":  candidate["archive_id"],
+			"task_id":     candidate["task_id"],
+		},
+	})
+	if resumeResult.IsError {
+		t.Fatalf("resume from archived failed: %s", resumeResult.Content)
+	}
+	if tid, _ := resumeResult.Evidence["task_id"].(string); tid != old.ID {
+		t.Fatalf("resume evidence: expected task_id=%q, got %q", old.ID, tid)
+	}
+	if !strings.Contains(resumeResult.Content, old.Summary) {
+		t.Fatalf("resume content should contain archived task summary: %s", resumeResult.Content)
+	}
+
+	currentCandidates, _ := currentResult.Evidence["candidates"].([]map[string]any)
+	if len(currentCandidates) == 0 {
+		t.Fatal("expected current candidates")
+	}
+	currentCandidate := currentCandidates[0]
+	cResume := resumeTool.Run(context.Background(), agentcore.ToolCall{
+		ID: "resume_current", Name: "task.resume",
+		Args: map[string]any{
+			"session_key": currentCandidate["session_key"],
+			"task_id":     currentCandidate["task_id"],
+		},
+	})
+	if cResume.IsError {
+		t.Fatalf("resume from current failed: %s", cResume.Content)
+	}
+	if !strings.Contains(cResume.Content, current.Summary) {
+		t.Fatalf("resume content should contain current task summary: %s", cResume.Content)
 	}
 }

@@ -126,6 +126,17 @@ func PrintTraceReport(out io.Writer, path string) error {
 		if report.HiddenTools > 0 {
 			fmt.Fprintf(out, "- hidden_tools: %d\n", report.HiddenTools)
 		}
+		if len(report.TrimmedTools) > 0 {
+			fmt.Fprintf(out, "- trimmed (budget): %s\n", strings.Join(report.TrimmedTools, ", "))
+		}
+		if len(report.NonDefaultExposed) > 0 {
+			var entries []string
+			for name, reason := range report.NonDefaultExposed {
+				entries = append(entries, name+":"+reason)
+			}
+			sort.Strings(entries)
+			fmt.Fprintf(out, "- non-default exposed: %s\n", strings.Join(entries, ", "))
+		}
 	}
 	if len(report.ToolPolicies) > 0 || len(report.Tools) > 0 {
 		fmt.Fprintln(out)
@@ -293,19 +304,21 @@ func processToolEndEvent(event map[string]any, duration int64, eventTime string)
 }
 
 type traceReport struct {
-	TraceID      string
-	SessionKey   string
-	TaskID       string
-	AgentID      string
-	Request      string
-	Contract     traceReportContract
-	Models       []traceReportModel
-	VisibleTools []string
-	HiddenTools  int
-	ToolPolicies []traceReportToolPolicy
-	Tools        []traceReportTool
-	Judgments    []traceReportJudgment
-	FinalReply   string
+	TraceID           string
+	SessionKey        string
+	TaskID            string
+	AgentID           string
+	Request           string
+	Contract          traceReportContract
+	Models            []traceReportModel
+	VisibleTools      []string
+	HiddenTools       int
+	TrimmedTools      []string
+	NonDefaultExposed map[string]string
+	ToolPolicies      []traceReportToolPolicy
+	Tools             []traceReportTool
+	Judgments         []traceReportJudgment
+	FinalReply        string
 }
 
 type traceReportContract struct {
@@ -409,6 +422,17 @@ func buildTraceReport(path string) (traceReport, error) {
 			}
 			if hidden := int(int64Number(event["hidden_tools"])); hidden > 0 {
 				report.HiddenTools = hidden
+			}
+		case "context_budget_trimmed":
+			report.TrimmedTools = stringListFromAny(event["trimmed_tools"])
+		case "context_budget_non_default_exposed":
+			if exposed, _ := event["non_default_exposed"].(map[string]any); exposed != nil {
+				if report.NonDefaultExposed == nil {
+					report.NonDefaultExposed = make(map[string]string)
+				}
+				for name, reason := range exposed {
+					report.NonDefaultExposed[name] = traceString(reason)
+				}
 			}
 		case "hook_event":
 			if traceString(event["hook"]) == "tool_policy_hook" {

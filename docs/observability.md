@@ -15,7 +15,12 @@ The runtime should emit a stable stream of process events:
 - `final.failed`: the task stopped at a safe point.
 - `context_budget_estimated`: the runtime estimated per-turn input tokens, visible tools, and budget limits.
 - `context_budget_compacted`: the runtime compacted transcript/tool content before a model turn.
+- `context_budget_trimmed`: non-default tools excluded by visible tool budget, with trim reason.
+- `context_budget_non_default_exposed`: non-default tools exposed to the model, with entry reason (contract, recent).
 - `session_summary_updated`: the runtime updated the deterministic session summary after a task state transition.
+- `task_recall_selected`: a previous task was activated via continuity judgment, with the reason.
+- `task_continuity_not_selected`: open tasks existed but were not matched by continuity judgment, and a new task was created instead.
+- `task_recall_context_injected`: previous-task weak context was injected into the system prompt, with prior task count and IDs.
 
 These events are not chain-of-thought. They describe operational state: what is being called, what returned, what is waiting, and what was blocked by policy.
 

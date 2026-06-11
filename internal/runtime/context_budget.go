@@ -44,6 +44,8 @@ type contextBudgetResult struct {
 	VisibleTools          int
 	HiddenTools           int
 	ToolNames             []string
+	TrimmedTools          []string
+	NonDefaultExposed     map[string]string
 	RawRefs               []string
 	MissingContractTools  []string
 	ContextWindowTokens   int
@@ -112,9 +114,12 @@ func packMessagesForContextBudget(input contextBudgetInput) contextBudgetResult 
 	if softLimit <= 0 || softLimit > hardLimit {
 		softLimit = hardLimit
 	}
+	visibleTools, trimmedNames, nonDefaultExposed := selectVisibleTools(input.Tools, input.Messages, input.Contract, cfg, input.DefaultVisible)
 	result := contextBudgetResult{
 		Messages:             append([]agentcore.Message(nil), input.Messages...),
-		Tools:                selectVisibleTools(input.Tools, input.Messages, input.Contract, cfg, input.DefaultVisible),
+		Tools:                visibleTools,
+		TrimmedTools:         trimmedNames,
+		NonDefaultExposed:    nonDefaultExposed,
 		SoftLimitTokens:      softLimit,
 		HardLimitTokens:      hardLimit,
 		ContextWindowTokens:  window,
@@ -147,16 +152,21 @@ func contextBudgetConfig(root *config.Root) config.ContextBudgetConfig {
 	return root.Execution.ContextBudget
 }
 
-func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, contract session.TaskContract, cfg config.ContextBudgetConfig, defaultVisible []string) []agentcore.Tool {
+func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, contract session.TaskContract, cfg config.ContextBudgetConfig, defaultVisible []string) ([]agentcore.Tool, []string, map[string]string) {
 	if len(tools) == 0 {
-		return nil
+		return nil, nil, nil
 	}
 	limit := cfg.MaxVisibleToolsValue()
 	if limit >= len(tools) {
-		return append([]agentcore.Tool(nil), tools...)
+		return append([]agentcore.Tool(nil), tools...), nil, nil
 	}
 	if len(defaultVisible) == 0 {
 		defaultVisible = cfg.DefaultVisibleValue()
+	}
+
+	defaultSet := map[string]bool{}
+	for _, name := range defaultVisible {
+		defaultSet[name] = true
 	}
 
 	contractSet := map[string]bool{}
@@ -169,20 +179,19 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		}
 	}
 
-	scores := map[string]int{}
-	for _, name := range defaultVisible {
-		addToolScore(scores, name, 50)
-	}
-	text := strings.ToLower(messagesText(messages))
-	for _, callName := range recentToolCallNames(messages) {
-		addToolScore(scores, callName, 90)
-	}
-	if strings.Contains(text, "raw_ref") || strings.Contains(text, "tool-result:") {
-		addToolScore(scores, "toolresult.read", 95)
-	}
-
 	out := make([]agentcore.Tool, 0, limit)
 	used := map[string]bool{}
+	exposed := map[string]string{}
+
+	for _, name := range defaultVisible {
+		if used[name] {
+			continue
+		}
+		if found := findToolByName(tools, name); found != nil {
+			used[name] = true
+			out = append(out, found)
+		}
+	}
 
 	for _, name := range contract.RequiredTools {
 		if used[name] {
@@ -191,6 +200,13 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		if found := findToolByName(tools, name); found != nil {
 			used[name] = true
 			out = append(out, found)
+			if !defaultSet[name] {
+				reason := "contract"
+				if containsToolName(recentToolCallNames(messages), name) {
+					reason = "contract+recent"
+				}
+				exposed[name] = reason
+			}
 		}
 	}
 	for _, item := range contract.PlanItems {
@@ -201,17 +217,28 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		if found := findToolByName(tools, name); found != nil {
 			used[name] = true
 			out = append(out, found)
+			if !defaultSet[name] {
+				reason := "contract"
+				if containsToolName(recentToolCallNames(messages), name) {
+					reason = "contract+recent"
+				}
+				exposed[name] = reason
+			}
 		}
 	}
 
-	if len(out) >= limit {
-		if len(out) == 0 {
-			return append([]agentcore.Tool(nil), tools...)
-		}
-		return out
+	scores := map[string]int{}
+	text := strings.ToLower(messagesText(messages))
+	for _, callName := range recentToolCallNames(messages) {
+		addToolScore(scores, callName, 90)
+	}
+	if strings.Contains(text, "raw_ref") || strings.Contains(text, "tool-result:") {
+		addToolScore(scores, "toolresult.read", 95)
 	}
 
-	for len(out) < limit {
+	budgetRemaining := limit
+	var trimmed []string
+	for budgetRemaining > 0 {
 		bestIndex := -1
 		bestScore := 0
 		bestName := ""
@@ -219,12 +246,12 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 			if tool == nil || used[tool.Name()] {
 				continue
 			}
-			score := scores[tool.Name()]
-			if score <= 0 {
+			name := tool.Name()
+			if defaultSet[name] || contractSet[name] {
 				continue
 			}
-			name := tool.Name()
-			if contractSet[name] {
+			score := scores[name]
+			if score <= 0 {
 				continue
 			}
 			if bestIndex < 0 || score > bestScore || score == bestScore && name < bestName {
@@ -239,11 +266,27 @@ func selectVisibleTools(tools []agentcore.Tool, messages []agentcore.Message, co
 		tool := tools[bestIndex]
 		used[tool.Name()] = true
 		out = append(out, tool)
+		exposed[tool.Name()] = "recent"
+		budgetRemaining--
 	}
+
+	for _, tool := range tools {
+		if tool == nil || used[tool.Name()] {
+			continue
+		}
+		name := tool.Name()
+		if defaultSet[name] || contractSet[name] {
+			continue
+		}
+		if scores[name] > 0 {
+			trimmed = append(trimmed, name)
+		}
+	}
+
 	if len(out) == 0 {
-		return append([]agentcore.Tool(nil), tools...)
+		return append([]agentcore.Tool(nil), tools...), nil, nil
 	}
-	return out
+	return out, trimmed, exposed
 }
 
 func missingContractTools(tools []agentcore.Tool, contract session.TaskContract) []string {
@@ -300,6 +343,15 @@ func addToolScore(scores map[string]int, name string, score int) {
 	if score > scores[name] {
 		scores[name] = score
 	}
+}
+
+func containsToolName(names []string, target string) bool {
+	for _, name := range names {
+		if name == target {
+			return true
+		}
+	}
+	return false
 }
 
 func findToolByName(tools []agentcore.Tool, name string) agentcore.Tool {
@@ -491,6 +543,19 @@ func writeContextBudgetTrace(trace *traceRecorder, cfg config.ContextBudgetConfi
 		"hidden_tools":           result.HiddenTools,
 		"tools":                  result.ToolNames,
 	})
+	if len(result.TrimmedTools) > 0 {
+		_ = trace.write(map[string]any{
+			"type":          "context_budget_trimmed",
+			"trimmed_tools": result.TrimmedTools,
+			"reason":        "visible_tool_budget",
+		})
+	}
+	if len(result.NonDefaultExposed) > 0 {
+		_ = trace.write(map[string]any{
+			"type":                "context_budget_non_default_exposed",
+			"non_default_exposed": result.NonDefaultExposed,
+		})
+	}
 	if len(result.MissingContractTools) > 0 {
 		_ = trace.write(map[string]any{
 			"type":                   "context_budget_missing_contract_tools",

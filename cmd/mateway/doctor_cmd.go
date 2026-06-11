@@ -240,9 +240,9 @@ func doctorToolRegistry(cfg *config.Root) []doctorCheck {
 			checks = append(checks, doctorCheck{Status: doctorFAIL, Name: "tool.missing", Message: name})
 		}
 	}
-	for _, name := range []string{"script.run"} {
+	for _, name := range []string{"script.run", "project.index", "schedule.create", "schedule.list", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run_now"} {
 		if _, ok := registry.Get(name); ok {
-			checks = append(checks, doctorCheck{Status: doctorFAIL, Name: "tool.unexpected", Message: name})
+			checks = append(checks, doctorCheck{Status: doctorFAIL, Name: "tool.unexpected", Message: name + " should not be registered"})
 		}
 	}
 	for _, tool := range registry.List() {

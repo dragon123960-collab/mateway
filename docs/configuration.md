@@ -40,8 +40,8 @@ Mateway 从 `~/.mateway/config/` 读取本地配置。配置目标是保持小�
 - `hard_ratio`: fraction of available input window that cannot be exceeded after compaction.
 - `recent_turns`: recent transcript turns to preserve before older messages are summarized or dropped.
 - `tool_result_target_tokens`: target size for compacted tool result content.
-- `max_visible_tools`: maximum tool schemas/contracts exposed to one model turn.
-- `trace_telemetry`: write budget diagnostics such as `context_budget_estimated`, `context_budget_compacted`, visible tools, hidden tools, and estimated token savings.
+- `max_visible_tools`: budget for non-default, non-contract tools exposed via recent usage. Default and contract-required tools are always visible and do not count against this budget.
+- `trace_telemetry`: write budget diagnostics such as `context_budget_estimated`, `context_budget_compacted`, `context_budget_trimmed`, `context_budget_non_default_exposed`, visible tools, hidden tools, and estimated token savings.
 
 The selected model's `context_window` and `max_tokens` come from `~/.mateway/config/models/*.yaml`. Runtime uses them to estimate input headroom; exact provider tokenizers are not required for the local estimate.
 
