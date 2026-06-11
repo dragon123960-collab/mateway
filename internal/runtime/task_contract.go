@@ -825,6 +825,22 @@ type contractToolValidation struct {
 	SkillNames           map[string]string
 }
 
+func addInvalidContractExecutionEvent(state *session.State, taskID string, validation contractToolValidation) {
+	if state == nil {
+		return
+	}
+	state.AddExecutionEvent(taskID, session.ExecutionEvent{
+		Type:    "task_contract_invalid",
+		Status:  "failed",
+		Summary: validation.InvalidReason(),
+		Evidence: map[string]any{
+			"invalid_tools":  validation.InvalidTools,
+			"invalid_skills": validation.InvalidSkills,
+			"skill_mismatch": validation.HasSkillNameMismatch,
+		},
+	})
+}
+
 func (v contractToolValidation) IsValid() bool {
 	return len(v.InvalidTools) == 0 && len(v.InvalidSkills) == 0
 }

@@ -159,6 +159,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		blocker := invalidContractBlockerText(contract, invalid, msg)
 		_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
 		state.BlockActiveTask("failed")
+		addInvalidContractExecutionEvent(state, task.ID, invalid)
 		if saveErr := rt.saveState(state, trace); saveErr != nil {
 			return Response{}, saveErr
 		}

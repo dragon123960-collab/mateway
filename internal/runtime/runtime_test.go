@@ -2050,6 +2050,26 @@ func TestMissingContractToolProducesBlocker(t *testing.T) {
 	if !strings.Contains(resp.Reply.Text, "nonexistent.tool") {
 		t.Fatalf("expected nonexistent.tool in blocker, got: %q", resp.Reply.Text)
 	}
+	state := loadState(t, rt, "cli:test")
+	task := findTaskByGoal(state, "use nonexistent tool")
+	if task.Execution.Status != "failed" {
+		t.Fatalf("expected failed execution status, got %q", task.Execution.Status)
+	}
+	foundEvent := false
+	for _, event := range task.Execution.Events {
+		if event.Type == "task_contract_invalid" {
+			foundEvent = true
+			if event.Status != "failed" {
+				t.Fatalf("expected failed invalid contract event, got %#v", event)
+			}
+			if !evidenceListContains(event.Evidence["invalid_tools"], "nonexistent.tool") {
+				t.Fatalf("expected invalid_tools evidence to include nonexistent.tool, got %#v", event.Evidence)
+			}
+		}
+	}
+	if !foundEvent {
+		t.Fatalf("expected task_contract_invalid execution event, got %#v", task.Execution.Events)
+	}
 
 	trace, err := os.ReadFile(resp.TracePath)
 	if err != nil {
@@ -2059,6 +2079,20 @@ func TestMissingContractToolProducesBlocker(t *testing.T) {
 	if !strings.Contains(traceStr, "task_contract_blocked") {
 		t.Fatalf("expected task_contract_blocked trace, got:\n%s", traceStr)
 	}
+}
+
+func evidenceListContains(value any, want string) bool {
+	switch values := value.(type) {
+	case []string:
+		return containsString(values, want)
+	case []any:
+		for _, item := range values {
+			if s, ok := item.(string); ok && s == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestProfileDeniedContractToolProducesBlocker(t *testing.T) {
