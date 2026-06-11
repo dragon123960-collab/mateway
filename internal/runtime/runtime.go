@@ -154,6 +154,27 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		"task_id":  task.ID,
 	})
 	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
+	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
+	if invalid := validateContractTools(contract, rt.Tools, discoveredSkills); !invalid.IsValid() {
+		blocker := invalidContractBlockerText(contract, invalid, msg)
+		_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
+		state.BlockActiveTask("failed")
+		if saveErr := rt.saveState(state, trace); saveErr != nil {
+			return Response{}, saveErr
+		}
+		_ = trace.write(map[string]any{"type": "reply", "text": blocker, "style": channel.StyleError})
+		return Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     blocker,
+				Style:    channel.StyleError,
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+			Failed:    true,
+		}, nil
+	}
 	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract) {
 		state.Pending = &session.PendingAction{
 			Kind:     session.PendingKindTaskPlanConfirm,
@@ -176,7 +197,6 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			TracePath: trace.path,
 		}, nil
 	}
-	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
 	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
 	if contractContext := renderTaskContractContext(contract); contractContext != "" {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)

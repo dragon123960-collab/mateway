@@ -208,6 +208,20 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 			userText = strings.TrimSpace(task.Goal + "\nPlan feedback: " + feedback)
 		}
 		contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
+		if invalid := validateContractTools(contract, rt.Tools, discoverSkillsForAgent(rt.Config, rt.Pool.ProfileForMessage(msg).ID, 12)); !invalid.IsValid() {
+			blocker := invalidContractBlockerText(contract, invalid, msg)
+			_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
+			state.BlockActiveTask("failed")
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return Response{Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     blocker,
+				Style:    channel.StyleError,
+			}, TraceID: trace.id, TracePath: trace.path, Failed: true}, true, nil
+		}
 		state.Pending = pending
 		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhasePlanReview, MessageID: msg.ID})
 		if err := rt.saveState(state, trace); err != nil {

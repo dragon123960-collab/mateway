@@ -16,6 +16,12 @@ type discoveredSkill struct {
 	Stage       string
 	Priority    string
 	Path        string
+	Scope       string
+}
+
+type skillRelevance struct {
+	skill     discoveredSkill
+	relevance float64
 }
 
 func skillScope(path string) string {
@@ -57,14 +63,7 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 			out = append(out, skill)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		left := skillPriority(out[i])
-		right := skillPriority(out[j])
-		if left != right {
-			return left > right
-		}
-		return out[i].Name < out[j].Name
-	})
+	sortDiscoveredSkills(out)
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -102,6 +101,7 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 			skill.Name = entry.Name()
 		}
 		skill.Path = path
+		skill.Scope = skillScope(path)
 		out = append(out, skill)
 	}
 	return out
@@ -188,6 +188,20 @@ func skillPriority(skill discoveredSkill) int {
 	return priority
 }
 
+func sortDiscoveredSkills(skills []discoveredSkill) {
+	if len(skills) <= 1 {
+		return
+	}
+	sort.SliceStable(skills, func(i, j int) bool {
+		pi := skillPriority(skills[i])
+		pj := skillPriority(skills[j])
+		if pi != pj {
+			return pi > pj
+		}
+		return skills[i].Name < skills[j].Name
+	})
+}
+
 func stripSkillFrontMatter(text string) string {
 	lines := strings.Split(text, "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
@@ -207,4 +221,11 @@ func truncateString(text string, limit int) string {
 		return text
 	}
 	return strings.TrimSpace(string(runes[:limit])) + "\n..."
+}
+
+func executionHint(skill discoveredSkill) string {
+	if skill.Stage == "cli" {
+		return "read SKILL.md with file.read, then execute via terminal.run with the CLI/helper described in the skill"
+	}
+	return "read SKILL.md with file.read, then follow the skill workflow using existing runtime tools"
 }

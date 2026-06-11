@@ -20,11 +20,15 @@ Use English JSON keys and concise English values.
 Use the same natural language as the user for user-visible string values: summary, expected_outcome, completion_policy, required_evidence.description, plan_items.title, and plan_items.criteria.
 Preserve the user's target exactly. Do not reinterpret a server/service/process status request as a software release or project status request.
 
+CRITICAL: required_tools and plan_items[].tool must use exact tool names from "Available tools" below.
+Skill names from "Available skills" are NOT tools. Put skill references in required_skills, never in required_tools or plan_items[].tool.
+
 Schema:
 {
   "summary": "short task summary",
   "requires_tools": true,
   "required_tools": ["web.search"],
+  "required_skills": [{"name": "skill-name", "path": "/path/to/SKILL.md", "reason": "why this skill is needed"}],
   "required_evidence": [{"kind":"current_external_fact","tool":"web.search","description":"current weather for relevant cities and date"}],
   "plan_items": [{"id":"plan-1","title":"search current weather","status":"pending","tool":"web.search","criteria":"collect current weather for the requested city"}],
   "expected_outcome": "travel recommendation with reasoning",
@@ -34,7 +38,7 @@ Schema:
 Plan item rules:
 - Use id values plan-1, plan-2, ...
 - status must be "pending".
-- tool is the exact tool name when a tool is expected, or empty for reasoning-only work.
+- tool is the exact tool name from Available tools, or empty for reasoning-only work.
 - criteria is a short verifiable completion condition.
 - Prefer 1-4 plan items.
 
@@ -71,7 +75,23 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		contractModel = rt.ContractModel
 	}
 	profile := rt.Pool.ProfileForMessage(msg)
-	contract, err := rt.generateTaskContract(ctx, task, userText, contractModel, discoverSkillsForAgent(rt.Config, profile.ID, 12))
+	skills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
+	if len(skills) > 0 {
+		var traceSkills []map[string]any
+		for _, s := range skills {
+			traceSkills = append(traceSkills, map[string]any{
+				"name":     s.Name,
+				"priority": skillPriority(s),
+				"path":     s.Path,
+				"scope":    s.Scope,
+			})
+		}
+		_ = trace.write(map[string]any{
+			"type":   "task_contract_skills_selected",
+			"skills": traceSkills,
+		})
+	}
+	contract, err := rt.generateTaskContract(ctx, task, userText, contractModel, skills)
 	if err != nil {
 		_ = trace.write(map[string]any{"type": "task_contract_parse_failed", "task_id": task.ID, "error": err.Error()})
 		contract = fallbackTaskContract(task.Goal, userText)
@@ -80,6 +100,45 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		contract.Summary = summarize(firstNonEmpty(userText, task.Goal))
 	}
 	contract = strengthenTaskContract(contract, task.Goal, userText)
+	validation := validateContractTools(contract, rt.Tools, skills)
+	replanAttempted := false
+	if !validation.IsValid() && !replanAttempted {
+		_ = trace.write(map[string]any{
+			"type":           "task_contract_invalid_tool",
+			"task_id":        task.ID,
+			"invalid_tools":  validation.InvalidTools,
+			"invalid_skills": validation.InvalidSkills,
+			"skill_mismatch": validation.HasSkillNameMismatch,
+		})
+		replanErr := contractReplanFeedback(validation, contract)
+		replanContract, replanErr2 := rt.generateTaskContract(ctx, task, userText, contractModel, skills, replanErr)
+		if replanErr2 == nil {
+			if strings.TrimSpace(replanContract.Summary) == "" {
+				replanContract.Summary = summarize(firstNonEmpty(userText, task.Goal))
+			}
+			replanContract = strengthenTaskContract(replanContract, task.Goal, userText)
+			contract = replanContract
+			replanAttempted = true
+			validation = validateContractTools(contract, rt.Tools, skills)
+			_ = trace.write(map[string]any{
+				"type":          "task_contract_replanned",
+				"task_id":       task.ID,
+				"replan_reason": "invalid_tool_detected",
+				"invalid_tools": validation.InvalidTools,
+			})
+		}
+	}
+	if len(validation.InvalidTools) > 0 || len(validation.InvalidSkills) > 0 {
+		reason := validation.InvalidReason()
+		_ = trace.write(map[string]any{
+			"type":           "task_contract_invalid_after_replan",
+			"task_id":        task.ID,
+			"invalid_tools":  validation.InvalidTools,
+			"invalid_skills": validation.InvalidSkills,
+			"reason":         reason,
+			"skill_mismatch": validation.HasSkillNameMismatch,
+		})
+	}
 	state.SetTaskContract(task.ID, contract)
 	_ = trace.write(map[string]any{
 		"type":              "task_contract_created",
@@ -123,11 +182,14 @@ func shouldSkipTaskContractModel(goal, userText string) bool {
 	return false
 }
 
-func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNode, userText string, model agentcore.Model, skills []discoveredSkill) (session.TaskContract, error) {
+func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNode, userText string, model agentcore.Model, skills []discoveredSkill, replanFeedback ...string) (session.TaskContract, error) {
 	if model == nil {
 		return fallbackTaskContract(task.Goal, userText), nil
 	}
 	prompt := renderTaskContractPrompt(task.Goal, userText, rt.Tools, skills)
+	if len(replanFeedback) > 0 && strings.TrimSpace(replanFeedback[0]) != "" {
+		prompt = prompt + "\n\nContract repair needed:\n" + strings.TrimSpace(replanFeedback[0])
+	}
 	contractCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	reply, err := model.Next(contractCtx, agentcore.Context{
@@ -150,11 +212,28 @@ func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegist
 	}
 	b.WriteString("\n\nRuntime freshness policy:\nUse tools for weather, news, prices, schedules, software versions, laws, APIs, local files, commands, or anything likely to have changed or requiring verification.\n")
 	b.WriteString("If the user asks to inspect a local or remote machine, service, process, daemon, port, plist, systemctl unit, SSH host, or current configuration, require terminal.run evidence. Running a single command through terminal.run is not the same as writing a script file.\n")
-	if skills := skillsPrompt(skills); skills != "" {
+	if len(skills) > 0 {
 		b.WriteString("\nAvailable skills:\n")
-		b.WriteString(skills)
+		b.WriteString("- Skill names are instructional references, NOT executable tools. Do NOT put skill names in required_tools or plan_items[].tool.\n")
+		b.WriteString("- To use a skill, read its SKILL.md with file.read, then follow its workflow using real runtime tools listed under Available tools below.\n")
+		for _, skill := range skills {
+			b.WriteString("- name: ")
+			b.WriteString(skill.Name)
+			b.WriteString("\n  description: ")
+			b.WriteString(strings.TrimSpace(skill.Description))
+			b.WriteString("\n  stage: ")
+			b.WriteString(defaultText(skill.Stage, "instruction"))
+			b.WriteString("\n  priority: ")
+			b.WriteString(defaultText(skill.Priority, "0"))
+			b.WriteString("\n  path: ")
+			b.WriteString(skill.Path)
+			b.WriteString("\n  scope: ")
+			b.WriteString(defaultText(skill.Scope, "unknown"))
+			b.WriteString("\n  execution_hint: ")
+			b.WriteString(executionHint(skill))
+			b.WriteString("\n")
+		}
 		b.WriteString("\n")
-		b.WriteString("If the task matches an available skill, require file.read evidence for that SKILL.md and require the execution tool named by the skill workflow, usually terminal.run for CLI/helper-script skills.\n")
 	}
 	b.WriteString("\nAvailable tools:\n")
 	for _, tool := range toolsForContract(tools) {
@@ -423,7 +502,11 @@ func availabilityReason(toolName string, agentRegistry, fullRegistry *agentcore.
 }
 
 func contractBlockerText(contract session.TaskContract, validation taskContractValidation, rt Runtime, msg channel.InboundMessage) string {
+	isChinese := prefersChinese(msg.Text, contract.Summary)
 	if len(validation.Missing) == 0 {
+		if isChinese {
+			return "\n\n任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。"
+		}
 		return "\n\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new."
 	}
 	fullRegistry := rt.Tools
@@ -432,7 +515,11 @@ func contractBlockerText(contract session.TaskContract, validation taskContractV
 		agentRegistry = agent.Tools
 	}
 	if agentRegistry == nil {
-		return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", strings.Join(validation.Missing, "; "))
+		missing := strings.Join(validation.Missing, "; ")
+		if isChinese {
+			return fmt.Sprintf("\n\n任务未能满足 contract。缺失证据：%s。\n任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。", missing)
+		}
+		return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", missing)
 	}
 	var parts []string
 	for _, m := range validation.Missing {
@@ -445,7 +532,11 @@ func contractBlockerText(contract session.TaskContract, validation taskContractV
 		}
 		parts = append(parts, label)
 	}
-	return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", strings.Join(parts, "; "))
+	missing := strings.Join(parts, "; ")
+	if isChinese {
+		return fmt.Sprintf("\n\n任务未能满足 contract。缺失证据：%s。\n任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。", missing)
+	}
+	return fmt.Sprintf("\n\nTask contract could not be satisfied. Missing evidence: %s.\nThe task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.", missing)
 }
 
 func toolNameFromMissing(missing string) string {
@@ -725,4 +816,214 @@ func prefersChinese(values ...string) bool {
 		}
 	}
 	return false
+}
+
+type contractToolValidation struct {
+	InvalidTools         []string
+	InvalidSkills        []string
+	HasSkillNameMismatch bool
+	SkillNames           map[string]string
+}
+
+func (v contractToolValidation) IsValid() bool {
+	return len(v.InvalidTools) == 0 && len(v.InvalidSkills) == 0
+}
+
+func (v contractToolValidation) InvalidReason() string {
+	if v.HasSkillNameMismatch {
+		return "skill name used as tool"
+	}
+	if len(v.InvalidSkills) > 0 {
+		return "required skill lacks file.read evidence"
+	}
+	return "tool not registered"
+}
+
+func validateContractTools(contract session.TaskContract, registry *agentcore.ToolRegistry, skills []discoveredSkill) contractToolValidation {
+	v := contractToolValidation{}
+	skillNames := map[string]string{}
+	for _, s := range skills {
+		skillNames[strings.ToLower(strings.TrimSpace(s.Name))] = s.Path
+	}
+	v.SkillNames = skillNames
+
+	seen := map[string]bool{}
+	for _, name := range contract.RequiredTools {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		if _, ok := registry.Get(name); !ok {
+			v.InvalidTools = append(v.InvalidTools, name)
+			if _, isSkill := skillNames[strings.ToLower(name)]; isSkill {
+				v.HasSkillNameMismatch = true
+			}
+		}
+	}
+	for _, item := range contract.PlanItems {
+		name := strings.TrimSpace(item.Tool)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		if _, ok := registry.Get(name); !ok {
+			v.InvalidTools = append(v.InvalidTools, name)
+			if _, isSkill := skillNames[strings.ToLower(name)]; isSkill {
+				v.HasSkillNameMismatch = true
+			}
+		}
+	}
+
+	for _, skill := range contract.RequiredSkills {
+		name := strings.TrimSpace(skill.Name)
+		if name == "" {
+			continue
+		}
+		if !contractHasFileReadForSkill(contract, name, skill.Path) {
+			v.InvalidSkills = append(v.InvalidSkills, name+": missing file.read evidence for SKILL.md")
+		}
+	}
+
+	return v
+}
+
+func contractHasFileReadForSkill(contract session.TaskContract, skillName, skillPath string) bool {
+	for _, ev := range contract.RequiredEvidence {
+		if strings.EqualFold(strings.TrimSpace(ev.Tool), "file.read") {
+			desc := strings.ToLower(strings.TrimSpace(ev.Description))
+			needle := strings.ToLower(strings.TrimSpace(skillPath))
+			if needle != "" && strings.Contains(desc, needle) {
+				return true
+			}
+			if strings.Contains(desc, "skill") && strings.Contains(desc, strings.ToLower(skillName)) {
+				return true
+			}
+		}
+	}
+	for _, item := range contract.PlanItems {
+		if strings.EqualFold(strings.TrimSpace(item.Tool), "file.read") {
+			criteria := strings.ToLower(strings.TrimSpace(item.Criteria))
+			needle := strings.ToLower(strings.TrimSpace(skillPath))
+			if needle != "" && strings.Contains(criteria, needle) {
+				return true
+			}
+			if strings.Contains(criteria, "skill") && strings.Contains(criteria, strings.ToLower(skillName)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func contractReplanFeedback(v contractToolValidation, contract session.TaskContract) string {
+	var b strings.Builder
+	hasTools := len(v.InvalidTools) > 0
+	hasSkills := len(v.InvalidSkills) > 0
+
+	if hasTools {
+		b.WriteString("The contract contains invalid tool names. ")
+		b.WriteString("The following names are not registered tools")
+		if v.HasSkillNameMismatch {
+			b.WriteString(" and appear to be skill names, not tools")
+		}
+		b.WriteString(": ")
+		b.WriteString(strings.Join(v.InvalidTools, ", "))
+		b.WriteString(".\n")
+		if v.HasSkillNameMismatch {
+			b.WriteString("Skill names go in required_skills, not required_tools or plan_items[].tool. ")
+			b.WriteString("For skill usage, require file.read to read the SKILL.md, and require the execution tool (e.g. terminal.run) for CLI/helper-script skills.\n")
+		}
+		b.WriteString("Please regenerate the contract using ONLY tool names from the Available tools list.")
+	}
+
+	if hasSkills {
+		if hasTools {
+			b.WriteString(" ")
+		}
+		b.WriteString("The contract has required_skills without corresponding file.read evidence. ")
+		b.WriteString("Each required skill must include a file.read evidence for its SKILL.md file. ")
+		b.WriteString("Missing evidence for: ")
+		b.WriteString(strings.Join(v.InvalidSkills, "; "))
+		b.WriteString(".\n")
+		b.WriteString("Add required_evidence with kind=local_file tool=file.read and description referencing the SKILL.md path.")
+	}
+
+	if !hasTools && !hasSkills {
+		b.WriteString("Please regenerate the contract using ONLY tool names from the Available tools list.")
+	}
+	return b.String()
+}
+
+func invalidContractBlockerText(contract session.TaskContract, v contractToolValidation, msg channel.InboundMessage) string {
+	isChinese := prefersChinese(msg.Text, contract.Summary)
+	if isChinese {
+		return invalidContractBlockerZH(contract, v)
+	}
+	return invalidContractBlockerEN(contract, v)
+}
+
+func invalidContractBlockerEN(contract session.TaskContract, v contractToolValidation) string {
+	var b strings.Builder
+	b.WriteString("\n\nTask contract could not be satisfied.")
+
+	hasTools := len(v.InvalidTools) > 0
+	hasSkills := len(v.InvalidSkills) > 0
+
+	if hasTools {
+		if v.HasSkillNameMismatch {
+			b.WriteString(" The following names appear to be skill names, not registered tools")
+		} else {
+			b.WriteString(" The following tools are not registered")
+		}
+		b.WriteString(": ")
+		b.WriteString(strings.Join(v.InvalidTools, ", "))
+		b.WriteString(".\n")
+		if v.HasSkillNameMismatch {
+			b.WriteString("Skill names belong in required_skills, not in required_tools or plan_items[].tool. ")
+			b.WriteString("For each required skill, add file.read evidence for the SKILL.md file.\n")
+		}
+	}
+
+	if hasSkills {
+		b.WriteString(" Required skills lack file.read evidence: ")
+		b.WriteString(strings.Join(v.InvalidSkills, "; "))
+		b.WriteString(".\n")
+		b.WriteString("Each required skill must have a corresponding file.read evidence for its SKILL.md.\n")
+	}
+
+	b.WriteString("The task is blocked. Review the contract requirements and profile configuration, or start a new task with /new.")
+	return b.String()
+}
+
+func invalidContractBlockerZH(contract session.TaskContract, v contractToolValidation) string {
+	var b strings.Builder
+	b.WriteString("\n\n任务无法继续执行。")
+
+	hasTools := len(v.InvalidTools) > 0
+	hasSkills := len(v.InvalidSkills) > 0
+
+	if hasTools {
+		if v.HasSkillNameMismatch {
+			b.WriteString("以下名称疑似为 skill 而非已注册的工具：")
+		} else {
+			b.WriteString("以下工具未注册：")
+		}
+		b.WriteString(strings.Join(v.InvalidTools, "、"))
+		b.WriteString("。\n")
+		if v.HasSkillNameMismatch {
+			b.WriteString("skill 名称应放在 required_skills 中，而非 required_tools 或 plan_items[].tool。")
+			b.WriteString("如需使用 skill，请添加 file.read evidence 读取对应 SKILL.md 文件。\n")
+		}
+	}
+
+	if hasSkills {
+		b.WriteString("缺少读取技能文件的 file.read 证据：")
+		b.WriteString(strings.Join(v.InvalidSkills, "；"))
+		b.WriteString("。\n")
+		b.WriteString("每个 required skill 必须有对应的 file.read evidence 用于读取其 SKILL.md。\n")
+	}
+
+	b.WriteString("任务被阻止。请检查 contract 要求和 profile 配置，或使用 /new 重新开始。")
+	return b.String()
 }

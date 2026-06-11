@@ -21,6 +21,9 @@ The runtime should emit a stable stream of process events:
 - `task_recall_selected`: a previous task was activated via continuity judgment, with the reason.
 - `task_continuity_not_selected`: open tasks existed but were not matched by continuity judgment, and a new task was created instead.
 - `task_recall_context_injected`: previous-task weak context was injected into the system prompt, with prior task count and IDs.
+- `task_contract_invalid_tool`: contract required a tool name that does not exist in the registry (may be a skill name), or a required skill lacks file.read evidence. Payload includes `invalid_tools` and/or `invalid_skills`.
+- `task_contract_replanned`: contract replan triggered automatically when invalid tools or skill requirements were detected.
+- `task_contract_invalid_after_replan`: contract still contains invalid tools or skill requirements after one replan attempt.
 
 These events are not chain-of-thought. They describe operational state: what is being called, what returned, what is waiting, and what was blocked by policy.
 
