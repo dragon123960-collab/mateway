@@ -170,11 +170,44 @@ func ClassifyToolFailure(toolName string, result agentcore.ToolResult) FailureIn
 				Guidance: "use alternative inspection methods like terminal.run curl with allowed hosts",
 			}
 		}
-		if strings.Contains(content, "timeout") || strings.Contains(content, "deadline") {
+		if strings.Contains(content, "too many requests") || strings.Contains(content, "429") {
+			return FailureInfo{
+				Category: FailureRetryable,
+				Reason:   "rate limited by target server",
+				Guidance: "use another source, search provider cache, official API, or wait; do not repeatedly fetch the same host",
+			}
+		}
+		if strings.Contains(content, "cloudflare") || strings.Contains(content, "please enable cookies") ||
+			strings.Contains(content, "please enable js") || strings.Contains(content, "disable any ad blocker") ||
+			strings.Contains(content, "captcha") || strings.Contains(content, "challenge") {
+			return FailureInfo{
+				Category: FailureBlocked,
+				Reason:   "bot protection or JS challenge page",
+				Guidance: "use web.search result summaries, official data API, or terminal.run API call; do not treat challenge page body as useful content",
+			}
+		}
+		if strings.Contains(content, "timeout") || strings.Contains(content, "timed out") ||
+			strings.Contains(content, "deadline") ||
+			strings.Contains(content, "client.timeout") || strings.Contains(content, "i/o timeout") {
 			return FailureInfo{
 				Category: FailureRetryable,
 				Reason:   "fetch request timed out",
-				Guidance: "retry or use a different approach to obtain the information",
+				Guidance: "retry once with alternate source or API; avoid repeated timeout on same host",
+			}
+		}
+		if strings.Contains(content, "connection refused") || strings.Contains(content, "connection reset") ||
+			strings.Contains(content, "no such host") || strings.Contains(content, "dns") {
+			return FailureInfo{
+				Category: FailureRetryable,
+				Reason:   "network or DNS failure",
+				Guidance: "verify the URL is correct and the host is reachable; use web.search to find current URL",
+			}
+		}
+		if strings.Contains(content, "status 4") || strings.Contains(content, "status 5") {
+			return FailureInfo{
+				Category: FailureFallback,
+				Reason:   "server returned HTTP error",
+				Guidance: "the URL returned an error status; use web.search to find an alternative source or official API",
 			}
 		}
 		return FailureInfo{

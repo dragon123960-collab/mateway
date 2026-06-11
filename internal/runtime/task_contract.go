@@ -75,8 +75,16 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		contractModel = rt.ContractModel
 	}
 	profile := rt.Pool.ProfileForMessage(msg)
-	skills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	if len(skills) > 0 {
+	const contractSkillsLimit = 24
+	allSkills := discoverSkillsForAgent(rt.Config, profile.ID, 0)
+	skills := allSkills
+	if len(skills) > contractSkillsLimit {
+		skills = skills[:contractSkillsLimit]
+	}
+	discoveredCount := len(allSkills)
+	selectedCount := len(skills)
+	omittedCount := discoveredCount - selectedCount
+	if len(skills) > 0 || discoveredCount > 0 {
 		var traceSkills []map[string]any
 		for _, s := range skills {
 			traceSkills = append(traceSkills, map[string]any{
@@ -87,8 +95,11 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 			})
 		}
 		_ = trace.write(map[string]any{
-			"type":   "task_contract_skills_selected",
-			"skills": traceSkills,
+			"type":             "task_contract_skills_selected",
+			"skills":           traceSkills,
+			"selected_count":   selectedCount,
+			"discovered_count": discoveredCount,
+			"omitted_count":    omittedCount,
 		})
 	}
 	contract, err := rt.generateTaskContract(ctx, task, userText, contractModel, skills)
@@ -146,6 +157,7 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		"summary":           contract.Summary,
 		"requires_tools":    contract.RequiresTools,
 		"required_tools":    contract.RequiredTools,
+		"required_skills":   contract.RequiredSkills,
 		"required_evidence": contract.RequiredEvidence,
 		"expected_outcome":  contract.ExpectedOutcome,
 	})
@@ -581,7 +593,7 @@ func taskContractFollowup(missing []string) string {
 	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(missing, "; "))
 }
 
-func taskContractFollowupWithGuidance(missing []string, failures map[string]FailureInfo) string {
+func taskContractFollowupWithGuidance(missing []string, failures map[string]FailureInfo, contract session.TaskContract, accepted map[string]bool) string {
 	if len(missing) == 0 {
 		return "The task contract is not satisfied yet. Use the smallest appropriate tool call now, or state the concrete blocker."
 	}
@@ -592,6 +604,17 @@ func taskContractFollowupWithGuidance(missing []string, failures map[string]Fail
 			parts = append(parts, m+" — "+info.Guidance)
 		} else {
 			parts = append(parts, m)
+		}
+	}
+	for _, skill := range contract.RequiredSkills {
+		name := strings.TrimSpace(skill.Name)
+		if name == "" {
+			continue
+		}
+		if requiredSkillReadCompleted(contract, skill) {
+			parts = append(parts, fmt.Sprintf("Required skill %s SKILL.md has been read. Now follow that skill's workflow using terminal.run or the suggested execution tool.", name))
+		} else {
+			parts = append(parts, fmt.Sprintf("Required skill %s must be read before execution: complete a file.read plan item for its SKILL.md, then follow its workflow.", name))
 		}
 	}
 	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(parts, "; "))
@@ -747,6 +770,21 @@ func renderTaskPlanForReviewEN(contract session.TaskContract, includeItems bool)
 		b.WriteString(strings.Join(contract.RequiredTools, ", "))
 		b.WriteString("\n")
 	}
+	if len(contract.RequiredSkills) > 0 {
+		b.WriteString("- Required skills: ")
+		for i, s := range contract.RequiredSkills {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(strings.TrimSpace(s.Name))
+			if strings.TrimSpace(s.Reason) != "" {
+				b.WriteString(" (")
+				b.WriteString(strings.TrimSpace(s.Reason))
+				b.WriteString(")")
+			}
+		}
+		b.WriteString("\n")
+	}
 	if includeItems && len(contract.PlanItems) > 0 {
 		b.WriteString("\nPlan:\n")
 		for _, item := range contract.PlanItems {
@@ -784,6 +822,21 @@ func renderTaskPlanForReviewZH(contract session.TaskContract, includeItems bool)
 	if len(contract.RequiredTools) > 0 {
 		b.WriteString("- 需要工具：")
 		b.WriteString(strings.Join(contract.RequiredTools, ", "))
+		b.WriteString("\n")
+	}
+	if len(contract.RequiredSkills) > 0 {
+		b.WriteString("- 需要技能：")
+		for i, s := range contract.RequiredSkills {
+			if i > 0 {
+				b.WriteString("、")
+			}
+			b.WriteString(strings.TrimSpace(s.Name))
+			if strings.TrimSpace(s.Reason) != "" {
+				b.WriteString("（")
+				b.WriteString(strings.TrimSpace(s.Reason))
+				b.WriteString("）")
+			}
+		}
 		b.WriteString("\n")
 	}
 	if includeItems && len(contract.PlanItems) > 0 {
@@ -896,15 +949,21 @@ func validateContractTools(contract session.TaskContract, registry *agentcore.To
 		if name == "" {
 			continue
 		}
-		if !contractHasFileReadForSkill(contract, name, skill.Path) {
+		hasEvidence := contractHasFileReadEvidenceForSkill(contract, name, skill.Path)
+		hasPlanItem := contractHasFileReadPlanItemForSkill(contract, name, skill.Path)
+		if !hasEvidence && !hasPlanItem {
+			v.InvalidSkills = append(v.InvalidSkills, name+": missing file.read evidence and plan item for SKILL.md")
+		} else if !hasEvidence {
 			v.InvalidSkills = append(v.InvalidSkills, name+": missing file.read evidence for SKILL.md")
+		} else if !hasPlanItem {
+			v.InvalidSkills = append(v.InvalidSkills, name+": missing file.read plan item for SKILL.md")
 		}
 	}
 
 	return v
 }
 
-func contractHasFileReadForSkill(contract session.TaskContract, skillName, skillPath string) bool {
+func contractHasFileReadEvidenceForSkill(contract session.TaskContract, skillName, skillPath string) bool {
 	for _, ev := range contract.RequiredEvidence {
 		if strings.EqualFold(strings.TrimSpace(ev.Tool), "file.read") {
 			desc := strings.ToLower(strings.TrimSpace(ev.Description))
@@ -917,19 +976,46 @@ func contractHasFileReadForSkill(contract session.TaskContract, skillName, skill
 			}
 		}
 	}
+	return false
+}
+
+func contractHasFileReadPlanItemForSkill(contract session.TaskContract, skillName, skillPath string) bool {
 	for _, item := range contract.PlanItems {
-		if strings.EqualFold(strings.TrimSpace(item.Tool), "file.read") {
-			criteria := strings.ToLower(strings.TrimSpace(item.Criteria))
-			needle := strings.ToLower(strings.TrimSpace(skillPath))
-			if needle != "" && strings.Contains(criteria, needle) {
-				return true
-			}
-			if strings.Contains(criteria, "skill") && strings.Contains(criteria, strings.ToLower(skillName)) {
-				return true
-			}
+		if fileReadPlanItemMatchesSkill(item, skillName, skillPath) {
+			return true
 		}
 	}
 	return false
+}
+
+func requiredSkillReadCompleted(contract session.TaskContract, skill session.RequiredSkill) bool {
+	for _, item := range contract.PlanItems {
+		if normalizePlanStatus(item.Status) != "completed" {
+			continue
+		}
+		if fileReadPlanItemMatchesSkill(item, skill.Name, skill.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func fileReadPlanItemMatchesSkill(item session.TaskPlanItem, skillName, skillPath string) bool {
+	if !strings.EqualFold(strings.TrimSpace(item.Tool), "file.read") {
+		return false
+	}
+	criteria := strings.ToLower(strings.TrimSpace(item.Criteria))
+	title := strings.ToLower(strings.TrimSpace(item.Title))
+	needle := strings.ToLower(strings.TrimSpace(skillPath))
+	if needle != "" && (strings.Contains(criteria, needle) || strings.Contains(title, needle)) {
+		return true
+	}
+	name := strings.ToLower(strings.TrimSpace(skillName))
+	if name == "" {
+		return false
+	}
+	return (strings.Contains(criteria, "skill") || strings.Contains(title, "skill")) &&
+		(strings.Contains(criteria, name) || strings.Contains(title, name))
 }
 
 func contractReplanFeedback(v contractToolValidation, contract session.TaskContract) string {
@@ -957,12 +1043,12 @@ func contractReplanFeedback(v contractToolValidation, contract session.TaskContr
 		if hasTools {
 			b.WriteString(" ")
 		}
-		b.WriteString("The contract has required_skills without corresponding file.read evidence. ")
-		b.WriteString("Each required skill must include a file.read evidence for its SKILL.md file. ")
-		b.WriteString("Missing evidence for: ")
+		b.WriteString("The contract has required_skills without corresponding file.read evidence and/or plan_items. ")
+		b.WriteString("Each required skill must include both: (1) required_evidence with kind=local_file tool=file.read referencing that skill's SKILL.md path, and (2) a plan_items entry with tool=file.read whose title or criteria references the same skill name or SKILL.md path. ")
+		b.WriteString("Missing skill read requirements for: ")
 		b.WriteString(strings.Join(v.InvalidSkills, "; "))
 		b.WriteString(".\n")
-		b.WriteString("Add required_evidence with kind=local_file tool=file.read and description referencing the SKILL.md path.")
+		b.WriteString("Add the file.read plan item before any execution step that follows the skill workflow.")
 	}
 
 	if !hasTools && !hasSkills {

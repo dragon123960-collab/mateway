@@ -47,6 +47,7 @@ func (WebFetchTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -71,6 +72,18 @@ func (WebFetchTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.
 	if resp.StatusCode >= 400 {
 		if fallback, ok := fetchFallback(ctx, call.ID, rawURL, fmt.Sprintf("HTTP status %d", resp.StatusCode)); ok {
 			return fallback
+		}
+	}
+	if isBotProtectionPage(data) {
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    "web.fetch received a bot-protection or JS challenge page. Use web.search result summaries or an official API instead.",
+			IsError:    true,
+			Evidence: map[string]any{
+				"url":          rawURL,
+				"status":       resp.StatusCode,
+				"failure_kind": "bot_protection",
+			},
 		}
 	}
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: string(data), IsError: resp.StatusCode >= 400, Evidence: map[string]any{"url": rawURL, "status": resp.StatusCode}}
@@ -539,4 +552,43 @@ func summarizeToolText(text string, limit int) string {
 		return text
 	}
 	return string(runes[:limit]) + fmt.Sprintf("... (%d chars)", len(runes))
+}
+
+func isBotProtectionPage(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(data))
+	indicators := []string{
+		"cf-browser-verification",
+		"cf-challenge",
+		"cloudflare",
+		"please enable cookies",
+		"please enable javascript",
+		"enable js",
+		"captcha",
+		"recaptcha",
+		"hcaptcha",
+		"challenge-platform",
+		"are you a human",
+		"verify you are human",
+		"verify you are a human",
+		"disable any ad blocker",
+		"turn off your ad blocker",
+	}
+	count := 0
+	for _, indicator := range indicators {
+		if strings.Contains(lower, indicator) {
+			count++
+			if count >= 2 {
+				return true
+			}
+		}
+	}
+	if len(data) < 2048 {
+		if strings.Contains(lower, "<title>") && strings.Contains(lower, "robot") {
+			return true
+		}
+	}
+	return false
 }

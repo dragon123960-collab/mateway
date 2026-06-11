@@ -186,7 +186,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
-		_ = trace.write(map[string]any{"type": "task_plan_review", "task_id": task.ID})
+		_ = trace.write(map[string]any{"type": "task_plan_review", "task_id": task.ID, "required_tools": contract.RequiredTools, "required_skills": contract.RequiredSkills, "plan_item_count": len(contract.PlanItems)})
 		return Response{
 			Reply: channel.OutboundMessage{
 				Channel:  msg.Channel,

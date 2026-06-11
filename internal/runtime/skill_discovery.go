@@ -43,9 +43,6 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 	if cfg == nil {
 		return nil
 	}
-	if limit <= 0 {
-		limit = 12
-	}
 	workspace := strings.TrimSpace(cfg.App.Workspace)
 	if workspace == "" {
 		workspace = filepath.Join(cfg.App.Home, "workspace")
@@ -64,7 +61,7 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 		}
 	}
 	sortDiscoveredSkills(out)
-	if len(out) > limit {
+	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	return out

@@ -191,7 +191,7 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				return true, nil
 			}
 			contractFollowups++
-			content := taskContractFollowupWithGuidance(validation.Missing, failures)
+			content := taskContractFollowupWithGuidance(validation.Missing, failures, contract, acceptedTools(currentTask))
 			followUps = append(followUps, agentcore.Message{
 				Role:    agentcore.RoleUser,
 				Content: content,

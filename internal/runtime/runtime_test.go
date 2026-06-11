@@ -1670,6 +1670,33 @@ func (t runtimeNamedTool) Run(_ context.Context, call agentcore.ToolCall) agentc
 	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: ev}
 }
 
+type captureCommandTool struct {
+	name     string
+	content  string
+	commands []string
+}
+
+func (t *captureCommandTool) Name() string        { return t.name }
+func (t *captureCommandTool) Description() string { return "test command capture tool" }
+func (t *captureCommandTool) Schema() agentcore.Schema {
+	return agentcore.Schema{Required: []string{"command"}}
+}
+func (t *captureCommandTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }
+func (t *captureCommandTool) ToolContract() agentcore.ToolContract {
+	return agentcore.ToolContract{ParallelMode: "never", Evidence: "captured command", Acceptance: "accepted when command is captured"}
+}
+func (t *captureCommandTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	cmd, _ := call.Args["command"].(string)
+	t.commands = append(t.commands, cmd)
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: map[string]any{"command": cmd}}
+}
+func (t *captureCommandTool) LastCommand() string {
+	if len(t.commands) == 0 {
+		return ""
+	}
+	return t.commands[len(t.commands)-1]
+}
+
 type runtimeFailingTool struct {
 	name      string
 	errorText string
@@ -3053,5 +3080,513 @@ func TestTraceRecordsSelectedContractSkills(t *testing.T) {
 	}
 	if !strings.Contains(traceStr, "test-skill") {
 		t.Fatalf("expected test-skill in trace, got:\n%s", traceStr)
+	}
+}
+
+func TestPlanReviewDisplaysRequiredSkillsChinese(t *testing.T) {
+	contract := session.TaskContract{
+		Summary: "查看纳指走势并整理成文档",
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Reason: "创建飞书云文档"},
+			{Name: "fresh-search", Reason: "搜索纳斯达克数据"},
+		},
+	}
+	text := renderTaskPlanForReviewZH(contract, false)
+	if !strings.Contains(text, "需要技能：") {
+		t.Fatalf("expected 需要技能 in plan review, got:\n%s", text)
+	}
+	if !strings.Contains(text, "feishu-notify") || !strings.Contains(text, "创建飞书云文档") {
+		t.Fatalf("expected feishu-notify with reason, got:\n%s", text)
+	}
+	if !strings.Contains(text, "fresh-search") || !strings.Contains(text, "搜索纳斯达克数据") {
+		t.Fatalf("expected fresh-search with reason, got:\n%s", text)
+	}
+}
+
+func TestPlanReviewDisplaysRequiredSkillsEnglish(t *testing.T) {
+	contract := session.TaskContract{
+		Summary: "check Nasdaq and create doc",
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Reason: "create Feishu cloud doc"},
+		},
+	}
+	text := renderTaskPlanForReviewEN(contract, false)
+	if !strings.Contains(text, "Required skills:") {
+		t.Fatalf("expected Required skills in plan review, got:\n%s", text)
+	}
+	if !strings.Contains(text, "feishu-notify") || !strings.Contains(text, "create Feishu cloud doc") {
+		t.Fatalf("expected feishu-notify with reason, got:\n%s", text)
+	}
+}
+
+func TestTaskContractCreatedTraceIncludesRequiredSkills(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":true,"required_tools":["file.read"],"required_skills":[{"name":"feishu-notify","path":"/tmp/skills/feishu-notify/SKILL.md","reason":"create Feishu cloud doc"}],"expected_outcome":"done"}`}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	rt.Tools = registry
+
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("test task")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	trace := mustTrace(t)
+	rt.ensureTaskContract(context.Background(), inbound("cli:test", "test task"), &state, task, "test task", nil, trace)
+
+	data, err := os.ReadFile(trace.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(data)
+	if !strings.Contains(traceStr, "task_contract_created") {
+		t.Fatal("expected task_contract_created trace")
+	}
+	if !strings.Contains(traceStr, "required_skills") || !strings.Contains(traceStr, "feishu-notify") {
+		t.Fatalf("expected required_skills in trace, got:\n%s", traceStr)
+	}
+}
+
+func TestSkillSelectionTraceIncludesOmittedCount(t *testing.T) {
+	rt := newTestRuntime(t)
+	ws := t.TempDir()
+	cfg := rt.Config
+	cfg.App.Workspace = ws
+	for i := 0; i < 30; i++ {
+		dir := filepath.Join(ws, "skills", fmt.Sprintf("skill-%d", i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		content := fmt.Sprintf("---\nname: skill-%d\ndescription: Test skill %d.\npriority: %d\n---\n", i, i, i)
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":false,"expected_outcome":"done"}`}
+
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("test task")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	trace := mustTrace(t)
+	rt.ensureTaskContract(context.Background(), inbound("cli:test", "test task"), &state, task, "test task", nil, trace)
+
+	data, err := os.ReadFile(trace.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(data)
+	if !strings.Contains(traceStr, "task_contract_skills_selected") {
+		t.Fatal("expected task_contract_skills_selected trace")
+	}
+	if !strings.Contains(traceStr, "discovered_count") || !strings.Contains(traceStr, "omitted_count") || !strings.Contains(traceStr, "selected_count") {
+		t.Fatalf("expected count fields in trace, got:\n%s", traceStr)
+	}
+	if !strings.Contains(traceStr, `"omitted_count":6`) {
+		t.Fatalf("expected 6 omitted skills (30 total - 24 limit), got:\n%s", traceStr)
+	}
+}
+
+func TestTaskPlanReviewTraceIncludesRequiredFields(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":true,"required_tools":["file.read"],"required_skills":[{"name":"feishu-notify","path":"/tmp/skills/feishu-notify/SKILL.md","reason":"create Feishu doc"}],"required_evidence":[{"kind":"local_file","tool":"file.read","description":"read /tmp/skills/feishu-notify/SKILL.md"}],"plan_items":[{"id":"plan-1","title":"read feishu-notify SKILL.md","status":"pending","tool":"file.read","criteria":"read /tmp/skills/feishu-notify/SKILL.md"}],"expected_outcome":"done"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, Content: "done"},
+	}}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "test plan review trace"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", resp.Reply)
+	}
+
+	trace, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceStr := string(trace)
+	if !strings.Contains(traceStr, "task_plan_review") {
+		t.Fatal("expected task_plan_review trace")
+	}
+	if !strings.Contains(traceStr, "required_tools") {
+		t.Fatal("expected required_tools in task_plan_review trace")
+	}
+	if !strings.Contains(traceStr, "required_skills") {
+		t.Fatal("expected required_skills in task_plan_review trace")
+	}
+	if !strings.Contains(traceStr, "plan_item_count") {
+		t.Fatal("expected plan_item_count in task_plan_review trace")
+	}
+}
+
+func TestFeishuCloudDocContractRequiresFeishuNotifyAndTerminalRun(t *testing.T) {
+	rt := newTestRuntime(t)
+	ws := t.TempDir()
+	cfg := rt.Config
+	cfg.App.Workspace = ws
+	skillDir := filepath.Join(ws, "skills", "feishu-notify")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: feishu-notify\ndescription: Send Feishu messages and create cloud documents.\npriority: 80\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "file.write", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "web.search", content: "ok"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"create Feishu cloud doc for Nasdaq report","requires_tools":true,"required_tools":["file.read","file.write","terminal.run","web.search"],"required_skills":[{"name":"feishu-notify","path":"/workspace/skills/feishu-notify/SKILL.md","reason":"create Feishu cloud document"}],"required_evidence":[{"kind":"local_file","tool":"file.read","description":"read /workspace/skills/feishu-notify/SKILL.md"},{"kind":"local_file","tool":"file.write","description":"write markdown document"}],"expected_outcome":"report on Nasdaq trend published to Feishu cloud doc"}`}
+
+	contract := rt.ensureTaskContract(context.Background(), inbound("cli:test", "查看纳指走势，发到飞书云文档"), &session.State{Key: "cli:test"}, &session.TaskNode{ID: "task-1", Goal: "查看纳指走势，发到飞书云文档", Status: "running"}, "查看纳指走势，发到飞书云文档", nil, mustTrace(t))
+
+	if len(contract.RequiredSkills) == 0 {
+		t.Fatal("expected feishu-notify in required_skills")
+	}
+	found := false
+	for _, s := range contract.RequiredSkills {
+		if s.Name == "feishu-notify" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected feishu-notify in required_skills, got %v", contract.RequiredSkills)
+	}
+	hasTerminal := false
+	for _, t := range contract.RequiredTools {
+		if t == "terminal.run" {
+			hasTerminal = true
+			break
+		}
+	}
+	if !hasTerminal {
+		t.Fatalf("expected terminal.run in required_tools, got %v", contract.RequiredTools)
+	}
+}
+
+func TestFeishuBotReadyDoesNotRequireUserLogin(t *testing.T) {
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+
+	contract := session.TaskContract{
+		Summary:       "create Feishu cloud document",
+		RequiresTools: true,
+		RequiredTools: []string{"file.read", "terminal.run"},
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md", Reason: "create Feishu cloud doc"},
+		},
+		RequiredEvidence: []session.TaskEvidenceContract{
+			{Kind: "local_file", Tool: "file.read", Description: "read /tmp/skills/feishu-notify/SKILL.md"},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "read feishu-notify SKILL.md", Status: "pending", Tool: "file.read", Criteria: "read /tmp/skills/feishu-notify/SKILL.md to get helper command"},
+			{ID: "plan-2", Title: "create document via helper", Status: "pending", Tool: "terminal.run", Criteria: "run helper script from skill"},
+		},
+	}
+	validation := validateContractTools(contract, registry, []discoveredSkill{
+		{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md"},
+	})
+	if !validation.IsValid() {
+		t.Fatalf("contract should be valid with feishu-notify + file.read + terminal.run: invalid tools=%v invalid skills=%v", validation.InvalidTools, validation.InvalidSkills)
+	}
+	for _, tool := range contract.RequiredTools {
+		if tool == "lark-cli" || tool == "feishu" {
+			t.Fatal("contract should not require a Feishu-specific runtime tool")
+		}
+	}
+}
+
+func TestContractReplanFeedbackRequiresSkillReadPlanItem(t *testing.T) {
+	contract := session.TaskContract{
+		Summary:       "create Feishu cloud document",
+		RequiresTools: true,
+		RequiredTools: []string{"file.read", "terminal.run"},
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md", Reason: "create Feishu cloud doc"},
+		},
+		RequiredEvidence: []session.TaskEvidenceContract{
+			{Kind: "local_file", Tool: "file.read", Description: "read /tmp/skills/feishu-notify/SKILL.md"},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "create document via helper", Status: "pending", Tool: "terminal.run", Criteria: "run helper script from skill"},
+		},
+	}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+
+	validation := validateContractTools(contract, registry, []discoveredSkill{
+		{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md"},
+	})
+	if validation.IsValid() {
+		t.Fatal("expected contract to be invalid without a file.read plan item for the required skill")
+	}
+	feedback := contractReplanFeedback(validation, contract)
+	for _, want := range []string{"plan_items", "tool=file.read", "SKILL.md", "file.read plan item"} {
+		if !strings.Contains(feedback, want) {
+			t.Fatalf("expected replan feedback to mention %q, got: %s", want, feedback)
+		}
+	}
+}
+
+func TestFeishuNotifyWrapperCommandSelected(t *testing.T) {
+	skill := discoveredSkill{
+		Name:        "feishu-notify",
+		Description: "Send Feishu messages and create cloud documents via lark-cli.",
+		Stage:       "cli",
+		Priority:    "80",
+		Path:        "/tmp/skills/feishu-notify/SKILL.md",
+		Scope:       "shared",
+	}
+	hint := executionHint(skill)
+	if !strings.Contains(hint, "terminal.run") {
+		t.Fatalf("CLI skill execution hint should mention terminal.run, got: %s", hint)
+	}
+
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+
+	prompt := renderTaskContractPrompt("创建飞书云文档", "", registry, []discoveredSkill{skill})
+	if !strings.Contains(prompt, "execution_hint") {
+		t.Fatal("contract prompt should include execution_hint")
+	}
+	if !strings.Contains(prompt, "terminal.run") {
+		t.Fatal("contract prompt should mention terminal.run for CLI skill")
+	}
+}
+
+func TestContractFollowupSuggestsAlternativeEvidenceForBotProtection(t *testing.T) {
+	missing := []string{"tool:web.fetch"}
+	failures := map[string]FailureInfo{
+		"web.fetch": {
+			Category: FailureBlocked,
+			Reason:   "bot protection or JS challenge page",
+			Guidance: "use web.search result summaries, official data API, or terminal.run API call; do not treat challenge page body as useful content",
+		},
+	}
+	guidance := taskContractFollowupWithGuidance(missing, failures, session.TaskContract{}, nil)
+	if !strings.Contains(guidance, "search") && !strings.Contains(guidance, "API") && !strings.Contains(guidance, "alternative") {
+		t.Fatalf("follow-up should suggest alternative evidence for bot protection, got: %s", guidance)
+	}
+}
+
+func TestSearchEvidenceCanSatisfyMarketDataWhenContractAllowsSearch(t *testing.T) {
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+
+	contract := session.TaskContract{
+		Summary:       "查纳斯达克走势",
+		RequiresTools: true,
+		RequiredTools: []string{"web.search"},
+		RequiredEvidence: []session.TaskEvidenceContract{
+			{Kind: "current_external_fact", Tool: "web.search", Description: "Nasdaq index values with date and source"},
+		},
+	}
+	validation := validateContractTools(contract, registry, nil)
+	if !validation.IsValid() {
+		t.Fatalf("contract with search-based market data should be valid: %v", validation.InvalidTools)
+	}
+	for _, tool := range contract.RequiredTools {
+		if tool == "web.fetch" {
+			t.Fatal("contract should not hard-require web.fetch when web.search with date/value/source is sufficient")
+		}
+	}
+}
+
+func TestFeishuNotifyIsDiscoveredWhenInstalled(t *testing.T) {
+	ws := t.TempDir()
+	cfg := config.DefaultRoot()
+	cfg.App.Workspace = ws
+	skillDir := filepath.Join(ws, "skills", "feishu-notify")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: feishu-notify\ndescription: Send Feishu messages and create cloud documents.\npriority: 80\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skills := discoverSkillsForAgent(&cfg, "main", 24)
+	found := false
+	for _, s := range skills {
+		if s.Name == "feishu-notify" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected feishu-notify in discovered skills, got %v", skillNames(skills))
+	}
+}
+
+func skillNames(skills []discoveredSkill) []string {
+	var names []string
+	for _, s := range skills {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+func TestSkillReadThenWrongCommandFollowupGuidesNextTool(t *testing.T) {
+	contract := session.TaskContract{
+		Summary:       "create Feishu cloud document",
+		RequiresTools: true,
+		RequiredTools: []string{"file.read", "terminal.run"},
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md", Reason: "create Feishu cloud doc"},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "read feishu-notify SKILL.md", Status: "completed", Tool: "file.read", Criteria: "read /tmp/skills/feishu-notify/SKILL.md"},
+			{ID: "plan-2", Title: "create document via helper", Status: "pending", Tool: "terminal.run", Criteria: "run helper script from skill"},
+		},
+	}
+	missing := []string{"plan:create document via helper"}
+	failures := map[string]FailureInfo{}
+	guidance := taskContractFollowupWithGuidance(missing, failures, contract, nil)
+	if !strings.Contains(guidance, "SKILL.md has been read") {
+		t.Fatalf("follow-up should note that skill was read, got: %s", guidance)
+	}
+	if !strings.Contains(guidance, "terminal.run") {
+		t.Fatalf("follow-up should guide toward terminal.run, got: %s", guidance)
+	}
+}
+
+func TestSkillReadFollowupMatchesRequiredSkillExactly(t *testing.T) {
+	contract := session.TaskContract{
+		Summary:       "create Feishu cloud document",
+		RequiresTools: true,
+		RequiredTools: []string{"file.read", "terminal.run"},
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md", Reason: "create Feishu cloud doc"},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "read other-skill SKILL.md", Status: "completed", Tool: "file.read", Criteria: "read /tmp/skills/other-skill/SKILL.md"},
+			{ID: "plan-2", Title: "create document via helper", Status: "pending", Tool: "terminal.run", Criteria: "run helper script from skill"},
+		},
+	}
+	guidance := taskContractFollowupWithGuidance([]string{"plan:create document via helper"}, nil, contract, nil)
+	if strings.Contains(guidance, "Required skill feishu-notify SKILL.md has been read") {
+		t.Fatalf("follow-up should not treat another skill as feishu-notify read, got: %s", guidance)
+	}
+	if !strings.Contains(guidance, "complete a file.read plan item") {
+		t.Fatalf("follow-up should ask to read the required skill first, got: %s", guidance)
+	}
+}
+
+func TestFeishuDocTaskReadsSkillWritesMarkdownAndUsesBotHelper(t *testing.T) {
+	rt := newTestRuntime(t)
+	terminal := &captureCommandTool{name: "terminal.run", content: `{"url":"https://example.feishu.cn/docx/mock"}`}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "Nasdaq Composite 2026-06-09 17800; 2026-06-10 17920; 2026-06-11 18010"})
+	registry.Register(runtimeNamedTool{name: "file.read", content: "Use scripts/feishu.docs.create with --markdown-file <absolute path> --as bot. Bot auth may be ready even when user auth is missing."})
+	registry.Register(runtimeNamedTool{name: "file.write", content: "wrote /tmp/nasdaq.md"})
+	registry.Register(terminal)
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_search",
+			Name: "web.search",
+			Args: map[string]any{"query": "Nasdaq Composite last three trading days"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_read_skill",
+			Name: "file.read",
+			Args: map[string]any{"path": "/tmp/skills/feishu-notify/SKILL.md"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_write",
+			Name: "file.write",
+			Args: map[string]any{"path": "/tmp/nasdaq.md", "content": "# Nasdaq\n\nLast three days."},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_create",
+			Name: "terminal.run",
+			Args: map[string]any{"command": "python3 /tmp/skills/feishu-notify/scripts/feishu.docs.create --title \"Nasdaq last three days\" --markdown-file /tmp/nasdaq.md --as bot"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "已创建飞书云文档：https://example.feishu.cn/docx/mock"},
+	}}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"查看纳斯达克近三天走势并发到飞书云文档","requires_tools":true,"required_tools":["web.search","file.read","file.write","terminal.run"],"required_skills":[{"name":"feishu-notify","path":"/tmp/skills/feishu-notify/SKILL.md","reason":"创建飞书云文档"}],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"Nasdaq last three trading days with source/date"},{"kind":"local_file","tool":"file.read","description":"read /tmp/skills/feishu-notify/SKILL.md"},{"kind":"local_file","tool":"file.write","description":"write markdown report before uploading"},{"kind":"remote_publish","tool":"terminal.run","description":"create Feishu cloud doc via feishu-notify helper using --markdown-file and --as bot"}],"plan_items":[{"id":"plan-1","title":"search Nasdaq data","status":"pending","tool":"web.search","criteria":"collect Nasdaq last three trading days"},{"id":"plan-2","title":"read feishu-notify SKILL.md","status":"pending","tool":"file.read","criteria":"read /tmp/skills/feishu-notify/SKILL.md"},{"id":"plan-3","title":"write local markdown report","status":"pending","tool":"file.write","criteria":"write markdown report to an absolute local path"},{"id":"plan-4","title":"create Feishu cloud document","status":"pending","tool":"terminal.run","criteria":"run feishu.docs.create --markdown-file <path> --as bot"}],"expected_outcome":"飞书云文档创建完成并返回链接","completion_policy":"final answer must include the created Feishu doc URL or a concrete blocker"}`}
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "查看纳斯达克指数情况，近三天的走势，将其整理成文档，发到我的飞书云文档"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style != channel.StyleInputRequired {
+		t.Fatalf("expected plan review, got %#v", resp.Reply)
+	}
+	resp, err = rt.Handle(context.Background(), inbound("cli:test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("expected Feishu doc task to complete, got %#v", resp.Reply)
+	}
+	cmd := terminal.LastCommand()
+	for _, want := range []string{"feishu.docs.create", "--markdown-file", "/tmp/nasdaq.md", "--as bot"} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("expected terminal command to contain %q, got %q", want, cmd)
+		}
+	}
+	state := loadState(t, rt, "cli:test")
+	contract := state.Tasks[0].Execution.Contract
+	if contract == nil {
+		t.Fatal("expected stored contract")
+	}
+	for _, item := range contract.PlanItems {
+		if item.Status != "completed" {
+			t.Fatalf("expected all plan items completed, got %#v", contract.PlanItems)
+		}
+	}
+}
+
+func TestSearchEvidenceSatisfiesMarketDataContractEndToEnd(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "2026-06-11 Nasdaq Composite: 17,862.31 (+0.52%), S&P 500: 5,358.12 (+0.31%)"})
+	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+	registry.Register(runtimeNamedTool{name: "file.write", content: "ok"})
+	rt.Tools = registry
+	rt.ContractModel = contractJSONModel{json: `{"summary":"查纳斯达克走势并写入文档","requires_tools":true,"required_tools":["web.search","file.write"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"Nasdaq index values with date and source"}],"plan_items":[{"id":"plan-1","title":"search Nasdaq data","status":"pending","tool":"web.search","criteria":"get current Nasdaq index values"},{"id":"plan-2","title":"write markdown","status":"pending","tool":"file.write","criteria":"write report to file"}],"expected_outcome":"Nasdaq report written"}`}
+
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID: "call_search", Name: "web.search", Args: map[string]any{"query": "Nasdaq index today"},
+		}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID: "call_write", Name: "file.write", Args: map[string]any{"path": "/tmp/report.md", "content": "# Nasdaq Report\n2026-06-11: 17,862.31"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "Nasdaq report written to /tmp/report.md."},
+	}}, rt.Tools)
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:test", "查看纳指走势，写入文档"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Reply.Style == channel.StyleInputRequired {
+		resp2, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp2.Failed {
+			t.Fatalf("task should not fail with search evidence: %v", resp2.Reply.Text)
+		}
+		return
+	}
+	if resp.Failed {
+		t.Fatalf("task should not fail with search evidence: %v", resp.Reply.Text)
 	}
 }
