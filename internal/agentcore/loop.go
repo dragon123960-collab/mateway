@@ -307,6 +307,7 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 	}
 	results := make([]ToolResult, len(prepared))
 	durations := make([]time.Duration, len(prepared))
+	blockedResults := make([]bool, len(prepared))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, limit)
 	for i, item := range prepared {
@@ -322,11 +323,46 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 			if item.Context != nil {
 				callCtx = item.Context
 			}
-			result, duration := executeToolWithControls(callCtx, cfg, message, item.Call, item.Tool, iteration, func(execCtx context.Context) ToolResult {
-				return cfg.Tools.Execute(execCtx, item.Call)
-			})
-			results[i] = result
-			durations[i] = duration
+			maxRetries := cfg.MaxToolRetries
+			if maxRetries <= 0 {
+				maxRetries = cfg.Hooks.toolRetryBudget(ToolExecutionContext{Message: message, ToolCall: item.Call, Tool: item.Tool})
+			}
+			attempt := 0
+			var lastResult ToolResult
+			var blocked bool
+			for {
+				attempt++
+				var execErr error
+				result, duration := executeToolWithControls(callCtx, cfg, message, item.Call, item.Tool, iteration, func(execCtx context.Context) ToolResult {
+					if attempt == 1 {
+						return cfg.Tools.Execute(execCtx, item.Call)
+					}
+					var runResult ToolResult
+					runResult, blocked, execErr = prepareAndExecuteTool(execCtx, cfg, message, item.Call)
+					return runResult
+				})
+				if execErr != nil {
+					lastResult = ToolResult{ToolCallID: item.Call.ID, Content: execErr.Error(), IsError: true}
+					durations[i] = duration
+					break
+				}
+				lastResult = result
+				durations[i] = duration
+				if blocked || !result.IsError || attempt > maxRetries {
+					break
+				}
+				if !IsRetryableToolResult(item.Call.Name, result) {
+					break
+				}
+			}
+			if attempt > 1 {
+				if lastResult.Evidence == nil {
+					lastResult.Evidence = map[string]any{}
+				}
+				lastResult.Evidence["retry_count"] = attempt
+			}
+			blockedResults[i] = blocked
+			results[i] = lastResult
 		}(i, item)
 	}
 	wg.Wait()
@@ -343,6 +379,9 @@ func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message M
 		if after.Terminate {
 			stopReason = firstNonEmptyString(after.StopReason, "tool_execution_stopped")
 		}
+		if blockedResults[i] && stopReason == "" {
+			stopReason = "tool_execution_blocked"
+		}
 		results[i] = result
 		if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: item.Call, ToolResult: result, Iteration: iteration, Duration: durations[i]}); err != nil {
 			return nil, "", err
@@ -356,23 +395,47 @@ func executeOneToolCall(ctx context.Context, cfg Config, message Message, call T
 		return ToolResult{}, "", err
 	}
 	tool, _ := cfg.Tools.Get(call.Name)
-	var blocked bool
-	var execErr error
-	result, toolDuration := executeToolWithControls(ctx, cfg, message, call, tool, iteration, func(execCtx context.Context) ToolResult {
-		var runResult ToolResult
-		runResult, blocked, execErr = prepareAndExecuteTool(execCtx, cfg, message, call)
-		return runResult
-	})
-	err := execErr
-	if err != nil {
-		return ToolResult{}, "", err
+	maxRetries := cfg.MaxToolRetries
+	if maxRetries <= 0 {
+		maxRetries = cfg.Hooks.toolRetryBudget(ToolExecutionContext{Message: message, ToolCall: call, Tool: tool})
 	}
-	after, err := afterToolCall(ctx, cfg, message, call, result)
+	var lastResult ToolResult
+	var lastDuration time.Duration
+	var blocked bool
+	attempt := 0
+	for {
+		attempt++
+		var execErr error
+		result, toolDuration := executeToolWithControls(ctx, cfg, message, call, tool, iteration, func(execCtx context.Context) ToolResult {
+			var runResult ToolResult
+			runResult, blocked, execErr = prepareAndExecuteTool(execCtx, cfg, message, call)
+			return runResult
+		})
+		err := execErr
+		if err != nil {
+			return ToolResult{}, "", err
+		}
+		lastResult = result
+		lastDuration = toolDuration
+		if !result.IsError || attempt > maxRetries {
+			break
+		}
+		if !IsRetryableToolResult(call.Name, result) {
+			break
+		}
+	}
+	if attempt > 1 {
+		if lastResult.Evidence == nil {
+			lastResult.Evidence = map[string]any{}
+		}
+		lastResult.Evidence["retry_count"] = attempt
+	}
+	after, err := afterToolCall(ctx, cfg, message, call, lastResult)
 	if err != nil {
 		return ToolResult{}, "", err
 	}
 	if after.ToolResult != nil {
-		result = *after.ToolResult
+		lastResult = *after.ToolResult
 	}
 	stopReason := ""
 	if blocked {
@@ -381,10 +444,10 @@ func executeOneToolCall(ctx context.Context, cfg Config, message Message, call T
 	if after.Terminate {
 		stopReason = firstNonEmptyString(after.StopReason, "tool_execution_stopped")
 	}
-	if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: call, ToolResult: result, Iteration: iteration, Duration: toolDuration}); err != nil {
+	if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: call, ToolResult: lastResult, Iteration: iteration, Duration: lastDuration}); err != nil {
 		return ToolResult{}, "", err
 	}
-	return result, stopReason, nil
+	return lastResult, stopReason, nil
 }
 
 func executeToolWithControls(ctx context.Context, cfg Config, message Message, call ToolCall, tool Tool, iteration int, run func(context.Context) ToolResult) (ToolResult, time.Duration) {
@@ -500,7 +563,8 @@ func shouldRunToolCallsInParallel(cfg Config, calls []ToolCall) bool {
 			return false
 		}
 		contract := ContractFor(tool)
-		if strings.TrimSpace(contract.ParallelMode) != "read_only_ok" {
+		mode := strings.TrimSpace(contract.ParallelMode)
+		if mode == "forbid" || mode == "no_parallel" {
 			return false
 		}
 	}
@@ -554,5 +618,37 @@ func finish(ctx context.Context, hooks Hooks, result Result) (Result, error) {
 }
 
 func looksLikeMalformedToolCall(text string) bool {
-	return strings.Contains(strings.ToUpper(text), "[TOOL_CALL]")
+	return looksLikeMalformedToolBlock(text)
+}
+
+func looksLikeMalformedToolBlock(text string) bool {
+	upper := strings.ToUpper(text)
+	toolCallIdx := strings.Index(upper, "[TOOL_CALL]")
+	if toolCallIdx < 0 {
+		return false
+	}
+	afterTag := text[toolCallIdx+len("[TOOL_CALL]"):]
+	afterTag = strings.TrimSpace(afterTag)
+	if afterTag == "" || !strings.Contains(afterTag, "{") {
+		return false
+	}
+	if strings.Contains(afterTag, `"id"`) || strings.Contains(afterTag, `"name"`) || strings.Contains(afterTag, `"args"`) {
+		jsonStart := strings.Index(afterTag, "{")
+		if jsonStart < 0 {
+			return false
+		}
+		jsonText := afterTag[jsonStart:]
+		openBraces := strings.Count(jsonText, "{")
+		closeBraces := strings.Count(jsonText, "}")
+		if openBraces == 0 {
+			return false
+		}
+		if openBraces > closeBraces {
+			return true
+		}
+		if !strings.Contains(jsonText, "}") {
+			return true
+		}
+	}
+	return false
 }

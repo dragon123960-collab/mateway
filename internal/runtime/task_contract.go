@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -15,7 +16,10 @@ import (
 
 const taskContractSystemPrompt = `You create a lightweight completion contract and execution plan for one user task.
 Return only one JSON object. Do not execute tools. Do not write narrative outside JSON.
-The contract states what evidence is required before the task may be marked complete, and the plan states the smallest concrete execution steps.
+The contract has two parts:
+  1. Tool execution list (plan_items) — always required, even for simple Q&A. Each plan_items entry is one logical action; plan_items[].criteria is the per-step acceptance condition.
+  2. Acceptance list (required_evidence) — required for tool/action tasks, may be omitted/empty for direct Q&A. Each required_evidence.description is the global acceptance condition.
+Together they form the universal "tool execution list + acceptance list" shape: every task always has a plan (plan_items); tool/action tasks also carry an acceptance list (required_evidence) against which the completion evaluator judges the task done.
 Use English JSON keys and concise English values.
 Use the same natural language as the user for user-visible string values: summary, expected_outcome, completion_policy, required_evidence.description, plan_items.title, and plan_items.criteria.
 Preserve the user's target exactly. Do not reinterpret a server/service/process status request as a software release or project status request.
@@ -39,10 +43,17 @@ Plan item rules:
 - Use id values plan-1, plan-2, ...
 - status must be "pending".
 - tool is the exact tool name from Available tools, or empty for reasoning-only work.
-- criteria is a short verifiable completion condition.
+- criteria is a short verifiable completion condition (the per-step acceptance condition).
 - Prefer 1-4 plan items.
+- For direct Q&A, still emit one plan_item (tool="") so the task has a plan shape.
 
-Set requires_tools=false only when the task can be answered from general reasoning, existing conversation context, or user-provided facts without external/current/local verification.`
+Acceptance list rules:
+- required_evidence entries describe what evidence must be gathered before final answer.
+- Each entry's description is a verifiable acceptance condition (the global acceptance condition).
+- For tool tasks, mirror the tool/skill behind every required_evidence entry.
+- For direct Q&A (requires_tools=false), required_evidence may be left empty. The task completes through final answer, input request, or the empty-action promise check without needing evidence entries.
+
+Set requires_tools=false only when the task can be answered from general reasoning, existing conversation context, or user-provided facts without external/current/local verification. Direct Q&A still emits a plan_item (tool="") but may leave required_evidence empty — the task completes through final answer, input request, or the empty-action promise check.`
 
 func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, model agentcore.Model, trace *traceRecorder) session.TaskContract {
 	if task == nil {
@@ -53,11 +64,26 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		return *task.Execution.Contract
 	}
 
+	profile := rt.Pool.ProfileForMessage(msg)
+	workspace := strings.TrimSpace(rt.Config.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(rt.Config.App.Home, "workspace")
+	}
+	const contractSkillsLimit = 24
+	allSkills := discoverSkillsForAgent(rt.Config, profile.ID, 0)
+	// Slice 6B: only let execution skills pull a direct-looking task through
+	// the contract model when the user text is action-like. Plain Q&A should
+	// keep the minimal direct contract even if execution skills are installed.
+	hasExecutionSkill := false
+	for _, s := range allSkills {
+		if !isGuidanceSkillStage(s.Stage) {
+			hasExecutionSkill = true
+			break
+		}
+	}
 	fallback := fallbackTaskContract(task.Goal, userText)
 	fallbackStrategy := classifyContractStrategy(task.Goal, userText, fallback)
-
-	if fallbackStrategy == contractStrategyDirect {
-		// For direct path, record the strategy immediately and return
+	if fallbackStrategy == contractStrategyDirect && (!hasExecutionSkill || !looksLikeActionTask(firstNonEmpty(userText, task.Goal))) {
 		_ = trace.write(map[string]any{
 			"type":           "task_contract_strategy",
 			"task_id":        task.ID,
@@ -70,6 +96,19 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 			contract.Summary = summarize(firstNonEmpty(userText, task.Goal))
 		}
 		state.SetTaskContract(task.ID, contract)
+		// Slice 6A: every task has a plan/contract shape, even direct Q&A.
+		// Emit task_contract_created for the direct path so trace readers see
+		// the minimal contract (plan_items) and acceptance list.
+		_ = trace.write(map[string]any{
+			"type":              "task_contract_created",
+			"task_id":           task.ID,
+			"summary":           contract.Summary,
+			"requires_tools":    contract.RequiresTools,
+			"required_tools":    contract.RequiredTools,
+			"required_skills":   requiredSkillsWithoutBody(contract.RequiredSkills),
+			"required_evidence": contract.RequiredEvidence,
+			"expected_outcome":  contract.ExpectedOutcome,
+		})
 		if updated := state.TaskByID(task.ID); updated != nil {
 			*task = *updated
 		}
@@ -79,9 +118,6 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 	if rt.ContractModel != nil {
 		contractModel = rt.ContractModel
 	}
-	profile := rt.Pool.ProfileForMessage(msg)
-	const contractSkillsLimit = 24
-	allSkills := discoverSkillsForAgent(rt.Config, profile.ID, 0)
 	skills := allSkills
 	if len(skills) > contractSkillsLimit {
 		skills = skills[:contractSkillsLimit]
@@ -117,6 +153,9 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 	}
 	contract = strengthenTaskContract(contract, task.Goal, userText)
 	contract = repairContractSkillUsage(contract, skills)
+	contract = readSelectedSkillBodies(contract, skills, workspace, profile.ID)
+	contract = augmentContractWithSkillPlanItems(contract, skills)
+	traceSelectedSkillBodies(trace, contract)
 	validation := validateContractTools(contract, rt.Tools, skills)
 	replanAttempted := false
 	if !validation.IsValid() && !replanAttempted {
@@ -135,6 +174,9 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 			}
 			replanContract = strengthenTaskContract(replanContract, task.Goal, userText)
 			replanContract = repairContractSkillUsage(replanContract, skills)
+			replanContract = readSelectedSkillBodies(replanContract, skills, workspace, profile.ID)
+			replanContract = augmentContractWithSkillPlanItems(replanContract, skills)
+			traceSelectedSkillBodies(trace, replanContract)
 			contract = replanContract
 			replanAttempted = true
 			validation = validateContractTools(contract, rt.Tools, skills)
@@ -290,8 +332,12 @@ func parseTaskContract(raw string) (session.TaskContract, error) {
 	if len(contract.RequiredTools) > 0 || len(contract.RequiredEvidence) > 0 {
 		contract.RequiresTools = true
 	}
-	if contract.RequiresTools && len(contract.PlanItems) == 0 {
-		contract.PlanItems = fallbackPlanItems(firstNonEmpty(contract.Summary, contract.ExpectedOutcome), true, contract.RequiredTools)
+	if len(contract.PlanItems) == 0 {
+		// Slice 6A universal plan shape: every task carries at least one
+		// plan_items entry, even direct Q&A. The model's contract may omit
+		// plan_items for plain Q&A; fall back to a single empty-tool item
+		// so completion evaluator and trace readers see a plan.
+		contract.PlanItems = fallbackPlanItems(firstNonEmpty(contract.Summary, contract.ExpectedOutcome), contract.RequiresTools, contract.RequiredTools)
 	}
 	if contract.RequiresTools && len(contract.RequiredTools) == 0 {
 		for _, evidence := range contract.RequiredEvidence {
@@ -582,18 +628,26 @@ func validateTaskContract(contract session.TaskContract, task session.TaskNode) 
 		return taskContractValidation{Satisfied: len(missing) == 0, Missing: missing}
 	}
 	accepted := acceptedTools(task)
+	fetchCanBeSubstituted := fetchCanBeSubstitutedBySearch(contract, task)
 	var missing []string
 	for _, tool := range contract.RequiredTools {
-		if strings.TrimSpace(tool) == "" {
+		toolName := strings.TrimSpace(tool)
+		if toolName == "" {
 			continue
 		}
-		if !accepted[strings.ToLower(strings.TrimSpace(tool))] {
-			missing = append(missing, "tool:"+strings.TrimSpace(tool))
+		if strings.EqualFold(toolName, "web.fetch") && fetchCanBeSubstituted {
+			continue
+		}
+		if !accepted[strings.ToLower(toolName)] {
+			missing = append(missing, "tool:"+toolName)
 		}
 	}
 	for _, evidence := range contract.RequiredEvidence {
 		toolName := strings.TrimSpace(evidence.Tool)
 		if toolName == "" {
+			continue
+		}
+		if strings.EqualFold(toolName, "web.fetch") && fetchCanBeSubstituted {
 			continue
 		}
 		if !accepted[strings.ToLower(toolName)] {
@@ -607,6 +661,146 @@ func validateTaskContract(contract session.TaskContract, task session.TaskNode) 
 	missing = append(missing, missingPlanItems(contract)...)
 	missing = cleanStringList(missing)
 	return taskContractValidation{Satisfied: len(missing) == 0, Missing: missing}
+}
+
+func allFetchPlanItemsBlocked(contract session.TaskContract) bool {
+	hasFetchItem := false
+	for _, item := range contract.PlanItems {
+		if !strings.EqualFold(strings.TrimSpace(item.Tool), "web.fetch") {
+			continue
+		}
+		hasFetchItem = true
+		if normalizePlanStatus(item.Status) != "blocked" {
+			return false
+		}
+	}
+	return hasFetchItem
+}
+
+func fetchCanBeSubstitutedBySearch(contract session.TaskContract, task session.TaskNode) bool {
+	if !allFetchPlanItemsBlocked(contract) {
+		return false
+	}
+	searchEvidence := acceptedEvidenceTextForTool(task, "web.search")
+	if strings.TrimSpace(searchEvidence) == "" {
+		return false
+	}
+	hasFetchRequirement := false
+	for _, evidence := range contract.RequiredEvidence {
+		if !strings.EqualFold(strings.TrimSpace(evidence.Tool), "web.fetch") {
+			continue
+		}
+		hasFetchRequirement = true
+		if !evidenceTextCoversRequirement(searchEvidence, evidence.Description) {
+			return false
+		}
+	}
+	if hasFetchRequirement {
+		return true
+	}
+	for _, item := range contract.PlanItems {
+		if !strings.EqualFold(strings.TrimSpace(item.Tool), "web.fetch") {
+			continue
+		}
+		requirement := strings.TrimSpace(item.Criteria)
+		if requirement == "" {
+			requirement = item.Title
+		}
+		if !evidenceTextCoversRequirement(searchEvidence, requirement) {
+			return false
+		}
+	}
+	return true
+}
+
+func acceptedEvidenceTextForTool(task session.TaskNode, toolName string) string {
+	toolName = strings.ToLower(strings.TrimSpace(toolName))
+	var parts []string
+	for _, step := range task.Steps {
+		if !strings.EqualFold(strings.TrimSpace(step.Tool), toolName) {
+			continue
+		}
+		if !step.Accepted && strings.TrimSpace(step.Status) != "accepted" {
+			continue
+		}
+		parts = append(parts, step.Summary, evidenceMapText(step.Evidence))
+	}
+	for _, event := range task.Execution.Events {
+		if strings.TrimSpace(event.Type) != "tool_result" || strings.TrimSpace(event.Status) != "accepted" {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(event.Tool), toolName) {
+			continue
+		}
+		parts = append(parts, event.Summary, evidenceMapText(event.Evidence))
+	}
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func evidenceMapText(evidence map[string]any) string {
+	if len(evidence) == 0 {
+		return ""
+	}
+	var parts []string
+	for key, value := range evidence {
+		parts = append(parts, key, fmt.Sprint(value))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
+}
+
+func evidenceTextCoversRequirement(evidenceText, requirement string) bool {
+	evidenceText = strings.ToLower(strings.TrimSpace(evidenceText))
+	if evidenceText == "" {
+		return false
+	}
+	keywords := requirementKeywords(requirement)
+	if len(keywords) == 0 {
+		return true
+	}
+	matched := 0
+	for _, keyword := range keywords {
+		if strings.Contains(evidenceText, keyword) {
+			matched++
+		}
+	}
+	if len(keywords) <= 2 {
+		return matched == len(keywords)
+	}
+	return matched >= 2
+}
+
+func requirementKeywords(text string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		word := strings.TrimSpace(raw)
+		if len(word) < 4 || seen[word] || fetchSubstitutionStopWords[word] {
+			continue
+		}
+		seen[word] = true
+		out = append(out, word)
+	}
+	return out
+}
+
+var fetchSubstitutionStopWords = map[string]bool{
+	"fetch":    true,
+	"page":     true,
+	"source":   true,
+	"sources":  true,
+	"result":   true,
+	"results":  true,
+	"data":     true,
+	"with":     true,
+	"from":     true,
+	"that":     true,
+	"this":     true,
+	"current":  true,
+	"external": true,
+	"evidence": true,
 }
 
 func checkContractToolAvailability(agentRegistry, fullRegistry *agentcore.ToolRegistry, contract session.TaskContract) map[string]string {
@@ -921,7 +1115,9 @@ func missingPlanItems(contract session.TaskContract) []string {
 }
 
 func renderTaskPlanForReview(contract session.TaskContract, userText string) string {
-	return renderTaskPlanForReviewEN(contract, false)
+	// Slice 6A: plan review must show the ordered tool checklist (plan_items)
+	// alongside skills, expected outcome, and acceptance criteria.
+	return renderTaskPlanForReviewEN(contract, true)
 }
 
 func renderTaskPlanForExecution(contract session.TaskContract, userText string) string {
@@ -977,6 +1173,28 @@ func renderTaskPlanForReviewEN(contract session.TaskContract, includeItems bool)
 			}
 			b.WriteString("\n")
 		}
+	}
+	if len(contract.RequiredEvidence) > 0 {
+		b.WriteString("\nAcceptance criteria:\n")
+		for _, ev := range contract.RequiredEvidence {
+			b.WriteString("- ")
+			if tool := strings.TrimSpace(ev.Tool); tool != "" {
+				b.WriteString("[")
+				b.WriteString(tool)
+				b.WriteString("] ")
+			}
+			if kind := strings.TrimSpace(ev.Kind); kind != "" {
+				b.WriteString(kind)
+				b.WriteString(": ")
+			}
+			b.WriteString(strings.TrimSpace(ev.Description))
+			b.WriteString("\n")
+		}
+	}
+	if strings.TrimSpace(contract.CompletionPolicy) != "" {
+		b.WriteString("\nCompletion policy: ")
+		b.WriteString(contract.CompletionPolicy)
+		b.WriteString("\n")
 	}
 	b.WriteString("\nReply 1 to execute, 2 to replan, or describe what to change.")
 	return strings.TrimSpace(b.String())
@@ -1158,6 +1376,53 @@ func contractReplanFeedback(v contractToolValidation, contract session.TaskContr
 
 func invalidContractBlockerText(contract session.TaskContract, v contractToolValidation, msg channel.InboundMessage) string {
 	return invalidContractBlockerEN(contract, v)
+}
+
+func traceSelectedSkillBodies(trace *traceRecorder, contract session.TaskContract) {
+	if trace == nil {
+		return
+	}
+	count := 0
+	for _, skill := range contract.RequiredSkills {
+		if skill.Body != "" {
+			count++
+		}
+	}
+	if count == 0 {
+		return
+	}
+	var skillInfos []map[string]any
+	for _, skill := range contract.RequiredSkills {
+		if skill.Body == "" {
+			continue
+		}
+		skillInfos = append(skillInfos, map[string]any{
+			"name":     skill.Name,
+			"path":     skill.Path,
+			"body_len": len(skill.Body),
+		})
+	}
+	_ = trace.write(map[string]any{
+		"type":         "task_contract_skill_read",
+		"read_count":   count,
+		"total_skills": len(contract.RequiredSkills),
+		"skills":       skillInfos,
+	})
+}
+
+func requiredSkillsWithoutBody(skills []session.RequiredSkill) []session.RequiredSkill {
+	if len(skills) == 0 {
+		return nil
+	}
+	out := make([]session.RequiredSkill, len(skills))
+	for i, s := range skills {
+		out[i] = session.RequiredSkill{
+			Name:   s.Name,
+			Path:   s.Path,
+			Reason: s.Reason,
+		}
+	}
+	return out
 }
 
 func invalidContractBlockerEN(contract session.TaskContract, v contractToolValidation) string {

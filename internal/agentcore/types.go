@@ -138,6 +138,7 @@ type Config struct {
 	Tools            *ToolRegistry
 	MaxParallelTools int
 	MaxIterations    int
+	MaxToolRetries   int
 	Hooks            Hooks
 }
 

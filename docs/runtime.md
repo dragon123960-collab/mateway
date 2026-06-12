@@ -14,7 +14,9 @@ Runtime 处理一条用户消息时的优先级：
 2. `memory_proposal_review` pending：只接受数字选择。
 3. 有 open active task：用户新消息直接 steering 到这个任务。
 4. 无 active task：创建新 task，并注入 session summary 与 previous task weak context，让模型自己判断是否接续。
-5. AgentCore loop：每轮模型调用前执行 context budget packing 和动态工具暴露；模型调用工具则执行并继续；模型不再调用工具则停止回复；达到 `max_iterations` 或发生错误则停止并保留任务状态。
+5. Task contract：生成或复用轻量完成契约，包含 required tools、required evidence、required skills 和 plan items。
+6. Plan strategy：`direct` 不打断，`auto_contract` 自动执行，`review_required` 展示 plan review 并等待用户确认。
+7. AgentCore loop：每轮模型调用前执行 context budget packing 和动态工具暴露；模型调用工具则执行并继续；模型不再调用工具则停止回复；达到 `max_iterations` 或发生错误则停止并保留任务状态。
 
 ## Open Task 状态
 
@@ -51,12 +53,31 @@ Session 会持续维护一个 deterministic summary，记录最近任务结果�
 - 每轮只向模型暴露相关 tool schemas/contracts，执行层仍保留完整 tool registry。
 - 大型 tool result 的完整内容保存为 `raw_ref`，模型可用 `toolresult.read` 按 query 精确回读。
 
+## Task Contract、Plan Review 与 Skill
+
+Task contract 是完成度边界，不是 workflow engine。它可以包含：
+
+- `required_tools`：必须使用的真实工具名。
+- `required_skills`：需要读取和遵循的 execution skill，skill name 不是工具名。
+- `required_evidence`：任务完成前必须出现的 evidence。
+- `plan_items`：当前任务 checklist，随 tool result 更新状态。
+- `expected_outcome` / `completion_policy`：最终回复和 blocker 的判断依据。
+
+Runtime 使用 contract strategy 减少不必要 review：
+
+- `direct`：无需工具的简单任务，使用 minimal contract，不展示 plan review。
+- `auto_contract`：低风险工具任务，生成 contract 后自动进入执行。
+- `review_required`：复杂交付、写文件、远程发布、高风险 mutation 或用户明确要求先计划时展示 plan review。
+
+Execution skill 由 `required_skills` 表达，并通过 `file.read` 读取 `SKILL.md`。后续动作仍必须使用真实 runtime tools，例如 `file.write`、`terminal.run`、`web.search`。Skill name 不进入 `required_tools` 或 `plan_items[].tool`。
+
 ## 停止与状态
 
 - 模型给出实质性 final answer 且没有工具调用：任务完成，清空 active task。
 - 模型请求用户补充信息：任务进入 `await_user_input`，继续保留 active task。
 - 达到 `max_iterations`、模型错误或 activity timeout：任务标记为 `failed` 或 partial，继续保留 active task。用户说“继续”时会 steering 回原任务。
 - 模型说“我来检查/我来执行”但没有工具调用：视为空承诺，不算完成，任务保持 open。
+- Completion evaluator 统一判断 contract satisfied、missing evidence、unavailable tool、follow-up limit 和 final blocker，避免 loop 内外重复判断。
 
 ## Hooks
 

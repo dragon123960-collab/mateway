@@ -101,6 +101,7 @@ type RequiredSkill struct {
 	Name   string `json:"name,omitempty"`
 	Path   string `json:"path,omitempty"`
 	Reason string `json:"reason,omitempty"`
+	Body   string `json:"-"`
 }
 
 type TraceRef struct {

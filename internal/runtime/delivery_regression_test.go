@@ -72,6 +72,35 @@ func hasTraceEvent(events []map[string]any, eventType string) bool {
 	return false
 }
 
+// findToolExecutionEnd returns the first tool_execution_end event whose
+// tool_call.name matches the given tool and whose args contain key==value.
+// It returns nil if no such event exists.
+func findToolExecutionEnd(events []map[string]any, toolName, argKey, argValue string) map[string]any {
+	for _, ev := range events {
+		if ev["type"] != "tool_execution_end" {
+			continue
+		}
+		tc, ok := ev["tool_call"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := tc["Name"].(string); name != toolName {
+			continue
+		}
+		if argKey == "" {
+			return ev
+		}
+		args, ok := tc["Args"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, _ := args[argKey].(string); strings.Contains(v, argValue) {
+			return ev
+		}
+	}
+	return nil
+}
+
 func countTraceEvent(events []map[string]any, eventType string) int {
 	count := 0
 	for _, ev := range events {
@@ -377,6 +406,40 @@ Guidance only.
 	if !selectedFound {
 		t.Fatal("expected cloud-doc-publish to appear in task_contract_skills_selected")
 	}
+
+	// Direct trace evidence: a file.read of the SKILL.md path proves the
+	// skill-read evidence chain. We assert on tool_execution_end so this
+	// fails if the trace redaction layer ever drops tool_call.args.path.
+	readEv := findToolExecutionEnd(events, "file.read", "path", "SKILL.md")
+	if readEv == nil {
+		t.Fatal("expected trace to contain tool_execution_end for file.read of SKILL.md")
+	}
+	if isErr, _ := readEv["tool_result"].(map[string]any)["IsError"].(bool); isErr {
+		t.Fatalf("file.read of SKILL.md should not be an error, got %v", readEv["tool_result"])
+	}
+
+	// Direct trace evidence: the terminal.run call's command includes the
+	// publish keyword AND the tool result contains the published URL.
+	pubEv := findToolExecutionEnd(events, "terminal.run", "command", "publish")
+	if pubEv == nil {
+		t.Fatal("expected trace to contain tool_execution_end for terminal.run publish")
+	}
+	tr, ok := pubEv["tool_result"].(map[string]any)
+	if !ok {
+		t.Fatalf("terminal.run tool_execution_end missing tool_result, got %v", pubEv)
+	}
+	if isErr, _ := tr["IsError"].(bool); isErr {
+		t.Fatalf("publish terminal.run should not be an error, got %v", tr)
+	}
+	if content, _ := tr["Content"].(string); !strings.Contains(content, "https://example.cloud/x") {
+		t.Fatalf("publish terminal.run result should contain the published URL, got %q", content)
+	}
+
+	// task_contract_satisfied should follow the publish step, confirming
+	// the contract stage saw all required evidence.
+	if !hasTraceEvent(events, "task_contract_satisfied") {
+		t.Fatal("expected task_contract_satisfied trace event after publish")
+	}
 }
 
 // TestDeliveryFixtureLocalArtifactBeforeRemotePublish verifies the universal
@@ -475,5 +538,41 @@ Run the publish CLI.
 		if strings.Contains(strings.ToLower(resp.Reply.Text), banned) {
 			t.Fatalf("final reply must not include default audit evidence list, got %q", resp.Reply.Text)
 		}
+	}
+
+	// Direct trace evidence: file.write of the local artifact must appear
+	// as a successful tool_execution_end before the publish terminal.run.
+	events := readTraceEvents(t, home, "cli:local-then-remote")
+	writeEv := findToolExecutionEnd(events, "file.write", "path", ".md")
+	if writeEv == nil {
+		t.Fatal("expected trace to contain tool_execution_end for file.write of local artifact")
+	}
+	if isErr, _ := writeEv["tool_result"].(map[string]any)["IsError"].(bool); isErr {
+		t.Fatalf("file.write of artifact should not be an error, got %v", writeEv["tool_result"])
+	}
+
+	// file.write event must appear before the publish terminal.run in the trace.
+	writeIdxTrace, pubIdxTrace := -1, -1
+	for i, ev := range events {
+		if writeIdxTrace < 0 {
+			if tc, ok := ev["tool_call"].(map[string]any); ok && tc["Name"] == "file.write" {
+				writeIdxTrace = i
+			}
+		}
+		if pubIdxTrace < 0 {
+			if tc, ok := ev["tool_call"].(map[string]any); ok && tc["Name"] == "terminal.run" {
+				if args, ok := tc["Args"].(map[string]any); ok {
+					if cmd, _ := args["command"].(string); strings.Contains(cmd, "publish") {
+						pubIdxTrace = i
+					}
+				}
+			}
+		}
+	}
+	if writeIdxTrace < 0 || pubIdxTrace < 0 {
+		t.Fatalf("expected both file.write and publish terminal.run in trace, write=%d pub=%d", writeIdxTrace, pubIdxTrace)
+	}
+	if writeIdxTrace >= pubIdxTrace {
+		t.Fatalf("file.write (trace idx %d) must precede publish terminal.run (trace idx %d)", writeIdxTrace, pubIdxTrace)
 	}
 }

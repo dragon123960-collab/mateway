@@ -55,6 +55,9 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 		ToolProgressInterval: func(input agentcore.ToolExecutionContext) time.Duration {
 			return runtimeToolProgressInterval(rt.Config, input.ToolCall.Name)
 		},
+		ToolRetryBudget: func(input agentcore.ToolExecutionContext) int {
+			return runtimeToolRetryBudget(rt.Config, input.ToolCall.Name)
+		},
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
 			if steeringSent {
 				return nil, nil
@@ -182,7 +185,60 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					Evidence: evidence,
 				}))
 			}
+
+			if input.ToolCall.Name == "web.fetch" && input.ToolResult.IsError {
+				kind, _ := ClassifyFetchFailure(input.ToolResult)
+				if kind != "" {
+					rawURL, _ := input.ToolCall.Args["url"].(string)
+					domain := ""
+					if parsed, err := resolveFetchURL(rawURL); err == nil {
+						domain = parsed.Hostname()
+					}
+					_ = trace.write(map[string]any{
+						"type":         "fetch_failure",
+						"task_id":      taskID,
+						"url":          rawURL,
+						"domain":       domain,
+						"failure_kind": string(kind),
+						"tool_call_id": input.ToolCall.ID,
+					})
+					state.AddExecutionEvent(taskID, session.ExecutionEvent{
+						Type:    "fetch_failure",
+						Status:  "failed",
+						Tool:    input.ToolCall.ID,
+						Summary: summarize(input.ToolResult.Content),
+						Evidence: map[string]any{
+							"tool":         input.ToolCall.Name,
+							"url":          rawURL,
+							"domain":       domain,
+							"failure_kind": string(kind),
+						},
+					})
+					fetchBudget := fetchBudgetForState(state, taskID)
+					if fetchBudget.IsExhausted(rawURL) {
+						_ = trace.write(map[string]any{
+							"type":         "fetch_budget_exhausted",
+							"task_id":      taskID,
+							"url":          rawURL,
+							"domain":       domain,
+							"failure_kind": string(kind),
+						})
+						blockPlanItemsForFetchFailure(state, taskID, rawURL)
+					}
+				}
+			}
+
 			result := compactToolResultForModel(input.ToolCall, input.ToolResult, rt.home(), trace.id)
+			if input.ToolResult.Evidence != nil {
+				if _, ok := result.Evidence["retry_count"]; !ok {
+					if rc, ok := input.ToolResult.Evidence["retry_count"]; ok {
+						if result.Evidence == nil {
+							result.Evidence = map[string]any{}
+						}
+						result.Evidence["retry_count"] = rc
+					}
+				}
+			}
 			return agentcore.AfterToolCallResult{ToolResult: &result}, nil
 		},
 	}
@@ -318,6 +374,18 @@ var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.D
 		return 0
 	}
 	return 30 * time.Second
+}
+
+var runtimeToolRetryBudget = func(cfg *config.Root, toolName string) int {
+	_ = cfg
+	switch strings.TrimSpace(toolName) {
+	case "web.fetch":
+		return 1
+	case "web.search":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func acceptToolResult(tool agentcore.Tool, call agentcore.ToolCall, result agentcore.ToolResult) (string, map[string]any) {

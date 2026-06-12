@@ -248,10 +248,7 @@ func updatePlanItemsForToolResult(state *session.State, taskID string, toolName 
 		return
 	}
 	contract := *task.Execution.Contract
-	item := planItemForTool(&contract, toolName, "running")
-	if item == nil {
-		item = planItemForTool(&contract, toolName, "pending")
-	}
+	item := planItemForTool(&contract, toolName, "running", "pending")
 	if item == nil {
 		return
 	}
@@ -273,10 +270,7 @@ func updatePlanItemForFileReadPath(state *session.State, taskID string, path str
 	contract := *task.Execution.Contract
 	item := findFileReadPlanItemForPath(&contract, path)
 	if item == nil {
-		item = planItemForTool(&contract, "file.read", "running")
-		if item == nil {
-			item = planItemForTool(&contract, "file.read", "pending")
-		}
+		item = planItemForTool(&contract, "file.read", "running", "pending")
 	}
 	if item == nil {
 		return
@@ -387,31 +381,50 @@ func planItemForTool(contract *session.TaskContract, toolName string, statuses .
 	if wantTool == "" {
 		return nil
 	}
-	allowed := map[string]bool{}
-	for _, status := range statuses {
-		allowed[normalizePlanStatus(status)] = true
-	}
-	for i := range contract.PlanItems {
-		item := &contract.PlanItems[i]
-		if strings.TrimSpace(item.Tool) == "" || !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
-			continue
+	if len(statuses) > 0 {
+		// Search in priority order: first status has highest priority.
+		for _, status := range statuses {
+			allowed := normalizePlanStatus(status)
+			for i := range contract.PlanItems {
+				item := &contract.PlanItems[i]
+				if !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
+					continue
+				}
+				if normalizePlanStatus(item.Status) == allowed {
+					return item
+				}
+			}
 		}
-		if len(allowed) == 0 || allowed[normalizePlanStatus(item.Status)] {
-			return item
+		// Fallback: allow retry of a blocked item when "blocked" is not explicitly asked for.
+		if !containsStatus(statuses, "blocked") {
+			for i := range contract.PlanItems {
+				item := &contract.PlanItems[i]
+				if !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
+					continue
+				}
+				if normalizePlanStatus(item.Status) == "blocked" {
+					return item
+				}
+			}
 		}
-	}
-	// Fallback: allow retry of a blocked item (e.g. after a retryable block)
-	if len(allowed) > 0 && allowed["blocked"] {
 		return nil
 	}
+	// No status filter: return first matching item.
 	for i := range contract.PlanItems {
 		item := &contract.PlanItems[i]
 		if strings.TrimSpace(item.Tool) == "" || !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
 			continue
 		}
-		if normalizePlanStatus(item.Status) == "blocked" {
-			return item
-		}
+		return item
 	}
 	return nil
+}
+
+func containsStatus(statuses []string, target string) bool {
+	for _, s := range statuses {
+		if normalizePlanStatus(s) == target {
+			return true
+		}
+	}
+	return false
 }

@@ -103,7 +103,7 @@ Sessions are runtime state, not an ever-growing raw chat log. Before each model 
 - the compacted recent session transcript
 - the current user message
 
-System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, task contracts, trace refs, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt. For action-oriented tasks, the task contract can include lightweight `plan_items`; Mateway asks for confirmation before executing the first plan, then updates item status from tool results while preserving per-run trace files.
+System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, task contracts, trace refs, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt. For action-oriented tasks, the task contract can include lightweight `plan_items`, required evidence, and selected execution skills. Mateway uses a small strategy split: direct answers skip review, low-risk tool tasks can run automatically, and complex or risky tasks show a plan review before execution. Tool results update plan item status while each run keeps its own trace file.
 
 Mateway also runs an invisible context economy before every model turn. It estimates input tokens against the selected model's `context_window` and `max_tokens`, automatically compacts old transcript/tool content over a soft budget, stops only at a hard budget, and records estimated savings in trace/TUI diagnostics. Tool schemas are exposed dynamically: each model turn sees only relevant tool contracts, while the full registry remains available for execution. Full compacted tool output is stored as `raw_ref`; `toolresult.read` can retrieve the original output by `raw_ref` and optional multi-term `query`, returning matching line snippets and line ranges instead of feeding large outputs back into the prompt.
 
@@ -152,6 +152,7 @@ Mateway currently supports:
 - hook events in trace
 - workspace profile injection
 - skill discovery from `workspace/skills` and agent-specific skill overrides
+- skill-aware task contracts: selected execution skills stay in `required_skills`, while actual work still uses real tools such as `file.read`, `file.write`, `terminal.run`, `web.search`, and `web.fetch`
 - Markdown memory lint/search/index
 - memory proposal create/list/show/commit/reject
 - automatic diary/proposal generation after useful completed tasks

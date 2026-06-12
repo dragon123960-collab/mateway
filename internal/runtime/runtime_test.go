@@ -1779,6 +1779,16 @@ func (m contractJSONModel) Next(context.Context, agentcore.Context) (agentcore.M
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.json}, nil
 }
 
+type panicModel struct {
+	t *testing.T
+}
+
+func (m panicModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
+	m.t.Helper()
+	m.t.Fatal("model should not be called")
+	return agentcore.Message{}, nil
+}
+
 type dynamicContractModel struct {
 	gen func() string
 }

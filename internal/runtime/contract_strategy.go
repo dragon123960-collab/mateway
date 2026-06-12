@@ -72,6 +72,7 @@ func looksLikeActionTask(text string) bool {
 	for _, marker := range []string{
 		"read ", "write ", "edit ", "create ", "delete ", "run ", "test ",
 		"fix ", "implement ", "build ", "update ", "commit ", "use ",
+		"publish ", "deploy ", "generate ", "send ", "research ", "search ", "fetch ",
 		"file", "repo", "repository", "project", "code",
 		"web", "http", "https",
 	} {

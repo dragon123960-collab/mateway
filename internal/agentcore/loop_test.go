@@ -624,3 +624,376 @@ func (m *captureContextModel) Next(_ context.Context, ctx Context) (Message, err
 	m.messages = append([]Message(nil), ctx.Messages...)
 	return Message{Role: RoleAssistant, Content: "ok"}, nil
 }
+
+func TestRunTransientTimeoutRetrySucceedsOnce(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.flaky_echo", Args: map[string]any{"text": "ok"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(&flakyEchoTool{Failures: 1, Delay: 0})
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxToolRetries: 2}, []Message{{Role: RoleUser, Content: "use tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsToolMessage(result.Messages, "ok") {
+		t.Fatalf("expected retry success, got %#v", result.Messages)
+	}
+}
+
+func TestRunRateLimitFiniteRetryOrBlocker(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.rate_limited_echo", Args: map[string]any{"text": "limit"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(rateLimitedEchoTool{})
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxToolRetries: 2}, []Message{{Role: RoleUser, Content: "use tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsToolMessage(result.Messages, "too many requests") {
+		t.Fatalf("expected rate limit error in tool result, got %#v", result.Messages)
+	}
+}
+
+func TestRunPolicyDeniedDoesNotRetry(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.blocked_echo", Args: map[string]any{"text": "block"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(blockedEchoTool{})
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxToolRetries: 2}, []Message{{Role: RoleUser, Content: "use tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsToolMessage(result.Messages, "policy denied") {
+		t.Fatalf("expected policy denied error, got %#v", result.Messages)
+	}
+}
+
+func TestRunTwoSafeReadToolsParallelDefault(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.slow_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.slow_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(slowEchoTool{Delay: 60 * time.Millisecond})
+	start := time.Now()
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxParallelTools: 4}, []Message{{Role: RoleUser, Content: "read files"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 110*time.Millisecond {
+		t.Fatalf("expected parallel execution for safe-read tools, elapsed %s", elapsed)
+	}
+	if got := toolMessages(result.Messages); strings.Join(got, ",") != "first,second" {
+		t.Fatalf("tool result order = %#v", got)
+	}
+}
+
+func TestRunExplicitNoParallelSafeReadStaysSerial(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.no_parallel_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.no_parallel_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(noParallelEchoTool{Delay: 60 * time.Millisecond})
+	start := time.Now()
+	_, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxParallelTools: 4}, []Message{{Role: RoleUser, Content: "serial tools"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 110*time.Millisecond {
+		t.Fatalf("expected serial execution for no-parallel safe-read tools, elapsed %s", elapsed)
+	}
+}
+
+func TestRunGuardedMutationStaysSerial(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "test.unsafe_echo", Args: map[string]any{"text": "first"}},
+			{ID: "2", Name: "test.unsafe_echo", Args: map[string]any{"text": "second"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(unsafeEchoTool{Delay: 60 * time.Millisecond})
+	start := time.Now()
+	_, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxParallelTools: 4}, []Message{{Role: RoleUser, Content: "mutation tools"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 110*time.Millisecond {
+		t.Fatalf("expected serial execution for guarded mutation tools, elapsed %s", elapsed)
+	}
+}
+
+func TestRunPlainTextWithToolCallLiteralDoesNotTriggerMalformed(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, Content: "Here is [TOOL_CALL] example text in docs."},
+	}}
+	result, err := Run(context.Background(), Config{Model: &model}, []Message{{Role: RoleUser, Content: "explain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText != "Here is [TOOL_CALL] example text in docs." {
+		t.Fatalf("expected plain text accepted, got %q", result.FinalText)
+	}
+}
+
+func TestRunUnclosedToolBlockTriggersMalformed(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, Content: "checking\n[TOOL_CALL]\n{\"id\":\"call_1\""},
+		{Role: RoleAssistant, Content: "recovered answer"},
+	}}
+	result, err := Run(context.Background(), Config{Model: &model}, []Message{{Role: RoleUser, Content: "use tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText != "recovered answer" {
+		t.Fatalf("expected malformed repair, got FinalText=%q", result.FinalText)
+	}
+}
+
+func TestRunCodeBlockWithToolCallLiteralDoesNotTriggerMalformed(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, Content: "Example: [TOOL_CALL] format uses JSON {\"id\":\"call_1\", \"name\":\"web.fetch\"}"},
+	}}
+	result, err := Run(context.Background(), Config{Model: &model}, []Message{{Role: RoleUser, Content: "explain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.FinalText, "[TOOL_CALL]") {
+		t.Fatalf("expected untouched text, got %q", result.FinalText)
+	}
+}
+
+func TestRunBotProtectionResultDoesNotRetry(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.bot_blocked_echo", Args: map[string]any{"text": "block"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(botBlockedEchoTool{})
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxToolRetries: 2}, []Message{{Role: RoleUser, Content: "use tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsToolMessage(result.Messages, "bot protection") {
+		t.Fatalf("expected bot protection error, got %#v", result.Messages)
+	}
+}
+
+func TestRunRetrySuccessUpdatesEvidence(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "test.flaky_echo", Args: map[string]any{"text": "evidence"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(&flakyEchoTool{Failures: 1, Delay: 0})
+	result, err := Run(context.Background(), Config{Model: &model, Tools: registry, MaxToolRetries: 3}, []Message{{Role: RoleUser, Content: "use tool"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsToolMessage(result.Messages, "evidence") {
+		t.Fatal("expected retry success with evidence content")
+	}
+}
+
+func TestRunToolRetryBudgetReceivesToolContext(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "web.fetch", Args: map[string]any{"url": "https://example.com"}}}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(&flakyFetchTool{Failures: 1})
+	var budgetTool string
+	result, err := Run(context.Background(), Config{
+		Model: &model,
+		Tools: registry,
+		Hooks: Hooks{
+			ToolRetryBudget: func(input ToolExecutionContext) int {
+				budgetTool = input.ToolCall.Name
+				if input.ToolCall.Name == "web.fetch" {
+					return 1
+				}
+				return 0
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "fetch"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budgetTool != "web.fetch" {
+		t.Fatalf("expected retry budget hook to receive web.fetch, got %q", budgetTool)
+	}
+	if !containsToolMessage(result.Messages, "fetched") {
+		t.Fatalf("expected retry success through hook budget, got %#v", result.Messages)
+	}
+}
+
+func TestRunParallelRetryRunsBeforeHookEachAttempt(t *testing.T) {
+	model := scriptedModel{messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{
+			{ID: "1", Name: "web.fetch", Args: map[string]any{"url": "https://example.com/a"}},
+			{ID: "2", Name: "web.fetch", Args: map[string]any{"url": "https://example.com/b"}},
+		}},
+		{Role: RoleAssistant, Content: "done"},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(alwaysTimeoutFetchTool{})
+	var beforeCount int
+	_, err := Run(context.Background(), Config{
+		Model:            &model,
+		Tools:            registry,
+		MaxParallelTools: 4,
+		MaxToolRetries:   1,
+		Hooks: Hooks{
+			BeforeToolCall: func(context.Context, BeforeToolCallContext) (BeforeToolCallResult, error) {
+				beforeCount++
+				return BeforeToolCallResult{}, nil
+			},
+		},
+	}, []Message{{Role: RoleUser, Content: "fetch both"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeCount != 4 {
+		t.Fatalf("expected BeforeToolCall for 2 calls x 2 attempts, got %d", beforeCount)
+	}
+}
+
+type flakyEchoTool struct {
+	Failures int
+	Delay    time.Duration
+	attempts int
+}
+
+func (flakyEchoTool) Name() string        { return "test.flaky_echo" }
+func (flakyEchoTool) Description() string { return "test flaky echo" }
+func (flakyEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (flakyEchoTool) Risk() Risk          { return RiskSafeRead }
+func (flakyEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (t *flakyEchoTool) Run(ctx context.Context, call ToolCall) ToolResult {
+	t.attempts++
+	if t.attempts <= t.Failures {
+		if t.Delay > 0 {
+			timer := time.NewTimer(t.Delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ToolResult{ToolCallID: call.ID, Content: ctx.Err().Error(), IsError: true}
+			case <-timer.C:
+			}
+		}
+		return ToolResult{ToolCallID: call.ID, Content: "i/o timeout", IsError: true}
+	}
+	return ToolResult{ToolCallID: call.ID, Content: call.Args["text"].(string)}
+}
+
+type flakyFetchTool struct {
+	Failures int
+	attempts int
+}
+
+func (flakyFetchTool) Name() string        { return "web.fetch" }
+func (flakyFetchTool) Description() string { return "test flaky fetch" }
+func (flakyFetchTool) Schema() Schema      { return Schema{Required: []string{"url"}} }
+func (flakyFetchTool) Risk() Risk          { return RiskSafeRead }
+func (flakyFetchTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (t *flakyFetchTool) Run(_ context.Context, call ToolCall) ToolResult {
+	t.attempts++
+	if t.attempts <= t.Failures {
+		return ToolResult{ToolCallID: call.ID, Content: "i/o timeout", IsError: true}
+	}
+	return ToolResult{ToolCallID: call.ID, Content: "fetched"}
+}
+
+type alwaysTimeoutFetchTool struct{}
+
+func (alwaysTimeoutFetchTool) Name() string        { return "web.fetch" }
+func (alwaysTimeoutFetchTool) Description() string { return "test timeout fetch" }
+func (alwaysTimeoutFetchTool) Schema() Schema      { return Schema{Required: []string{"url"}} }
+func (alwaysTimeoutFetchTool) Risk() Risk          { return RiskSafeRead }
+func (alwaysTimeoutFetchTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (alwaysTimeoutFetchTool) Run(_ context.Context, call ToolCall) ToolResult {
+	return ToolResult{ToolCallID: call.ID, Content: "i/o timeout", IsError: true}
+}
+
+type rateLimitedEchoTool struct{}
+
+func (rateLimitedEchoTool) Name() string        { return "test.rate_limited_echo" }
+func (rateLimitedEchoTool) Description() string { return "test rate limited" }
+func (rateLimitedEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (rateLimitedEchoTool) Risk() Risk          { return RiskSafeRead }
+func (rateLimitedEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (rateLimitedEchoTool) Run(_ context.Context, call ToolCall) ToolResult {
+	return ToolResult{ToolCallID: call.ID, Content: "too many requests", IsError: true}
+}
+
+type blockedEchoTool struct{}
+
+func (blockedEchoTool) Name() string        { return "test.blocked_echo" }
+func (blockedEchoTool) Description() string { return "test blocked" }
+func (blockedEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (blockedEchoTool) Risk() Risk          { return RiskSafeRead }
+func (blockedEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (blockedEchoTool) Run(_ context.Context, call ToolCall) ToolResult {
+	return ToolResult{ToolCallID: call.ID, Content: "policy denied", IsError: true}
+}
+
+type botBlockedEchoTool struct{}
+
+func (botBlockedEchoTool) Name() string        { return "test.bot_blocked_echo" }
+func (botBlockedEchoTool) Description() string { return "test bot blocked" }
+func (botBlockedEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (botBlockedEchoTool) Risk() Risk          { return RiskSafeRead }
+func (botBlockedEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "read_only_ok"}
+}
+func (botBlockedEchoTool) Run(_ context.Context, call ToolCall) ToolResult {
+	return ToolResult{ToolCallID: call.ID, Content: "bot protection challenge page", IsError: true}
+}
+
+type noParallelEchoTool struct {
+	Delay time.Duration
+}
+
+func (noParallelEchoTool) Name() string        { return "test.no_parallel_echo" }
+func (noParallelEchoTool) Description() string { return "test no parallel echo" }
+func (noParallelEchoTool) Schema() Schema      { return Schema{Required: []string{"text"}} }
+func (noParallelEchoTool) Risk() Risk          { return RiskSafeRead }
+func (noParallelEchoTool) ToolContract() ToolContract {
+	return ToolContract{ParallelMode: "forbid"}
+}
+func (t noParallelEchoTool) Run(ctx context.Context, call ToolCall) ToolResult {
+	timer := time.NewTimer(t.Delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ToolResult{ToolCallID: call.ID, Content: ctx.Err().Error(), IsError: true}
+	case <-timer.C:
+		return ToolResult{ToolCallID: call.ID, Content: call.Args["text"].(string)}
+	}
+}
