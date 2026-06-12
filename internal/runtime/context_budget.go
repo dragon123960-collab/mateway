@@ -50,6 +50,7 @@ type contextBudgetResult struct {
 	MissingContractTools  []string
 	ContextWindowTokens   int
 	MaxOutputTokens       int
+	ProtectedMessages     int
 	Compacted             bool
 	HardLimitExceeded     bool
 	HardLimitExceededText string
@@ -135,6 +136,7 @@ func packMessagesForContextBudget(input contextBudgetInput) contextBudgetResult 
 		return result
 	}
 	result.Messages = compactMessagesByTier(result.Messages, input.State, input.TaskID, cfg, &result)
+	result.Messages = ensureProtectedContractMessage(result.Messages, input.Contract, input.State, input.TaskID, &result)
 	result.EstimatedInputTokens = estimateModelInputTokens(input.SystemPrompt, result.Messages, result.Tools)
 	result.SavedEstimatedTokens = maxInt(0, result.BeforeInputTokens-result.EstimatedInputTokens)
 	result.Compacted = result.SavedEstimatedTokens > 0 || result.DroppedMessages > 0 || result.CompactedMessages > 0 || result.CompactedToolResults > 0
@@ -410,6 +412,108 @@ func compactMessagesByTier(messages []agentcore.Message, state session.State, ta
 	return out
 }
 
+func ensureProtectedContractMessage(messages []agentcore.Message, contract session.TaskContract, state session.State, taskID string, result *contextBudgetResult) []agentcore.Message {
+	text := protectedContractContext(contract, state, taskID)
+	if text == "" {
+		return messages
+	}
+	for _, msg := range messages {
+		if msg.Role == agentcore.RoleSystem && strings.Contains(msg.Content, "Protected current task contract:") {
+			return messages
+		}
+	}
+	if result != nil {
+		result.ProtectedMessages++
+	}
+	return append([]agentcore.Message{{Role: agentcore.RoleSystem, Content: text}}, messages...)
+}
+
+func protectedContractContext(contract session.TaskContract, state session.State, taskID string) string {
+	if strings.TrimSpace(contract.Summary) == "" && len(contract.RequiredTools) == 0 && len(contract.RequiredEvidence) == 0 && len(contract.PlanItems) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Protected current task contract:\n")
+	if summary := strings.TrimSpace(contract.Summary); summary != "" {
+		b.WriteString("- summary: ")
+		b.WriteString(summary)
+		b.WriteString("\n")
+	}
+	if len(contract.RequiredTools) > 0 {
+		b.WriteString("- required_tools: ")
+		b.WriteString(strings.Join(contract.RequiredTools, ", "))
+		b.WriteString("\n")
+	}
+	if len(contract.RequiredEvidence) > 0 {
+		b.WriteString("- required_evidence:\n")
+		for _, ev := range contract.RequiredEvidence {
+			b.WriteString("  - ")
+			if tool := strings.TrimSpace(ev.Tool); tool != "" {
+				b.WriteString("[")
+				b.WriteString(tool)
+				b.WriteString("] ")
+			}
+			b.WriteString(strings.TrimSpace(ev.Description))
+			b.WriteString("\n")
+		}
+	}
+	if len(contract.PlanItems) > 0 {
+		b.WriteString("- plan_items:\n")
+		for _, item := range contract.PlanItems {
+			b.WriteString("  - ")
+			if id := strings.TrimSpace(item.ID); id != "" {
+				b.WriteString(id)
+				b.WriteString(" ")
+			}
+			b.WriteString(strings.TrimSpace(item.Status))
+			if tool := strings.TrimSpace(item.Tool); tool != "" {
+				b.WriteString(" [")
+				b.WriteString(tool)
+				b.WriteString("]")
+			}
+			if title := strings.TrimSpace(item.Title); title != "" {
+				b.WriteString(" ")
+				b.WriteString(title)
+			}
+			if criteria := strings.TrimSpace(item.Criteria); criteria != "" {
+				b.WriteString(" - ")
+				b.WriteString(criteria)
+			}
+			b.WriteString("\n")
+		}
+	}
+	if evidence := protectedTaskEvidenceSummary(state, taskID); evidence != "" {
+		b.WriteString("- accepted_evidence:\n")
+		b.WriteString(evidence)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func protectedTaskEvidenceSummary(state session.State, taskID string) string {
+	task := state.TaskByID(taskID)
+	if task == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, step := range task.Steps {
+		if !step.Accepted && strings.TrimSpace(step.Status) != "accepted" {
+			continue
+		}
+		if strings.TrimSpace(step.Tool) == "" && strings.TrimSpace(step.Summary) == "" {
+			continue
+		}
+		b.WriteString("  - ")
+		if tool := strings.TrimSpace(step.Tool); tool != "" {
+			b.WriteString("[")
+			b.WriteString(tool)
+			b.WriteString("] ")
+		}
+		b.WriteString(strings.TrimSpace(step.Summary))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 func compactToolMessageForBudget(content string, targetChars int) string {
 	if len(content) <= targetChars {
 		return content
@@ -565,12 +669,14 @@ func writeContextBudgetTrace(trace *traceRecorder, cfg config.ContextBudgetConfi
 	if result.Compacted {
 		_ = trace.write(map[string]any{
 			"type":                   "context_budget_compacted",
+			"scope":                  "per_model_call",
 			"estimated_input_tokens": result.EstimatedInputTokens,
 			"soft_limit_tokens":      result.SoftLimitTokens,
 			"hard_limit_tokens":      result.HardLimitTokens,
 			"dropped_messages":       result.DroppedMessages,
 			"compacted_messages":     result.CompactedMessages,
 			"compacted_tool_results": result.CompactedToolResults,
+			"protected_messages":     result.ProtectedMessages,
 			"raw_refs":               uniqueStrings(result.RawRefs),
 			"saved_estimated_tokens": result.SavedEstimatedTokens,
 		})

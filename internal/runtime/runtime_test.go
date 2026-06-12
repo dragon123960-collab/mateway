@@ -966,6 +966,93 @@ func TestRuntimeProgressSinkEmitsLongRunningToolProgress(t *testing.T) {
 	}
 }
 
+func TestRuntimeToolTimeoutTraceDistinctFromActivityTimeout(t *testing.T) {
+	rt := newTestRuntime(t)
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeSlowTool{delay: 80 * time.Millisecond})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "test.runtime_slow",
+			Args: map[string]any{"text": "ok"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "tool timed out"},
+	}}, rt.Tools)
+	oldTimeout := runtimeToolTimeout
+	runtimeToolTimeout = func(*config.Root, string) time.Duration {
+		return 10 * time.Millisecond
+	}
+	defer func() { runtimeToolTimeout = oldTimeout }()
+
+	resp, err := rt.Handle(context.Background(), inbound("cli:tool-timeout", "run slow tool"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	if !strings.Contains(trace, `"type":"tool_timeout"`) {
+		t.Fatalf("expected tool_timeout trace event, got:\n%s", trace)
+	}
+	if strings.Contains(trace, `"type":"task_inactivity_timeout"`) {
+		t.Fatalf("tool timeout must not be reported as activity timeout, got:\n%s", trace)
+	}
+}
+
+func TestRuntimeActivityTimeoutTraceDistinctFromToolTimeout(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.InactivityTimeout = "20ms"
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rt.Pool.agents["main"] = agentcore.NewAgent(blockingModel{
+		started: started,
+		release: release,
+		text:    "late",
+	}, rt.Tools)
+	defer close(release)
+
+	done := make(chan Response, 1)
+	errs := make(chan error, 1)
+	go func() {
+		resp, err := rt.Handle(context.Background(), inbound("cli:activity-timeout", "think too long"))
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- resp
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("model did not start")
+	}
+	var resp Response
+	select {
+	case err := <-errs:
+		t.Fatalf("unexpected error: %v", err)
+	case resp = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not return after activity timeout")
+	}
+	if !resp.Failed || !strings.Contains(strings.ToLower(resp.Reply.Text), "inactivity timeout") {
+		t.Fatalf("expected activity timeout blocker, got %#v", resp)
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	if !strings.Contains(trace, `"type":"task_inactivity_timeout"`) {
+		t.Fatalf("expected task_inactivity_timeout trace event, got:\n%s", trace)
+	}
+	if strings.Contains(trace, `"type":"tool_timeout"`) {
+		t.Fatalf("activity timeout must not be reported as tool timeout, got:\n%s", trace)
+	}
+}
+
 func TestRuntimeCancelledContextReturnsInterruptedReply(t *testing.T) {
 	rt := newTestRuntime(t)
 	started := make(chan struct{})

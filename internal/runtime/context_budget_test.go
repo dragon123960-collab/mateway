@@ -234,6 +234,96 @@ func TestRawToolResultStillStoredOutsidePrompt(t *testing.T) {
 	}
 }
 
+func TestContextBudgetPreservesCurrentTaskContract(t *testing.T) {
+	cfg := config.DefaultRoot()
+	cfg.Execution.ContextBudget.RecentTurns = 1
+	cfg.Execution.ContextBudget.ToolResultTargetTokens = 64
+	contract := session.TaskContract{
+		Summary:       "publish report",
+		RequiresTools: true,
+		RequiredTools: []string{"file.write", "terminal.run"},
+		RequiredEvidence: []session.TaskEvidenceContract{
+			{Kind: "local_file", Tool: "file.write", Description: "markdown artifact path"},
+			{Kind: "remote_publish", Tool: "terminal.run", Description: "published URL"},
+		},
+		PlanItems: []session.TaskPlanItem{
+			{ID: "plan-1", Title: "write report", Status: "completed", Tool: "file.write", Criteria: "write markdown artifact"},
+			{ID: "plan-2", Title: "publish report", Status: "pending", Tool: "terminal.run", Criteria: "return published URL"},
+		},
+	}
+	state := session.State{}
+	task := state.StartTask("publish report")
+	state.SetTaskContract(task.ID, contract)
+	state.AddStep(task.ID, session.TaskStep{Tool: "file.write", Status: "accepted", Accepted: true, Summary: "wrote /tmp/report.md"})
+
+	messages := []agentcore.Message{
+		{Role: agentcore.RoleUser, Content: strings.Repeat("old request ", 500)},
+		{Role: agentcore.RoleAssistant, Content: strings.Repeat("old answer ", 800)},
+		{Role: agentcore.RoleTool, ToolCallID: "call_1", Content: strings.Repeat("tool output\n", 1000)},
+		{Role: agentcore.RoleUser, Content: "continue"},
+	}
+	result := packMessagesForContextBudget(contextBudgetInput{
+		Config:       &cfg,
+		ModelConfig:  config.ModelConfig{ContextWindow: 2200, MaxTokens: 200},
+		SystemPrompt: "system",
+		Messages:     messages,
+		Contract:     contract,
+		State:        state,
+		TaskID:       task.ID,
+	})
+	joined := messagesText(result.Messages)
+	for _, want := range []string{"Protected current task contract", "file.write", "terminal.run", "published URL", "plan-2", "wrote /tmp/report.md"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected protected contract context to contain %q, got:\n%s", want, joined)
+		}
+	}
+	if result.ProtectedMessages == 0 {
+		t.Fatalf("expected protected message telemetry, got %#v", result)
+	}
+}
+
+func TestTraceTelemetryDistinguishesStorageAndPerCallCompaction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.jsonl")
+	trace := &traceRecorder{path: path}
+	writeCompactTrace(trace, "session_compacted", messageCompactStats{
+		BeforeMessages: 3,
+		AfterMessages:  2,
+		BeforeChars:    300,
+		AfterChars:     200,
+	})
+	writeContextBudgetTrace(trace, config.ContextBudgetConfig{TraceTelemetry: boolPtrTest(true)}, contextBudgetResult{
+		Compacted:            true,
+		EstimatedInputTokens: 100,
+		SoftLimitTokens:      90,
+		HardLimitTokens:      120,
+		CompactedMessages:    1,
+		CompactedToolResults: 1,
+		ProtectedMessages:    1,
+		SavedEstimatedTokens: 50,
+		ContextWindowTokens:  1000,
+		MaxOutputTokens:      100,
+		BeforeInputTokens:    150,
+		VisibleTools:         1,
+		HiddenTools:          0,
+		ToolNames:            []string{"file.read"},
+	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"type":"session_compacted"`) {
+		t.Fatalf("expected storage compaction event, got:\n%s", text)
+	}
+	if !strings.Contains(text, `"type":"context_budget_compacted"`) || !strings.Contains(text, `"scope":"per_model_call"`) {
+		t.Fatalf("expected per-call context budget event with scope, got:\n%s", text)
+	}
+	if !strings.Contains(text, `"protected_messages":1`) {
+		t.Fatalf("expected protected_messages telemetry, got:\n%s", text)
+	}
+}
+
 type countingModel struct {
 	text  string
 	calls int
@@ -265,6 +355,10 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func boolPtrTest(value bool) *bool {
+	return &value
 }
 
 func (m *countingModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {

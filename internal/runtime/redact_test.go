@@ -119,6 +119,26 @@ func TestRuntimeTaskStepSummaryRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestRuntimeNextModelTurnSeesRedactedToolResult(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
+	rt := New(cfg)
+	rt.Tools = agentcore.NewToolRegistry()
+	rt.Tools.Register(secretTool{})
+	model := &captureToolMessageModel{}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "inspect secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(model.seenToolContent, "PXUj5ftvjscRpPy7") || strings.Contains(model.seenToolContent, "QBptnPtt6Hnp3awb") || strings.Contains(model.seenToolContent, "abcdef1234567890") {
+		t.Fatalf("next model turn saw unredacted tool content: %q", model.seenToolContent)
+	}
+	if !strings.Contains(model.seenToolContent, redactedSecret) {
+		t.Fatalf("expected next model turn to see redacted marker, got %q", model.seenToolContent)
+	}
+}
+
 func TestRuntimeFinalReplyRedactsSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
@@ -211,6 +231,27 @@ func (secretToolModel) Next(_ context.Context, ctx agentcore.Context) (agentcore
 }
 
 var _ agentcore.Tool = secretTool{}
+
+type captureToolMessageModel struct {
+	seenToolContent string
+}
+
+func (m *captureToolMessageModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	for _, msg := range ctx.Messages {
+		if msg.Role == agentcore.RoleTool {
+			m.seenToolContent = msg.Content
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "checked"}, nil
+		}
+	}
+	return agentcore.Message{
+		Role: agentcore.RoleAssistant,
+		ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_secret",
+			Name: "secret.read",
+			Args: map[string]any{"api_key": "abcdef1234567890"},
+		}},
+	}, nil
+}
 
 type secretFinalModel struct{}
 

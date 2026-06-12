@@ -90,7 +90,7 @@ Every run writes a JSONL trace:
 - final reply
 - runtime timings
 
-Persistent traces, session transcripts, and task step summaries redact secret-like fields such as `api_key`, `token`, `password`, `smtp_pass`, `imap_pass`, and bearer tokens. The model still sees live tool output for the current task; persistent logs avoid storing obvious credentials.
+Persistent traces, session transcripts, task step summaries, and tool-result messages passed to later model turns redact secret-like fields such as `api_key`, `token`, `password`, `smtp_pass`, `imap_pass`, and bearer tokens.
 
 ### 5. Bounded Session Context
 Sessions are runtime state, not an ever-growing raw chat log. Before each model call, Mateway builds context from:
@@ -105,7 +105,7 @@ Sessions are runtime state, not an ever-growing raw chat log. Before each model 
 
 System context is regenerated on every request and is not stored back into the session transcript. Stored session messages are compacted: system messages are dropped, large tool results are truncated, and only the most recent conversation messages are retained. Task nodes keep short summaries, task contracts, trace refs, and tool-step evidence so old work remains auditable without forcing the whole transcript into the next prompt. For action-oriented tasks, the task contract can include lightweight `plan_items`, required evidence, and selected execution skills. Mateway uses a small strategy split: direct answers skip review, low-risk tool tasks can run automatically, and complex or risky tasks show a plan review before execution. Tool results update plan item status while each run keeps its own trace file.
 
-Mateway also runs an invisible context economy before every model turn. It estimates input tokens against the selected model's `context_window` and `max_tokens`, automatically compacts old transcript/tool content over a soft budget, stops only at a hard budget, and records estimated savings in trace/TUI diagnostics. Tool schemas are exposed dynamically: each model turn sees only relevant tool contracts, while the full registry remains available for execution. Full compacted tool output is stored as `raw_ref`; `toolresult.read` can retrieve the original output by `raw_ref` and optional multi-term `query`, returning matching line snippets and line ranges instead of feeding large outputs back into the prompt.
+Mateway also runs an invisible context economy before every model turn. It estimates input tokens against the selected model's `context_window` and `max_tokens`, automatically compacts old transcript/tool content over a soft budget while preserving the current task contract, required tools/evidence, plan items, and accepted evidence, stops only at a hard budget, and records estimated savings in trace/TUI diagnostics. Tool schemas are exposed dynamically: each model turn sees only relevant tool contracts, while the full registry remains available for execution. Full compacted tool output is stored as `raw_ref`; `toolresult.read` can retrieve the original output by `raw_ref` and optional multi-term `query`, returning matching line snippets and line ranges instead of feeding large outputs back into the prompt.
 
 Feishu image messages are downloaded under `~/.mateway/media`, and Weixin media items are normalized into the same message part schema when the channel provides a URL or local path. Transcripts store media references, not inline image bytes. Model details, enable switches, `context_window`, and `max_tokens` live in `~/.mateway/config/models/*.yaml`; `config.yaml` only selects defaults, fallbacks, and roles. If the selected model declares `modalities: [text, image]`, the user text and image parts are sent together in the same user turn. Otherwise Mateway can use `model.roles.vision` as a single model or ordered list such as `vision: [glm-4.6v-flash, minimax]` before falling back to other image-capable models. Audio, video, and file parts are reserved in the message schema for future channel support.
 
@@ -376,7 +376,7 @@ Use traces to inspect:
 - model request count, input/output/total tokens, cache read/write tokens, estimated input tokens, and context compaction savings
 - hook decisions
 - tool calls and acceptance evidence
-- context budget decisions, visible tool counts, hidden tool counts, and session summary updates
+- context budget decisions, protected contract context, visible tool counts, hidden tool counts, and session summary updates
 - memory proposal generation
 - Feishu gateway timing
 

@@ -159,6 +159,16 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 						evidence[key] = value
 					}
 				}
+				if timedOut, _ := input.ToolResult.Evidence["timed_out"].(bool); timedOut {
+					_ = trace.write(map[string]any{
+						"type":         "tool_timeout",
+						"task_id":      taskID,
+						"tool":         input.ToolCall.Name,
+						"tool_call_id": input.ToolCall.ID,
+						"elapsed_ms":   input.ToolResult.Evidence["elapsed_ms"],
+						"deadline_ms":  input.ToolResult.Evidence["deadline_ms"],
+					})
+				}
 				state.AddExecutionEvent(taskID, session.ExecutionEvent{
 					Type:     "tool_result",
 					Status:   observe.TaskStep.Status,
@@ -228,10 +238,11 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				}
 			}
 
-			result := compactToolResultForModel(input.ToolCall, input.ToolResult, rt.home(), trace.id)
-			if input.ToolResult.Evidence != nil {
+			redactedToolResult := redactToolResult(input.ToolResult)
+			result := compactToolResultForModel(input.ToolCall, redactedToolResult, rt.home(), trace.id)
+			if redactedToolResult.Evidence != nil {
 				if _, ok := result.Evidence["retry_count"]; !ok {
-					if rc, ok := input.ToolResult.Evidence["retry_count"]; ok {
+					if rc, ok := redactedToolResult.Evidence["retry_count"]; ok {
 						if result.Evidence == nil {
 							result.Evidence = map[string]any{}
 						}
