@@ -154,6 +154,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		"task_id":  task.ID,
 	})
 	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
+	strategy := classifyContractStrategy(task.Goal, userText, contract)
 	discoveredSkills := skillsForRuntimeContext(rt.Config, profile.ID)
 	if invalid := validateContractTools(contract, rt.Tools, discoveredSkills); !invalid.IsValid() {
 		blocker := invalidContractBlockerText(contract, invalid, msg)
@@ -176,7 +177,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Failed:    true,
 		}, nil
 	}
-	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract) {
+	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract, strategy) {
 		state.Pending = &session.PendingAction{
 			Kind:     session.PendingKindTaskPlanConfirm,
 			TaskID:   task.ID,
@@ -202,7 +203,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	if contractContext := renderTaskContractContext(contract); contractContext != "" {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
 	}
-	if phase != tracePhasePlanReview && len(contract.PlanItems) > 0 {
+	if phase != tracePhasePlanReview && len(contract.PlanItems) > 0 && strategy != contractStrategyDirect {
 		rt.emitProgress(msg, *state, task.ID, taskExecutionEventCount(*state, task.ID), channel.ProgressStep{
 			Title:   "plan",
 			Status:  "running",
@@ -259,7 +260,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxIterations = maxIterations(rt.Config)
 	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
 	defer stopActivityWatch()
-	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil)
+	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil, discoveredSkills)
 	agent.Hooks = agentHooks
 	result, err := agent.Continue(runCtx)
 	if err != nil {

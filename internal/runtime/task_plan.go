@@ -131,7 +131,13 @@ func meaningfulTokens(text string) []string {
 	return out
 }
 
-func shouldPauseForTaskPlan(contract session.TaskContract) bool {
+func shouldPauseForTaskPlan(contract session.TaskContract, strategy contractStrategy) bool {
+	if strategy == contractStrategyDirect {
+		return false
+	}
+	if strategy == contractStrategyAutoContract {
+		return false
+	}
 	if contract.RequiresTools || len(contract.RequiredTools) > 0 || len(contract.RequiredEvidence) > 0 {
 		return true
 	}
@@ -259,6 +265,68 @@ func updatePlanItemsForToolResult(state *session.State, taskID string, toolName 
 	state.SetTaskContract(taskID, contract)
 }
 
+func updatePlanItemForFileReadPath(state *session.State, taskID string, path string, status string, evidence string) {
+	task := state.TaskByID(taskID)
+	if task == nil || task.Execution.Contract == nil {
+		return
+	}
+	contract := *task.Execution.Contract
+	item := findFileReadPlanItemForPath(&contract, path)
+	if item == nil {
+		item = planItemForTool(&contract, "file.read", "running")
+		if item == nil {
+			item = planItemForTool(&contract, "file.read", "pending")
+		}
+	}
+	if item == nil {
+		return
+	}
+	next := "completed"
+	if status == "failed" || status == "suspect" || status == "blocked" {
+		next = "blocked"
+	}
+	item.Status = next
+	item.Evidence = summarize(evidence)
+	item.UpdatedAt = time.Now()
+	state.SetTaskContract(taskID, contract)
+}
+
+func findFileReadPlanItemForPath(contract *session.TaskContract, path string) *session.TaskPlanItem {
+	if contract == nil || path == "" {
+		return nil
+	}
+	lookFor := strings.ToLower(strings.TrimSpace(path))
+	if lookFor == "" {
+		return nil
+	}
+	for i := range contract.PlanItems {
+		item := &contract.PlanItems[i]
+		if !strings.EqualFold(strings.TrimSpace(item.Tool), "file.read") {
+			continue
+		}
+		criteria := strings.ToLower(strings.TrimSpace(item.Criteria))
+		title := strings.ToLower(strings.TrimSpace(item.Title))
+		if criteria != "" && (strings.Contains(criteria, lookFor) || strings.Contains(lookFor, criteria)) {
+			return item
+		}
+		if title != "" && (strings.Contains(title, lookFor) || strings.Contains(lookFor, title)) {
+			return item
+		}
+	}
+	for _, skill := range contract.RequiredSkills {
+		skillPath := strings.ToLower(strings.TrimSpace(skill.Path))
+		if skillPath != "" && skillPath == lookFor {
+			for i := range contract.PlanItems {
+				item := &contract.PlanItems[i]
+				if fileReadPlanItemMatchesSkill(*item, skill.Name, skill.Path) {
+					return item
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func taskHasTracePhase(task *session.TaskNode, phase string) bool {
 	if task == nil {
 		return false
@@ -329,6 +397,19 @@ func planItemForTool(contract *session.TaskContract, toolName string, statuses .
 			continue
 		}
 		if len(allowed) == 0 || allowed[normalizePlanStatus(item.Status)] {
+			return item
+		}
+	}
+	// Fallback: allow retry of a blocked item (e.g. after a retryable block)
+	if len(allowed) > 0 && allowed["blocked"] {
+		return nil
+	}
+	for i := range contract.PlanItems {
+		item := &contract.PlanItems[i]
+		if strings.TrimSpace(item.Tool) == "" || !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
+			continue
+		}
+		if normalizePlanStatus(item.Status) == "blocked" {
 			return item
 		}
 	}

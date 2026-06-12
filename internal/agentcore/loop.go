@@ -203,6 +203,10 @@ func prepareAndExecuteTool(ctx context.Context, cfg Config, message Message, cal
 			if reason == "" {
 				reason = "tool execution blocked"
 			}
+			// Retryable blocks don't stop the loop — the model can retry.
+			if result.Retryable {
+				return ToolResult{ToolCallID: call.ID, Content: reason, IsError: true}, false, nil
+			}
 			return ToolResult{ToolCallID: call.ID, Content: reason, IsError: true}, true, nil
 		}
 		if result.Context != nil {
@@ -214,12 +218,12 @@ func prepareAndExecuteTool(ctx context.Context, cfg Config, message Message, cal
 
 func executeToolCalls(ctx context.Context, cfg Config, message Message, iteration int) ([]ToolResult, string, error) {
 	if shouldRunToolCallsInParallel(cfg, message.ToolCalls) {
-		prepared, blocked, err := prepareParallelToolCalls(ctx, cfg, message, iteration)
+		prepared, blocked, stopReason, err := prepareParallelToolCalls(ctx, cfg, message, iteration)
 		if err != nil {
 			return nil, "", err
 		}
 		if blocked != nil {
-			return []ToolResult{*blocked}, "tool_execution_blocked", nil
+			return []ToolResult{*blocked}, stopReason, nil
 		}
 		return executePreparedToolCallsParallel(ctx, cfg, message, iteration, prepared)
 	}
@@ -248,48 +252,52 @@ type preparedToolCall struct {
 	Context context.Context
 }
 
-func prepareParallelToolCalls(ctx context.Context, cfg Config, message Message, iteration int) ([]preparedToolCall, *ToolResult, error) {
+func prepareParallelToolCalls(ctx context.Context, cfg Config, message Message, iteration int) ([]preparedToolCall, *ToolResult, string, error) {
 	prepared := make([]preparedToolCall, 0, len(message.ToolCalls))
 	for _, call := range message.ToolCalls {
 		tool, ok := cfg.Tools.Get(call.Name)
 		if !ok {
-			return nil, nil, fmt.Errorf("parallel tool call %q was not found after eligibility check", call.Name)
+			return nil, nil, "", fmt.Errorf("parallel tool call %q was not found after eligibility check", call.Name)
 		}
 		if before := cfg.Hooks.BeforeToolCall; before != nil {
 			toolStart := time.Now()
-			result, err := before(ctx, BeforeToolCallContext{Message: message, ToolCall: call, Tool: tool})
+			beforeResult, err := before(ctx, BeforeToolCallContext{Message: message, ToolCall: call, Tool: tool})
 			toolDuration := time.Since(toolStart)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, "", err
 			}
-			if result.Block {
-				reason := strings.TrimSpace(result.Reason)
+			if beforeResult.Block {
+				reason := strings.TrimSpace(beforeResult.Reason)
 				if reason == "" {
 					reason = "tool execution blocked"
 				}
 				blocked := ToolResult{ToolCallID: call.ID, Content: reason, IsError: true}
 				if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionStart, Message: message, ToolCall: call, Iteration: iteration}); err != nil {
-					return nil, nil, err
+					return nil, nil, "", err
 				}
 				after, err := afterToolCall(ctx, cfg, message, call, blocked)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, "", err
 				}
 				if after.ToolResult != nil {
 					blocked = *after.ToolResult
 				}
 				if err := emit(ctx, cfg.Hooks, Event{Type: EventToolExecutionEnd, Message: message, ToolCall: call, ToolResult: blocked, Iteration: iteration, Duration: toolDuration}); err != nil {
-					return nil, nil, err
+					return nil, nil, "", err
 				}
-				return nil, &blocked, nil
+				stopReason := "tool_execution_blocked"
+				if beforeResult.Retryable {
+					stopReason = ""
+				}
+				return nil, &blocked, stopReason, nil
 			}
-			if result.Context != nil {
-				ctx = result.Context
+			if beforeResult.Context != nil {
+				ctx = beforeResult.Context
 			}
 		}
 		prepared = append(prepared, preparedToolCall{Call: call, Tool: tool, Context: ctx})
 	}
-	return prepared, nil, nil
+	return prepared, nil, "", nil
 }
 
 func executePreparedToolCallsParallel(ctx context.Context, cfg Config, message Message, iteration int, prepared []preparedToolCall) ([]ToolResult, string, error) {

@@ -52,19 +52,24 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		_ = trace.write(map[string]any{"type": "task_contract_reused", "task_id": task.ID})
 		return *task.Execution.Contract
 	}
-	if shouldSkipTaskContractModel(task.Goal, userText) {
-		contract := fallbackTaskContract(task.Goal, userText)
+
+	fallback := fallbackTaskContract(task.Goal, userText)
+	fallbackStrategy := classifyContractStrategy(task.Goal, userText, fallback)
+
+	if fallbackStrategy == contractStrategyDirect {
+		// For direct path, record the strategy immediately and return
+		_ = trace.write(map[string]any{
+			"type":           "task_contract_strategy",
+			"task_id":        task.ID,
+			"strategy":       string(fallbackStrategy),
+			"summary":        fallback.Summary,
+			"requires_tools": fallback.RequiresTools,
+		})
+		contract := fallback
 		if strings.TrimSpace(contract.Summary) == "" {
 			contract.Summary = summarize(firstNonEmpty(userText, task.Goal))
 		}
 		state.SetTaskContract(task.ID, contract)
-		_ = trace.write(map[string]any{
-			"type":           "task_contract_skipped",
-			"task_id":        task.ID,
-			"reason":         "simple_non_tool_turn",
-			"summary":        contract.Summary,
-			"requires_tools": contract.RequiresTools,
-		})
 		if updated := state.TaskByID(task.ID); updated != nil {
 			*task = *updated
 		}
@@ -153,6 +158,15 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		})
 	}
 	state.SetTaskContract(task.ID, contract)
+	// Record the final strategy based on the fully processed contract
+	finalStrategy := classifyContractStrategy(task.Goal, userText, contract)
+	_ = trace.write(map[string]any{
+		"type":           "task_contract_strategy",
+		"task_id":        task.ID,
+		"strategy":       string(finalStrategy),
+		"summary":        contract.Summary,
+		"requires_tools": contract.RequiresTools,
+	})
 	_ = trace.write(map[string]any{
 		"type":              "task_contract_created",
 		"task_id":           task.ID,
@@ -167,33 +181,6 @@ func (rt Runtime) ensureTaskContract(ctx context.Context, msg channel.InboundMes
 		*task = *updated
 	}
 	return contract
-}
-
-func shouldSkipTaskContractModel(goal, userText string) bool {
-	text := strings.TrimSpace(firstNonEmpty(userText, goal))
-	if text == "" || len([]rune(text)) > 240 {
-		return false
-	}
-	lower := strings.ToLower(text)
-	for _, marker := range []string{
-		"read ", "write ", "edit ", "create ", "delete ", "run ", "test ", "fix ", "implement ",
-		"file", "repo", "repository", "project", "code", "web", "http", "https", "today", "latest",
-		"weather", "price", "schedule", "news", "search", "lookup", "verify", "check", "travel",
-		"decide", "answer",
-	} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
-	}
-	for _, prefix := range []string{"hi", "hello", "thanks", "thank you", "what is ", "what are ", "how does ", "why is ", "explain "} {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
-	}
-	if strings.HasSuffix(text, "?") {
-		return len(strings.Fields(text)) <= 12
-	}
-	return false
 }
 
 func (rt Runtime) generateTaskContract(ctx context.Context, task *session.TaskNode, userText string, model agentcore.Model, skills []discoveredSkill, replanFeedback ...string) (session.TaskContract, error) {
@@ -246,9 +233,11 @@ func renderTaskContractPrompt(goal, userText string, tools *agentcore.ToolRegist
 			b.WriteString(skill.Path)
 			b.WriteString("\n  scope: ")
 			b.WriteString(defaultText(skill.Scope, "unknown"))
-			b.WriteString("\n  execution_hint: ")
-			b.WriteString(executionHint(skill))
-			b.WriteString("\n")
+			if hint := executionHint(skill); hint != "" {
+				b.WriteString("\n  execution_hint: ")
+				b.WriteString(hint)
+				b.WriteString("\n")
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -530,13 +519,14 @@ func appendSkillReadPlanItem(items []session.TaskPlanItem, skillName, skillPath 
 	for used[strings.ToLower(id)] {
 		id = fmt.Sprintf("plan-%d", len(used)+1)
 	}
-	return append(items, session.TaskPlanItem{
+	newItem := session.TaskPlanItem{
 		ID:       id,
 		Title:    "read " + strings.TrimSpace(skillName) + " SKILL.md",
 		Status:   "pending",
 		Tool:     "file.read",
 		Criteria: "read " + strings.TrimSpace(skillPath),
-	})
+	}
+	return append([]session.TaskPlanItem{newItem}, items...)
 }
 
 func looksLikeCommandInspectionTask(lower string) bool {
@@ -771,6 +761,45 @@ func taskContractFollowupWithGuidance(missing []string, failures map[string]Fail
 		}
 	}
 	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(parts, "; "))
+}
+
+func requiredSkillReadCompleted(contract session.TaskContract, skill session.RequiredSkill) bool {
+	for _, item := range contract.PlanItems {
+		if normalizePlanStatus(item.Status) != "completed" {
+			continue
+		}
+		if fileReadPlanItemMatchesSkill(item, skill.Name, skill.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func requiredSkillReadCompletedWithSteps(steps []session.TaskStep, contract session.TaskContract, skill session.RequiredSkill) bool {
+	if requiredSkillReadCompleted(contract, skill) {
+		return true
+	}
+	return skillStepReadAccepted(skill, steps)
+}
+
+func skillStepReadAccepted(skill session.RequiredSkill, steps []session.TaskStep) bool {
+	needle := strings.ToLower(strings.TrimSpace(skill.Path))
+	if needle == "" {
+		needle = strings.ToLower(strings.TrimSpace(skill.Name))
+	}
+	for _, step := range steps {
+		if !strings.EqualFold(step.Tool, "file.read") || !step.Accepted {
+			continue
+		}
+		if needle == "" {
+			return true
+		}
+		summary := strings.ToLower(step.Summary)
+		if strings.Contains(summary, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 const toolMissingPrefix = "tool:"
@@ -1064,18 +1093,6 @@ func contractHasFileReadEvidenceForSkill(contract session.TaskContract, skillNam
 func contractHasFileReadPlanItemForSkill(contract session.TaskContract, skillName, skillPath string) bool {
 	for _, item := range contract.PlanItems {
 		if fileReadPlanItemMatchesSkill(item, skillName, skillPath) {
-			return true
-		}
-	}
-	return false
-}
-
-func requiredSkillReadCompleted(contract session.TaskContract, skill session.RequiredSkill) bool {
-	for _, item := range contract.PlanItems {
-		if normalizePlanStatus(item.Status) != "completed" {
-			continue
-		}
-		if fileReadPlanItemMatchesSkill(item, skill.Name, skill.Path) {
 			return true
 		}
 	}

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -13,7 +14,7 @@ import (
 	toolpkg "github.com/dongping/mateway/internal/tool"
 )
 
-func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message, discoveredSkills []discoveredSkill) agentcore.Hooks {
 	steeringSent := false
 	progressEventOffset := taskExecutionEventCount(*state, taskID)
 	hooks := agentcore.Hooks{
@@ -78,6 +79,50 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
 			}
+			// Only gate a skill's execution tool until that skill is read.
+			// The phase B requirement is "skill read before related execution tool", not before all tools.
+			// Use the skill's execution hint to determine which specific tool is the skill's execution tool.
+			if input.ToolCall.Name != "file.read" {
+				contract := taskContractFromState(*state, taskID)
+				var steps []session.TaskStep
+				if t := state.TaskByID(taskID); t != nil {
+					steps = t.Steps
+				}
+				for _, skill := range contract.RequiredSkills {
+					if !requiredSkillReadCompletedWithSteps(steps, contract, skill) {
+						// Determine which tool is the execution tool for this skill.
+						execTool := skillExecutionTool(skill, contract, discoveredSkills)
+						if execTool == "" || !strings.EqualFold(input.ToolCall.Name, execTool) {
+							continue
+						}
+						blockMsg := fmt.Sprintf("required skill %s must be read before execution tools. Call file.read for its SKILL.md first.", skill.Name)
+						state.AddExecutionEvent(taskID, session.ExecutionEvent{
+							Type:    "tool_blocked",
+							Status:  "failed",
+							Tool:    input.ToolCall.Name,
+							Summary: blockMsg,
+							Evidence: map[string]any{
+								"reason":         blockMsg,
+								"skill_not_read": skill.Name,
+							},
+						})
+						_ = trace.write(map[string]any{
+							"type":    "tool_blocked_skill_not_read",
+							"task_id": taskID,
+							"tool":    input.ToolCall.Name,
+							"skill":   skill.Name,
+						})
+						rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{
+							Tool:    input.ToolCall.Name,
+							Status:  "blocked",
+							Summary: blockMsg,
+						})
+						// Retryable block keeps the loop alive so the contract follow-up
+						// guides the model to read the skill before retrying.
+						return agentcore.BeforeToolCallResult{Block: true, Retryable: true, Reason: blockMsg}, nil
+					}
+				}
+			}
 			markPlanItemRunning(state, taskID, input.ToolCall.Name)
 			rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
@@ -119,7 +164,12 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					Summary:  observe.TaskStep.Summary,
 					Evidence: evidence,
 				})
-				updatePlanItemsForToolResult(state, taskID, input.ToolCall.Name, observe.TaskStep.Status, observe.TaskStep.Summary)
+				if input.ToolCall.Name == "file.read" {
+					path, _ := input.ToolCall.Args["path"].(string)
+					updatePlanItemForFileReadPath(state, taskID, path, observe.TaskStep.Status, observe.TaskStep.Summary)
+				} else {
+					updatePlanItemsForToolResult(state, taskID, input.ToolCall.Name, observe.TaskStep.Status, observe.TaskStep.Summary)
+				}
 				switch observe.TaskStep.Status {
 				case "accepted":
 				case "failed", "suspect":
@@ -297,6 +347,77 @@ func acceptToolResult(tool agentcore.Tool, call agentcore.ToolCall, result agent
 	}
 	evidence["acceptance"] = "accepted"
 	return "accepted", evidence
+}
+
+// skillExecutionTool returns the name of the execution tool for a required skill,
+// derived from the execution hint. For "cli" stage skills the execution tool is
+// terminal.run. For other stages, the hint is generic and no specific tool is
+// gated (returns "").
+func skillExecutionTool(skill session.RequiredSkill, contract session.TaskContract, discoveredSkills []discoveredSkill) string {
+	hint := executionHintForSkill(skill, discoveredSkills)
+	if hint == "" {
+		if contractRequiresSkillRead(contract, skill) && contractHasTool(contract, "terminal.run") {
+			return "terminal.run"
+		}
+		return ""
+	}
+	// CLI stage hint: "read SKILL.md with file.read, then execute via terminal.run ..."
+	if strings.Contains(hint, "terminal.run") {
+		return "terminal.run"
+	}
+	return ""
+}
+
+func contractRequiresSkillRead(contract session.TaskContract, skill session.RequiredSkill) bool {
+	for _, item := range contract.PlanItems {
+		if fileReadPlanItemMatchesSkill(item, skill.Name, skill.Path) {
+			return true
+		}
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		if !strings.EqualFold(strings.TrimSpace(evidence.Tool), "file.read") {
+			continue
+		}
+		text := strings.ToLower(strings.TrimSpace(evidence.Description))
+		if strings.Contains(text, strings.ToLower(strings.TrimSpace(skill.Path))) {
+			return true
+		}
+		if strings.TrimSpace(skill.Name) != "" && strings.Contains(text, strings.ToLower(strings.TrimSpace(skill.Name))) {
+			return true
+		}
+	}
+	return false
+}
+
+func contractHasTool(contract session.TaskContract, toolName string) bool {
+	for _, tool := range contract.RequiredTools {
+		if strings.EqualFold(strings.TrimSpace(tool), toolName) {
+			return true
+		}
+	}
+	for _, item := range contract.PlanItems {
+		if strings.EqualFold(strings.TrimSpace(item.Tool), toolName) {
+			return true
+		}
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		if strings.EqualFold(strings.TrimSpace(evidence.Tool), toolName) {
+			return true
+		}
+	}
+	return false
+}
+
+// executionHintForSkill returns the execution hint for a required skill by
+// looking it up in the discovered skills slice. Returns "" if not found.
+func executionHintForSkill(skill session.RequiredSkill, discoveredSkills []discoveredSkill) string {
+	skillLower := strings.ToLower(strings.TrimSpace(skill.Name))
+	for _, s := range discoveredSkills {
+		if strings.ToLower(strings.TrimSpace(s.Name)) == skillLower {
+			return executionHint(s)
+		}
+	}
+	return ""
 }
 
 func checkUnavailableContractTools(rt Runtime, msg channel.InboundMessage, contract session.TaskContract) map[string]string {

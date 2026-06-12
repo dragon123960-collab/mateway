@@ -243,9 +243,21 @@ func truncateString(text string, limit int) string {
 	return strings.TrimSpace(string(runes[:limit])) + "\n..."
 }
 
+func isGuidanceSkillStage(stage string) bool {
+	switch strings.ToLower(strings.TrimSpace(stage)) {
+	case "planning", "synthesis", "guidance":
+		return true
+	}
+	return false
+}
+
 func executionHint(skill discoveredSkill) string {
-	if skill.Stage == "cli" {
+	stage := strings.ToLower(strings.TrimSpace(skill.Stage))
+	if stage == "cli" {
 		return "read SKILL.md with file.read, then execute via terminal.run with the CLI/helper described in the skill"
+	}
+	if isGuidanceSkillStage(stage) {
+		return ""
 	}
 	return "read SKILL.md with file.read, then follow the skill workflow using existing runtime tools"
 }

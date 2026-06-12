@@ -149,24 +149,23 @@ func TestTraceSummaryContextBudgetTelemetry(t *testing.T) {
 func TestRuntimeBudgetsEveryModelTurn(t *testing.T) {
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "web.search", content: strings.Repeat("search result\n", 1200)})
+	registry.Register(runtimeNamedTool{name: "terminal.run", content: strings.Repeat("search result\n", 1200)})
 	rt.Tools = registry
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "one"}}}},
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "web.search", Args: map[string]any{"query": "two"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": "echo one"}}}},
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "terminal.run", Args: map[string]any{"command": "echo two"}}}},
 		{Role: agentcore.RoleAssistant, Content: "done"},
 	}}, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"search twice","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"search evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
-	resp, err := rt.Handle(context.Background(), inbound("cli:budget-turns", "search the web twice"))
+	rt.ContractModel = contractJSONModel{json: `{"summary":"search twice","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"kind":"runtime_state","tool":"terminal.run","description":"search evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
+	resp, err := rt.Handle(context.Background(), inbound("cli:budget-turns", "check singbox service status"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "input_required" {
-		t.Fatalf("expected plan review, got %#v", resp)
-	}
-	resp, err = rt.Handle(context.Background(), inbound("cli:budget-turns", "1"))
-	if err != nil {
-		t.Fatal(err)
+	if resp.Reply.Style == "input_required" {
+		resp, err = rt.Handle(context.Background(), inbound("cli:budget-turns", "1"))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if resp.Failed {
 		t.Fatalf("unexpected failure %#v", resp)
@@ -185,32 +184,31 @@ func TestRuntimeModelSeesFilteredTools(t *testing.T) {
 	cfg := rt.Config
 	cfg.Execution.ContextBudget.MaxVisibleTools = 2
 	registry := agentcore.NewToolRegistry()
-	for _, name := range []string{"file.read", "web.search", "terminal.run", "schedule.manage", "task.search"} {
+	for _, name := range []string{"file.read", "terminal.run", "schedule.manage", "task.search"} {
 		registry.Register(runtimeNamedTool{name: name, content: "ok"})
 	}
 	rt.Tools = registry
 	capture := &captureToolsModel{text: "done"}
 	rt.Pool.agents["main"] = agentcore.NewAgent(capture, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"search","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"external_fact","tool":"web.search","description":"search evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
-	resp, err := rt.Handle(context.Background(), inbound("cli:filtered-tools", "search latest release"))
+	rt.ContractModel = contractJSONModel{json: `{"summary":"check service","requires_tools":false,"expected_outcome":"answer","completion_policy":"answer directly"}`}
+	resp, err := rt.Handle(context.Background(), inbound("cli:filtered-tools", "explain project structure"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Reply.Style != "input_required" {
-		t.Fatalf("expected plan review, got %#v", resp)
-	}
-	resp, err = rt.Handle(context.Background(), inbound("cli:filtered-tools", "1"))
-	if err != nil {
-		t.Fatal(err)
+	if resp.Reply.Style == "input_required" {
+		resp, err = rt.Handle(context.Background(), inbound("cli:filtered-tools", "1"))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if resp.Failed {
 		t.Fatalf("unexpected failure %#v", resp)
 	}
-	if len(capture.toolNames) < 3 {
-		t.Fatalf("expected at least 3 default visible tools, got %#v", capture.toolNames)
+	if len(capture.toolNames) < 2 {
+		t.Fatalf("expected at least 2 default visible tools, got %#v", capture.toolNames)
 	}
-	if !containsString(capture.toolNames, "web.search") {
-		t.Fatalf("expected web.search in filtered tools, got %#v", capture.toolNames)
+	if !containsString(capture.toolNames, "terminal.run") {
+		t.Fatalf("expected terminal.run in filtered tools, got %#v", capture.toolNames)
 	}
 	if containsString(capture.toolNames, "schedule.manage") || containsString(capture.toolNames, "task.search") {
 		t.Fatalf("non-default tools should be trimmed under budget, got %#v", capture.toolNames)
@@ -276,8 +274,9 @@ func (m *countingModel) Next(context.Context, agentcore.Context) (agentcore.Mess
 
 func TestShouldSkipTaskContractModelKeepsToolTasks(t *testing.T) {
 	for _, text := range []string{"read README.md", "latest weather today", "fix the code"} {
-		if shouldSkipTaskContractModel(text, text) {
-			t.Fatalf("expected tool-like task not to skip: %q", text)
+		strategy := classifyContractStrategyFromGoalAndText(text, text)
+		if strategy == contractStrategyDirect {
+			t.Fatalf("expected tool-like task not to be direct: %q (got %s)", text, strategy)
 		}
 	}
 }
