@@ -2968,7 +2968,7 @@ func TestCLITUIRenderTaskStepWithoutRiskRecalculation(t *testing.T) {
 }
 
 func TestOpenTaskReceivesNextMessageAsSteering(t *testing.T) {
-	for _, status := range []string{"running", "await_user_input", "failed", "resuming"} {
+	for _, status := range []string{"running", "await_user_input", "resuming"} {
 		t.Run(status, func(t *testing.T) {
 			rt := newTestRuntime(t)
 			state := session.State{Key: "cli:test"}
@@ -2993,6 +2993,29 @@ func TestOpenTaskReceivesNextMessageAsSteering(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("failed", func(t *testing.T) {
+		rt := newTestRuntime(t)
+		state := session.State{Key: "cli:test"}
+		task := state.StartTask("original analysis goal")
+		task.Status = "failed"
+		state.ActiveTask = task.ID
+		if err := rt.Store.Save(state); err != nil {
+			t.Fatal(err)
+		}
+		rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "new task"}, rt.Tools)
+
+		if _, err := rt.Handle(context.Background(), inbound("cli:test", "add more detail")); err != nil {
+			t.Fatal(err)
+		}
+		updated := loadState(t, rt, "cli:test")
+		if len(updated.Tasks) != 2 {
+			t.Fatalf("status=failed: expected new graph to create new task, got %d tasks", len(updated.Tasks))
+		}
+		if updated.ActiveTask != "" {
+			t.Fatalf("status=failed: expected no active task after new graph + single-turn model")
+		}
+	})
 }
 
 func TestCompletedTaskClearsActiveAndDoesNotImplicitlyResume(t *testing.T) {

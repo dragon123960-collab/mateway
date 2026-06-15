@@ -96,6 +96,13 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 	if state.Pending == nil {
 		return Response{}, false, nil
 	}
+	_ = trace.write(map[string]any{
+		"type":         "continuation_decision",
+		"action":       ActionAnswerPending,
+		"task_id":      state.Pending.TaskID,
+		"reason":       "pending action intercepted before state machine",
+		"pending_kind": state.Pending.Kind,
+	})
 	if state.Pending.Kind == session.PendingKindTaskPlanConfirm {
 		return rt.handleTaskPlanConfirm(ctx, state, msg, trace)
 	}

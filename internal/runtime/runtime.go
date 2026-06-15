@@ -84,28 +84,35 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		return resp, err
 	}
 	userText := strings.TrimSpace(msg.Text)
-	continuity := judgeTaskContinuity(state, userText)
-	if continuity.Continue && continuity.TaskID != "" {
-		state.ActivateTask(continuity.TaskID)
-		_ = trace.write(map[string]any{"type": "task_continuity", "task_id": continuity.TaskID, "reason": continuity.Reason})
-		_ = trace.write(map[string]any{"type": "task_recall_selected", "task_id": continuity.TaskID, "reason": continuity.Reason})
-	}
-	hadOpenTask := latestOpenTask(state) != nil
-	if shouldStartNewTaskInsteadOfSteering(state, userText) {
+	decision := determineContinuation(state, userText)
+	_ = trace.write(map[string]any{
+		"type":         "continuation_decision",
+		"action":       decision.Action,
+		"task_id":      decision.TaskID,
+		"node_id":      decision.NodeID,
+		"reason":       decision.Reason,
+		"context_refs": decision.ContextRefs,
+	})
+
+	switch decision.Action {
+	case ActionResumeNode, ActionContinueGraph:
+		if decision.TaskID != "" {
+			state.ActivateTask(decision.TaskID)
+		}
+	case ActionNewGraph, ActionReferenceCompleted, ActionHistoricalSearch:
 		state.ActiveTask = ""
 	}
+
 	task := state.EnsureTask(msg.Text)
-	isNewTask := task.Goal == userText
 	if task.Goal != userText && state.ActiveTask == task.ID {
 		userText = mergeTaskAndInstruction(task.Goal, userText)
 	}
-	if !continuity.Continue && isNewTask && hadOpenTask {
-		_ = trace.write(map[string]any{"type": "task_continuity_not_selected", "text": msg.Text, "reason": "open task not matched"})
-	}
+
 	phase := tracePhaseExecute
-	if continuity.IsFollowup {
+	if decision.Action == ActionContinueGraph || decision.Action == ActionResumeNode {
 		phase = tracePhaseFollowupExecute
 	}
+
 	trace.setIdentity(map[string]any{"task_id": task.ID})
 	_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "effective_text": userText})
 	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})

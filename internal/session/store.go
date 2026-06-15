@@ -36,6 +36,7 @@ type TaskNode struct {
 	Summary   string         `json:"summary,omitempty"`
 	Status    string         `json:"status"`
 	Execution ExecutionFrame `json:"execution,omitempty"`
+	Graph     *TaskGraph     `json:"graph,omitempty"`
 	Steps     []TaskStep     `json:"steps,omitempty"`
 	TraceID   string         `json:"trace_id,omitempty"`
 	TracePath string         `json:"trace_path,omitempty"`
