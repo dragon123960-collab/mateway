@@ -1,66 +1,66 @@
-# Execution Flow
+# 执行流程
 
-Mateway's main flow is:
+Mateway 的主要流程如下：
 
 ```text
-inbound message
-  -> active task steering or new task
+入站消息
+  -> 活跃任务导向或新任务
   -> task contract
-  -> optional plan review
-  -> selected skill preflight
-  -> AgentCore ReAct loop
-  -> tool evidence and plan item updates
+  -> 可选计划审核
+  -> 已选 skill 预检
+  -> AgentCore ReAct 循环
+  -> 工具 evidence 和 plan item 更新
   -> completion evaluator
-  -> final answer or blocker
+  -> 最终答案或 blocker
 ```
 
-## 1. Message And Task
+## 1. 消息和任务
 
-Gateway and channel adapters normalize inbound messages. Runtime either routes the message into an active task or starts a new `TaskNode`.
+Gateway 和渠道适配器归一化入站消息。Runtime 要么将消息路由到现有活跃任务，要么创建新的 `TaskNode`。
 
-Short follow-ups can reuse previous task context. Independent new tasks should not receive weak previous-task prompt context.
+简短追问可复用先前任务上下文。独立的新任务不应接收弱化的前置任务提示上下文。
 
-## 2. Contract Planning
+## 2. Contract 规划
 
-Runtime creates a lightweight `TaskContract`:
+Runtime 创建轻量级 `TaskContract`：
 
-- direct tasks get a minimal plan shape
-- low-risk tool tasks can auto-execute
-- complex or risky tasks can pause for plan review
+- 直接任务获得最小计划形态
+- 低风险工具任务可自动执行
+- 复杂或高风险任务可暂停等待计划审核
 
-The contract expresses a tool execution checklist and an acceptance checklist. Required tools must be real tool names. Selected skills are recorded separately.
+Contract 包含一个工具执行检查清单和一个验收检查清单。必需工具必须是真实工具名称。已选技能单独记录。
 
-## 3. Skill Preflight
+## 3. Skill 预检
 
-Planning can discover local `SKILL.md` headers and select relevant execution skills. Selected skills can be read before execution and converted into real tool plan items.
+规划阶段可以发现本地 `SKILL.md` header 并选择相关执行技能。已选技能可在执行前读取并转换为真实工具 plan items。
 
-Execution does not receive the whole skill catalog by default. It receives only selected task skills or explicit skill/workflow context.
+执行阶段默认不会收到完整技能目录。只接收已选任务技能或显式的 skill/workflow 上下文。
 
-## 4. ReAct Execution
+## 4. ReAct 执行
 
-The model runs in the normal AgentCore loop. It can call visible tools, receive observations, and decide the next step from transcript context.
+模型在正常的 AgentCore 循环中运行。它可以调用可见工具、接收观察结果，并根据 transcript 上下文决定下一步。
 
-Mateway does not replay the plan mechanically. Hooks and evaluator enforce the task contract while preserving a small loop.
+Mateway 不会机械地重放计划。Hooks 和 evaluator 在保持循环简洁的同时强制执行 task contract。
 
-## 5. Tool Evidence
+## 5. 工具 Evidence
 
-Tool results update task steps, execution events, evidence summaries, and plan item status. Large tool outputs can be compacted and retrieved later through `toolresult.read`.
+工具结果会更新任务步骤、执行事件、evidence 摘要和 plan item 状态。大型工具输出可被压缩，后续通过 `toolresult.read` 检索。
 
-Secret-like data is redacted before persistent storage and before later model turns.
+类 secret 数据在持久化存储和后续模型轮次之前会被脱敏。
 
-## 6. Completion Evaluation
+## 6. 完成评估
 
-Before final answer, the completion evaluator checks:
+在最终回答之前，completion evaluator 检查：
 
-- required tools were accepted
-- required evidence exists or has a valid substitute
-- required plan items are completed or blocked
-- unavailable tools produce a concrete blocker
+- 必需工具已被接受
+- 必需 evidence 存在或有有效替代
+- 必需 plan items 已完成或已阻塞
+- 不可用的工具产生具体 blocker
 
-If the task is not done, the model receives a short follow-up:
+如果任务未完成，模型会收到简短追问：
 
 ```text
 Missing: <requirement>. Next required action: call <tool> or state blocker.
 ```
 
-Final output should report the result, deliverable path/URL when relevant, or a concrete blocker.
+最终输出应报告结果、交付物路径/URL（如适用）或具体的 blocker。

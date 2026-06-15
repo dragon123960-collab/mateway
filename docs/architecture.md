@@ -1,62 +1,62 @@
-# Architecture
+# 架构
 
-Mateway is a small local-first Go runtime. The main design constraint is to keep one transcript-driven AgentCore loop and add reliability through hooks, tool contracts, task contracts, evidence, and memory.
+Mateway 是一个小型 local-first 的 Go runtime。核心设计约束是保持单一 transcript-driven 的 AgentCore 循环，并通过 hooks、tool contracts、task contracts、evidence 和 memory 来增加可靠性。
 
-## Package Map
+## 包地图
 
-- `cmd/mateway`: CLI entrypoint.
-- `internal/cli`: command handlers, TUI rendering, trace display, and local diagnostics.
-- `internal/runtime`: task lifecycle, task contracts, hooks, context budgeting, completion evaluation, progress events, and trace writing.
-- `internal/agentcore`: model/tool loop, tool registry, tool contracts, risk classes, and tool call execution.
-- `internal/tool`: built-in tools such as file, terminal, web, schedule, task, and secret tools.
-- `internal/session`: persisted session state, task nodes, task contracts, pending actions, archives, and compacted transcripts.
-- `internal/gateway`: channel routing, dedupe, session keys, asynchronous runtime execution, and reply dispatch.
-- `internal/channel`: platform I/O adapters and message normalization.
-- `internal/config`: config loading, defaults, init assets, models, agents, channels, skills, and security settings.
-- `internal/memory`: Markdown memory, proposals, lint/search/index, learning distill, and skill learning evidence.
-- `internal/skill`: skill catalog, validation, install/proposal helpers, and secret scanning.
+- `cmd/mateway`: CLI 入口。
+- `internal/cli`: 命令处理器、TUI 渲染、trace 展示和本地诊断。
+- `internal/runtime`: 任务生命周期、task contracts、hooks、context budget、completion 评估、进度事件和 trace 写入。
+- `internal/agentcore`: 模型/工具循环、工具注册表、tool contracts、风险分类和工具调用执行。
+- `internal/tool`: 内置工具，包括 file、terminal、web、schedule、task 和 secret 工具。
+- `internal/session`: 持久化的会话状态、任务节点、task contracts、待处理动作、归档和压缩后的 transcript。
+- `internal/gateway`: 渠道路由、去重、session keys、异步 runtime 执行和回复分发。
+- `internal/channel`: 平台 I/O 适配器和消息归一化。
+- `internal/config`: 配置加载、默认值、初始化资产、models、agents、channels、skills 和安全设置。
+- `internal/memory`: Markdown 记忆、proposals、lint/搜索/索引、学习蒸馏和技能学习 evidence。
+- `internal/skill`: 技能目录、验证、安装/proposal 辅助和 secret 扫描。
 
-## Runtime Boundaries
+## Runtime 边界
 
-The runtime owns task state and execution policy, but it does not become a workflow engine.
+Runtime 拥有任务状态和执行策略，但不会变成 workflow 引擎。
 
-- `AgentCore` remains a model/tool loop.
-- Runtime hooks add context, policy, observation, response cleanup, and completion checks.
-- Tool implementations perform real actions and return evidence.
-- Channel packages only receive, normalize, send, and react to platform messages.
-- Gateway handles session routing and channel fan-out, not business-level agent routing.
+- `AgentCore` 保持为模型/工具循环。
+- Runtime hooks 添加上下文、策略、观察、回复清理和完成检查。
+- 工具实现执行真实动作并返回 evidence。
+- Channel 包只负责接收、归一化、发送和响应平台消息。
+- Gateway 负责会话路由和渠道分发，而非业务级的多 agent 路由。
 
-## Task And Evidence Model
+## 任务和 Evidence 模型
 
-Action tasks are represented by `TaskContract`:
+动作任务由 `TaskContract` 表示：
 
-- `required_tools`: real tool names only.
-- `required_skills`: selected skills, never tool names.
-- `required_evidence`: acceptance conditions.
-- `plan_items`: an executable checklist with tool and status.
-- `completion_policy`: concise finishing rule.
+- `required_tools`: 仅限真实工具名称。
+- `required_skills`: 已选技能，绝不能是工具名称。
+- `required_evidence`: 验收条件。
+- `plan_items`: 带有工具和状态的可执行检查清单。
+- `completion_policy`: 简洁的完成规则。
 
-The execution loop is still ReAct. Mateway does not mechanically replay the checklist. Instead, tool results update plan item status and the completion evaluator decides whether final output is allowed.
+执行循环仍然是 ReAct。Mateway 不会机械地重放检查清单。相反，工具结果会更新 plan item 状态，由 completion evaluator 决定是否允许最终输出。
 
 ## Skills
 
-Skills are editable `SKILL.md` files under:
+Skill 是位于以下路径的可编辑 `SKILL.md` 文件：
 
 ```text
 workspace/agents/<agent_id>/skills/<skill_name>/SKILL.md
 workspace/skills/<skill_name>/SKILL.md
 ```
 
-Planning may discover skill headers and select relevant skills. Execution only receives selected skill context. Skill names are not accepted tools; work must still be performed through real tools such as `terminal.run`, `file.read`, or `web.search`.
+规划阶段可以发现 skill header 并选择相关的技能。执行阶段只接收已选技能上下文。技能名称不是可接受的工具；工作仍必须通过真实工具（如 `terminal.run`、`file.read`、`web.search`）来完成。
 
 ## Memory
 
-Long-term memory is stored as Markdown under `workspace/memory`. Runtime observations can produce proposals, but durable memory changes require explicit user action. Derived indexes are rebuildable and are not the source of truth.
+长期记忆以 Markdown 格式存储在 `workspace/memory` 下。Runtime 观察可以产生 proposals，但持久的记忆变更需要用户明确操作。派生的索引可重建，不作为唯一事实来源。
 
-## Non-Goals
+## 非目标
 
-- No PlanExecute framework.
-- No DAG runtime.
-- No multi-agent supervisor.
-- No gateway business routing.
-- No command execution tool besides `terminal.run`.
+- 无 PlanExecute 框架。
+- 无 DAG runtime。
+- 无 multi-agent supervisor。
+- 无 gateway 业务路由。
+- 除 `terminal.run` 外无其他命令执行工具。
