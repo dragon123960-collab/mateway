@@ -1,177 +1,44 @@
 # Mateway
+
 <p align="center">
-  <img src="banner.png" alt="Mateway — memory-native local agent runtime" width="100%" />
+  <img src="banner.png" alt="Mateway — local-first agent runtime" width="100%" />
 </p>
 
 [English](./README.md) | [中文](./README.zh.md)
 
-**Mateway 是一个面向真实工作区的本地优先 Agent Runtime，围绕白盒记忆、自我学习和可审计工具使用构建。**
+**Mateway 是一个面向真实工作区的 local-first Go agent runtime。它会先把用户任务变成轻量 contract，再通过小型 transcript-driven 工具循环执行，最后只有在证据满足或出现明确 blocker 时才收口。**
 
-它不是重型工作流平台，也不是只能演示的聊天机器人。Mateway 是一个围绕小型 AgentCore 主循环构建的 Go 运行时，同时已经预留多 agent profile 和 binding 基础，用于不同工作身份、渠道、skills 和记忆作用域。
-
-> **一句话：Mateway = 小型 AgentCore + 多 Agent Profile + Hook Runtime + 工具边界 + 类 Git 记忆 + 自学习 Proposal + Trace Ledger。**
+它不是重型 workflow 平台。Mateway 的核心方向是 loop engineering：保持 AgentCore loop 足够小，把可靠性交给 task contract、工具边界、可编辑 skills、白盒 memory 和可审计 evidence。
 
 ```text
-receive -> active task steering or new task
-        -> context_hook -> AgentCore model/tool loop
-        -> tool_policy_hook -> observe_hook -> response_hook -> reply
+message -> task contract/checklist -> selected skill preflight
+        -> AgentCore ReAct loop -> tool evidence
+        -> completion evaluator -> final answer or blocker
 ```
 
-## 为什么需要 Mateway？
+## 特色
 
-大多数 Agent 框架都能做出惊艳的第一版 demo。真正困难的是：当一个 Agent 和你一起工作几周之后，它还能不能可信。
+- **Task contract，而不是盲聊。** 动作型任务会带 required tools、required evidence、selected skills 和 plan items。runtime 用这份 checklist 判断任务是否完成。
+- **Transcript-driven execution。** Mateway 不机械 replay PlanExecute 图或 DAG。模型仍通过正常 ReAct loop 行动，hooks 和 evaluator 负责约束完成质量。
+- **可编辑 skills。** Skills 是 workspace 中的 `SKILL.md` 文件。Planning 可以选择相关 skill，但 skill name 永远不是 tool name；真实执行仍使用 `file.read`、`file.write`、`terminal.run`、`web.search`、`web.fetch` 等工具。
+- **白盒 memory。** 长期记忆是带 YAML frontmatter 的 Markdown，并配套 proposal 和 audit。Agent 可以建议保存长期记忆，但由用户决定是否提交。
+- **Trace ledger。** 每次运行都会产生 JSONL trace，记录 model turns、tool calls、evidence、hook events、timing、token diagnostics，并对 secret 做脱敏。
+- **小型本地 runtime。** CLI、飞书、微信、定时任务和测试共用同一套 runtime，而不是各自一套 agent stack。
 
-- 它应该记住有价值的经验，但不能悄悄改写自己的长期认知。
-- 它应该从完成的任务中学习，但在提交长期记忆之前仍然让用户确认。
-- 它应该解释自己用了哪些工具、看到了什么证据、结果从哪里来。
-- 它应该在 CLI、飞书、测试和未来的定时任务中使用同一套运行时。
-- 它应该诚实说明 connector 缺口，而不是假装已经发了邮件或登录了服务器。
+## 当前能力
 
-Mateway 选择保守路径：先保持 AgentCore 主循环足够小，再通过 profiles、hooks、skills、tools 和 Markdown memory 自然增长能力。
+- CLI 入口：`mateway ask`
+- 飞书 WebSocket gateway 和原生微信 iLink Bot channel
+- 内置工具：`file.read`、`file.write`、`file.edit`、`file.delete`、`terminal.run`、`web.search`、`web.fetch`、`secret.set`、`schedule.manage`、`task.search`、`task.resume`、`toolresult.read`
+- Tool policy：阻断 destructive terminal command、路径校验、secret 脱敏
+- 复杂或高风险任务的 plan review
+- Context budget、压缩 tool output、通过 `raw_ref` 回读原始输出
+- 多 agent profile 基础：channel bindings、agent-specific skills、agent-scoped memory
+- Memory proposal、lint、search、index rebuild 和 learning heartbeat 命令
 
-## 独特之处
-
-### 1. 类 Git 记忆机制
-
-Mateway 把记忆当成一个可 review 的工作区，而不是黑箱向量库。
-
-```text
-task / trace / tool evidence
-  -> diary
-  -> proposal
-  -> save or ignore
-  -> Markdown long-term memory
-  -> rebuildable index
-  -> safe-read injection
-```
-
-Agent 在有价值的任务完成后可以提出长期记忆候选。用户可以回复 `1` 提交，也可以回复 `2` 拒绝。底层流程接近一个轻量 Git 工作流：
-
-| 记忆步骤 | 类 Git 含义 |
-|---|---|
-| diary | 工作笔记 |
-| proposal | 暂存候选 |
-| save / commit | 持久长期记忆 |
-| reject | 丢弃候选 |
-| audit log | 提交历史 |
-| index rebuild | 派生索引，不是事实源 |
-
-长期记忆以带 YAML frontmatter 的 Markdown 存在 `~/.mateway/workspace/memory/` 下，可以用 Obsidian 打开、手工编辑、lint、search、rebuild 和 audit。
-
-### 2. 自我学习，但不静默篡改
-
-任务完成后，`observe_hook` 会记录 task steps，并可能生成 memory proposal。候选会出现在最终回答里，让人做决定：
-
-```text
-保存到长期记忆:
-mateway memory proposal commit <proposal_id>
-
-忽略这条候选:
-mateway memory proposal reject <proposal_id>
-```
-
-在聊天入口里，只有数字回复会被 runtime 当成 memory review：`1` 保存，`2` 忽略。其他文本会被 runtime 拒绝并提示用户回复 `1` 或 `2`；如果用户要开始另一个任务，需要先发 `/new`。
-
-### 3. Hook-first Runtime
-
-核心循环保持小而清晰，扩展点显式存在：
-
-| Hook | 作用 |
-|---|---|
-| `context_hook` | 注入 runtime context、workspace profile、已发现 skills 和相关 memory snippets |
-| `tool_policy_hook` | 执行硬规则，例如 destructive terminal block、路径限制和 secret 边界 |
-| `observe_hook` | 记录已接受工具步骤、任务证据、diary 和 memory proposals |
-| `response_hook` | 清理最终回复，并附加 memory review 提示 |
-
-### 4. 带 Secret 脱敏的 Trace Ledger
-
-每次运行都会写入 JSONL trace：
-
-- request 和 channel
-- model turns
-- provider 返回时的模型请求数、token usage、cache usage 和 context budget telemetry
-- tool calls 和 tool results
-- hook events
-- final reply
-- runtime timings
-
-持久化 trace、session transcript、task step summary，以及传给后续模型轮次的 tool-result message，都会脱敏明显的 secret 字段，例如 `api_key`、`token`、`password`、`smtp_pass`、`imap_pass` 和 bearer token。
-
-### 5. 有边界的 Session Context
-
-Session 是运行时状态，不是无限增长的原始聊天记录。每次调用模型前，Mateway 会从这些来源临时组装 context：
-
-- `context_hook` 每轮重新生成的 system/runtime context
-- 当前 agent profile 的 Markdown 文件
-- 已发现 skill 的精简 guidance
-- `memory_safe_read` 命中时的相关长期记忆片段
-- deterministic session summary，包括最近结果、open items 和已接受 evidence
-- 压缩后的最近 session transcript
-- 当前用户消息
-
-System context 每轮重新生成，不会写回 session transcript。持久化 session 消息会被压缩：system 消息会丢弃，大型 tool result 会截断，只保留最近的对话消息。Task node 会保存短摘要、task contract、trace refs 和工具步骤证据，所以旧工作仍可审计，但不会把完整历史 transcript 强行塞进下一次 prompt。对于动作型任务，task contract 可以包含轻量 `plan_items`、required evidence 和 selected execution skills。Mateway 会区分 direct / auto_contract / review_required：直接回答不打断，低风险工具任务可自动执行，复杂或高风险任务才展示 plan review。Tool result 会更新 plan item 状态，同时保持每次 run 独立 trace 文件。
-
-Mateway 还会在每次模型调用前运行一层无感的 context economy。它会根据当前模型的 `context_window` 和 `max_tokens` 估算 input tokens，超过 soft budget 时自动压缩旧 transcript 和 tool content，同时保留当前 task contract、required tools/evidence、plan items 和已接受 evidence；只有超过 hard budget 才停止，并把估算节省量写入 trace/TUI diagnostics。Tool schema 也会动态暴露：每一轮模型只看到相关 tool contract，但执行层仍保留完整 registry。被压缩的大型 tool output 会保存为 `raw_ref`；`toolresult.read` 可以按 `raw_ref` 和可选多关键词 `query` 精确回读原始输出，返回命中行片段和 line ranges，而不是把大块原文重新塞回 prompt。
-
-飞书图片消息会下载到 `~/.mateway/media`；微信 channel 如果收到带 URL 或本地路径的媒体 item，也会归一化到同一套 message part。Session transcript 只保存媒体引用，不内联图片字节。模型详情、启用开关、`context_window` 和 `max_tokens` 放在 `~/.mateway/config/models/*.yaml`；`config.yaml` 只选择默认模型、fallback 和角色。如果当前模型声明了 `modalities: [text, image]`，用户文字和图片会作为同一个 user turn 一起发送给多模态模型；否则 Mateway 会优先使用 `model.roles.vision`，它可以是单个模型，也可以是 `vision: [glm-4.6v-flash, minimax]` 这样的有序列表，然后再尝试其他支持图片的 fallback 模型。音频、视频和文件 part 已在消息结构中预留，后续再接渠道下载和模型发送。
-
-发送 `/new`、`/新会话` 或 `新会话` 会归档当前 session，并在同一个 `session_key` 下清空 active state。飞书长 thread 仍然保持稳定 session key，但 agent 可以从干净上下文重新开始。
-
-Runtime 不会在 `/new` 后自动猜测旧任务。用户要找回之前工作时，默认 `task-recall` skill 会引导 agent 使用 `task.search`；候选不明确时让用户补充关键词、时间或任务内容，候选多个时列编号，明确后再调用 `task.resume`。
-
-### 6. Skills 是可编辑行为，不是魔法工具
-
-Mateway 会发现本地 `SKILL.md` 文件，并把精简 guidance 注入 runtime context。当前默认 skills 包括：
-
-- `software-install`
-- `fresh-search`
-- `source-evaluation`
-- `connector-gap`
-- `task-recall`
-- `skillcreate`
-
-Skills 是行为指导，本身不是可执行能力。如果任务需要真实动作，Agent 仍必须调用真实工具，或通过 `terminal.run` 执行命令，并给出证据。
-
-## 当前能做什么
-
-Mateway 目前支持：
-
-- CLI 任务入口：`mateway ask`
-- 飞书 WebSocket gateway
-- 原生微信 iLink Bot channel：`mateway weixin login`、`mateway weixin enable`
-- 从本地 channel 配置文件发现 channel id：`mateway channel list`
-- 真实 runtime 测试：`mateway test`
-- 本地诊断：`mateway doctor`
-- trace 回看：`mateway trace`
-- session 查看和归档命令：`mateway session list`、`mateway session show`、`mateway session archive list/show`
-- task tree 和 active-task steering
-- 工具默认直接执行，删除/破坏类 terminal 命令硬阻拦
-- 内置工具：`file.read`、`file.write`、`file.edit`、`file.delete`、`terminal.run`、`web.search`、`web.fetch`、`secret.set`、`schedule.manage`，以及 `task.search` / `task.resume`
-- Anthropic-compatible 和 OpenAI Chat-compatible 模型优先使用原生 tool/function calling，不支持时才退回文本协议
-- 同一轮 safe-read 工具批次可并行执行，由 `execution.max_parallel_tools` 控制
-- 无感 token economy：per-turn context budget、session summary、动态 visible tools、压缩 tool result 和 `raw_ref` query 回读
-- usage diagnostics：provider tokens、cache read/write tokens、estimated input tokens 和估算压缩节省量
-- 本地 secret store：`mateway secret set/get/list/delete`
-- trace 中可见 hook events
-- workspace profile 注入
-- 从 `workspace/skills` 和 agent-specific overrides 发现 skills
-- skill-aware task contract：被选中的 execution skill 保留在 `required_skills`，真实执行仍使用 `file.read`、`file.write`、`terminal.run`、`web.search`、`web.fetch` 等工具
-- Markdown memory lint/search/index
-- memory proposal create/list/show/commit/reject
-- 有价值任务完成后的自动 diary/proposal 生成
-- 可按 channel、间隔和展示数量配置的候选记忆提醒
-- memory proposal 的聊天回复处理：`1` / `2`
-- 通过 `context_hook` 做 memory safe-read 注入
-- session 和 project distill 命令
-- 手动 memory heartbeat：lint + index rebuild
-- 持久化 runtime 记录中的 secret 脱敏
-- 多 agent profile 基础：`config.agents.profiles[]`、channel bindings、agent-specific skills 和 agent-scoped memory directories
-
-`terminal.run` 是唯一命令执行工具，支持 `env_secrets` 注入 secret 到环境变量。trace/evidence 只记录 secret id 和 env 名，不记录明文；`rm`、`shred`、`git reset`、`git clean` 或 pipe-to-shell 这类危险形态会直接拦截。
+`terminal.run` 是唯一命令执行工具。它可以通过 `env_secrets` 注入 secret；trace 只记录 secret id 和环境变量名，不记录明文 secret。
 
 ## 快速开始
-
-### 构建
 
 ```bash
 git clone https://github.com/dragon123960-collab/mateway.git
@@ -179,33 +46,11 @@ cd mateway
 
 go test ./...
 go build -o build/mateway ./cmd/mateway
-```
-
-### 初始化
-
-```bash
 ./build/mateway init
+./build/mateway doctor
 ```
 
-`mateway init` 会从 `assets/init` 读取默认配置、模型/渠道样例、shared skills 和 memory 模板。使用 release 下载时，需要保留 binary 旁边的 `assets/` 目录；也可以传 `--assets-dir /path/to/assets/init`。脚本或打包环境可用 `MATEWAY_ASSETS_DIR` 提供同样的覆盖。
-
-会创建：
-
-```text
-~/.mateway/
-  config/
-  workspace/
-    agents/
-    skills/
-    memory/
-  sessions/
-  trace/
-  observe/
-  indexes/
-  run/
-```
-
-### 配置
+然后配置本地模型和渠道：
 
 ```bash
 cp ~/.mateway/config/mateway.env.sample ~/.mateway/config/mateway.env
@@ -213,407 +58,42 @@ vim ~/.mateway/config/mateway.env
 vim ~/.mateway/config/config.yaml
 ```
 
-校验配置：
-
-```bash
-./build/mateway doctor
-```
-
-### 从 CLI 提问
+试一下 CLI：
 
 ```bash
 ./build/mateway ask "Read README.md and summarize this project."
 ./build/mateway ask "Inspect the current project directory and identify the runtime entrypoint."
-./build/mateway ask "Search today's latest AI news and summarize 5 high-value items."
 ```
 
-### 运行真实 Runtime 测试
-
-```bash
-./build/mateway test --case read-readme
-./build/mateway test --case project-index
-./build/mateway test --case web-search
-./build/mateway test --case write-file
-```
-
-自定义任务：
-
-```bash
-./build/mateway test --session-key demo:a001 --message "Read README.md and explain the memory system."
-```
-
-### 启动 Gateway
-
-```bash
-./build/mateway gateway serve
-```
-
-`gateway serve` 会以前台进程启动已启用的内置 channel。如果要常驻后台，可以用 launchd、systemd 或其他服务管理器托管。
-
-查看当前可配置的 channel id：
-
-```bash
-./build/mateway channel list
-```
-
-示例：
+`mateway init` 会在 `~/.mateway/` 下创建本地 home：
 
 ```text
-ID      ENABLED  CONFIG
-feishu  true     ~/.mateway/config/channels/feishu.yaml
-weixin  true     ~/.mateway/config/channels/weixin.yaml
+config/      models, channels, runtime settings
+workspace/   agent profiles, shared skills, Markdown memory
+sessions/    compacted session state
+trace/       JSONL runtime traces
+observe/     memory and skill learning evidence
+indexes/     derived indexes
+run/         runtime locks and channel state
 ```
 
-配置候选记忆提醒等 channel-scoped 行为时，使用 `ID` 列里的名字。
+## 文档
 
-### 接入微信
+- [Architecture](./docs/architecture.md)：代码结构、包边界和小型 runtime 设计。
+- [Configuration](./docs/configuration.md)：本地路径、模型、渠道、skills、memory 和安全配置。
+- [Execution Flow](./docs/execution-flow.md)：从用户消息到最终回答或 blocker 的完整链路。
+- [Roadmap](./docs/roadmap.md)：当前路线和明确不做的方向。
 
-Mateway 的原生微信 channel 参考 Hermes 的 iLink Bot API 路线，支持扫码登录、保存账号、长轮询接收文本消息和发送文本回复。
+开发 scratch 放在 `dev-notes/`，完成后应及时清理。
 
-```bash
-./build/mateway weixin login
-./build/mateway weixin enable
-./build/mateway gateway restart
-```
+## 设计边界
 
-登录凭据保存在 `~/.mateway/run/weixin/accounts/`。`weixin enable` 会更新 `~/.mateway/config/channels/weixin.yaml`，但不会把 token 写进配置文件。媒体/CDN 支持暂不纳入当前版本。
+Mateway 不追求变成 workflow platform。当前明确不做：
 
-## Memory 命令
+- 不做 PlanExecute framework。
+- 不做 DAG runtime。
+- 不做 multi-agent supervisor 或 subagent spawning。
+- 不做 gateway 业务级 routing。
+- 不新增 `terminal.run` 之外的命令执行工具。
 
-Lint memory：
-
-```bash
-./build/mateway memory lint
-```
-
-重建索引：
-
-```bash
-./build/mateway memory index rebuild
-```
-
-搜索记忆：
-
-```bash
-./build/mateway memory search "README experience"
-```
-
-Review proposals：
-
-```bash
-./build/mateway memory proposal list
-./build/mateway memory proposal show <proposal_id>
-./build/mateway memory proposal commit <proposal_id>
-./build/mateway memory proposal reject <proposal_id> --reason "not reusable"
-```
-
-候选记忆提醒可以在 `~/.mateway/config/config.yaml` 配置：
-
-```yaml
-execution:
-  max_parallel_tools: 4
-
-memory:
-  proposal_nudge:
-    enabled: true
-    interval: 24h
-    channels:
-      - cli
-    max_proposals: 3
-```
-
-提醒由 runtime 生成，但只会出现在配置的 channel id 中。提醒会展示少量候选摘要，并给出 `mateway memory proposal show <proposal_id>` 查看详情，不会把所有待审核候选一次性塞进聊天窗口。
-
-蒸馏 session 或 project：
-
-```bash
-./build/mateway memory distill session <session_key>
-./build/mateway memory distill project close <project_id>
-```
-
-运行手动 heartbeat 维护：
-
-```bash
-./build/mateway memory heartbeat lint-index
-./build/mateway memory heartbeat learning
-./build/mateway memory heartbeat skill
-```
-
-以前台循环运行 heartbeat 维护：
-
-```bash
-./build/mateway memory heartbeat serve
-```
-
-这个 heartbeat 命令会 lint Markdown memory，在安全时重建 `indexes/memory_index.json`，蒸馏学习 evidence，并从重复复杂流程里生成 skill patch 或新 skill proposal，最后写入 audit entry。
-
-## 定时任务
-
-定时任务是 channel-neutral 的。Mateway 负责直接保存 active 任务、到点执行，并把运行记录写到 `~/.mateway/schedules/runs/`。它不会自动把结果发回飞书、邮件、Slack 或其他渠道。
-
-创建任务：
-
-```bash
-./build/mateway schedule create --run-at 2026-05-29T18:00:00+08:00 "检查未读邮件并总结重要事项"
-./build/mateway schedule list
-```
-
-执行到期任务一次，或以前台 runner 持续运行：
-
-```bash
-./build/mateway schedule run-due
-./build/mateway schedule serve
-```
-
-如果定时任务需要通知某人，请把通知写进任务本身，通过已有 tool、CLI 命令、connector 或 skill 完成。没有可用投递渠道时，agent 应说明缺口，并询问是否需要创建相关命令流程或 skill。
-
-## 模型工具调用
-
-Mateway 现在优先使用大模型原生 tool/function calling，不再把手写工具 JSON 当作主路径。Anthropic-compatible 模型，例如 MiniMax M3，会使用 Anthropic `tools` / `tool_use`；OpenAI Chat-compatible 模型，例如 GLM Flash，会使用 Chat Completions `tools` / `tool_calls`。旧的 `[TOOL_CALL]` 文本协议只保留为兜底：当某个模型 API 不支持原生工具调用，或原生请求失败时才使用。
-
-所有 runtime 入口共用同一个 AgentCore loop，所以 CLI、飞书、微信和定时任务，只要配置的模型支持原生工具调用，都会走同一条原生工具路径。OpenAI Responses 风格的 `api: openai` 目前保持保守处理，在对应 provider 或代理的原生 Responses tools 验证完成前继续使用 fallback 路径。
-
-## Trace 命令
-
-```bash
-./build/mateway trace <trace-jsonl-path>
-```
-
-Trace 可用于检查：
-
-- model/tool/runtime latency
-- 模型请求数、input/output/total tokens、cache read/write tokens、estimated input tokens 和 context compaction savings
-- hook decisions
-- tool calls 和 acceptance evidence
-- context budget decisions、受保护的 contract context、visible/hidden tool counts 和 session summary updates
-- memory proposal generation
-- Feishu gateway timing
-
-## HOME 目录结构
-
-```text
-~/.mateway/
-  config/        # config.yaml, env files, model/channel config
-  workspace/     # agent profiles, skills, Markdown memory
-  sessions/      # transcripts, task trees, pending states
-    archive/     # /new 创建的旧 session 归档
-  trace/         # JSONL traces
-  observe/       # diary, proposals, reflections, audit logs
-  indexes/       # rebuildable memory indexes
-  run/           # runtime files such as gateway locks
-```
-
-如果要在全新 runtime 状态测试，同时保留配置、密钥、agent profiles 和 skills：
-
-```bash
-./build/mateway home reset-runtime        # dry-run
-./build/mateway home reset-runtime --apply
-```
-
-这个命令会清理生成态 runtime 数据，例如 sessions、trace、observe、indexes、schedules、logs、tmp 和 raw tool-result artifacts；会保留 `config/`、`secrets/`、`workspace/`，以及 `run/weixin/accounts/` 这类已保存连接器凭据。
-
-Workspace：
-
-```text
-~/.mateway/workspace/
-  agents/
-    main/
-      agent.md
-      soul.md
-      user.md
-      tools.md
-      memory.md
-      skills/
-  skills/
-    software-install/
-    fresh-search/
-    source-evaluation/
-    connector-gap/
-    task-recall/
-    skillcreate/
-  memory/
-    user/
-      long/
-    org/
-      long/
-    agents/
-      main/
-        memory.md
-        experiences/
-```
-
-## Skills
-
-Mateway skills 是可编辑行为指导，存放在：
-
-```text
-workspace/agents/<agent_id>/skills/<skill_name>/SKILL.md
-workspace/skills/<skill_name>/SKILL.md
-```
-
-发现顺序：
-
-1. agent-specific skills
-2. shared workspace skills
-
-同名时 agent-specific skills 优先。
-
-Skills 不能保存明文凭证。凭证应进入本地 secret store，skill frontmatter 里只引用 secret id：
-
-```yaml
-required_secrets:
-  - id: mail.smtp_pass
-    env: SMTP_PASS
-```
-
-`mateway skill install` 和写入 `SKILL.md` 的 `file.write` 会拒绝 password、API key、token、bearer token 等疑似明文 secret。
-
-当前行为：
-
-- Runtime 发现本地 skills，并把短 guidance 注入 context。
-- 默认初始化的 shared skills 覆盖 fresh search、source evaluation、connector gaps、task recall、software installation workflow 和 Mateway skill creation rules。
-- Agent 可以检查已有 skills、安装本地/raw skills，并在用户审核后 promote skill patch proposal。
-
-已可用：
-
-- `mateway skill catalog report`
-- `mateway skill search <query>`
-- `mateway skill install <name-or-url>`
-- `mateway skill proposal list|show|promote|reject`
-- `mateway skill usage report`
-- 外部 skill catalog 集成。规划中的首批来源：`skills.sh`、`skillhub.cn`、`clawhub.ai`
-- heartbeat 生成 skill patch 和新 skill proposal 的审核工作流
-
-辅助脚本只是 skill 或 workspace 里的普通文件。Mateway 不再提供 script registry、`script.run` 或 `mateway script` CLI。需要执行时用 `terminal.run` 调用文件路径；需要凭证时用 `secret.set` 保存，再通过 `terminal.run.env_secrets` 注入，这样 trace 只记录 secret id 和 env 名。
-
-## 多 Agent Profiles
-
-Mateway 目前还没有 multi-agent supervisor、subagent spawn 或 DAG router。但它已经具备多个 agent profile 的底座：
-
-- `config.agents.default`
-- `config.agents.profiles[]`
-- `config.agents.bindings[]`
-- `workspace/agents/<agent_id>/`
-- `workspace/agents/<agent_id>/skills/`
-- `workspace/memory/agents/<agent_id>/`
-
-每个 agent profile 使用同一组 core prompt 文件：`agent.md`、`soul.md`、`user.md`、`tools.md`、`memory.md`。`mateway agent create` 新建 profile 时会生成英文基线模板，且不会覆盖已有文件。
-
-这意味着不同 channel 或 session namespace 可以选择不同 agent 身份、prompt 文件、skill overrides 和 memory scope，同时仍然共享同一个小型 AgentCore runtime。
-
-飞书也可以在同一个 `channels/feishu.yaml` 里启动多个机器人账号。顶层保留共享默认值，在 `feishu.accounts[]` 里写每个机器人的覆盖项，然后用 `--account-id` 绑定 agent：
-
-```yaml
-feishu:
-  enabled: true
-  websocket:
-    enabled: true
-  accounts:
-    - id: ops-bot
-      app_id_env: MATEWAY_FEISHU_OPS_APP_ID
-      app_secret_env: MATEWAY_FEISHU_OPS_APP_SECRET
-    - id: local-bot
-      app_id_env: MATEWAY_FEISHU_LOCAL_APP_ID
-      app_secret_env: MATEWAY_FEISHU_LOCAL_APP_SECRET
-```
-
-```bash
-mateway agent bind --channel feishu --account-id ops-bot ops
-mateway agent bind --channel feishu --account-id local-bot local
-```
-
-边界也很明确：profiles 和 bindings 在当前范围内；自主多 agent 编排不属于当前版本。
-
-Profile 产品化命令：
-
-- `mateway agent list`
-- `mateway agent report <agent_id>`
-- `mateway agent lint <agent_id>`
-- `mateway agent create <agent_id> [--name <name>] [--default]`
-- `mateway agent bind --channel <channel> [--account-id <id>] [--peer-id <id>] <agent_id>`
-- `mateway agent unbind --channel <channel> [--account-id <id>] [--peer-id <id>]`
-
-## Gateway 边界
-
-Gateway 是 channel 汇聚层：负责 session key、dedupe、异步 runtime 执行和 reply 分发。`gateway serve` 会从 `channels/` 启动已启用的内置 channel，包括飞书 WebSocket 和原生微信长轮询。
-
-新的稳定 channel 应优先做成内置 channel spec，这样一个 gateway 进程就能统一管理。channel package 负责平台 I/O 和消息归一化，gateway 负责 session key、dedupe、异步 runtime 执行和 trace。
-
-原生微信 channel 参考 Hermes 的 iLink Bot API 路线：`mateway weixin login` 扫码并把凭据保存到 `~/.mateway/run/weixin/accounts/`；`gateway serve` 之后通过 `getupdates` 长轮询收消息，并通过 `sendmessage` 发送文本回复。媒体/CDN 支持暂不纳入首版。
-
-使用 `mateway channel list` 可以从 `~/.mateway/config/channels/*.yaml` 查看 canonical channel id。runtime 配置应使用这些 id，例如 `feishu` 或 `weixin`，而不是 `lark`、`wechat` 这类别名。
-
-`gateway serve` 使用和 CLI 命令相同的 config loader，因此会读取 `~/.mateway/config/mateway.env`。如果进程环境变量里已经有同名变量，则进程环境变量优先。
-
-## 当前边界
-
-Mateway 不会把这些能力伪装成已经完成：
-
-- 还没有 multi-agent supervisor 或 DAG router
-- 还没有 OS-level sandbox wrapper
-- 还没有通用 mail/SSH/GitHub connector framework
-- 还没有可视化 workspace UI
-- 还没有外部 skill marketplace installer
-
-当前可用版本聚焦于：稳定小核心 runtime、多 agent profile 基础、hook pipeline、带风险边界的真实工具、飞书/CLI 入口、traceability 和 white-box memory。
-
-
-## Roadmap
-
-### 足以给开发者试用的部分
-
-- 小型 AgentCore runtime loop
-- 多 agent profile 和 binding 基础
-- CLI / test / Feishu / Weixin entrypoints
-- Hook pipeline
-- Tool policy 和破坏性命令阻拦
-- JSONL traces
-- Per-turn context budget、动态 visible tools、cache usage telemetry 和 deterministic session summary
-- Skill discovery 和 context injection
-- 本地 secret store 和 skill secret 扫描
-- Markdown memory lint/search/index
-- Memory proposal list/show/commit/reject workflow
-- 可配置的候选记忆提醒
-- Self-learning diary/proposal generation
-- Memory safe-read context injection
-- Session/project distill commands
-- Heartbeat `lint-index` 和前台 heartbeat runner
-- Channel-neutral scheduled task create/test/run-due/serve
-- 通过 `mateway channel list` 发现内置 channel
-- 持久化 runtime 记录 secret redaction
-
-### 下一步
-
-- 更多内置 channel：钉钉、QQ、企业微信、Telegram
-- channel 音频/视频/文件等媒体能力
-- user-provided integrations 的 connector command templates 和 skill guidance
-- skill source adapters 和 promote workflow
-- safer terminal sandbox wrappers
-- 只读 trace/task/memory workspace UI
-- mail、SSH、GitHub 和 publishing connector packages
-
-## 设计原则
-
-### 保持核心小而清晰
-
-主循环保持小而清晰。复杂能力通过 hooks、tool contracts、skills 和明确工具接入。
-
-### 记忆必须可 review
-
-长期记忆应该显示来源，支持编辑/拒绝，并允许重建索引。
-
-### 信任来自 traces
-
-Agent 的可信度来自知道发生了什么、使用了哪些证据、执行了哪些边界。
-
-### Local-first 不等于 local-only
-
-Mateway 优先服务本地工作区和用户机器，但也通过飞书、网页搜索、外部 CLI 和未来 connectors 连接更大的系统。
-
-### 不伪造 connector
-
-当 mail、SSH、GitHub 或 publishing connector 缺失时，Mateway 应该报告缺口，检查安全的本地选项，并提出集成路径，而不是编造执行结果。
-
-## License
-
-Apache License 2.0.
+未来方向是继续做深 loop engineering：更好的 planning contract、更干净的执行上下文、更强的 evidence evaluator、更安全的 terminal isolation，以及更有用的 skill/memory crystallization。

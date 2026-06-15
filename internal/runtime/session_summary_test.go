@@ -40,8 +40,16 @@ func TestUpdateSessionSummaryStoresTaskEvidenceAndContext(t *testing.T) {
 
 func TestAppendPreviousTaskContextIncludesSessionSummaryWithoutTasks(t *testing.T) {
 	state := session.State{Summary: session.SessionSummary{Text: "User prefers concise answers."}}
-	context := appendPreviousTaskContext("Base prompt", state, "task-current")
+	context := appendPreviousTaskContext("Base prompt", state, "task-current", "ok")
 	if !strings.Contains(context, "Base prompt") || !strings.Contains(context, "Session summary:") || !strings.Contains(context, "User prefers concise answers.") {
 		t.Fatalf("unexpected context %q", context)
+	}
+}
+
+func TestAppendPreviousTaskContextSkipsIndependentTask(t *testing.T) {
+	state := session.State{Summary: session.SessionSummary{Text: "User prefers concise answers."}}
+	context := appendPreviousTaskContext("Base prompt", state, "task-current", "summarize the repository architecture")
+	if context != "Base prompt" {
+		t.Fatalf("independent task should not receive previous context, got %q", context)
 	}
 }

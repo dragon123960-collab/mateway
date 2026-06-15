@@ -199,7 +199,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			TracePath: trace.path,
 		}, nil
 	}
-	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
+	systemPrompt := prependTaskFocus(buildRuntimeSystemContextForTask(rt.Config, profile, userText, contract), task, userText)
 	if contractContext := renderTaskContractContext(contract); contractContext != "" {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
 	}
@@ -210,7 +210,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			Summary: renderTaskPlanForExecution(contract, userText),
 		})
 	}
-	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
+	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID, userText)
 	if strings.Contains(systemPrompt, "Continuity judgment:") {
 		tasks := recentPreviousTasks(*state, task.ID, 3)
 		var taskIDs []string

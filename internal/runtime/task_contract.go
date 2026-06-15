@@ -606,15 +606,110 @@ func renderTaskContractContext(contract session.TaskContract) string {
 	if strings.TrimSpace(contract.Summary) == "" && !contract.RequiresTools {
 		return ""
 	}
-	data, err := json.Marshal(contract)
-	if err != nil {
-		return ""
+	var b strings.Builder
+	b.WriteString("Task completion checklist:\n")
+	writeContextLine(&b, "- summary: ", contract.Summary)
+	if len(contract.RequiredTools) > 0 {
+		b.WriteString("- required_tools: ")
+		b.WriteString(strings.Join(contract.RequiredTools, ", "))
+		b.WriteString("\n")
 	}
-	return "Task completion contract:\n" +
-		"- Continue using the normal ReAct loop; this contract only gates completion.\n" +
-		"- Before final answer, satisfy the required evidence or state a concrete blocker.\n" +
-		"- Treat plan_items as the current task checklist; complete or block required action items before final answer.\n" +
-		string(data)
+	if len(contract.RequiredSkills) > 0 {
+		var skills []string
+		for _, skill := range contract.RequiredSkills {
+			name := strings.TrimSpace(skill.Name)
+			if name == "" {
+				continue
+			}
+			if strings.TrimSpace(skill.Path) != "" {
+				name += " (" + strings.TrimSpace(skill.Path) + ")"
+			}
+			skills = append(skills, name)
+		}
+		if len(skills) > 0 {
+			b.WriteString("- selected_skills: ")
+			b.WriteString(strings.Join(skills, ", "))
+			b.WriteString("\n")
+		}
+	}
+	if len(contract.RequiredEvidence) > 0 {
+		b.WriteString("- required_evidence:\n")
+		for _, evidence := range contract.RequiredEvidence {
+			desc := strings.TrimSpace(evidence.Description)
+			if desc == "" {
+				desc = strings.TrimSpace(evidence.Tool)
+			}
+			if desc == "" {
+				continue
+			}
+			b.WriteString("  - ")
+			if tool := strings.TrimSpace(evidence.Tool); tool != "" {
+				b.WriteString("[")
+				b.WriteString(tool)
+				b.WriteString("] ")
+			}
+			b.WriteString(desc)
+			b.WriteString("\n")
+		}
+	}
+	if len(contract.PlanItems) > 0 {
+		b.WriteString("- plan_items:\n")
+		for _, item := range contract.PlanItems {
+			title := strings.TrimSpace(item.Title)
+			if title == "" {
+				title = strings.TrimSpace(item.Criteria)
+			}
+			if title == "" {
+				continue
+			}
+			status := defaultText(normalizePlanStatus(item.Status), "pending")
+			b.WriteString("  - ")
+			if id := strings.TrimSpace(item.ID); id != "" {
+				b.WriteString(id)
+				b.WriteString(" ")
+			}
+			b.WriteString("[")
+			b.WriteString(status)
+			b.WriteString("]")
+			if tool := strings.TrimSpace(item.Tool); tool != "" {
+				b.WriteString(" [")
+				b.WriteString(tool)
+				b.WriteString("]")
+			}
+			b.WriteString(" ")
+			b.WriteString(title)
+			b.WriteString("\n")
+		}
+		if next := nextPendingPlanItem(contract); next != "" {
+			b.WriteString("- next_required_action: ")
+			b.WriteString(next)
+			b.WriteString("\n")
+		}
+	}
+	writeContextLine(&b, "- expected_outcome: ", contract.ExpectedOutcome)
+	writeContextLine(&b, "- completion_policy: ", contract.CompletionPolicy)
+	b.WriteString("- Final answer only after the checklist is satisfied, or state the concrete blocker.\n")
+	return strings.TrimSpace(b.String())
+}
+
+func nextPendingPlanItem(contract session.TaskContract) string {
+	for _, item := range contract.PlanItems {
+		status := normalizePlanStatus(item.Status)
+		if status == "" || status == "pending" || status == "running" {
+			title := strings.TrimSpace(item.Title)
+			if title == "" {
+				title = strings.TrimSpace(item.Criteria)
+			}
+			if title == "" {
+				continue
+			}
+			if tool := strings.TrimSpace(item.Tool); tool != "" {
+				return "call " + tool + " for " + title
+			}
+			return title
+		}
+	}
+	return ""
 }
 
 type taskContractValidation struct {
@@ -925,14 +1020,14 @@ func acceptedTools(task session.TaskNode) map[string]bool {
 
 func taskContractFollowup(missing []string) string {
 	if len(missing) == 0 {
-		return "The task contract is not satisfied yet. Use the smallest appropriate tool call now, or state the concrete blocker."
+		return "Missing: task contract evidence. Next required action: call the smallest appropriate tool or state blocker."
 	}
-	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(missing, "; "))
+	return fmt.Sprintf("Missing: %s. Next required action: call %s or state blocker.", strings.Join(missing, "; "), nextToolForMissing(missing, session.TaskContract{}))
 }
 
 func taskContractFollowupWithGuidance(missing []string, failures map[string]FailureInfo, contract session.TaskContract, accepted map[string]bool) string {
 	if len(missing) == 0 {
-		return "The task contract is not satisfied yet. Use the smallest appropriate tool call now, or state the concrete blocker."
+		return "Missing: task contract evidence. Next required action: call the smallest appropriate tool or state blocker."
 	}
 	var parts []string
 	for _, m := range missing {
@@ -949,12 +1044,35 @@ func taskContractFollowupWithGuidance(missing []string, failures map[string]Fail
 			continue
 		}
 		if requiredSkillReadCompleted(contract, skill) {
-			parts = append(parts, fmt.Sprintf("Required skill %s SKILL.md has been read. Now follow that skill's workflow using terminal.run or the suggested execution tool.", name))
+			parts = append(parts, fmt.Sprintf("skill:%s read", name))
 		} else {
-			parts = append(parts, fmt.Sprintf("Required skill %s must be read before execution: complete a file.read plan item for its SKILL.md, then follow its workflow.", name))
+			parts = append(parts, fmt.Sprintf("skill:%s needs file.read SKILL.md", name))
 		}
 	}
-	return fmt.Sprintf("The task contract is not satisfied yet. Missing evidence: %s. Use the smallest appropriate tool call now, or state the concrete blocker.", strings.Join(parts, "; "))
+	return fmt.Sprintf("Missing: %s. Next required action: call %s or state blocker.", strings.Join(parts, "; "), nextToolForMissing(missing, contract))
+}
+
+func nextToolForMissing(missing []string, contract session.TaskContract) string {
+	for _, item := range contract.PlanItems {
+		status := normalizePlanStatus(item.Status)
+		if status != "" && status != "pending" && status != "running" {
+			continue
+		}
+		if tool := strings.TrimSpace(item.Tool); tool != "" {
+			return tool
+		}
+	}
+	for _, m := range missing {
+		if tool := toolNameFromMissing(m); tool != "" {
+			return tool
+		}
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		if tool := strings.TrimSpace(evidence.Tool); tool != "" {
+			return tool
+		}
+	}
+	return "the smallest appropriate tool"
 }
 
 func requiredSkillReadCompleted(contract session.TaskContract, skill session.RequiredSkill) bool {

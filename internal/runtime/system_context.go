@@ -15,6 +15,10 @@ import (
 )
 
 func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConfig) string {
+	return buildRuntimeSystemContextForTask(cfg, profile, "", session.TaskContract{})
+}
+
+func buildRuntimeSystemContextForTask(cfg *config.Root, profile config.AgentProfileConfig, userText string, contract session.TaskContract) string {
 	var b strings.Builder
 	b.WriteString("Runtime context:\n")
 	loc, timezone := cfg.TimezoneLocation()
@@ -49,31 +53,103 @@ func buildRuntimeSystemContext(cfg *config.Root, profile config.AgentProfileConf
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString("\nTask freshness policy:\n")
-	b.WriteString("- First decide whether the task needs real-time or external information.\n")
-	b.WriteString("- Use web.search or web.fetch for weather, news, prices, schedules, software versions, laws, APIs, or anything likely to have changed.\n")
-	b.WriteString("- When building search queries for today/current/latest tasks, use the current date above exactly; do not silently substitute an older year.\n")
-	b.WriteString("- Do not present stale dated search results as current. If sources disagree or are old, say so clearly.\n")
-	b.WriteString("- Prefer official and primary sources when available; otherwise summarize uncertainty.\n")
-	b.WriteString("\nMateway self-knowledge policy:\n")
-	b.WriteString("- When the user asks about Mateway's own configuration, sandbox, security, tools, CLI commands, or architecture, always read docs/ or internal/config/ first before using web.search.\n")
-	b.WriteString("- Web search results about mateway are likely about unrelated projects with the same name; prefer local doc evidence.\n")
-	b.WriteString("\nConnector gap policy:\n")
-	b.WriteString("- When a task needs a missing connector such as mail, SSH, or publishing, do not simply stop at \"not supported\".\n")
-	b.WriteString("- First use safe local inspection with terminal.run when useful: check available CLIs, local app configuration, config files, and documented commands without exposing secrets.\n")
-	b.WriteString("- If the user asks for SSH/server/service status and has a configured local command or host alias, try terminal.run with the smallest safe command before asking the user to run it manually. Treat \"do not write a script\" as permission for a one-shot command unless they explicitly forbid terminal execution.\n")
-	b.WriteString("- If no configured connector exists, propose a concrete script or integration plan with required inputs, safety boundaries, and verification commands.\n")
-	b.WriteString("- Static runtime context is not proof that a scripting runtime exists. Before creating Python, Node, shell, or other scripts, verify the required executable with command -v and a version command.\n")
-	b.WriteString("- Do not claim that email was sent, remote servers were checked, or content was published unless an actual tool or script completed that action.\n")
+	if needsFreshnessContext(userText, contract) {
+		b.WriteString("\nTask freshness policy:\n")
+		b.WriteString("- Use web.search or web.fetch for weather, news, prices, schedules, software versions, laws, APIs, or anything likely to have changed.\n")
+		b.WriteString("- When building search queries for today/current/latest tasks, use the current date above exactly; do not silently substitute an older year.\n")
+		b.WriteString("- Do not present stale dated search results as current. Prefer official and primary sources when available.\n")
+	}
+	if needsMatewaySelfKnowledgeContext(userText) {
+		b.WriteString("\nMateway self-knowledge policy:\n")
+		b.WriteString("- When the user asks about Mateway configuration, sandbox, security, tools, CLI commands, or architecture, read local docs/ and source before using web.search.\n")
+		b.WriteString("- Web search results about mateway are likely unrelated projects; prefer local evidence.\n")
+	}
+	if needsConnectorGapContext(userText, contract) {
+		b.WriteString("\nConnector gap policy:\n")
+		b.WriteString("- When a missing connector is needed, first inspect safe local CLIs, config, and documented commands before stopping.\n")
+		b.WriteString("- Verify required Python, Node, shell, or other runtimes before creating scripts.\n")
+		b.WriteString("- Do not claim email, server checks, publishing, or notification succeeded unless a real tool or script completed the action.\n")
+	}
 	if workspace := workspaceProfileContext(cfg, profile); workspace != "" {
 		b.WriteString("\nWorkspace profile context:\n")
 		b.WriteString(workspace)
 	}
-	if skills := skillsPrompt(skillsForRuntimeContext(cfg, profile.ID)); skills != "" {
+	if skills := selectedSkillsPrompt(contract); skills != "" {
 		b.WriteString("\n\n")
 		b.WriteString(skills)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func needsFreshnessContext(userText string, contract session.TaskContract) bool {
+	text := strings.ToLower(userText + " " + contract.Summary + " " + contract.ExpectedOutcome + " " + contract.CompletionPolicy)
+	if containsAnyLiteral(text,
+		"today", "latest", "current", "real-time", "realtime", "now", "news", "weather", "price", "prices",
+		"schedule", "version", "release", "api", "law", "regulation", "stock", "market", "exchange rate",
+		"今天", "最新", "当前", "现在", "实时", "新闻", "天气", "价格", "股价", "汇率", "版本", "法规",
+	) {
+		return true
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		kind := strings.ToLower(strings.TrimSpace(evidence.Kind))
+		desc := strings.ToLower(strings.TrimSpace(evidence.Description))
+		if strings.Contains(kind, "current") || strings.Contains(kind, "external") || strings.Contains(desc, "current") || strings.Contains(desc, "latest") {
+			return true
+		}
+	}
+	return false
+}
+
+func needsMatewaySelfKnowledgeContext(userText string) bool {
+	text := strings.ToLower(userText)
+	if !strings.Contains(text, "mateway") {
+		return false
+	}
+	return containsAnyLiteral(text,
+		"config", "configuration", "sandbox", "security", "tool", "tools", "cli", "command", "architecture", "runtime", "agentcore",
+		"配置", "沙箱", "安全", "工具", "命令", "架构", "运行时",
+	)
+}
+
+func needsConnectorGapContext(userText string, contract session.TaskContract) bool {
+	text := strings.ToLower(userText + " " + contract.Summary + " " + contract.ExpectedOutcome)
+	return containsAnyLiteral(text,
+		"mail", "email", "smtp", "imap", "ssh", "server", "publish", "deploy", "notify", "notification", "calendar", "saas",
+		"邮件", "邮箱", "服务器", "发布", "部署", "通知", "日历", "连接器",
+	)
+}
+
+func selectedSkillsPrompt(contract session.TaskContract) string {
+	if len(contract.RequiredSkills) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Selected task skills:\n")
+	b.WriteString("- Only these contract-selected skills are relevant for execution; skill names are not tool names.\n")
+	for _, skill := range contract.RequiredSkills {
+		name := strings.TrimSpace(skill.Name)
+		if name == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(name)
+		writeInlineContext(&b, "path", skill.Path)
+		writeInlineContext(&b, "reason", skill.Reason)
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func writeInlineContext(b *strings.Builder, key, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	b.WriteString(" (")
+	b.WriteString(key)
+	b.WriteString(": ")
+	b.WriteString(value)
+	b.WriteString(")")
 }
 
 func skillsForRuntimeContext(cfg *config.Root, agentID string) []discoveredSkill {
@@ -127,14 +203,9 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 		b.WriteString(current)
 		b.WriteString("\n")
 	}
-	b.WriteString("- Before every tool call or final answer, check the next action against the original user task above.\n")
-	b.WriteString("- Do not finish with a plan; continue with tools until the original task is completed or a concrete blocker/user input is required.\n")
-	b.WriteString("- A message like \"I will check now\" or \"let me confirm\" is not a final answer. If you say you will check, confirm, create, update, or inspect something, call the required tool in the same turn.\n")
-	b.WriteString("- If file.read is blocked by path policy while the task still requires local file evidence, try an allowed safe-read terminal.run fallback such as ls, find, cat, sed, or rg. If that fallback is also blocked, state the concrete path-policy blocker instead of inventing content.\n")
-	b.WriteString("- Do not replace server/service/process status requests with software release or project status research unless the user explicitly asks for versions or releases.\n")
-	b.WriteString("- For long tasks, work in verifiable stages, preserve completed stage evidence, and summarize progress between stages when possible.\n")
-	b.WriteString("- If a tool is slow, cancelled, or timed out, name the tool, elapsed time, and fallback action instead of asking the user to keep waiting.\n")
-	b.WriteString("- When creating or updating long-term memory pages under workspace/memory/agents/<agent>/, update that agent's index.md navigation page in the same task.\n")
+	b.WriteString("- Do not finish with only a plan; complete the task with tools or state the concrete blocker.\n")
+	b.WriteString("- If you promise to check, create, update, inspect, or run something, call the required tool in the same turn.\n")
+	b.WriteString("- Before final answer, satisfy the current task contract/checklist or explain why it is blocked.\n")
 	if prompt := strings.TrimSpace(systemPrompt); prompt != "" {
 		b.WriteString("\n")
 		b.WriteString(prompt)
@@ -142,7 +213,10 @@ func prependTaskFocus(systemPrompt string, task *session.TaskNode, userText stri
 	return strings.TrimSpace(b.String())
 }
 
-func appendPreviousTaskContext(systemPrompt string, state session.State, currentTaskID string) string {
+func appendPreviousTaskContext(systemPrompt string, state session.State, currentTaskID string, userText string) string {
+	if !shouldInjectPreviousTaskContext(state, currentTaskID, userText) {
+		return strings.TrimSpace(systemPrompt)
+	}
 	tasks := recentPreviousTasks(state, currentTaskID, 3)
 	sessionSummary := renderSessionSummaryContext(state.Summary)
 	if len(tasks) == 0 && sessionSummary == "" {
@@ -181,6 +255,45 @@ func appendPreviousTaskContext(systemPrompt string, state session.State, current
 		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func shouldInjectPreviousTaskContext(state session.State, currentTaskID string, userText string) bool {
+	if strings.TrimSpace(renderSessionSummaryContext(state.Summary)) != "" && likelyFollowupText(userText) {
+		return true
+	}
+	tasks := recentPreviousTasks(state, currentTaskID, 3)
+	if len(tasks) == 0 {
+		return false
+	}
+	return likelyFollowupText(userText)
+}
+
+func likelyFollowupText(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	if len([]rune(lower)) <= 24 {
+		return true
+	}
+	return containsAnyFollowupPhrase(lower,
+		"continue", "resume", "continue that", "resume that", "try again", "do it again",
+		"ok now", "yes now", "done now", "fixed now", "approved now", "authorized now",
+		"继续", "接着", "刚才", "上次", "那个", "这个", "好了", "可以了", "修复了", "授权了", "同意",
+	)
+}
+
+func containsAnyFollowupPhrase(text string, phrases ...string) bool {
+	for _, phrase := range phrases {
+		phrase = strings.TrimSpace(phrase)
+		if phrase == "" {
+			continue
+		}
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func recentPreviousTasks(state session.State, currentTaskID string, limit int) []session.TaskNode {

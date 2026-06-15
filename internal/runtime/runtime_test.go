@@ -78,6 +78,30 @@ func TestRuntimeSystemContextUsesConfiguredTimezone(t *testing.T) {
 	if strings.Contains(text, "Asia/Shanghai") {
 		t.Fatalf("runtime context should use configured timezone, got:\n%s", text)
 	}
+	if strings.Contains(text, "Task freshness policy:") || strings.Contains(text, "Available skills:") {
+		t.Fatalf("default runtime context should not include triggered sections or skill catalog, got:\n%s", text)
+	}
+}
+
+func TestRuntimeSystemContextAddsTriggeredSectionsAndSelectedSkills(t *testing.T) {
+	cfg := config.DefaultRoot()
+	contract := session.TaskContract{
+		Summary:       "publish latest market report",
+		RequiresTools: true,
+		RequiredSkills: []session.RequiredSkill{
+			{Name: "publish-skill", Path: "/workspace/skills/publish-skill/SKILL.md", Reason: "publish workflow"},
+		},
+		RequiredEvidence: []session.TaskEvidenceContract{{Kind: "current_external_fact", Tool: "web.search", Description: "latest market data"}},
+	}
+	text := buildRuntimeSystemContextForTask(&cfg, config.AgentProfileConfig{}, "publish latest report by email", contract)
+	for _, want := range []string{"Task freshness policy:", "Connector gap policy:", "Selected task skills:", "publish-skill"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in triggered runtime context, got:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "software-install") {
+		t.Fatalf("runtime context should not inject unrelated default skills, got:\n%s", text)
+	}
 }
 
 func TestRuntimeActiveTaskSteersNewMessageIntoExistingTask(t *testing.T) {
@@ -1615,7 +1639,7 @@ func TestPreviousTaskContextSupportsContinuityJudgment(t *testing.T) {
 	state.CompleteActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
 	second := state.StartTask("开通了")
 
-	prompt := appendPreviousTaskContext("Base prompt.", state, second.ID)
+	prompt := appendPreviousTaskContext("Base prompt.", state, second.ID, "开通了")
 	if !strings.Contains(prompt, "Continuity judgment:") {
 		t.Fatalf("expected previous task context, got %q", prompt)
 	}
@@ -1651,6 +1675,25 @@ func TestRuntimeNewTaskReceivesPreviousTaskContinuityContext(t *testing.T) {
 	updated := loadState(t, rt, "cli:test")
 	if len(updated.Tasks) != 2 || updated.Tasks[1].Goal != "ok" {
 		t.Fatalf("expected completed previous task to create a new task, got %#v", updated.Tasks)
+	}
+}
+
+func TestIndependentTaskDoesNotReceivePreviousTaskContinuityContext(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	state.StartTask("create a Lark document from /tmp/source.md")
+	state.CompleteActiveTaskWithSummary("Waiting for authorization.", "trace-one", "/tmp/trace-one.jsonl")
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	model := &capturePromptModel{text: "done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
+
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "summarize this repository architecture")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(model.systemPrompt, "Continuity judgment:") || strings.Contains(model.systemPrompt, "create a Lark document from /tmp/source.md") {
+		t.Fatalf("independent task should not receive previous task context, got %q", model.systemPrompt)
 	}
 }
 
@@ -3830,8 +3873,8 @@ func TestSkillReadThenWrongCommandFollowupGuidesNextTool(t *testing.T) {
 	missing := []string{"plan:create document via helper"}
 	failures := map[string]FailureInfo{}
 	guidance := taskContractFollowupWithGuidance(missing, failures, contract, nil)
-	if !strings.Contains(guidance, "SKILL.md has been read") {
-		t.Fatalf("follow-up should note that skill was read, got: %s", guidance)
+	if !strings.Contains(guidance, "skill:feishu-notify read") {
+		t.Fatalf("follow-up should note that skill was read compactly, got: %s", guidance)
 	}
 	if !strings.Contains(guidance, "terminal.run") {
 		t.Fatalf("follow-up should guide toward terminal.run, got: %s", guidance)
@@ -3852,10 +3895,10 @@ func TestSkillReadFollowupMatchesRequiredSkillExactly(t *testing.T) {
 		},
 	}
 	guidance := taskContractFollowupWithGuidance([]string{"plan:create document via helper"}, nil, contract, nil)
-	if strings.Contains(guidance, "Required skill feishu-notify SKILL.md has been read") {
+	if strings.Contains(guidance, "skill:feishu-notify read") {
 		t.Fatalf("follow-up should not treat another skill as feishu-notify read, got: %s", guidance)
 	}
-	if !strings.Contains(guidance, "complete a file.read plan item") {
+	if !strings.Contains(guidance, "skill:feishu-notify needs file.read SKILL.md") {
 		t.Fatalf("follow-up should ask to read the required skill first, got: %s", guidance)
 	}
 }
@@ -5074,7 +5117,7 @@ func TestSkillReadCompletedFollowupEncouragesRealTools(t *testing.T) {
 	if !strings.Contains(followup, "terminal.run") {
 		t.Fatal("followup should mention terminal.run as the real tool to execute")
 	}
-	if !strings.Contains(followup, "SKILL.md has been read") {
+	if !strings.Contains(followup, "skill:publish-skill read") {
 		t.Fatal("followup should acknowledge skill has been read")
 	}
 	if strings.Contains(followup, "publish-skill") && strings.Contains(followup, "must be read") {
