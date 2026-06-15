@@ -12,6 +12,11 @@ coverage.out
 *.log
 /dev-notes/*
 !/dev-notes/project-development-guide.md
+!/dev-notes/graph-native-skill-registration-plan.md
+!/dev-notes/graph-native-skill-registration/
+!/dev-notes/graph-native-skill-registration/*.md
+!/dev-notes/task-graph-runtime/
+!/dev-notes/task-graph-runtime/*.md
 /dev-notes/archive/
 /testdata/
 /bin/
