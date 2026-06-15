@@ -16,6 +16,7 @@ type discoveredSkill struct {
 	Name        string
 	Description string
 	Stage       string
+	Granularity string
 	Priority    string
 	Path        string
 	Scope       string
@@ -156,6 +157,8 @@ func parseSkillHeader(text string) discoveredSkill {
 			skill.Description = value
 		case "stage":
 			skill.Stage = value
+		case "granularity":
+			skill.Granularity = value
 		case "priority":
 			skill.Priority = value
 		}

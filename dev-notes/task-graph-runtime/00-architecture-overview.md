@@ -59,6 +59,7 @@ inbound message
 8. [08：Trace / Session / Recovery](./08-trace-session-recovery.md)
 9. [09：Memory 集成](./09-memory-integration.md)
 10. [10：Runtime 主路径替换](./10-runtime-replacement.md)
+11. [11：真实模型端到端 Dogfood](./11-real-model-dogfood.md)
 
 配套参考：
 
@@ -78,4 +79,3 @@ inbound message
 - 保留旧机制测试作为迁移保护线，但不代表可回退到旧 runtime。
 - 每次改动保持仓库可测试。
 - 阶段完成后由 Codex 按该阶段文档 review。
-

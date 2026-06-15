@@ -1,0 +1,262 @@
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/channel"
+	"github.com/dongping/mateway/internal/session"
+)
+
+const finalizerSystemPrompt = `You are a task finalizer. Summarize the completed graph nodes into a concise final answer for the user.
+
+## Rules
+- Only use verified node results. Do not invent or assume.
+- If a node has acceptance criteria that was not verified, do not use its result.
+- Keep the answer short and direct. Do not describe the graph structure.
+- Do NOT suggest new actions, call tools, or modify the task.
+- If input is required from the user, clearly state what is needed.
+- Output only the final answer text. No JSON, no markdown blocks.`
+
+func (rt Runtime) finalizeGraph(
+	ctx context.Context,
+	g *session.TaskGraph,
+	vr session.GraphVerificationResult,
+	trace *traceRecorder,
+) session.GraphFinalizeResult {
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":     "graph_finalize_start",
+			"graph_id": g.ID,
+			"task_id":  g.TaskID,
+			"status":   vr.Status,
+		})
+	}
+
+	result := session.FinalizeGraph(g, vr)
+
+	if result.Status == session.FinalizeCompleted && rt.Model != nil {
+		prompt := renderFinalizerPrompt(g, vr)
+		finalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		reply, err := rt.Model.Next(finalCtx, agentcore.Context{
+			SystemPrompt: finalizerSystemPrompt,
+			Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
+		})
+		if err == nil && strings.TrimSpace(reply.Content) != "" {
+			result.ReplyText = strings.TrimSpace(reply.Content)
+		}
+	}
+
+	if result.Status == session.FinalizeBlocked && trace != nil {
+		_ = trace.write(map[string]any{
+			"type":     "graph_blocked",
+			"graph_id": g.ID,
+			"task_id":  g.TaskID,
+			"reason":   result.ReplyText,
+		})
+	}
+
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":        "graph_finalized",
+			"graph_id":    g.ID,
+			"task_id":     g.TaskID,
+			"status":      result.Status,
+			"reply_style": result.ReplyStyle,
+			"keep_task":   result.KeepTask,
+		})
+	}
+
+	return result
+}
+
+func (rt Runtime) FinalizeAndRespond(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	vr session.GraphVerificationResult,
+	trace *traceRecorder,
+) (Response, error) {
+	result := rt.finalizeGraph(ctx, g, vr, trace)
+
+	switch result.Status {
+	case session.FinalizeCompleted:
+		summary := summarize(result.ReplyText)
+		state.CompleteActiveTaskWithSummary(summary, traceID(trace), tracePath(trace))
+		state.AddExecutionEvent(g.TaskID, session.ExecutionEvent{
+			Type:    "graph_completed",
+			Status:  "completed",
+			Summary: summary,
+		})
+		taskCompletedObserve(ctx, rt, msg, state, g.TaskID, result.ReplyText, trace)
+
+	case session.FinalizeFailed:
+		state.BlockActiveTask("failed")
+		state.AddExecutionEvent(g.TaskID, session.ExecutionEvent{
+			Type:    "graph_failed",
+			Status:  "failed",
+			Summary: result.ReplyText,
+		})
+
+	case session.FinalizeBlocked:
+		state.AddExecutionEvent(g.TaskID, session.ExecutionEvent{
+			Type:    "graph_blocked",
+			Status:  "blocked",
+			Summary: result.ReplyText,
+		})
+
+	case session.FinalizeAwaitingInput:
+		ensurePendingForGraph(state, g)
+		summary := summarize(result.ReplyText)
+		state.AwaitUserInputActiveTaskWithSummary(summary, traceID(trace), tracePath(trace))
+
+	case session.FinalizePartial:
+	}
+
+	state.ActiveTask = ""
+	if result.KeepTask {
+		state.ActiveTask = g.TaskID
+	}
+
+	finalText := result.ReplyText
+	if finalText == "" {
+		finalText = "Task processing complete."
+	}
+
+	redacted := redactSecretString(finalText)
+	text := rt.Hooks.response(ctx, ResponseHookInput{RawText: redacted}, trace)
+	text = redactSecretString(text)
+
+	style := mapReplyStyle(result.ReplyStyle)
+
+	if err := rt.saveState(state, trace); err != nil {
+		return Response{}, err
+	}
+
+	if trace != nil {
+		_ = trace.write(map[string]any{"type": "reply", "text": text, "style": string(style)})
+	}
+
+	failed := result.Status == session.FinalizeFailed
+
+	return Response{
+		Reply: channel.OutboundMessage{
+			Channel:  msg.Channel,
+			ThreadID: msg.ThreadID,
+			Text:     text,
+			Style:    style,
+		},
+		TraceID:   traceID(trace),
+		TracePath: tracePath(trace),
+		Failed:    failed,
+	}, nil
+}
+
+func taskCompletedObserve(
+	ctx context.Context,
+	rt Runtime,
+	msg channel.InboundMessage,
+	state *session.State,
+	taskID string,
+	finalText string,
+	trace *traceRecorder,
+) {
+	home := rt.home()
+	observe := rt.Hooks.observe(ctx, ObserveHookInput{
+		Kind:       "task_completed",
+		Home:       home,
+		SessionKey: state.Key,
+		State:      *state,
+		TaskID:     taskID,
+		FinalText:  finalText,
+		TraceID:    traceID(trace),
+		TracePath:  tracePath(trace),
+	}, trace)
+	if observe.LearningResult != nil {
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":            "self_learning",
+				"diary_path":      observe.LearningResult.DiaryPath,
+				"reflection_path": observe.LearningResult.ReflectionPath,
+			})
+		}
+		if observe.LearningResult.Proposal != nil {
+			state.Pending = &session.PendingAction{
+				Kind:       "memory_proposal_review",
+				TaskID:     taskID,
+				ProposalID: observe.LearningResult.Proposal.ID,
+				Question:   "1 save, 2 ignore",
+			}
+		}
+	}
+}
+
+func ensurePendingForGraph(state *session.State, g *session.TaskGraph) {
+	if state.Pending != nil {
+		if state.Pending.GraphID == "" {
+			state.Pending.GraphID = g.ID
+		}
+		return
+	}
+
+	var awaitingNodeID string
+	for _, n := range g.Nodes {
+		if n.Status == session.NodeStatusAwaitingInput {
+			awaitingNodeID = n.ID
+			break
+		}
+	}
+
+	state.Pending = &session.PendingAction{
+		Kind:     session.PendingKindHumanReview,
+		TaskID:   g.TaskID,
+		GraphID:  g.ID,
+		NodeID:   awaitingNodeID,
+		Question: "Please provide input to continue the task.",
+	}
+}
+
+func mapReplyStyle(finalizerStyle string) channel.MessageStyle {
+	switch finalizerStyle {
+	case "error":
+		return channel.StyleError
+	case "input_required":
+		return channel.StyleInputRequired
+	case "partial":
+		return channel.StylePartial
+	default:
+		return ""
+	}
+}
+
+func renderFinalizerPrompt(g *session.TaskGraph, vr session.GraphVerificationResult) string {
+	var sb strings.Builder
+	sb.WriteString("Produce a final answer based on the following verified node results.\n\n")
+	sb.WriteString(fmt.Sprintf("Task Goal: %s\n\n", taskGoalFromGraph(g)))
+	sb.WriteString("Verified Results:\n")
+	for _, n := range g.Nodes {
+		if n.Status != session.NodeStatusCompleted && n.Status != session.NodeStatusSkipped {
+			continue
+		}
+		if n.Acceptance.Criteria != "" && !n.Acceptance.Verified {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", n.Goal, n.ResultSummary))
+	}
+	sb.WriteString("\nProvide a brief final answer for the user.")
+	return sb.String()
+}
+
+func taskGoalFromGraph(g *session.TaskGraph) string {
+	for _, n := range g.Nodes {
+		if strings.TrimSpace(n.Goal) != "" {
+			return n.Goal
+		}
+	}
+	return g.TaskID
+}

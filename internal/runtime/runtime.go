@@ -116,7 +116,53 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	trace.setIdentity(map[string]any{"task_id": task.ID})
 	_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "effective_text": userText})
 	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})
+
+	if task.Graph != nil && len(task.Graph.Nodes) > 0 {
+		return rt.runGraphTask(ctx, msg, &state, task, userText, trace)
+	}
+
 	return rt.runTask(ctx, msg, &state, task, userText, phase, trace)
+}
+
+func (rt Runtime) runGraphTask(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	task *session.TaskNode,
+	userText string,
+	trace *traceRecorder,
+) (Response, error) {
+	g := task.Graph
+
+	_ = trace.write(map[string]any{
+		"type":     "graph_lifecycle_start",
+		"graph_id": g.ID,
+		"task_id":  task.ID,
+		"nodes":    len(g.Nodes),
+	})
+
+	for {
+		ready := session.ReadyNodes(g, 1)
+		if len(ready) == 0 {
+			break
+		}
+
+		node := g.NodeByID(ready[0])
+		if node == nil {
+			break
+		}
+
+		if err := rt.executeNode(ctx, msg, state, g, node, userText, trace); err != nil {
+			return Response{}, err
+		}
+		if err := rt.saveState(state, trace); err != nil {
+			return Response{}, err
+		}
+	}
+
+	vr := session.VerifyTaskGraph(g)
+
+	return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
 }
 
 func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, phase string, trace *traceRecorder) (Response, error) {

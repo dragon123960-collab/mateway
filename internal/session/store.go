@@ -116,6 +116,8 @@ type TraceRef struct {
 const (
 	PendingKindMemoryProposalReview = "memory_proposal_review"
 	PendingKindTaskPlanConfirm      = "task_plan_confirm"
+	PendingKindHumanReview          = "human_review"
+	PendingKindHumanConfirm         = "human_confirm"
 )
 
 type ExecutionEvent struct {
@@ -132,6 +134,8 @@ type ExecutionEvent struct {
 type PendingAction struct {
 	Kind        string `json:"kind"`
 	TaskID      string `json:"task_id"`
+	GraphID     string `json:"graph_id,omitempty"`
+	NodeID      string `json:"node_id,omitempty"`
 	ProposalID  string `json:"proposal_id,omitempty"`
 	Question    string `json:"question,omitempty"`
 	Feedback    string `json:"feedback,omitempty"`

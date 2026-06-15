@@ -52,9 +52,54 @@ type VerificationResult struct {
 }
 ```
 
+## Verification Strategy
+
+第一版 verifier 可以使用 deterministic checks 作为安全底线，但不能把关键词匹配当作最终可靠验收。
+
+分层策略：
+
+```text
+hard checks
+  -> model verifier
+  -> deterministic apply result
+```
+
+Hard checks 负责不可协商条件：
+
+- tool 是否有 evidence refs。
+- tool 是否被 policy blocked。
+- node 是否缺 result summary。
+- human node 是否仍 awaiting input。
+- secret/raw trace 是否不能进入结果。
+
+Model verifier 负责语义判断：
+
+- result summary 是否满足 acceptance criteria。
+- evidence 是否足以支撑 node goal。
+- task contract 是否已被 completed nodes 满足。
+- blocker 是否具体、是否可恢复。
+
+模型只能输出结构化 verification result，不能执行工具、改变 dependency、修改 graph plan、绕过 human confirm 或 tool policy。
+
+建议模型输出：
+
+```json
+{
+  "status": "passed | failed | blocked | needs_input",
+  "reason": "short reason",
+  "missing": ["..."],
+  "confidence": "low | medium | high"
+}
+```
+
+代码中不要加入中文关键词规则。若需要 deterministic keyword extraction，也只作为辅助 guard，并应使用语言无关或配置化逻辑；中文验收语义应交给 model verifier。
+
+如果本阶段暂不接 model verifier，必须在代码和测试中明确这是 conservative fallback：有 acceptance criteria 但证据不足时返回 blocked，而不是 passed。
+
 ## 实现 TODO
 
 - [ ] 新增 node verifier，优先 deterministic evidence checks，必要时复用 completion evaluator 模型判断。
+- [ ] 为 semantic acceptance 预留 model verifier 接口；模型只判断，不执行动作。
 - [ ] 工具调用成功后不直接 completed，必须经过 node verifier。
 - [ ] verifier passed 时设置 node `completed`、`Acceptance.Verified=true`、`VerifiedAt`。
 - [ ] verifier failed 且可重试时保留 node status，交给 executor/scheduler 重试策略。
@@ -71,6 +116,8 @@ type VerificationResult struct {
 - [ ] task verifier 在关键 node 未完成时不允许 final answer。
 - [ ] task verifier 在全部关键 node completed 时 passed。
 - [ ] verifier 不绕过 tool policy 或 human confirm。
+- [ ] 中文 acceptance criteria 不依赖硬编码中文关键词。
+- [ ] model verifier 输出 malformed 时保守 blocked/failed，不 passed。
 
 ## 非目标
 
