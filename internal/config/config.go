@@ -38,9 +38,10 @@ func DefaultRoot() Root {
 			Fallbacks: []string{},
 		},
 		Execution: ExecutionConfig{
-			MaxParallelTools:  4,
-			MaxIterations:     intPtr(50),
-			InactivityTimeout: "5m",
+			MaxParallelTools:     4,
+			MaxIterations:        intPtr(50),
+			InactivityTimeout:    "5m",
+			MaxContractFollowups: 4,
 			ContextBudget: ContextBudgetConfig{
 				Enabled:                boolPtr(true),
 				SoftRatio:              0.65,
@@ -48,7 +49,16 @@ func DefaultRoot() Root {
 				RecentTurns:            8,
 				ToolResultTargetTokens: 1200,
 				MaxVisibleTools:        8,
-				TraceTelemetry:         boolPtr(true),
+				DefaultVisible: []string{
+					"file.read",
+					"file.write",
+					"file.edit",
+					"terminal.run",
+					"web.search",
+					"web.fetch",
+					"toolresult.read",
+				},
+				TraceTelemetry: boolPtr(true),
 			},
 		},
 		Memory: MemoryConfig{
@@ -333,20 +343,22 @@ type ModelConfig struct {
 }
 
 type ExecutionConfig struct {
-	MaxParallelTools  int                 `yaml:"max_parallel_tools"`
-	MaxIterations     *int                `yaml:"max_iterations"`
-	InactivityTimeout string              `yaml:"inactivity_timeout"`
-	ContextBudget     ContextBudgetConfig `yaml:"context_budget"`
+	MaxParallelTools     int                 `yaml:"max_parallel_tools"`
+	MaxIterations        *int                `yaml:"max_iterations"`
+	InactivityTimeout    string              `yaml:"inactivity_timeout"`
+	MaxContractFollowups int                 `yaml:"max_contract_followups"`
+	ContextBudget        ContextBudgetConfig `yaml:"context_budget"`
 }
 
 type ContextBudgetConfig struct {
-	Enabled                *bool   `yaml:"enabled"`
-	SoftRatio              float64 `yaml:"soft_ratio"`
-	HardRatio              float64 `yaml:"hard_ratio"`
-	RecentTurns            int     `yaml:"recent_turns"`
-	ToolResultTargetTokens int     `yaml:"tool_result_target_tokens"`
-	MaxVisibleTools        int     `yaml:"max_visible_tools"`
-	TraceTelemetry         *bool   `yaml:"trace_telemetry"`
+	Enabled                *bool    `yaml:"enabled"`
+	SoftRatio              float64  `yaml:"soft_ratio"`
+	HardRatio              float64  `yaml:"hard_ratio"`
+	RecentTurns            int      `yaml:"recent_turns"`
+	ToolResultTargetTokens int      `yaml:"tool_result_target_tokens"`
+	MaxVisibleTools        int      `yaml:"max_visible_tools"`
+	DefaultVisible         []string `yaml:"default_visible"`
+	TraceTelemetry         *bool    `yaml:"trace_telemetry"`
 }
 
 func (c ContextBudgetConfig) EnabledValue() bool {
@@ -398,6 +410,36 @@ func (c ContextBudgetConfig) MaxVisibleToolsValue() int {
 	return c.MaxVisibleTools
 }
 
+var defaultVisibleTools = []string{
+	"file.read",
+	"file.write",
+	"file.edit",
+	"terminal.run",
+	"web.search",
+	"web.fetch",
+	"toolresult.read",
+}
+
+func (c ContextBudgetConfig) DefaultVisibleValue() []string {
+	if len(c.DefaultVisible) == 0 {
+		return append([]string(nil), defaultVisibleTools...)
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(c.DefaultVisible))
+	for _, name := range c.DefaultVisible {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return append([]string(nil), defaultVisibleTools...)
+	}
+	return out
+}
+
 func (c ExecutionConfig) MaxIterationsValue() int {
 	if c.MaxIterations == nil {
 		return 50
@@ -414,6 +456,13 @@ func (c ExecutionConfig) InactivityTimeoutDuration() time.Duration {
 		return 0
 	}
 	return timeout
+}
+
+func (c ExecutionConfig) MaxContractFollowupsValue() int {
+	if c.MaxContractFollowups <= 0 {
+		return 4
+	}
+	return c.MaxContractFollowups
 }
 
 type MemoryConfig struct {

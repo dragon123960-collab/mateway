@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -44,9 +45,10 @@ type ToolExecutionContext struct {
 }
 
 type BeforeToolCallResult struct {
-	Block   bool
-	Reason  string
-	Context context.Context
+	Block     bool
+	Retryable bool
+	Reason    string
+	Context   context.Context
 }
 
 type AfterToolCallContext struct {
@@ -83,4 +85,67 @@ type Hooks struct {
 	PrepareNextTurn      func(context.Context, TurnContext) (NextTurnUpdate, error)
 	GetSteeringMessages  func(context.Context) ([]Message, error)
 	GetFollowUpMessages  func(context.Context) ([]Message, error)
+	ToolRetryBudget      func(ToolExecutionContext) int
+}
+
+func (h Hooks) toolRetryBudget(ctx ToolExecutionContext) int {
+	if h.ToolRetryBudget == nil {
+		return 0
+	}
+	return h.ToolRetryBudget(ctx)
+}
+
+func IsRetryableToolResult(toolName string, result ToolResult) bool {
+	if !result.IsError {
+		return false
+	}
+	lower := strings.ToLower(result.Content)
+	switch {
+	case toolName == "web.fetch":
+		return matchesRetryableFetchFailure(lower)
+	case toolName == "web.search":
+		if strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline") {
+			return true
+		}
+		return false
+	case toolName == "terminal.run":
+		if strings.Contains(lower, "signal: killed") || strings.Contains(lower, "timed_out") ||
+			strings.Contains(lower, "timed out") || strings.Contains(lower, "deadline") {
+			return true
+		}
+		return false
+	default:
+		if strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") ||
+			strings.Contains(lower, "deadline") || strings.Contains(lower, "i/o timeout") {
+			return true
+		}
+		return false
+	}
+}
+
+func matchesRetryableFetchFailure(lower string) bool {
+	if strings.Contains(lower, "ssrf") || strings.Contains(lower, "internal") {
+		return false
+	}
+	if strings.Contains(lower, "cloudflare") || strings.Contains(lower, "please enable cookies") ||
+		strings.Contains(lower, "please enable js") || strings.Contains(lower, "disable any ad blocker") ||
+		strings.Contains(lower, "captcha") || strings.Contains(lower, "challenge") {
+		return false
+	}
+	if strings.Contains(lower, "bot") && strings.Contains(lower, "protection") {
+		return false
+	}
+	if strings.Contains(lower, "too many requests") || strings.Contains(lower, "429") {
+		return true
+	}
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "deadline") ||
+		strings.Contains(lower, "client.timeout") || strings.Contains(lower, "i/o timeout") {
+		return true
+	}
+	if strings.Contains(lower, "connection refused") || strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "no such host") || strings.Contains(lower, "dns") {
+		return true
+	}
+	return false
 }

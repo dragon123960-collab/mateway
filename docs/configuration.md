@@ -1,77 +1,91 @@
-# 配置说明
+# 配置
 
-Mateway 从 `~/.mateway/config/` 读取本地配置。配置目标是保持小而稳定：runtime 只保留执行所需的通用开关，不再保留 followup/review/approval/i18n/script 这类已经删除的运行层配置。
+Mateway 默认在 `~/.mateway` 下存储本地运行时数据。`mateway init` 从 `assets/init` 创建初始配置、workspace、skills 和 memory 模板。
 
-## 根配置
+## 主目录布局
 
-当前稳定保留的根配置：
+```text
+~/.mateway/
+  config/
+    config.yaml
+    mateway.env
+    models/
+    channels/
+  workspace/
+    agents/
+    skills/
+    memory/
+  sessions/
+  trace/
+  observe/
+  indexes/
+  run/
+```
 
-- `app.name`
-- `app.home`
-- `app.workspace`
-- `model.default`
-- `model.fallbacks`
-- `model.roles.vision`
-- `model.roles.strong`
-- `execution.max_parallel_tools`
-- `execution.max_iterations`
-- `execution.inactivity_timeout`
-- `execution.context_budget`
-- `memory.enabled`
-- `memory.root`
-- `memory.recent_days`
-- `memory.auto_propose`
-- `memory.proposal_nudge`
-- `learning.enabled`
-- `learning.skill_crystallization`
-- `skills.catalogs`
-- `scheduler`
-- `security.enforce_workspace_paths`
-- `security.accessible_paths`
-- `security.terminal_sandbox`
-- search、provider、channel、model-specific configs
+## 主配置
 
-## Context Budget
+`config/config.yaml` 选择默认值和本地运行时行为：
 
-`execution.context_budget` controls invisible token-saving behavior before each model turn:
+- `app.home`: Mateway 主目录。
+- `app.workspace`: 用于 profiles、skills 和 memory 的工作区根目录。
+- `model`: 默认模型、备用模型和角色模型。
+- `agents`: agent profiles 和渠道绑定。
+- `channels`: 飞书和微信配置。
+- `security`: 工作区路径强制、可访问路径和终端沙箱设置。
+- `search`: 网页搜索供应商和预算。
+- `scheduler`: 本地调度循环设置。
 
-- `enabled`: enable per-turn budget packing.
-- `soft_ratio`: fraction of available input window where compaction starts.
-- `hard_ratio`: fraction of available input window that cannot be exceeded after compaction.
-- `recent_turns`: recent transcript turns to preserve before older messages are summarized or dropped.
-- `tool_result_target_tokens`: target size for compacted tool result content.
-- `max_visible_tools`: maximum tool schemas/contracts exposed to one model turn.
-- `trace_telemetry`: write budget diagnostics such as `context_budget_estimated`, `context_budget_compacted`, visible tools, hidden tools, and estimated token savings.
+模型定义位于 `config/models/*.yaml`。渠道定义位于 `config/channels/*.yaml`。
 
-The selected model's `context_window` and `max_tokens` come from `~/.mateway/config/models/*.yaml`. Runtime uses them to estimate input headroom; exact provider tokenizers are not required for the local estimate.
+## Agents
 
-已经删除或不应再出现在默认配置中的键：
+Agent profiles 可以设置：
 
-- `app.locale`
-- `app.message_catalog_dir`
-- `model.roles.followup`
-- `model.roles.review`
-- completion-review / no-progress execution knobs
-- chat approval config
-- `scripts`
-- remote profile confirmation config
+- profile id 和名称
+- 工作区根目录和 agent 目录
+- 模型选择
+- 心跳任务
+- 技能允许/拒绝列表
+- 工具允许/拒绝列表
+- 渠道绑定
 
-## 语言策略
+当名称冲突时，agent 特定的技能会覆盖共享工作区的技能。
 
-Prompt guidance、few-shot examples、config keys、trace keys、tool names 和 machine-readable output 保持英文。用户可见回复由模型根据用户消息自然决定语言。
+## Skills
 
-Runtime 不再使用本地化短语 alias 来触发 action。尤其不要通过“保存/忽略/save/ignore”等短语让 runtime 分支；需要机器判定的 pending 控制只接受明确的数字或结构化字段。
+默认技能作为可编辑的工作区资产安装：
 
-## 已存在的 HOME 目录
+```text
+workspace/skills/<skill_name>/SKILL.md
+```
 
-`mateway init` 会补齐缺失的默认文件，但不会覆盖已有 workspace skills 或用户编辑过的文件。已经存在的 `~/.mateway` 在 runtime 精简后可能仍保留旧 skill guidance、旧配置片段或旧 trace，需要显式检查和同步。
+它们应保持为技能，而非嵌入到 runtime 代码中。Runtime 代码拥有硬边界；技能拥有用户可编辑的工作流指导。
 
-初始化默认资源来自外置 `assets/init` 目录，而不是编译进二进制的大段模板。查找顺序是：`mateway init --assets-dir <dir>`、`MATEWAY_ASSETS_DIR`、binary 同级的 `assets/init`、当前工作目录下的 `assets/init`。release 包需要保留 `assets/` 目录；如果只复制裸 binary，`init` 会报错并提示设置 assets 路径。
+执行提示上下文是有门的：
 
-`mateway doctor` 会报告：
+- 规划阶段可以发现 skill header
+- contract 可以选择所需技能
+- 执行阶段只接收已选技能或显式的 skill/workflow 上下文
 
-- 默认工具 registry 是否仍包含已删除工具。
-- 本地 skills 是否还引用 `script.run` 或 `mateway script`。
-- 外部 skills 是否缺少 `.mateway/metadata.yaml` 适配信息。
-- config 是否还包含已删除配置键。
-- 默认模型、agent、目录、tool contract、workspace skills 是否存在明显漂移。
+## Secrets
+
+使用本地 secret store，不要将凭证写入配置、技能、脚本、trace 或提示中。
+
+```bash
+mateway secret set <secret_id>
+mateway secret list
+```
+
+`terminal.run` 接受 `env_secrets` 条目，例如：
+
+```json
+{"id":"service/token","env":"SERVICE_TOKEN"}
+```
+
+Trace 和 evidence store 只记录 secret id 和环境变量名称。
+
+## 安全说明
+
+`terminal.run` 仍然是唯一的命令执行工具。破坏性命令被 tool policy 阻断。文件工具强制执行路径验证。类 secret 值会从 trace、存储的 transcript、任务步骤和最终回复中脱敏。
+
+Docker 沙箱工作另行跟踪，不属于当前非沙箱计划的一部分。

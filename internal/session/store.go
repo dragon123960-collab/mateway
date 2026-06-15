@@ -73,6 +73,7 @@ type TaskContract struct {
 	Summary          string                 `json:"summary,omitempty"`
 	RequiresTools    bool                   `json:"requires_tools,omitempty"`
 	RequiredTools    []string               `json:"required_tools,omitempty"`
+	RequiredSkills   []RequiredSkill        `json:"required_skills,omitempty"`
 	RequiredEvidence []TaskEvidenceContract `json:"required_evidence,omitempty"`
 	PlanItems        []TaskPlanItem         `json:"plan_items,omitempty"`
 	ExpectedOutcome  string                 `json:"expected_outcome,omitempty"`
@@ -94,6 +95,13 @@ type TaskEvidenceContract struct {
 	Kind        string `json:"kind,omitempty"`
 	Tool        string `json:"tool,omitempty"`
 	Description string `json:"description,omitempty"`
+}
+
+type RequiredSkill struct {
+	Name   string `json:"name,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Body   string `json:"-"`
 }
 
 type TraceRef struct {

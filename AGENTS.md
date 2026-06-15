@@ -9,6 +9,7 @@
 - 除非用户明确要求，不要执行破坏性 Git 操作，例如 `reset --hard`、强制 checkout、删除分支。
 - 新增或修改 Go 代码后必须 `gofmt`。
 - 能用窄范围测试验证的，先跑相关包测试；影响 runtime、tool、session、gateway 等共享行为时，再扩大测试范围。
+- 代码中不要包含中文关键词等中文内容，除非是测试。
 
 ## 架构限制
 
@@ -24,7 +25,6 @@
 - 稳定说明放在 `docs/`，临时观察、dogfood、当前状态和 TODO 放在 `dev-notes/`。
 - 修改公开介绍、安装、命令、配置、功能列表、使用方式时，必须同步更新 `README.md` 和 `README.zh.md`。
 - 修改稳定机制说明时，必须同步检查 `docs/README.md` 的文档地图是否需要更新。
-- 修改当前开发状态、近期计划或 dogfood 结论时，必须同步检查 `dev-notes/CURRENT.md`、`dev-notes/TODO.md`、`dev-notes/full-chain-review.md` 是否需要更新。
 - 不要让文档保留已失效的工具名、trace key、配置项、路径或测试结论。
 - 中文说明可以写在文档里；tool name、trace key、config key、命令、机器可读示例尽量保持英文。
 

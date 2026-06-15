@@ -88,13 +88,19 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	if continuity.Continue && continuity.TaskID != "" {
 		state.ActivateTask(continuity.TaskID)
 		_ = trace.write(map[string]any{"type": "task_continuity", "task_id": continuity.TaskID, "reason": continuity.Reason})
+		_ = trace.write(map[string]any{"type": "task_recall_selected", "task_id": continuity.TaskID, "reason": continuity.Reason})
 	}
+	hadOpenTask := latestOpenTask(state) != nil
 	if shouldStartNewTaskInsteadOfSteering(state, userText) {
 		state.ActiveTask = ""
 	}
 	task := state.EnsureTask(msg.Text)
+	isNewTask := task.Goal == userText
 	if task.Goal != userText && state.ActiveTask == task.ID {
 		userText = mergeTaskAndInstruction(task.Goal, userText)
+	}
+	if !continuity.Continue && isNewTask && hadOpenTask {
+		_ = trace.write(map[string]any{"type": "task_continuity_not_selected", "text": msg.Text, "reason": "open task not matched"})
 	}
 	phase := tracePhaseExecute
 	if continuity.IsFollowup {
@@ -148,7 +154,30 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		"task_id":  task.ID,
 	})
 	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
-	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract) {
+	strategy := classifyContractStrategy(task.Goal, userText, contract)
+	discoveredSkills := skillsForRuntimeContext(rt.Config, profile.ID)
+	if invalid := validateContractTools(contract, rt.Tools, discoveredSkills); !invalid.IsValid() {
+		blocker := invalidContractBlockerText(contract, invalid, msg)
+		_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
+		state.BlockActiveTask("failed")
+		addInvalidContractExecutionEvent(state, task.ID, invalid)
+		if saveErr := rt.saveState(state, trace); saveErr != nil {
+			return Response{}, saveErr
+		}
+		_ = trace.write(map[string]any{"type": "reply", "text": blocker, "style": channel.StyleError})
+		return Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     blocker,
+				Style:    channel.StyleError,
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+			Failed:    true,
+		}, nil
+	}
+	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract, strategy) {
 		state.Pending = &session.PendingAction{
 			Kind:     session.PendingKindTaskPlanConfirm,
 			TaskID:   task.ID,
@@ -158,7 +187,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
-		_ = trace.write(map[string]any{"type": "task_plan_review", "task_id": task.ID})
+		_ = trace.write(map[string]any{"type": "task_plan_review", "task_id": task.ID, "required_tools": contract.RequiredTools, "required_skills": contract.RequiredSkills, "plan_item_count": len(contract.PlanItems)})
 		return Response{
 			Reply: channel.OutboundMessage{
 				Channel:  msg.Channel,
@@ -170,19 +199,30 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 			TracePath: trace.path,
 		}, nil
 	}
-	discoveredSkills := discoverSkillsForAgent(rt.Config, profile.ID, 12)
-	systemPrompt := prependTaskFocus(buildRuntimeSystemContext(rt.Config, profile), task, userText)
+	systemPrompt := prependTaskFocus(buildRuntimeSystemContextForTask(rt.Config, profile, userText, contract), task, userText)
 	if contractContext := renderTaskContractContext(contract); contractContext != "" {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
 	}
-	if phase != tracePhasePlanReview && len(contract.PlanItems) > 0 {
+	if phase != tracePhasePlanReview && len(contract.PlanItems) > 0 && strategy != contractStrategyDirect {
 		rt.emitProgress(msg, *state, task.ID, taskExecutionEventCount(*state, task.ID), channel.ProgressStep{
 			Title:   "plan",
 			Status:  "running",
 			Summary: renderTaskPlanForExecution(contract, userText),
 		})
 	}
-	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID)
+	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID, userText)
+	if strings.Contains(systemPrompt, "Continuity judgment:") {
+		tasks := recentPreviousTasks(*state, task.ID, 3)
+		var taskIDs []string
+		for _, t := range tasks {
+			taskIDs = append(taskIDs, t.ID)
+		}
+		_ = trace.write(map[string]any{
+			"type":             "task_recall_context_injected",
+			"prior_task_count": len(tasks),
+			"prior_task_ids":   taskIDs,
+		})
+	}
 	contextMessages := rt.Hooks.contextMessages(ctx, ContextHookInput{
 		Message:  msg,
 		State:    *state,
@@ -205,13 +245,14 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	})
 	var budgetResults []contextBudgetResult
 	agent.Model = budgetedModel{
-		inner:       agent.Model,
-		config:      rt.Config,
-		modelConfig: modelCfg,
-		trace:       trace,
-		state:       *state,
-		taskID:      task.ID,
-		results:     &budgetResults,
+		inner:          agent.Model,
+		config:         rt.Config,
+		modelConfig:    modelCfg,
+		trace:          trace,
+		state:          *state,
+		taskID:         task.ID,
+		results:        &budgetResults,
+		defaultVisible: rt.Config.Execution.ContextBudget.DefaultVisibleValue(),
 	}
 	agent.SystemPrompt = systemPrompt
 	agent.Messages = messages
@@ -219,7 +260,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	agent.MaxIterations = maxIterations(rt.Config)
 	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
 	defer stopActivityWatch()
-	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil)
+	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil, discoveredSkills)
 	agent.Hooks = agentHooks
 	result, err := agent.Continue(runCtx)
 	if err != nil {
@@ -262,32 +303,69 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 	addUsage(&state.Usage, usage)
 	writeUsageTrace(trace, usage)
 	taskCompleted := false
-	emptyActionPromise := looksLikeEmptyActionPromise(finalText)
+	contractUnsatisfied := false
+	var classification FinalClassification
 	if state.Pending == nil {
-		contractValidation := validateTaskContract(taskContractFromState(*state, task.ID), taskFromState(*state, task.ID))
-		if result.StopReason != "" {
-			state.BlockActiveTask("failed")
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
-			_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
-		} else if !contractValidation.Satisfied {
-			state.BlockActiveTask("failed")
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "task_contract_unsatisfied", Status: "failed", Summary: strings.Join(contractValidation.Missing, "; "), Evidence: map[string]any{"missing": contractValidation.Missing}})
-			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": task.ID, "status": "failed", "missing": contractValidation.Missing})
-		} else if looksLikeInputRequest(finalText) {
-			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
-			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
-			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
-		} else if emptyActionPromise || looksLikeUnexecutedCommitment(finalText) {
-			state.BlockActiveTask("failed")
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "empty_action_promise", Status: "failed", Summary: summarize(finalText)})
-			_ = trace.write(map[string]any{"type": "empty_action_promise", "task_id": task.ID, "status": "failed"})
-		} else {
+		contract := taskContractFromState(*state, task.ID)
+		currentTask := taskFromState(*state, task.ID)
+		// Re-derive the unavailable tool check and followup count from the
+		// task itself, so the post-loop classification does not depend on
+		// any state the hook passed back through a pointer.
+		unavailable := checkUnavailableContractTools(rt, msg, contract)
+		classification = EvaluateFinal(FinalInput{
+			Contract:         contract,
+			Task:             currentTask,
+			FinalText:        finalText,
+			StopReason:       result.StopReason,
+			UnavailableTools: unavailable,
+			AgentRegistry:    agentToolsForMessage(rt, msg),
+			FullRegistry:     rt.Tools,
+			FollowupCount:    countContractFollowupEvents(currentTask),
+			MaxFollowups:     rt.Config.Execution.MaxContractFollowupsValue(),
+		})
+		switch classification.State {
+		case "completed":
 			completeNoToolPlanItems(state, task.ID, finalText)
 			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
 			updateSessionSummary(state, task.ID, finalText, "completed", trace)
 			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
 			taskCompleted = true
+		case "await_user_input":
+			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
+			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
+			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
+			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
+		case "failed":
+			switch classification.BlockerKind {
+			case completionBlockerStopReason:
+				state.BlockActiveTask("failed")
+				state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
+				_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
+			default:
+				contractUnsatisfied = true
+				state.BlockActiveTask("failed")
+				followupAttempts := countContractFollowupEvents(currentTask)
+				evidence := buildBlockedTaskEvidence(classification, followupAttempts)
+				state.AddExecutionEvent(task.ID, session.ExecutionEvent{
+					Type:     "task_contract_unsatisfied",
+					Status:   "failed",
+					Summary:  classification.BlockerReason,
+					Evidence: evidence,
+				})
+				// The hook already wrote contract_tool_unavailable or
+				// task_contract_followup_limit to the trace when it forced
+				// the loop to stop. The post-loop only records the task
+				// state change as a single task_contract_unsatisfied
+				// execution event; no parallel _post trace event.
+			}
+		}
+	}
+	if contractUnsatisfied && classification.BlockerText != "" {
+		finalText = strings.TrimSpace(finalText)
+		if finalText != "" {
+			finalText = finalText + classification.BlockerText
+		} else {
+			finalText = classification.BlockerText
 		}
 	}
 	if err := rt.saveState(state, trace); err != nil {
@@ -347,7 +425,7 @@ func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state
 		}
 	}
 	style := channel.MessageStyle("")
-	failed := result.StopReason != "" || emptyActionPromise
+	failed := result.StopReason != "" || (state.Pending == nil && classification.State == "failed")
 	if failed && style == "" {
 		style = channel.StylePartial
 	}

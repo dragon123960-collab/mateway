@@ -131,7 +131,13 @@ func meaningfulTokens(text string) []string {
 	return out
 }
 
-func shouldPauseForTaskPlan(contract session.TaskContract) bool {
+func shouldPauseForTaskPlan(contract session.TaskContract, strategy contractStrategy) bool {
+	if strategy == contractStrategyDirect {
+		return false
+	}
+	if strategy == contractStrategyAutoContract {
+		return false
+	}
 	if contract.RequiresTools || len(contract.RequiredTools) > 0 || len(contract.RequiredEvidence) > 0 {
 		return true
 	}
@@ -185,11 +191,7 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 		return resp, true, err
 	case "replan":
 		if pending.ReplanCount >= 5 {
-			text := "Replan limit reached. Reply 1 to execute the current plan or /new to start over."
-			if prefersChinese(msg.Text, task.Goal) {
-				text = "已达到重新规划次数上限。回复 1 执行当前计划，或发送 /new 开始新任务。"
-			}
-			resp := rt.reply(msg, text, channel.StyleInputRequired)
+			resp := rt.reply(msg, "Replan limit reached. Reply 1 to execute the current plan or /new to start over.", channel.StyleInputRequired)
 			resp.TraceID = trace.id
 			resp.TracePath = trace.path
 			return resp, true, nil
@@ -208,6 +210,21 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 			userText = strings.TrimSpace(task.Goal + "\nPlan feedback: " + feedback)
 		}
 		contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
+		if invalid := validateContractTools(contract, rt.Tools, skillsForRuntimeContext(rt.Config, rt.Pool.ProfileForMessage(msg).ID)); !invalid.IsValid() {
+			blocker := invalidContractBlockerText(contract, invalid, msg)
+			_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
+			state.BlockActiveTask("failed")
+			addInvalidContractExecutionEvent(state, task.ID, invalid)
+			if saveErr := rt.saveState(state, trace); saveErr != nil {
+				return Response{}, true, saveErr
+			}
+			return Response{Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     blocker,
+				Style:    channel.StyleError,
+			}, TraceID: trace.id, TracePath: trace.path, Failed: true}, true, nil
+		}
 		state.Pending = pending
 		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhasePlanReview, MessageID: msg.ID})
 		if err := rt.saveState(state, trace); err != nil {
@@ -231,9 +248,29 @@ func updatePlanItemsForToolResult(state *session.State, taskID string, toolName 
 		return
 	}
 	contract := *task.Execution.Contract
-	item := planItemForTool(&contract, toolName, "running")
+	item := planItemForTool(&contract, toolName, "running", "pending")
 	if item == nil {
-		item = planItemForTool(&contract, toolName, "pending")
+		return
+	}
+	next := "completed"
+	if status == "failed" || status == "suspect" || status == "blocked" {
+		next = "blocked"
+	}
+	item.Status = next
+	item.Evidence = summarize(evidence)
+	item.UpdatedAt = time.Now()
+	state.SetTaskContract(taskID, contract)
+}
+
+func updatePlanItemForFileReadPath(state *session.State, taskID string, path string, status string, evidence string) {
+	task := state.TaskByID(taskID)
+	if task == nil || task.Execution.Contract == nil {
+		return
+	}
+	contract := *task.Execution.Contract
+	item := findFileReadPlanItemForPath(&contract, path)
+	if item == nil {
+		item = planItemForTool(&contract, "file.read", "running", "pending")
 	}
 	if item == nil {
 		return
@@ -246,6 +283,42 @@ func updatePlanItemsForToolResult(state *session.State, taskID string, toolName 
 	item.Evidence = summarize(evidence)
 	item.UpdatedAt = time.Now()
 	state.SetTaskContract(taskID, contract)
+}
+
+func findFileReadPlanItemForPath(contract *session.TaskContract, path string) *session.TaskPlanItem {
+	if contract == nil || path == "" {
+		return nil
+	}
+	lookFor := strings.ToLower(strings.TrimSpace(path))
+	if lookFor == "" {
+		return nil
+	}
+	for i := range contract.PlanItems {
+		item := &contract.PlanItems[i]
+		if !strings.EqualFold(strings.TrimSpace(item.Tool), "file.read") {
+			continue
+		}
+		criteria := strings.ToLower(strings.TrimSpace(item.Criteria))
+		title := strings.ToLower(strings.TrimSpace(item.Title))
+		if criteria != "" && (strings.Contains(criteria, lookFor) || strings.Contains(lookFor, criteria)) {
+			return item
+		}
+		if title != "" && (strings.Contains(title, lookFor) || strings.Contains(lookFor, title)) {
+			return item
+		}
+	}
+	for _, skill := range contract.RequiredSkills {
+		skillPath := strings.ToLower(strings.TrimSpace(skill.Path))
+		if skillPath != "" && skillPath == lookFor {
+			for i := range contract.PlanItems {
+				item := &contract.PlanItems[i]
+				if fileReadPlanItemMatchesSkill(*item, skill.Name, skill.Path) {
+					return item
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func taskHasTracePhase(task *session.TaskNode, phase string) bool {
@@ -308,18 +381,50 @@ func planItemForTool(contract *session.TaskContract, toolName string, statuses .
 	if wantTool == "" {
 		return nil
 	}
-	allowed := map[string]bool{}
-	for _, status := range statuses {
-		allowed[normalizePlanStatus(status)] = true
+	if len(statuses) > 0 {
+		// Search in priority order: first status has highest priority.
+		for _, status := range statuses {
+			allowed := normalizePlanStatus(status)
+			for i := range contract.PlanItems {
+				item := &contract.PlanItems[i]
+				if !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
+					continue
+				}
+				if normalizePlanStatus(item.Status) == allowed {
+					return item
+				}
+			}
+		}
+		// Fallback: allow retry of a blocked item when "blocked" is not explicitly asked for.
+		if !containsStatus(statuses, "blocked") {
+			for i := range contract.PlanItems {
+				item := &contract.PlanItems[i]
+				if !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
+					continue
+				}
+				if normalizePlanStatus(item.Status) == "blocked" {
+					return item
+				}
+			}
+		}
+		return nil
 	}
+	// No status filter: return first matching item.
 	for i := range contract.PlanItems {
 		item := &contract.PlanItems[i]
 		if strings.TrimSpace(item.Tool) == "" || !strings.EqualFold(strings.TrimSpace(item.Tool), wantTool) {
 			continue
 		}
-		if len(allowed) == 0 || allowed[normalizePlanStatus(item.Status)] {
-			return item
-		}
+		return item
 	}
 	return nil
+}
+
+func containsStatus(statuses []string, target string) bool {
+	for _, s := range statuses {
+		if normalizePlanStatus(s) == target {
+			return true
+		}
+	}
+	return false
 }

@@ -18,3 +18,5 @@ coverage.out
 scripts/
 AGENTS.md
 issue.md
+.reasonix/
+.codegraph/

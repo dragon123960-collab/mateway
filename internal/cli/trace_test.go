@@ -27,9 +27,9 @@ func TestPrintTraceEventsRendersProcessLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl")
 	lines := []string{
 		`{"type":"model_start"}`,
-		`{"type":"message_start","duration_ms":12,"message":{"ToolCalls":[{"Name":"project.index"}]}}`,
-		`{"type":"tool_execution_start","tool_call":{"Name":"project.index","Args":{"path":"/tmp/project"}}}`,
-		`{"type":"tool_execution_end","duration_ms":34,"tool_call":{"Name":"project.index"},"tool_result":{"Content":"found files"}}`,
+		`{"type":"message_start","duration_ms":12,"message":{"ToolCalls":[{"Name":"file.read"}]}}`,
+		`{"type":"tool_execution_start","tool_call":{"Name":"file.read","Args":{"path":"/tmp/project"}}}`,
+		`{"type":"tool_execution_end","duration_ms":34,"tool_call":{"Name":"file.read"},"tool_result":{"Content":"found files"}}`,
 		`{"type":"reply","text":"done"}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
@@ -42,9 +42,9 @@ func TestPrintTraceEventsRendersProcessLines(t *testing.T) {
 	text := out.String()
 	for _, want := range []string{
 		"+ Thought:",
-		"prepared tool call project.index",
-		"→ Index /tmp/project",
-		"✓ Index (34ms)",
+		"prepared tool call file.read",
+		"→ Read /tmp/project",
+		"✓ Read (34ms)",
 		"Assistant\ndone",
 	} {
 		if !strings.Contains(text, want) {
@@ -93,6 +93,8 @@ func TestPrintTraceReportShowsContractToolsAndJudgment(t *testing.T) {
 		`{"type":"task_contract_created","summary":"check singbox status","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"tool":"terminal.run","description":"systemctl status output"}],"expected_outcome":"status report"}`,
 		`{"type":"model_route_selected","provider":"minimax","model":"MiniMax-M3"}`,
 		`{"type":"context_budget_estimated","tools":["web.search","terminal.run"],"hidden_tools":2}`,
+		`{"type":"context_budget_trimmed","trimmed_tools":["schedule.manage","task.search"],"reason":"visible_tool_budget"}`,
+		`{"type":"context_budget_non_default_exposed","non_default_exposed":{"terminal.run":"contract","schedule.manage":"recent"}}`,
 		`{"type":"hook_event","hook":"tool_policy_hook","tool":"terminal.run","block":false}`,
 		`{"type":"tool_execution_end","duration_ms":34,"tool_call":{"Name":"terminal.run","Args":{"command":"ssh overseas 'systemctl status sing-box --no-pager'"}},"tool_result":{"Content":"active","IsError":false}}`,
 		`{"type":"task_contract_satisfied","status":"completed"}`,
@@ -115,6 +117,8 @@ func TestPrintTraceReportShowsContractToolsAndJudgment(t *testing.T) {
 		"minimax/MiniMax-M3",
 		"Visible Tools",
 		"web.search, terminal.run",
+		"trimmed (budget): schedule.manage, task.search",
+		"non-default exposed: schedule.manage:recent, terminal.run:contract",
 		"Tool Process",
 		"policy allowed: terminal.run",
 		"ok terminal.run",

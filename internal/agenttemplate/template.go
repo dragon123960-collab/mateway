@@ -126,7 +126,7 @@ This file defines tool-use boundaries for agent %q. Edit it when this agent need
 
 - Respect each tool's risk, arguments, evidence, and confirmation boundary.
 - Prefer small, verifiable tool calls over broad actions.
-- For broad local inspection, prefer bounded project.index calls before terminal directory listings.
+- For broad local inspection, prefer bounded terminal.run find or ls calls before terminal directory listings.
 - Use fresh search or fetch tools for current facts such as news, prices, laws, schedules, APIs, and software versions.
 - Prefer official or primary sources when available.
 - Report tool failures plainly and do not invent missing results.

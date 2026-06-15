@@ -81,121 +81,6 @@ func TestToolResultReadRetrievesRawRef(t *testing.T) {
 	}
 }
 
-func TestProjectIndexLimitsWideDirectory(t *testing.T) {
-	home := t.TempDir()
-	root := filepath.Join(home, "wide")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 300; i++ {
-		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("file-%03d.txt", i)), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "project.index",
-		Args: map[string]any{"path": root, "limit": 25},
-	})
-	if result.IsError {
-		t.Fatalf("project.index failed: %s", result.Content)
-	}
-	if lines := strings.Split(strings.TrimSpace(result.Content), "\n"); len(lines) != 25 {
-		t.Fatalf("expected 25 entries, got %d", len(lines))
-	}
-	if result.Evidence["partial"] != true || result.Evidence["entries"] != 25 {
-		t.Fatalf("expected partial evidence, got %#v", result.Evidence)
-	}
-}
-
-func TestProjectIndexMarksCommonHeavyDirectories(t *testing.T) {
-	home := t.TempDir()
-	root := filepath.Join(home, "repo")
-	for _, name := range []string{"node_modules", ".git", "src"} {
-		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "project.index",
-		Args: map[string]any{"path": root},
-	})
-	if result.IsError {
-		t.Fatalf("project.index failed: %s", result.Content)
-	}
-	if !strings.Contains(result.Content, "DIR:  .git/ [skip]") || !strings.Contains(result.Content, "DIR:  node_modules/ [skip]") {
-		t.Fatalf("expected skip markers, got %q", result.Content)
-	}
-	if strings.Contains(result.Content, "DIR:  src/ [skip]") {
-		t.Fatalf("did not expect src skip marker, got %q", result.Content)
-	}
-	if result.Evidence["skipped"] != 2 {
-		t.Fatalf("expected skipped evidence, got %#v", result.Evidence)
-	}
-}
-
-func TestProjectIndexHonorsMaxDepthAndSkipDirs(t *testing.T) {
-	home := t.TempDir()
-	root := filepath.Join(home, "repo")
-	for _, path := range []string{
-		filepath.Join(root, "src", "pkg", "deep"),
-		filepath.Join(root, "generated", "nested"),
-	} {
-		if err := os.MkdirAll(path, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "src", "pkg", "deep", "hidden.go"), []byte("package deep\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "generated", "nested", "artifact.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	result := ProjectIndexTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "project.index",
-		Args: map[string]any{"path": root, "max_depth": 2, "skip_dirs": []any{"generated"}},
-	})
-	if result.IsError {
-		t.Fatalf("project.index failed: %s", result.Content)
-	}
-	if !strings.Contains(result.Content, "DIR:  generated/ [skip]") {
-		t.Fatalf("expected custom skip marker, got %q", result.Content)
-	}
-	if strings.Contains(result.Content, "artifact.txt") || strings.Contains(result.Content, "hidden.go") {
-		t.Fatalf("expected bounded scan to omit deep/skipped files, got %q", result.Content)
-	}
-	if result.Evidence["max_depth"] != 2 || result.Evidence["skipped"] != 1 {
-		t.Fatalf("expected max_depth and skipped evidence, got %#v", result.Evidence)
-	}
-}
-
-func TestProjectIndexHonorsCancelledContext(t *testing.T) {
-	home := t.TempDir()
-	root := filepath.Join(home, "repo")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	result := ProjectIndexTool{Config: cfg}.Run(ctx, agentcore.ToolCall{
-		ID:   "call_1",
-		Name: "project.index",
-		Args: map[string]any{"path": root},
-	})
-	if !result.IsError || !strings.Contains(result.Content, "context canceled") {
-		t.Fatalf("expected context cancellation, got %#v", result)
-	}
-}
-
 func TestTerminalRunReportsTimeoutEvidence(t *testing.T) {
 	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
 		ID:   "call_1",
@@ -876,11 +761,12 @@ func TestFileDeleteRejectsSymlinkToOutsideAllowedRoot(t *testing.T) {
 	}
 }
 
-func TestScheduleCreateToolWritesTask(t *testing.T) {
+func TestScheduleManageToolWritesTask(t *testing.T) {
 	home := t.TempDir()
 	runAt := "2026-05-29T16:30:00+08:00"
-	tool := ScheduleCreateTool{Config: &config.Root{App: config.AppConfig{Home: home}}}
+	tool := ScheduleManageTool{Config: &config.Root{App: config.AppConfig{Home: home}}}
 	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{
+		"action":      "create",
 		"text":        "提醒我检查日报",
 		"run_at":      runAt,
 		"session_key": "feishu:chat_1",
@@ -1003,5 +889,203 @@ func TestFileReadRejectsBinaryFile(t *testing.T) {
 	result := tool.Run(nil, agentcore.ToolCall{ID: "1", Args: map[string]any{"path": path}})
 	if !result.IsError || !strings.Contains(result.Content, "binary") {
 		t.Fatalf("expected binary file error, got %#v", result)
+	}
+}
+
+func TestFileEditSingleReplace(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "edit.txt")
+	if err := os.WriteFile(target, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "hello", "new_string": "hi"},
+	})
+	if result.IsError || result.Evidence["replaced"] != true || result.Evidence["matches"] != 1 {
+		t.Fatalf("expected single replace, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hi world" {
+		t.Fatalf("content = %q want %q", data, "hi world")
+	}
+}
+
+func TestFileEditMultiMatchWithoutReplaceAllFails(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "edit.txt")
+	content := "line one\nline two\nline one\n"
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "line one", "new_string": "replaced"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "found 2 times") || result.Evidence["matches"] != 2 {
+		t.Fatalf("expected multi-match error, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Fatalf("file should be unchanged, got %q", data)
+	}
+}
+
+func TestFileEditReplaceAll(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "edit.txt")
+	content := "line one\nline two\nline one\n"
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "line one", "new_string": "replaced", "replace_all": true},
+	})
+	if result.IsError || result.Evidence["matches"] != 2 || result.Evidence["replace_all"] != true {
+		t.Fatalf("expected replace all, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "replaced\nline two\nreplaced\n" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestFileEditOldStringNotFound(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "edit.txt")
+	if err := os.WriteFile(target, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "notfound", "new_string": "x"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "old_string not found") || result.Evidence["matches"] != 0 {
+		t.Fatalf("expected not-found error, got %#v", result)
+	}
+}
+
+func TestFileEditEmptyOldStringFails(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "edit.txt")
+	if err := os.WriteFile(target, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "", "new_string": "x"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "old_string must not be empty") {
+		t.Fatalf("expected empty old_string error, got %#v", result)
+	}
+}
+
+func TestFileEditRejectsBinaryFile(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "bin.bin")
+	if err := os.WriteFile(target, []byte{0, 1, 2, 3}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "x", "new_string": "y"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "binary") {
+		t.Fatalf("expected binary file error, got %#v", result)
+	}
+}
+
+func TestFileEditPreservesFilePermissions(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "script.sh")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\necho old\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "old", "new_string": "new"},
+	})
+	if result.IsError {
+		t.Fatalf("expected success, got %#v", result)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("expected 0755 permissions, got %#o", info.Mode().Perm())
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "#!/bin/sh\necho new\n" {
+		t.Fatalf("content = %q err=%v", data, err)
+	}
+}
+
+func TestFileEditCreatesProposalForCoreAgentProfile(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "user.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "old", "new_string": "new"},
+	})
+	if result.IsError || result.Evidence["requires_review"] != true || result.Evidence["proposal_id"].(string) == "" {
+		t.Fatalf("expected profile proposal, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old content" {
+		t.Fatalf("core profile should not be overwritten before review, got %q", data)
+	}
+}
+
+func TestFileEditAllowsDeleteWithEmptyNewString(t *testing.T) {
+	home := t.TempDir()
+	target := filepath.Join(home, "edit.txt")
+	if err := os.WriteFile(target, []byte("beforeTAGafter"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "TAG", "new_string": ""},
+	})
+	if result.IsError || result.Evidence["replaced"] != true {
+		t.Fatalf("expected delete-by-empty, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "beforeafter" {
+		t.Fatalf("content = %q", data)
 	}
 }

@@ -19,17 +19,11 @@ func NewRegistry(cfg ...*config.Root) *agentcore.ToolRegistry {
 	registry := agentcore.NewToolRegistry()
 	registry.Register(FileReadTool{Config: root})
 	registry.Register(FileWriteTool{Config: root})
+	registry.Register(FileEditTool{Config: root})
 	registry.Register(FileDeleteTool{Config: root})
-	registry.Register(ProjectIndexTool{Config: root})
 	registry.Register(TerminalRunTool{Config: root})
 	registry.Register(SecretSetTool{Config: root})
-	registry.Register(ScheduleCreateTool{Config: root})
-	registry.Register(ScheduleListTool{Config: root})
-	registry.Register(ScheduleUpdateTool{Config: root})
-	registry.Register(SchedulePauseTool{Config: root})
-	registry.Register(ScheduleResumeTool{Config: root})
-	registry.Register(ScheduleDeleteTool{Config: root})
-	registry.Register(ScheduleRunNowTool{Config: root})
+	registry.Register(ScheduleManageTool{Config: root})
 	registry.Register(TaskSearchTool{Config: root})
 	registry.Register(TaskResumeTool{Config: root})
 	registry.Register(ToolResultReadTool{Config: root})
@@ -96,18 +90,12 @@ func (EchoTool) ToolContract() agentcore.ToolContract {
 
 type FileWriteTool struct{ Config *config.Root }
 type FileReadTool struct{ Config *config.Root }
+type FileEditTool struct{ Config *config.Root }
 type FileDeleteTool struct{ Config *config.Root }
-type ProjectIndexTool struct{ Config *config.Root }
 type ToolResultReadTool struct{ Config *config.Root }
 
 type SecretSetTool struct{ Config *config.Root }
-type ScheduleCreateTool struct{ Config *config.Root }
-type ScheduleListTool struct{ Config *config.Root }
-type ScheduleUpdateTool struct{ Config *config.Root }
-type SchedulePauseTool struct{ Config *config.Root }
-type ScheduleResumeTool struct{ Config *config.Root }
-type ScheduleDeleteTool struct{ Config *config.Root }
-type ScheduleRunNowTool struct{ Config *config.Root }
+type ScheduleManageTool struct{ Config *config.Root }
 type TaskSearchTool struct{ Config *config.Root }
 type TaskResumeTool struct{ Config *config.Root }
 

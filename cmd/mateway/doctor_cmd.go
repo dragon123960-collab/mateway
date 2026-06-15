@@ -230,8 +230,8 @@ func searchProviderKnown(name string) bool {
 func doctorToolRegistry(cfg *config.Root) []doctorCheck {
 	registry := runtime.New(cfg).Tools
 	defaultNames := []string{
-		"file.read", "file.write", "file.delete", "project.index", "terminal.run", "toolresult.read", "web.search", "web.fetch", "secret.set",
-		"schedule.create", "schedule.list", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run_now",
+		"file.read", "file.write", "file.edit", "file.delete", "terminal.run", "toolresult.read", "web.search", "web.fetch", "secret.set",
+		"schedule.manage",
 		"task.search", "task.resume",
 	}
 	var checks []doctorCheck
@@ -240,9 +240,9 @@ func doctorToolRegistry(cfg *config.Root) []doctorCheck {
 			checks = append(checks, doctorCheck{Status: doctorFAIL, Name: "tool.missing", Message: name})
 		}
 	}
-	for _, name := range []string{"script.run"} {
+	for _, name := range []string{"script.run", "project.index", "schedule.create", "schedule.list", "schedule.update", "schedule.pause", "schedule.resume", "schedule.delete", "schedule.run_now"} {
 		if _, ok := registry.Get(name); ok {
-			checks = append(checks, doctorCheck{Status: doctorFAIL, Name: "tool.unexpected", Message: name})
+			checks = append(checks, doctorCheck{Status: doctorFAIL, Name: "tool.unexpected", Message: name + " should not be registered"})
 		}
 	}
 	for _, tool := range registry.List() {

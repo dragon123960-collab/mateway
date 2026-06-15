@@ -216,14 +216,14 @@ func TestRenderReplyMessageIncludesProgress(t *testing.T) {
 		Text:  "Processing...",
 		Style: "processing",
 		Progress: []channel.ProgressStep{
-			{Tool: "project.index", Status: "accepted", Summary: "listed files", DurationMS: 42},
+			{Tool: "file.read", Status: "accepted", Summary: "listed files", DurationMS: 42},
 			{Tool: "terminal.run", Status: "failed", Summary: strings.Repeat("long ", 40), DurationMS: 1000, TimedOut: true},
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Process", "project.index", "terminal.run", "timed out"} {
+	for _, want := range []string{"Process", "file.read", "terminal.run", "timed out"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected %q in progress card, got %s", want, content)
 		}

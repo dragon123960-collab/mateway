@@ -78,10 +78,6 @@ func compactToolContent(toolName, content string, limit int) (string, string) {
 		if compacted := compactFileReadContent(content, limit); len(compacted) < len(content) {
 			return compacted, "file_read"
 		}
-	case "project.index":
-		if compacted := compactProjectIndexContent(content, limit); len(compacted) < len(content) {
-			return compacted, "project_index"
-		}
 	case "web.search", "memory.search", "task.search":
 		if compacted := compactSearchContent(content, limit); len(compacted) < len(content) {
 			return compacted, "search_hits"

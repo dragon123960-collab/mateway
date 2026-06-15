@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -9,9 +11,10 @@ import (
 	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/session"
+	toolpkg "github.com/dongping/mateway/internal/tool"
 )
 
-func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message) agentcore.Hooks {
+func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage, taskID, userText string, trace *traceRecorder, steering []agentcore.Message, discoveredSkills []discoveredSkill) agentcore.Hooks {
 	steeringSent := false
 	progressEventOffset := taskExecutionEventCount(*state, taskID)
 	hooks := agentcore.Hooks{
@@ -52,6 +55,9 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 		ToolProgressInterval: func(input agentcore.ToolExecutionContext) time.Duration {
 			return runtimeToolProgressInterval(rt.Config, input.ToolCall.Name)
 		},
+		ToolRetryBudget: func(input agentcore.ToolExecutionContext) int {
+			return runtimeToolRetryBudget(rt.Config, input.ToolCall.Name)
+		},
 		GetSteeringMessages: func(context.Context) ([]agentcore.Message, error) {
 			if steeringSent {
 				return nil, nil
@@ -76,6 +82,50 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 				rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "blocked", Summary: policy.Reason})
 				return agentcore.BeforeToolCallResult{Block: true, Reason: policy.Reason}, nil
 			}
+			// Only gate a skill's execution tool until that skill is read.
+			// The phase B requirement is "skill read before related execution tool", not before all tools.
+			// Use the skill's execution hint to determine which specific tool is the skill's execution tool.
+			if input.ToolCall.Name != "file.read" {
+				contract := taskContractFromState(*state, taskID)
+				var steps []session.TaskStep
+				if t := state.TaskByID(taskID); t != nil {
+					steps = t.Steps
+				}
+				for _, skill := range contract.RequiredSkills {
+					if !requiredSkillReadCompletedWithSteps(steps, contract, skill) {
+						// Determine which tool is the execution tool for this skill.
+						execTool := skillExecutionTool(skill, contract, discoveredSkills)
+						if execTool == "" || !strings.EqualFold(input.ToolCall.Name, execTool) {
+							continue
+						}
+						blockMsg := fmt.Sprintf("required skill %s must be read before execution tools. Call file.read for its SKILL.md first.", skill.Name)
+						state.AddExecutionEvent(taskID, session.ExecutionEvent{
+							Type:    "tool_blocked",
+							Status:  "failed",
+							Tool:    input.ToolCall.Name,
+							Summary: blockMsg,
+							Evidence: map[string]any{
+								"reason":         blockMsg,
+								"skill_not_read": skill.Name,
+							},
+						})
+						_ = trace.write(map[string]any{
+							"type":    "tool_blocked_skill_not_read",
+							"task_id": taskID,
+							"tool":    input.ToolCall.Name,
+							"skill":   skill.Name,
+						})
+						rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{
+							Tool:    input.ToolCall.Name,
+							Status:  "blocked",
+							Summary: blockMsg,
+						})
+						// Retryable block keeps the loop alive so the contract follow-up
+						// guides the model to read the skill before retrying.
+						return agentcore.BeforeToolCallResult{Block: true, Retryable: true, Reason: blockMsg}, nil
+					}
+				}
+			}
 			markPlanItemRunning(state, taskID, input.ToolCall.Name)
 			rt.emitProgress(msg, *state, taskID, progressEventOffset, channel.ProgressStep{Tool: input.ToolCall.Name, Status: "running", Summary: summarizeToolCall(input.ToolCall)})
 			return agentcore.BeforeToolCallResult{}, nil
@@ -91,6 +141,13 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 			}, trace)
 			if observe.TaskStep != nil {
 				state.AddStep(taskID, *observe.TaskStep)
+				stepID := observe.TaskStep.ID
+				if stepID == "" {
+					ct := taskFromState(*state, taskID)
+					if len(ct.Steps) > 0 {
+						stepID = ct.Steps[len(ct.Steps)-1].ID
+					}
+				}
 				evidence := map[string]any{
 					"accepted": observe.TaskStep.Accepted,
 					"mutation": observe.TaskStep.Mutation,
@@ -102,15 +159,30 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 						evidence[key] = value
 					}
 				}
+				if timedOut, _ := input.ToolResult.Evidence["timed_out"].(bool); timedOut {
+					_ = trace.write(map[string]any{
+						"type":         "tool_timeout",
+						"task_id":      taskID,
+						"tool":         input.ToolCall.Name,
+						"tool_call_id": input.ToolCall.ID,
+						"elapsed_ms":   input.ToolResult.Evidence["elapsed_ms"],
+						"deadline_ms":  input.ToolResult.Evidence["deadline_ms"],
+					})
+				}
 				state.AddExecutionEvent(taskID, session.ExecutionEvent{
 					Type:     "tool_result",
 					Status:   observe.TaskStep.Status,
 					Tool:     input.ToolCall.Name,
-					StepID:   observe.TaskStep.ID,
+					StepID:   stepID,
 					Summary:  observe.TaskStep.Summary,
 					Evidence: evidence,
 				})
-				updatePlanItemsForToolResult(state, taskID, input.ToolCall.Name, observe.TaskStep.Status, observe.TaskStep.Summary)
+				if input.ToolCall.Name == "file.read" {
+					path, _ := input.ToolCall.Args["path"].(string)
+					updatePlanItemForFileReadPath(state, taskID, path, observe.TaskStep.Status, observe.TaskStep.Summary)
+				} else {
+					updatePlanItemsForToolResult(state, taskID, input.ToolCall.Name, observe.TaskStep.Status, observe.TaskStep.Summary)
+				}
 				switch observe.TaskStep.Status {
 				case "accepted":
 				case "failed", "suspect":
@@ -123,45 +195,162 @@ func (rt Runtime) hooksForState(state *session.State, msg channel.InboundMessage
 					Evidence: evidence,
 				}))
 			}
-			result := compactToolResultForModel(input.ToolCall, input.ToolResult, rt.home(), trace.id)
+
+			if input.ToolCall.Name == "web.fetch" && input.ToolResult.IsError {
+				kind, _ := ClassifyFetchFailure(input.ToolResult)
+				if kind != "" {
+					rawURL, _ := input.ToolCall.Args["url"].(string)
+					domain := ""
+					if parsed, err := resolveFetchURL(rawURL); err == nil {
+						domain = parsed.Hostname()
+					}
+					_ = trace.write(map[string]any{
+						"type":         "fetch_failure",
+						"task_id":      taskID,
+						"url":          rawURL,
+						"domain":       domain,
+						"failure_kind": string(kind),
+						"tool_call_id": input.ToolCall.ID,
+					})
+					state.AddExecutionEvent(taskID, session.ExecutionEvent{
+						Type:    "fetch_failure",
+						Status:  "failed",
+						Tool:    input.ToolCall.ID,
+						Summary: summarize(input.ToolResult.Content),
+						Evidence: map[string]any{
+							"tool":         input.ToolCall.Name,
+							"url":          rawURL,
+							"domain":       domain,
+							"failure_kind": string(kind),
+						},
+					})
+					fetchBudget := fetchBudgetForState(state, taskID)
+					if fetchBudget.IsExhausted(rawURL) {
+						_ = trace.write(map[string]any{
+							"type":         "fetch_budget_exhausted",
+							"task_id":      taskID,
+							"url":          rawURL,
+							"domain":       domain,
+							"failure_kind": string(kind),
+						})
+						blockPlanItemsForFetchFailure(state, taskID, rawURL)
+					}
+				}
+			}
+
+			redactedToolResult := redactToolResult(input.ToolResult)
+			result := compactToolResultForModel(input.ToolCall, redactedToolResult, rt.home(), trace.id)
+			if redactedToolResult.Evidence != nil {
+				if _, ok := result.Evidence["retry_count"]; !ok {
+					if rc, ok := redactedToolResult.Evidence["retry_count"]; ok {
+						if result.Evidence == nil {
+							result.Evidence = map[string]any{}
+						}
+						result.Evidence["retry_count"] = rc
+					}
+				}
+			}
 			return agentcore.AfterToolCallResult{ToolResult: &result}, nil
 		},
 	}
 	var followUps []agentcore.Message
 	followupSent := false
-	lastContractMissing := ""
 	contractFollowups := 0
 	hooks.ShouldStopAfterTurn = func(_ context.Context, turn agentcore.TurnContext) (bool, error) {
 		contract := taskContractFromState(*state, taskID)
 		currentTask := taskFromState(*state, taskID)
-		validation := validateTaskContract(contract, currentTask)
-		if contract.RequiresTools && !validation.Satisfied {
-			_ = trace.write(map[string]any{"type": "task_contract_unsatisfied", "task_id": taskID, "missing": validation.Missing})
-			missingKey := strings.Join(validation.Missing, "\n")
-			if contractFollowups >= 4 || (contractFollowups > 0 && missingKey == lastContractMissing) {
-				return true, nil
+		unavailable := checkUnavailableContractTools(rt, msg, contract)
+		decision := EvaluateLoopEnd(LoopEndInput{
+			Contract:         contract,
+			Task:             currentTask,
+			UserText:         userText,
+			TurnMessage:      turn.Message,
+			TurnToolResults:  turn.ToolResults,
+			TurnToolCalls:    turn.Message.ToolCalls,
+			UnavailableTools: unavailable,
+			FollowupCount:    contractFollowups,
+			MaxFollowups:     rt.Config.Execution.MaxContractFollowupsValue(),
+			DeliveryGateSent: followupSent,
+			AgentRegistry:    agentToolsForMessage(rt, msg),
+			FullRegistry:     rt.Tools,
+		})
+		if contract.RequiresTools && !decision.ContractSatisfied {
+			_ = trace.write(map[string]any{
+				"type":    "task_contract_unsatisfied",
+				"task_id": taskID,
+				"missing": decision.MissingEvidence,
+			})
+			if len(decision.FailureCategories) > 0 {
+				_ = trace.write(map[string]any{
+					"type":               "tool_failures_classified",
+					"task_id":            taskID,
+					"failure_categories": decision.FailureCategories,
+				})
 			}
+		}
+		if decision.StopLoopNow {
+			switch decision.BlockerKind {
+			case completionBlockerUnavailableTool:
+				names := make([]string, 0, len(unavailable))
+				for name := range unavailable {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				traceReasons := make(map[string]string, len(unavailable))
+				for name, reason := range unavailable {
+					traceReasons[name] = reason
+				}
+				_ = trace.write(map[string]any{
+					"type":                "contract_tool_unavailable",
+					"task_id":             taskID,
+					"unavailable":         names,
+					"unavailable_reasons": traceReasons,
+					"blocker_text":        decision.BlockerReason,
+				})
+			case completionBlockerFollowupLimit:
+				_ = trace.write(map[string]any{
+					"type":           "task_contract_followup_limit",
+					"task_id":        taskID,
+					"attempts_total": decision.FollowupAttempts,
+					"missing":        decision.MissingEvidence,
+					"blocker_text":   decision.BlockerReason,
+				})
+			}
+			return true, nil
+		}
+		if decision.ShouldFollowUp {
 			contractFollowups++
-			lastContractMissing = missingKey
 			followUps = append(followUps, agentcore.Message{
 				Role:    agentcore.RoleUser,
-				Content: taskContractFollowup(validation.Missing),
+				Content: decision.FollowupMessage,
 			})
+			if decision.FollowupReason == "unexecuted_commitment" {
+				followupSent = true
+				_ = trace.write(map[string]any{
+					"type":    "deliverable_gate_followup",
+					"task_id": taskID,
+					"reason":  decision.FollowupReason,
+				})
+			} else {
+				_ = trace.write(map[string]any{
+					"type":    "contract_followup_sent",
+					"task_id": taskID,
+					"attempt": contractFollowups,
+					"missing": decision.MissingEvidence,
+				})
+				// Record a task execution event so the runtime can re-derive
+				// followupCount post-loop without consulting the hook.
+				state.AddExecutionEvent(taskID, session.ExecutionEvent{
+					Type:     "contract_followup",
+					Status:   "running",
+					Summary:  decision.FollowupReason,
+					Evidence: map[string]any{"attempt": contractFollowups, "missing": decision.MissingEvidence},
+				})
+			}
 			return false, nil
 		}
 		if contract.RequiresTools {
 			_ = trace.write(map[string]any{"type": "task_contract_satisfied", "task_id": taskID})
-		}
-		if followupSent || turnHasToolEvidence(turn) || !needsAction(userText) || !looksLikeUnexecutedAction(turn.Message.Content) {
-			return false, nil
-		}
-		followupSent = true
-		if len(followUps) == 0 {
-			followUps = append(followUps, agentcore.Message{
-				Role:    agentcore.RoleUser,
-				Content: "You promised an action but did not execute any tool. Continue now with the smallest safe tool call, or state the concrete blocker that prevents execution.",
-			})
-			_ = trace.write(map[string]any{"type": "deliverable_gate_followup", "task_id": taskID, "reason": "unexecuted_commitment"})
 		}
 		return false, nil
 	}
@@ -181,7 +370,7 @@ func taskExecutionEventCount(state session.State, taskID string) int {
 var runtimeToolTimeout = func(cfg *config.Root, toolName string) time.Duration {
 	_ = cfg
 	switch strings.TrimSpace(toolName) {
-	case "project.index", "file.read":
+	case "file.read":
 		return 30 * time.Second
 	case "terminal.run":
 		return 120 * time.Second
@@ -198,14 +387,26 @@ var runtimeToolProgressInterval = func(cfg *config.Root, toolName string) time.D
 	return 30 * time.Second
 }
 
-func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string, map[string]any) {
+var runtimeToolRetryBudget = func(cfg *config.Root, toolName string) int {
+	_ = cfg
+	switch strings.TrimSpace(toolName) {
+	case "web.fetch":
+		return 1
+	case "web.search":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func acceptToolResult(tool agentcore.Tool, call agentcore.ToolCall, result agentcore.ToolResult) (string, map[string]any) {
 	evidence := map[string]any{}
 	for key, value := range result.Evidence {
 		evidence[key] = value
 	}
 	if tool != nil {
 		contract := agentcore.ContractFor(tool)
-		risk := tool.Risk()
+		risk := toolpkg.EffectiveRisk(tool, call)
 		evidence["risk"] = string(risk)
 		evidence["mutation"] = risk == agentcore.RiskGuardedMutation || risk == agentcore.RiskDangerous
 		if contract.Acceptance != "" {
@@ -225,4 +426,91 @@ func acceptToolResult(tool agentcore.Tool, result agentcore.ToolResult) (string,
 	}
 	evidence["acceptance"] = "accepted"
 	return "accepted", evidence
+}
+
+// skillExecutionTool returns the name of the execution tool for a required skill,
+// derived from the execution hint. For "cli" stage skills the execution tool is
+// terminal.run. For other stages, the hint is generic and no specific tool is
+// gated (returns "").
+func skillExecutionTool(skill session.RequiredSkill, contract session.TaskContract, discoveredSkills []discoveredSkill) string {
+	hint := executionHintForSkill(skill, discoveredSkills)
+	if hint == "" {
+		if contractRequiresSkillRead(contract, skill) && contractHasTool(contract, "terminal.run") {
+			return "terminal.run"
+		}
+		return ""
+	}
+	// CLI stage hint: "read SKILL.md with file.read, then execute via terminal.run ..."
+	if strings.Contains(hint, "terminal.run") {
+		return "terminal.run"
+	}
+	return ""
+}
+
+func contractRequiresSkillRead(contract session.TaskContract, skill session.RequiredSkill) bool {
+	for _, item := range contract.PlanItems {
+		if fileReadPlanItemMatchesSkill(item, skill.Name, skill.Path) {
+			return true
+		}
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		if !strings.EqualFold(strings.TrimSpace(evidence.Tool), "file.read") {
+			continue
+		}
+		text := strings.ToLower(strings.TrimSpace(evidence.Description))
+		if strings.Contains(text, strings.ToLower(strings.TrimSpace(skill.Path))) {
+			return true
+		}
+		if strings.TrimSpace(skill.Name) != "" && strings.Contains(text, strings.ToLower(strings.TrimSpace(skill.Name))) {
+			return true
+		}
+	}
+	return false
+}
+
+func contractHasTool(contract session.TaskContract, toolName string) bool {
+	for _, tool := range contract.RequiredTools {
+		if strings.EqualFold(strings.TrimSpace(tool), toolName) {
+			return true
+		}
+	}
+	for _, item := range contract.PlanItems {
+		if strings.EqualFold(strings.TrimSpace(item.Tool), toolName) {
+			return true
+		}
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		if strings.EqualFold(strings.TrimSpace(evidence.Tool), toolName) {
+			return true
+		}
+	}
+	return false
+}
+
+// executionHintForSkill returns the execution hint for a required skill by
+// looking it up in the discovered skills slice. Returns "" if not found.
+func executionHintForSkill(skill session.RequiredSkill, discoveredSkills []discoveredSkill) string {
+	skillLower := strings.ToLower(strings.TrimSpace(skill.Name))
+	for _, s := range discoveredSkills {
+		if strings.ToLower(strings.TrimSpace(s.Name)) == skillLower {
+			return executionHint(s)
+		}
+	}
+	return ""
+}
+
+func checkUnavailableContractTools(rt Runtime, msg channel.InboundMessage, contract session.TaskContract) map[string]string {
+	fullRegistry := rt.Tools
+	agentRegistry := rt.Tools
+	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
+		agentRegistry = agent.Tools
+	}
+	return checkContractToolAvailability(agentRegistry, fullRegistry, contract)
+}
+
+func agentToolsForMessage(rt Runtime, msg channel.InboundMessage) *agentcore.ToolRegistry {
+	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
+		return agent.Tools
+	}
+	return rt.Tools
 }
