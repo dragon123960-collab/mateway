@@ -153,7 +153,7 @@ func TestModelVerifier_StaticModel_PassesEnglishCriteria(t *testing.T) {
 		Acceptance:    session.Acceptance{Criteria: "must mention revenue change"},
 		EvidenceRefs:  []session.EvidenceRef{{Kind: "tool", ToolName: "file.read", Summary: "read report"}},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status != session.VerificationPassed {
 		t.Fatalf("expected passed for English criteria, got %q: %s", result.Status, result.Reason)
 	}
@@ -175,7 +175,7 @@ func TestModelVerifier_StaticModel_PassesChineseCriteria(t *testing.T) {
 		Acceptance:    session.Acceptance{Criteria: "必须包含收入变化"},
 		EvidenceRefs:  []session.EvidenceRef{{Kind: "tool", ToolName: "file.read", Summary: "读取报告"}},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status != session.VerificationPassed {
 		t.Fatalf("expected passed for Chinese criteria, got %q: %s", result.Status, result.Reason)
 	}
@@ -193,7 +193,7 @@ func TestModelVerifier_StaticModel_CriteriaNotSatisfied(t *testing.T) {
 		ResultSummary: "The system is running normally.",
 		Acceptance:    session.Acceptance{Criteria: "must include number of active users"},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status != session.VerificationBlocked {
 		t.Fatalf("expected blocked, got %q: %s", result.Status, result.Reason)
 	}
@@ -213,7 +213,7 @@ func TestModelVerifier_MalformedOutput_ConservativeBlocked(t *testing.T) {
 		ResultSummary: "some output",
 		Acceptance:    session.Acceptance{Criteria: "must be correct"},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status == session.VerificationPassed {
 		t.Fatal("malformed output must not result in passed")
 	}
@@ -236,7 +236,7 @@ func TestModelVerifier_NoModelConfigured(t *testing.T) {
 		ResultSummary: "some output",
 		Acceptance:    session.Acceptance{Criteria: "must be correct"},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status != session.VerificationBlocked {
 		t.Fatalf("expected blocked when no model, got %q", result.Status)
 	}
@@ -259,7 +259,7 @@ func TestModelVerifier_DoesNotExecuteTools(t *testing.T) {
 		ResultSummary: "result",
 		Acceptance:    session.Acceptance{Criteria: "test"},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status != session.VerificationPassed {
 		t.Fatalf("expected passed, got %q", result.Status)
 	}
@@ -305,7 +305,7 @@ func TestModelVerifier_TruncatedOutput_ConservativeBlocked(t *testing.T) {
 		ResultSummary: "output",
 		Acceptance:    session.Acceptance{Criteria: "must work"},
 	}
-	result := rt.verifyNodeWithModel(t.Context(), node, nil)
+	result := rt.verifyNodeWithModel(t.Context(), "test-graph", node, nil)
 	if result.Status == session.VerificationPassed {
 		t.Fatal("truncated output must not pass")
 	}

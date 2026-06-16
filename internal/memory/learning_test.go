@@ -220,7 +220,14 @@ func TestRecordTaskCompletionWritesSkillUsageLedger(t *testing.T) {
 			}},
 		},
 		TraceID: "trace-skill",
-		Skills:  []SkillEvidence{{Name: "fresh-search", Path: filepath.Join(home, "workspace", "skills", "fresh-search", "SKILL.md"), Scope: "shared"}},
+		GraphSummary: &session.GraphMemorySummary{
+			GraphID: "g1",
+			TaskID:  "task-skill",
+			Status:  "completed",
+			Nodes: []session.NodeMemorySummary{
+				{ID: "search", Type: "skill", Goal: "fresh-search", Status: "completed", ResultSummary: "found 5 results", Attempts: 1},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +237,10 @@ func TestRecordTaskCompletionWritesSkillUsageLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	if !strings.Contains(text, `"type":"skill_usage"`) || !strings.Contains(text, `"name":"fresh-search"`) || !strings.Contains(text, `"tool_sequence":["file.read"]`) {
+	if !strings.Contains(text, `"type":"skill_usage"`) || !strings.Contains(text, `"name":"fresh-search"`) {
 		t.Fatalf("unexpected skill usage ledger:\n%s", text)
+	}
+	if !strings.Contains(text, `"skill_node_id":"search"`) || !strings.Contains(text, `"graph_id":"g1"`) {
+		t.Fatalf("missing graph/node refs in skill usage:\n%s", text)
 	}
 }

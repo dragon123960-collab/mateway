@@ -34,6 +34,7 @@ type modelVerifyOutput struct {
 
 func (rt Runtime) verifyNodeWithModel(
 	ctx context.Context,
+	graphID string,
 	node *session.TaskGraphNode,
 	trace *traceRecorder,
 ) session.NodeVerificationResult {
@@ -63,9 +64,10 @@ func (rt Runtime) verifyNodeWithModel(
 
 	if trace != nil {
 		_ = trace.write(map[string]any{
-			"type":    "model_verifier_output",
-			"node_id": node.ID,
-			"raw":     summarize(reply.Content),
+			"type":     "model_verifier_output",
+			"graph_id": graphID,
+			"node_id":  node.ID,
+			"raw":      summarize(reply.Content),
 		})
 	}
 
@@ -73,6 +75,7 @@ func (rt Runtime) verifyNodeWithModel(
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":              "model_verifier_decision",
+			"graph_id":          graphID,
 			"node_id":           node.ID,
 			"verify_status":     result.Status,
 			"verify_reason":     result.Reason,

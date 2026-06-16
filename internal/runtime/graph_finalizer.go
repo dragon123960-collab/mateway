@@ -93,7 +93,7 @@ func (rt Runtime) FinalizeAndRespond(
 			Status:  "completed",
 			Summary: summary,
 		})
-		taskCompletedObserve(ctx, rt, msg, state, g.TaskID, result.ReplyText, trace)
+		taskMemoryObserve(ctx, rt, state, g.TaskID, result.ReplyText, "task_completed", trace)
 
 	case session.FinalizeFailed:
 		state.BlockActiveTask("failed")
@@ -102,6 +102,7 @@ func (rt Runtime) FinalizeAndRespond(
 			Status:  "failed",
 			Summary: result.ReplyText,
 		})
+		taskMemoryObserve(ctx, rt, state, g.TaskID, result.ReplyText, "task_failed", trace)
 
 	case session.FinalizeBlocked:
 		state.AddExecutionEvent(g.TaskID, session.ExecutionEvent{
@@ -109,6 +110,7 @@ func (rt Runtime) FinalizeAndRespond(
 			Status:  "blocked",
 			Summary: result.ReplyText,
 		})
+		taskMemoryObserve(ctx, rt, state, g.TaskID, result.ReplyText, "task_blocked", trace)
 
 	case session.FinalizeAwaitingInput:
 		ensurePendingForGraph(state, g)
@@ -157,25 +159,31 @@ func (rt Runtime) FinalizeAndRespond(
 	}, nil
 }
 
-func taskCompletedObserve(
+func taskMemoryObserve(
 	ctx context.Context,
 	rt Runtime,
-	msg channel.InboundMessage,
 	state *session.State,
 	taskID string,
 	finalText string,
+	kind string,
 	trace *traceRecorder,
 ) {
 	home := rt.home()
+	graphTask := state.TaskByID(taskID)
+	var graphSummary *session.GraphMemorySummary
+	if graphTask != nil && graphTask.Graph != nil {
+		graphSummary = session.BuildGraphMemorySummary(graphTask.Graph, graphTask.Goal)
+	}
 	observe := rt.Hooks.observe(ctx, ObserveHookInput{
-		Kind:       "task_completed",
-		Home:       home,
-		SessionKey: state.Key,
-		State:      *state,
-		TaskID:     taskID,
-		FinalText:  finalText,
-		TraceID:    traceID(trace),
-		TracePath:  tracePath(trace),
+		Kind:         kind,
+		Home:         home,
+		SessionKey:   state.Key,
+		State:        *state,
+		TaskID:       taskID,
+		FinalText:    finalText,
+		TraceID:      traceID(trace),
+		TracePath:    tracePath(trace),
+		GraphSummary: graphSummary,
 	}, trace)
 	if observe.LearningResult != nil {
 		if trace != nil {

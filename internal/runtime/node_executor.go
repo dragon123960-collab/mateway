@@ -38,6 +38,18 @@ func (rt Runtime) executeNode(
 	node.Attempts++
 	node.UpdatedAt = time.Now()
 
+	return rt.executeNodeRun(ctx, msg, state, g, node, userText, trace)
+}
+
+func (rt Runtime) executeNodeRun(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	userText string,
+	trace *traceRecorder,
+) error {
 	switch node.Type {
 	case session.NodeTypeModel:
 		return rt.executeModelNode(ctx, msg, state, g, node, userText, trace)
@@ -52,9 +64,10 @@ func (rt Runtime) executeNode(
 		node.FailureReason = fmt.Sprintf("unknown node type %q", node.Type)
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -84,16 +97,17 @@ func (rt Runtime) executeModelNode(
 		node.FailureReason = err.Error()
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   err.Error(),
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    err.Error(),
 			})
 		}
 		return nil
 	}
 
 	node.ResultSummary = summarize(reply.Content)
-	rt.verifyAndTraceNode(ctx, node, trace)
+	rt.verifyAndTraceNode(ctx, g.ID, node, trace)
 	return nil
 }
 
@@ -111,9 +125,10 @@ func (rt Runtime) executeToolNode(
 		node.FailureReason = "tool node has no executor"
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -125,9 +140,10 @@ func (rt Runtime) executeToolNode(
 		node.FailureReason = fmt.Sprintf("tool %q not found in registry", executor)
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -137,6 +153,7 @@ func (rt Runtime) executeToolNode(
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":      "node_tool_call",
+			"graph_id":  g.ID,
 			"node_id":   node.ID,
 			"tool":      executor,
 			"tool_args": redactPayload(cloneStringAnyMap(call.Args)),
@@ -154,9 +171,10 @@ func (rt Runtime) executeToolNode(
 		node.FailureReason = err.Error()
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   err.Error(),
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    err.Error(),
 			})
 		}
 		return nil
@@ -178,13 +196,14 @@ func (rt Runtime) executeToolNode(
 		node.FailureReason = summarize(result.Content)
 	} else {
 		node.ResultSummary = summarize(result.Content)
-		rt.verifyAndTraceNode(ctx, node, trace)
+		rt.verifyAndTraceNode(ctx, g.ID, node, trace)
 		return nil
 	}
 
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":     "node_execute_result",
+			"graph_id": g.ID,
 			"node_id":  node.ID,
 			"status":   node.Status,
 			"tool":     executor,
@@ -372,9 +391,10 @@ func (rt Runtime) executeSkillNode(
 		node.FailureReason = "skill node has no executor"
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -390,9 +410,10 @@ func (rt Runtime) executeSkillNode(
 		node.FailureReason = reason
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -403,9 +424,10 @@ func (rt Runtime) executeSkillNode(
 		node.FailureReason = fmt.Sprintf("skill %q has granularity=workflow and cannot be executed as a single node; it must be split into atomic nodes by the planner", skillName)
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -417,9 +439,10 @@ func (rt Runtime) executeSkillNode(
 		node.FailureReason = fmt.Sprintf("failed to read skill %q at %q: %v", skillName, registered.Path, err)
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   node.FailureReason,
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    node.FailureReason,
 			})
 		}
 		return nil
@@ -439,16 +462,17 @@ func (rt Runtime) executeSkillNode(
 		node.FailureReason = err.Error()
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "node_execute_failed",
-				"node_id": node.ID,
-				"error":   err.Error(),
+				"type":     "node_execute_failed",
+				"graph_id": g.ID,
+				"node_id":  node.ID,
+				"error":    err.Error(),
 			})
 		}
 		return nil
 	}
 
 	node.ResultSummary = summarize(reply.Content)
-	rt.verifyAndTraceNode(ctx, node, trace)
+	rt.verifyAndTraceNode(ctx, g.ID, node, trace)
 	return nil
 }
 
@@ -538,6 +562,7 @@ func (rt Runtime) executeHumanNode(
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":         "node_execute_result",
+			"graph_id":     g.ID,
 			"node_id":      node.ID,
 			"status":       node.Status,
 			"pending_kind": string(kind),
@@ -611,18 +636,19 @@ func isHumanNode(node *session.TaskGraphNode) bool {
 	return node.Type == session.NodeTypeHumanReview || node.Type == session.NodeTypeHumanConfirm
 }
 
-func (rt Runtime) verifyAndTraceNode(ctx context.Context, node *session.TaskGraphNode, trace *traceRecorder) {
+func (rt Runtime) verifyAndTraceNode(ctx context.Context, graphID string, node *session.TaskGraphNode, trace *traceRecorder) {
 	if trace != nil {
 		_ = trace.write(map[string]any{
-			"type":    "node_verify_start",
-			"node_id": node.ID,
+			"type":     "node_verify_start",
+			"graph_id": graphID,
+			"node_id":  node.ID,
 		})
 	}
 
 	result := session.VerifyNode(node)
 
 	if result.Status == session.VerificationPassed && node.Acceptance.Criteria != "" {
-		modelResult := rt.verifyNodeWithModel(ctx, node, trace)
+		modelResult := rt.verifyNodeWithModel(ctx, graphID, node, trace)
 		if modelResult.Status != "" {
 			result = modelResult
 		}
@@ -639,6 +665,7 @@ func (rt Runtime) verifyAndTraceNode(ctx context.Context, node *session.TaskGrap
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":          "node_verified",
+			"graph_id":      graphID,
 			"node_id":       node.ID,
 			"node_status":   node.Status,
 			"verify_status": result.Status,

@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -483,6 +485,185 @@ func TestFinalizeAndRespond_AwaitingInput_UpdatesTaskStatus(t *testing.T) {
 	}
 }
 
+func TestRunGraphTask_RecoversRunningNodes(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "done"}
+	msg := inbound("cli:test", "recover running")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("recover running node")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-recover",
+		TaskID: task.ID,
+		Status: session.GraphStatusRunning,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Goal: "answer", Status: session.NodeStatusRunning},
+			{ID: "n2", Type: session.NodeTypeModel, Goal: "verify", Status: session.NodeStatusPending, Depends: []string{"n1"}},
+		},
+	}
+
+	if err := rt.Store.Save(*state); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "recover running", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	g := task.Graph
+	if g.Nodes[0].Status != session.NodeStatusCompleted {
+		t.Fatalf("recovered running node should complete after execution, got %q", g.Nodes[0].Status)
+	}
+	if g.Nodes[1].Status != session.NodeStatusCompleted {
+		t.Fatalf("dependent node should complete after dep completed, got %q", g.Nodes[1].Status)
+	}
+}
+
+func TestGraphAwareContinuation_AwaitingInput(t *testing.T) {
+	g := &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusAwaitingInput,
+		Nodes: []session.TaskGraphNode{
+			{ID: "review", Type: session.NodeTypeHumanReview, Goal: "review", Status: session.NodeStatusAwaitingInput},
+		},
+	}
+	task := &session.TaskNode{ID: "t1", Goal: "review task", Status: "await_user_input", Graph: g}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "approved", task)
+	if d.Action != ActionResumeNode {
+		t.Fatalf("expected resume_node for awaiting input, got %q", d.Action)
+	}
+	if d.NodeID != "review" {
+		t.Fatalf("expected nodeID=review, got %q", d.NodeID)
+	}
+}
+
+func TestGraphAwareContinuation_AwaitingInputNewTaskNotOverridden(t *testing.T) {
+	g := &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusAwaitingInput,
+		Nodes: []session.TaskGraphNode{
+			{ID: "review", Type: session.NodeTypeHumanReview, Goal: "review", Status: session.NodeStatusAwaitingInput},
+		},
+	}
+	task := &session.TaskNode{ID: "t1", Goal: "review task", Status: "await_user_input", Graph: g}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "build a docker image from scratch", task)
+	if d.Action != ActionNewGraph {
+		t.Fatalf("awaiting_input with new task should be new_graph, got %q", d.Action)
+	}
+}
+
+func TestGraphAwareContinuation_CompletedGraph(t *testing.T) {
+	g := &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusCompleted,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Goal: "answer", Status: session.NodeStatusCompleted},
+		},
+	}
+	task := &session.TaskNode{ID: "t1", Goal: "done", Status: "completed", Graph: g}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "what was the answer", task)
+	if d.Action != ActionReferenceCompleted {
+		t.Fatalf("expected reference_completed for completed graph, got %q", d.Action)
+	}
+}
+
+func TestGraphAwareContinuation_ContinueGraph(t *testing.T) {
+	g := &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusRunning,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Goal: "answer", Status: session.NodeStatusPending},
+		},
+	}
+	task := &session.TaskNode{ID: "t1", Goal: "answer", Status: "running", Graph: g}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "continue", task)
+	if d.Action != ActionContinueGraph {
+		t.Fatalf("expected continue_graph, got %q", d.Action)
+	}
+	if d.GraphID != "g1" {
+		t.Fatalf("expected GraphID=g1, got %q", d.GraphID)
+	}
+}
+
+func TestGraphAwareContinuation_NoGraph(t *testing.T) {
+	state := session.State{Key: "cli:test", ActiveTask: "t1"}
+	task := &session.TaskNode{ID: "t1", Goal: "answer", Status: "running"}
+
+	d := graphAwareContinuation(state, "hello", task)
+	if d.Action != ActionNewGraph {
+		t.Fatalf("expected new_graph (no graph on task), got %q", d.Action)
+	}
+}
+
+func TestBuildGraphContinuation_AllCompleted(t *testing.T) {
+	g := &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusRunning,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Goal: "answer", Status: session.NodeStatusCompleted, ResultSummary: "done"},
+		},
+	}
+	task := &session.TaskNode{ID: "t1", Goal: "answer", Status: "running", Graph: g}
+
+	d := buildGraphContinuation(task, "status?")
+	if d.Action != ActionContinueGraph {
+		t.Fatalf("all completed should continue, got %q", d.Action)
+	}
+	if d.GraphID != "g1" {
+		t.Fatalf("expected GraphID=g1, got %q", d.GraphID)
+	}
+}
+
+func TestGraphAwareContinuation_BlockedGraphNewMessageNotOverridden(t *testing.T) {
+	task := &session.TaskNode{ID: "t1", Goal: "read file", Status: "blocked", Graph: &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusBlocked,
+		Nodes: []session.TaskGraphNode{
+			{ID: "bad", Type: session.NodeTypeTool, Goal: "read", Status: session.NodeStatusBlocked, Executor: "file.read", FailureReason: "permission denied"},
+		},
+	}}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "tell me a joke", task)
+	if d.Action != ActionNewGraph {
+		t.Fatalf("blocked graph with unrelated message should be new_graph, got %q: %s", d.Action, d.Reason)
+	}
+}
+
+func TestGraphAwareContinuation_PendingGraphNewTaskNotOverridden(t *testing.T) {
+	task := &session.TaskNode{ID: "t1", Goal: "analyze data", Status: "running", Graph: &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusRunning,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Goal: "analyze", Status: session.NodeStatusPending},
+		},
+	}}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "build a docker image from scratch", task)
+	if d.Action != ActionNewGraph {
+		t.Fatalf("pending graph with new task should be new_graph, got %q", d.Action)
+	}
+}
+
+func TestGraphAwareContinuation_BlockedGraphResumePreserved(t *testing.T) {
+	task := &session.TaskNode{ID: "t1", Goal: "read file", Status: "blocked", Graph: &session.TaskGraph{
+		ID: "g1", TaskID: "t1", Status: session.GraphStatusBlocked,
+		Nodes: []session.TaskGraphNode{
+			{ID: "bad", Type: session.NodeTypeTool, Goal: "read", Status: session.NodeStatusBlocked, Executor: "file.read", FailureReason: "permission denied"},
+		},
+	}}
+	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
+
+	d := graphAwareContinuation(state, "retry the read", task)
+	if d.Action == ActionNewGraph {
+		t.Fatalf("blocked graph with retry signal should not be new_graph, got %q", d.Action)
+	}
+}
+
 func TestExecuteNode_ModelNodeWithCriteria_CallsModelTwiceAndVerifies(t *testing.T) {
 	var callCount int
 	var verifierPrompt string
@@ -527,4 +708,70 @@ func TestExecuteNode_ModelNodeWithCriteria_CallsModelTwiceAndVerifies(t *testing
 	if !strings.Contains(verifierPrompt, "must provide a numeric answer") {
 		t.Fatal("verifier prompt missing acceptance criteria")
 	}
+}
+
+func TestRunGraphTask_ProducesSchedulerTraceEvents(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "done"}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("trace test graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-trace",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Goal: "answer", Status: session.NodeStatusPending},
+		},
+	}
+
+	if err := rt.Store.Save(*state); err != nil {
+		t.Fatal(err)
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := readTraceFile(t, trace.path)
+
+	required := []string{"graph_schedule_tick", "node_scheduled", "node_execute_start", "node_verified", "graph_finalized"}
+	for _, eventType := range required {
+		if !traceHasEvent(events, eventType) {
+			t.Fatalf("missing trace event: %s", eventType)
+		}
+	}
+}
+
+func traceHasEvent(events []map[string]any, eventType string) bool {
+	for _, e := range events {
+		if t, _ := e["type"].(string); t == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func readTraceFile(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read trace file: %v", err)
+	}
+	var events []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("trace parse: %v", err)
+		}
+		events = append(events, event)
+	}
+	return events
 }

@@ -79,3 +79,4 @@ inbound message
 - 保留旧机制测试作为迁移保护线，但不代表可回退到旧 runtime。
 - 每次改动保持仓库可测试。
 - 阶段完成后由 Codex 按该阶段文档 review。
+- 阶段 10 必须按 10A-10E 分段开发和 review，不能一次性替换 `Runtime.Handle` 或删除旧主循环。

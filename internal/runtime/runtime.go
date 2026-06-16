@@ -85,6 +85,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	}
 	userText := strings.TrimSpace(msg.Text)
 	decision := determineContinuation(state, userText)
+
+	if activeTask := state.TaskByID(state.ActiveTask); activeTask != nil && activeTask.Graph != nil {
+		decision = graphAwareContinuation(state, userText, activeTask)
+	}
+
 	_ = trace.write(map[string]any{
 		"type":         "continuation_decision",
 		"action":       decision.Action,
@@ -134,6 +139,8 @@ func (rt Runtime) runGraphTask(
 ) (Response, error) {
 	g := task.Graph
 
+	session.RecoverRunningNodes(g)
+
 	_ = trace.write(map[string]any{
 		"type":     "graph_lifecycle_start",
 		"graph_id": g.ID,
@@ -143,6 +150,15 @@ func (rt Runtime) runGraphTask(
 
 	for {
 		ready := session.ReadyNodes(g, 1)
+
+		_ = trace.write(map[string]any{
+			"type":        "graph_schedule_tick",
+			"graph_id":    g.ID,
+			"task_id":     task.ID,
+			"ready_nodes": ready,
+			"total_nodes": len(g.Nodes),
+		})
+
 		if len(ready) == 0 {
 			break
 		}
@@ -152,12 +168,44 @@ func (rt Runtime) runGraphTask(
 			break
 		}
 
-		if err := rt.executeNode(ctx, msg, state, g, node, userText, trace); err != nil {
-			return Response{}, err
+		if node.Status != session.NodeStatusPending {
+			break
 		}
+
+		_ = trace.write(map[string]any{
+			"type":      "node_scheduled",
+			"graph_id":  g.ID,
+			"task_id":   task.ID,
+			"node_id":   node.ID,
+			"node_type": node.Type,
+		})
+
+		node.Status = session.NodeStatusRunning
+		node.Attempts++
+		node.UpdatedAt = time.Now()
+
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
+
+		_ = trace.write(map[string]any{
+			"type":      "node_execute_start",
+			"graph_id":  g.ID,
+			"node_id":   node.ID,
+			"node_type": node.Type,
+			"goal":      node.Goal,
+		})
+
+		if err := rt.executeNodeRun(ctx, msg, state, g, node, userText, trace); err != nil {
+			return Response{}, err
+		}
+
+		session.UpdateGraphStatus(g)
+
+		if err := rt.saveState(state, trace); err != nil {
+			return Response{}, err
+		}
+
 	}
 
 	vr := session.VerifyTaskGraph(g)

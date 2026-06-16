@@ -29,7 +29,20 @@ type LearningEvidence struct {
 	FinalSummary string           `json:"final_summary,omitempty"`
 	ToolSequence []string         `json:"tool_sequence,omitempty"`
 	ToolSteps    []ToolStepRecord `json:"tool_steps,omitempty"`
+	NodeRecords  []NodeRecord     `json:"node_records,omitempty"`
 	Sources      []string         `json:"sources,omitempty"`
+}
+
+type NodeRecord struct {
+	ID            string                `json:"id"`
+	Type          string                `json:"type"`
+	Goal          string                `json:"goal"`
+	Status        string                `json:"status"`
+	Attempts      int                   `json:"attempts"`
+	ResultSummary string                `json:"result_summary,omitempty"`
+	FailureReason string                `json:"failure_reason,omitempty"`
+	EvidenceRefs  []session.EvidenceRef `json:"evidence_refs,omitempty"`
+	VerifiedAt    string                `json:"verified_at,omitempty"`
 }
 
 type ToolStepRecord struct {
@@ -49,6 +62,9 @@ type SkillUsageEvidence struct {
 	TraceID      string           `json:"trace_id,omitempty"`
 	TracePath    string           `json:"trace_path,omitempty"`
 	Skill        SkillEvidence    `json:"skill"`
+	SkillNodeID  string           `json:"skill_node_id,omitempty"`
+	GraphID      string           `json:"graph_id,omitempty"`
+	NodeResult   string           `json:"node_result,omitempty"`
 	ToolSequence []string         `json:"tool_sequence,omitempty"`
 	RelatedSteps []ToolStepRecord `json:"related_steps,omitempty"`
 	Sources      []string         `json:"sources,omitempty"`
@@ -68,6 +84,7 @@ func RecordLearningEvidence(event LearningEvent) error {
 		FinalSummary: strings.TrimSpace(event.FinalText),
 		ToolSequence: toolSequence(event.Task),
 		ToolSteps:    toolStepRecords(event.Task.Steps),
+		NodeRecords:  buildNodeRecords(event.GraphSummary),
 		Sources:      learningSources(event),
 	}
 	if err := appendJSONL(filepath.Join(home, "observe", "learning", "events.jsonl"), payload); err != nil {
@@ -84,30 +101,65 @@ func RecordLearningEvidence(event LearningEvent) error {
 
 func RecordSkillUsage(event LearningEvent) error {
 	home := defaultString(event.Home, ".mateway")
-	steps := toolStepRecords(event.Task.Steps)
-	for _, skill := range event.Skills {
-		if strings.TrimSpace(skill.Name) == "" {
-			continue
-		}
-		payload := SkillUsageEvidence{
-			Type:         "skill_usage",
-			Time:         time.Now().Format(time.RFC3339Nano),
-			SessionKey:   event.SessionKey,
-			TaskID:       event.Task.ID,
-			Goal:         event.Task.Goal,
-			Status:       event.Task.Status,
-			TraceID:      event.TraceID,
-			TracePath:    event.TracePath,
-			Skill:        skill,
-			ToolSequence: toolSequence(event.Task),
-			RelatedSteps: steps,
-			Sources:      learningSources(event),
-		}
-		if err := appendJSONL(filepath.Join(home, "observe", "skill_usage", "events.jsonl"), payload); err != nil {
-			return err
+
+	if event.GraphSummary != nil {
+		for _, n := range event.GraphSummary.Nodes {
+			if n.Type != "skill" {
+				continue
+			}
+			status := n.Status
+			if status == session.NodeStatusCompleted && n.ResultSummary != "" {
+				status = "success"
+			}
+			payload := SkillUsageEvidence{
+				Type:       "skill_usage",
+				Time:       time.Now().Format(time.RFC3339Nano),
+				SessionKey: event.SessionKey,
+				TaskID:     event.Task.ID,
+				Goal:       event.Task.Goal,
+				Status:     status,
+				TraceID:    event.TraceID,
+				TracePath:  event.TracePath,
+				Skill: SkillEvidence{
+					Name: n.Goal,
+				},
+				SkillNodeID: n.ID,
+				GraphID:     event.GraphSummary.GraphID,
+				NodeResult:  n.ResultSummary,
+				Sources:     learningSources(event),
+			}
+			if err := appendJSONL(filepath.Join(home, "observe", "skill_usage", "events.jsonl"), payload); err != nil {
+				return err
+			}
 		}
 	}
+
 	return nil
+}
+
+func buildNodeRecords(summary *session.GraphMemorySummary) []NodeRecord {
+	if summary == nil {
+		return nil
+	}
+	var records []NodeRecord
+	for _, n := range summary.Nodes {
+		verifiedAt := ""
+		if !n.VerifiedAt.IsZero() {
+			verifiedAt = n.VerifiedAt.Format(time.RFC3339)
+		}
+		records = append(records, NodeRecord{
+			ID:            n.ID,
+			Type:          n.Type,
+			Goal:          n.Goal,
+			Status:        n.Status,
+			Attempts:      n.Attempts,
+			ResultSummary: n.ResultSummary,
+			FailureReason: n.FailureReason,
+			EvidenceRefs:  n.EvidenceRefs,
+			VerifiedAt:    verifiedAt,
+		})
+	}
+	return records
 }
 
 func toolSequence(task session.TaskNode) []string {

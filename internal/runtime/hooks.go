@@ -71,19 +71,20 @@ type ToolPolicyHookProvider interface {
 }
 
 type ObserveHookInput struct {
-	Kind       string
-	Home       string
-	SessionKey string
-	State      session.State
-	TaskID     string
-	FinalText  string
-	TraceID    string
-	TracePath  string
-	Skills     []memory.SkillEvidence
-	UserText   string
-	ToolCall   agentcore.ToolCall
-	Tool       agentcore.Tool
-	ToolResult agentcore.ToolResult
+	Kind         string
+	Home         string
+	SessionKey   string
+	State        session.State
+	TaskID       string
+	FinalText    string
+	TraceID      string
+	TracePath    string
+	Skills       []memory.SkillEvidence
+	UserText     string
+	ToolCall     agentcore.ToolCall
+	Tool         agentcore.Tool
+	ToolResult   agentcore.ToolResult
+	GraphSummary *session.GraphMemorySummary
 }
 
 type ObserveHookResult struct {
@@ -572,16 +573,17 @@ func (defaultObserveHookProvider) ObserveHook(_ context.Context, input ObserveHo
 			Accepted:           status == "accepted",
 			Mutation:           mutation,
 		}}, nil
-	case "task_completed":
+	case "task_completed", "task_failed", "task_blocked":
 		result, err := memory.RecordTaskCompletion(memory.LearningEvent{
-			Home:       input.Home,
-			SessionKey: input.SessionKey,
-			Task:       taskFromState(input.State, input.TaskID),
-			FinalText:  input.FinalText,
-			TraceID:    input.TraceID,
-			TracePath:  input.TracePath,
-			Skills:     input.Skills,
-			UserText:   input.UserText,
+			Home:         input.Home,
+			SessionKey:   input.SessionKey,
+			Task:         taskFromState(input.State, input.TaskID),
+			FinalText:    input.FinalText,
+			TraceID:      input.TraceID,
+			TracePath:    input.TracePath,
+			Skills:       input.Skills,
+			UserText:     input.UserText,
+			GraphSummary: input.GraphSummary,
 		})
 		if err != nil {
 			return ObserveHookResult{}, err

@@ -11,14 +11,15 @@ import (
 )
 
 type LearningEvent struct {
-	Home       string
-	SessionKey string
-	Task       session.TaskNode
-	FinalText  string
-	TraceID    string
-	TracePath  string
-	Skills     []SkillEvidence
-	UserText   string
+	Home         string
+	SessionKey   string
+	Task         session.TaskNode
+	FinalText    string
+	TraceID      string
+	TracePath    string
+	Skills       []SkillEvidence
+	UserText     string
+	GraphSummary *session.GraphMemorySummary
 }
 
 type LearningResult struct {
@@ -201,6 +202,22 @@ func renderDiary(event LearningEvent, now string) string {
 		b.WriteString("\nFinal reply:\n")
 		b.WriteString(text)
 		b.WriteString("\n")
+	}
+	if event.GraphSummary != nil && len(event.GraphSummary.Nodes) > 0 {
+		b.WriteString("\n## Graph Timeline\n\n")
+		for _, n := range event.GraphSummary.Nodes {
+			b.WriteString(fmt.Sprintf("- [%s] %s (%s)", n.ID, n.Goal, n.Type))
+			if n.Status != "" {
+				b.WriteString(fmt.Sprintf(" -> %s", n.Status))
+			}
+			if n.Attempts > 1 {
+				b.WriteString(fmt.Sprintf(", attempts: %d", n.Attempts))
+			}
+			if n.FailureReason != "" {
+				b.WriteString(fmt.Sprintf(", failure: %s", n.FailureReason))
+			}
+			b.WriteString("\n")
+		}
 	}
 	return b.String()
 }
