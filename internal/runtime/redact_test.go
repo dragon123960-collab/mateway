@@ -146,7 +146,14 @@ func TestRuntimeFinalReplyRedactsSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(secretFinalModel{}, rt.Tools)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"store this secret",
+		"secret stored",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"store secret","acceptance":"stored"}`,
+	), text: "Secret stored: auth_code=QBptnPtt6Hnp3awb"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "store this secret"})
 	if err != nil {

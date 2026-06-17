@@ -58,6 +58,7 @@ const (
 	NodeTypeModel        = "model"
 	NodeTypeTool         = "tool"
 	NodeTypeSkill        = "skill"
+	NodeTypeSubtask      = "subtask"
 	NodeTypeHumanReview  = "human_review"
 	NodeTypeHumanConfirm = "human_confirm"
 )
@@ -66,16 +67,40 @@ var validNodeTypes = map[string]bool{
 	NodeTypeModel:        true,
 	NodeTypeTool:         true,
 	NodeTypeSkill:        true,
+	NodeTypeSubtask:      true,
 	NodeTypeHumanReview:  true,
 	NodeTypeHumanConfirm: true,
 }
 
+const (
+	NodeModeDirect = "direct"
+	NodeModeReact  = "react"
+	NodeModeSkill  = "skill"
+)
+
+var validNodeModes = map[string]bool{
+	NodeModeDirect: true,
+	NodeModeReact:  true,
+	NodeModeSkill:  true,
+}
+
 func ValidNodeTypes() []string {
-	return []string{NodeTypeModel, NodeTypeTool, NodeTypeSkill, NodeTypeHumanReview, NodeTypeHumanConfirm}
+	return []string{NodeTypeModel, NodeTypeTool, NodeTypeSkill, NodeTypeSubtask, NodeTypeHumanReview, NodeTypeHumanConfirm}
 }
 
 func IsValidNodeType(s string) bool {
 	return validNodeTypes[strings.TrimSpace(s)]
+}
+
+func IsValidNodeMode(s string) bool {
+	if s == "" {
+		return true
+	}
+	return validNodeModes[strings.TrimSpace(s)]
+}
+
+func ValidNodeModes() []string {
+	return []string{NodeModeDirect, NodeModeReact, NodeModeSkill}
 }
 
 type TaskGraph struct {
@@ -90,12 +115,14 @@ type TaskGraph struct {
 type TaskGraphNode struct {
 	ID            string         `json:"id"`
 	Type          string         `json:"type"`
+	Mode          string         `json:"mode,omitempty"`
 	Goal          string         `json:"goal"`
 	Status        string         `json:"status"`
 	Depends       []string       `json:"depends,omitempty"`
 	Executor      string         `json:"executor,omitempty"`
 	Input         map[string]any `json:"input,omitempty"`
 	Output        map[string]any `json:"output,omitempty"`
+	AllowedTools  []string       `json:"allowed_tools,omitempty"`
 	Attempts      int            `json:"attempts,omitempty"`
 	ResultSummary string         `json:"result_summary,omitempty"`
 	EvidenceRefs  []EvidenceRef  `json:"evidence_refs,omitempty"`

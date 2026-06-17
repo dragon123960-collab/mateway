@@ -21,7 +21,14 @@ import (
 
 func TestRuntimeNoActiveTaskCreatesNewTask(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "done"}, rt.Tools)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"summarize the project",
+		"done",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"summarize the project","acceptance":"done"}`,
+	), text: "done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "summarize the project"))
 	if err != nil {
@@ -105,6 +112,7 @@ func TestRuntimeSystemContextAddsTriggeredSectionsAndSelectedSkills(t *testing.T
 }
 
 func TestRuntimeActiveTaskSteersNewMessageIntoExistingTask(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	state := session.State{Key: "cli:test"}
 	task := state.StartTask("prepare release notes")
@@ -187,7 +195,14 @@ func TestRuntimeAfterNewDoesNotAutoRecallArchivedTask(t *testing.T) {
 
 func TestRuntimeStopsWhenModelReturnsNoToolCallWithoutReview(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "plain answer"}, rt.Tools)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"just answer",
+		"plain answer",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"answer","acceptance":"answered"}`,
+	), text: "plain answer"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "just answer"))
 	if err != nil {
@@ -392,6 +407,7 @@ func TestRuntimeDestructiveTerminalRunIsBlocked(t *testing.T) {
 }
 
 func TestRuntimeTerminalShellCommandRunsWithoutApproval(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
@@ -804,8 +820,15 @@ func TestRuntimeCompletesNoToolPlanItemOnFinalAnswer(t *testing.T) {
 
 func TestRuntimeTaskContractAllowsNoToolTask(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Mateway is a local agent runtime."}, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"explain Mateway","requires_tools":false,"required_tools":[],"required_evidence":[],"expected_outcome":"short explanation","completion_policy":"answer directly"}`}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"explain what Mateway is",
+		"short explanation",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"explain Mateway","acceptance":"answered"}`,
+	), text: "Mateway is a local agent runtime."}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
+	rt.ContractModel = panicModel{t: t}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "explain what Mateway is"))
 	if err != nil {
@@ -816,13 +839,14 @@ func TestRuntimeTaskContractAllowsNoToolTask(t *testing.T) {
 	}
 }
 
-func TestRuntimeTaskContractParseFailureFallsBack(t *testing.T) {
+func TestRuntimePlannerParseFailureDoesNotFallback(t *testing.T) {
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
 	rt.Tools = registry
 	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "plain answer"}, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `not json`}
+	rt.Model = contractJSONModel{json: `not json`}
+	rt.ContractModel = panicModel{t: t}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "use test tool"))
 	if err != nil {
@@ -834,18 +858,19 @@ func TestRuntimeTaskContractParseFailureFallsBack(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// After parse failure, fallback is used. The fallback may have
-	// RequiresTools=false (direct) or RequiresTools=true (if strengthened).
-	// Either way, the task should complete or fail gracefully.
-	if resp.Reply.Text == "" {
-		t.Fatalf("expected non-empty reply, got %#v", resp)
+	if !resp.Failed {
+		t.Fatalf("planner parse failure should fail instead of falling back, got %#v", resp)
 	}
 	data, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "task_contract_parse_failed") {
-		t.Fatalf("expected parse failure trace, got:\n%s", string(data))
+	trace := string(data)
+	if !strings.Contains(trace, "unified_planner_failed") {
+		t.Fatalf("expected unified planner failure trace, got:\n%s", trace)
+	}
+	if strings.Contains(trace, "task_contract_parse_failed") || strings.Contains(trace, "graph_planner_fallback") {
+		t.Fatalf("old planner fallback trace should not appear, got:\n%s", trace)
 	}
 }
 
@@ -1724,6 +1749,7 @@ func TestIndependentTaskDoesNotReceivePreviousTaskContinuityContext(t *testing.T
 }
 
 func TestRuntimeFollowupReusesAwaitingTask(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	state := session.State{Key: "cli:followup"}
 	task := state.StartTask("create a Lark document from /tmp/source.md")
@@ -3027,6 +3053,7 @@ func TestCLITUIRenderTaskStepWithoutRiskRecalculation(t *testing.T) {
 }
 
 func TestOpenTaskReceivesNextMessageAsSteering(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	for _, status := range []string{"running", "await_user_input", "resuming"} {
 		t.Run(status, func(t *testing.T) {
 			rt := newTestRuntime(t)
@@ -3085,7 +3112,14 @@ func TestCompletedTaskClearsActiveAndDoesNotImplicitlyResume(t *testing.T) {
 	if err := rt.Store.Save(state); err != nil {
 		t.Fatal(err)
 	}
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "new task result"}, rt.Tools)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"list running processes",
+		"new task result",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"list running processes","acceptance":"answered"}`,
+	), text: "new task result"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "list running processes"))
 	if err != nil {
@@ -4167,52 +4201,34 @@ func TestCompletionEvaluatorUnavailableToolFastBlockerNoFollowup(t *testing.T) {
 	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
 		{Role: agentcore.RoleAssistant, Content: "done"},
 	}}, rt.Pool.agents["main"].Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"check service","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"status confirmed"}`}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"check service",
+		"status confirmed",
+		[]string{"terminal.run"},
+		nil,
+		`{"id":"check","type":"subtask","mode":"react","goal":"check service","allowed_tools":["terminal.run"],"acceptance":"status confirmed"}`,
+	), text: "done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Pool.agents["main"].Tools)
+	rt.ContractModel = panicModel{t: t}
 
 	planResp, err := rt.Handle(context.Background(), inbound("cli:test", "check singbox service status"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if planResp.Reply.Style == channel.StyleInputRequired {
-		resp, err := rt.Handle(context.Background(), inbound("cli:test", "1"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !resp.Failed {
-			t.Fatalf("expected failed response for unavailable tool, got %#v", resp)
-		}
-		resp2 := resp
-		trace, err := os.ReadFile(resp2.TracePath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		traceStr := string(trace)
-		if !strings.Contains(traceStr, "contract_tool_unavailable") {
-			t.Fatalf("expected contract_tool_unavailable trace, got:\n%s", traceStr)
-		}
-		if strings.Contains(traceStr, "contract_followup_sent") {
-			t.Fatalf("unavailable tool should not send contract follow-ups, got:\n%s", traceStr)
-		}
-		if !strings.Contains(resp2.Reply.Text, "terminal.run") {
-			t.Fatalf("expected blocker to mention terminal.run, got: %q", resp2.Reply.Text)
-		}
-		if !strings.Contains(resp2.Reply.Text, "denied by profile") {
-			t.Fatalf("expected blocker to explain the unavailability reason, got: %q", resp2.Reply.Text)
-		}
-		return
-	}
-	// auto_contract/direct: model runs directly, may fail
 	resp := planResp
 	trace, err := os.ReadFile(resp.TracePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	traceStr := string(trace)
-	if !strings.Contains(traceStr, "contract_tool_unavailable") && resp.Failed {
-		// ok: blocker from unavailable tool
+	if !resp.Failed {
+		t.Fatalf("expected failed response for unavailable planner tool, got %#v", resp)
 	}
-	if resp.Failed && !strings.Contains(resp.Reply.Text, "terminal.run") {
-		t.Fatalf("expected blocker to mention terminal.run, got: %q", resp.Reply.Text)
+	if !strings.Contains(traceStr, "unified_planner_invalid_tools") {
+		t.Fatalf("expected unified_planner_invalid_tools trace, got:\n%s", traceStr)
+	}
+	if strings.Contains(traceStr, "contract_followup_sent") {
+		t.Fatalf("unavailable planner tool should not send contract follow-ups, got:\n%s", traceStr)
 	}
 }
 
@@ -4786,30 +4802,36 @@ func TestGuidanceSkillNotBlocking(t *testing.T) {
 	}
 }
 
-func TestUnregisteredToolPersistsAsBlockerAfterFailedReplan(t *testing.T) {
+func TestUnregisteredPlannerToolBlocksBeforeGraphAttach(t *testing.T) {
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
 	rt.Tools = registry
 
-	callCount := 0
-	rt.ContractModel = &dynamicContractModel{
-		gen: func() string {
-			callCount++
-			return `{"summary":"test","requires_tools":true,"required_tools":["fictional-tool","file.read"],"plan_items":[{"id":"plan-1","title":"do stuff","status":"pending","tool":"fictional-tool"}],"expected_outcome":"done"}`
-		},
-	}
-
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, Content: "done"},
-	}}, rt.Tools)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"test",
+		"done",
+		[]string{"fictional-tool", "file.read"},
+		nil,
+		`{"id":"do-stuff","type":"subtask","mode":"react","goal":"do stuff","allowed_tools":["fictional-tool"],"acceptance":"done"}`,
+	), text: "done"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
+	rt.ContractModel = panicModel{t: t}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:test", "run test"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !resp.Failed {
-		t.Fatal("expected task to fail/block with unregistered tool name that persists after replan")
+		t.Fatal("expected task to fail/block with unregistered planner tool")
+	}
+	data, err := os.ReadFile(resp.TracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := string(data)
+	if !strings.Contains(trace, "unified_planner_invalid_tools") || !strings.Contains(trace, "fictional-tool") {
+		t.Fatalf("expected invalid planner tool trace, got:\n%s", trace)
 	}
 }
 

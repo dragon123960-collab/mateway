@@ -104,8 +104,15 @@ func TestToolCompactionSpecializesFileContent(t *testing.T) {
 func TestSimpleTaskSkipsContractModel(t *testing.T) {
 	rt := newTestRuntime(t)
 	counter := &countingModel{text: `{"summary":"should not run","requires_tools":true}`}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"hello?",
+		"answer directly",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"answer the user","acceptance":"answered"}`,
+	), text: "hello"}
 	rt.ContractModel = counter
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "hello"}, rt.Tools)
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 	resp, err := rt.Handle(context.Background(), inbound("cli:simple-contract", "hello?"))
 	if err != nil {
 		t.Fatal(err)

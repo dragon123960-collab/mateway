@@ -539,6 +539,11 @@ func repairContractSkillUsage(contract session.TaskContract, skills []discovered
 			continue
 		}
 		path := firstNonEmpty(req.Path, skill.Path)
+		for i := range contract.RequiredSkills {
+			if strings.EqualFold(strings.TrimSpace(contract.RequiredSkills[i].Name), strings.TrimSpace(req.Name)) && strings.TrimSpace(contract.RequiredSkills[i].Path) == "" {
+				contract.RequiredSkills[i].Path = path
+			}
+		}
 		if !contractHasFileReadEvidenceForSkill(contract, req.Name, path) {
 			contract.RequiredEvidence = append(contract.RequiredEvidence, session.TaskEvidenceContract{
 				Kind:        "local_file",

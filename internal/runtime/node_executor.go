@@ -51,7 +51,10 @@ func (rt Runtime) executeNodeRun(
 	trace *traceRecorder,
 ) error {
 	switch node.Type {
-	case session.NodeTypeModel:
+	case session.NodeTypeModel, session.NodeTypeSubtask:
+		// TODO(task-graph-runtime): subtask/react nodes should run node-local
+		// ReAct with allowed_tools constraint. For now they execute as single
+		// model calls (stub for phase 01).
 		return rt.executeModelNode(ctx, msg, state, g, node, userText, trace)
 	case session.NodeTypeTool:
 		return rt.executeToolNode(ctx, msg, state, g, node, trace)
@@ -120,6 +123,14 @@ func (rt Runtime) executeModelNode(
 	}
 	node.Output["text"] = redactSecretString(reply.Content)
 	node.ResultSummary = summarize(reply.Content)
+	if node.ResultSummary == "" && len(reply.ToolCalls) > 0 {
+		for _, tc := range reply.ToolCalls {
+			if tc.Name != "" {
+				node.ResultSummary = fmt.Sprintf("tool call: %s", tc.Name)
+				break
+			}
+		}
+	}
 	rt.verifyAndTraceNode(ctx, g.ID, node, trace)
 	return nil
 }

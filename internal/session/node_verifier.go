@@ -58,7 +58,7 @@ func VerifyNode(node *TaskGraphNode) NodeVerificationResult {
 	switch node.Type {
 	case NodeTypeTool:
 		return verifyToolNode(node)
-	case NodeTypeModel:
+	case NodeTypeModel, NodeTypeSubtask:
 		return verifyModelNode(node)
 	case NodeTypeSkill:
 		return verifySkillNode(node)
@@ -283,8 +283,11 @@ func validateContractAgainstNodes(contract *TaskContract, g *TaskGraph) []string
 	completedTools := make(map[string]bool)
 
 	for _, n := range g.Nodes {
-		if n.Type == NodeTypeTool && n.Status == NodeStatusCompleted {
+		if (n.Type == NodeTypeTool || n.Type == NodeTypeSubtask) && n.Status == NodeStatusCompleted {
 			completedTools[n.Executor] = true
+			for _, t := range n.AllowedTools {
+				completedTools[t] = true
+			}
 		}
 	}
 

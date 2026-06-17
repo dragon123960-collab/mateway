@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/dongping/mateway/internal/agentcore"
@@ -15,7 +16,13 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 	if last.Role == agentcore.RoleTool {
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: last.Content}, nil
 	}
+	if strings.Contains(ctx.SystemPrompt, "verification judge") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"heuristic verifier accepted node output","missing":[],"confidence":"medium"}`}, nil
+	}
 	text := strings.TrimSpace(last.Content)
+	if strings.Contains(ctx.SystemPrompt, "TaskGraphPlan") || strings.Contains(ctx.SystemPrompt, "task graph planner") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: heuristicTaskGraphPlan(text)}, nil
+	}
 	if path, ok := strings.CutPrefix(text, "/read "); ok {
 		return agentcore.Message{
 			Role: agentcore.RoleAssistant,
@@ -46,6 +53,85 @@ func (HeuristicModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.
 		}
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: runtimeText(nil, channel.InboundMessage{}, "runtime.heuristic.echo", textValues("text", text))}, nil
+}
+
+func heuristicTaskGraphPlan(prompt string) string {
+	userText := extractHeuristicPlannerUserText(prompt)
+	node := map[string]any{
+		"id":         "answer",
+		"type":       "subtask",
+		"mode":       "direct",
+		"goal":       "answer the user request",
+		"acceptance": "responds to the user request",
+		"outputs":    []string{"final_answer"},
+	}
+	tools := []string{}
+	if tool := heuristicToolForSlashCommand(userText); tool != "" {
+		node["id"] = "execute"
+		node["goal"] = "complete the requested action"
+		node["acceptance"] = "requested action completed or a concrete blocker is reported"
+		// Phase 01 does not execute node-local ReAct yet. Keep heuristic slash
+		// tasks direct so local CLI smoke tests do not require tool evidence that
+		// the stub executor cannot produce.
+		_ = tool
+	}
+	plan := map[string]any{
+		"task": map[string]any{
+			"goal":       firstNonEmpty(userText, "answer the user request"),
+			"risk":       "low",
+			"acceptance": node["acceptance"],
+			"required_capabilities": map[string]any{
+				"tools":       tools,
+				"skills":      []string{},
+				"human_gates": []string{},
+			},
+			"final_output": map[string]any{
+				"text":       true,
+				"structured": []string{},
+			},
+		},
+		"nodes": []map[string]any{node},
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		return `{"task":{"goal":"answer the user request","risk":"low","acceptance":"responds to the user request","required_capabilities":{"tools":[],"skills":[],"human_gates":[]},"final_output":{"text":true,"structured":[]}},"nodes":[{"id":"answer","type":"subtask","mode":"direct","goal":"answer the user request","acceptance":"responds to the user request"}]}`
+	}
+	return string(data)
+}
+
+func extractHeuristicPlannerUserText(prompt string) string {
+	text := strings.TrimSpace(prompt)
+	for _, marker := range []string{"Current user message:\n", "User task:\n"} {
+		idx := strings.Index(text, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(text[idx+len(marker):])
+		if cut := strings.Index(rest, "\n\n"); cut >= 0 {
+			rest = strings.TrimSpace(rest[:cut])
+		}
+		if rest != "" {
+			return rest
+		}
+	}
+	return text
+}
+
+func heuristicToolForSlashCommand(text string) string {
+	switch {
+	case strings.HasPrefix(text, "/read "), strings.HasPrefix(text, "/index "):
+		return "file.read"
+	case strings.HasPrefix(text, "/write "):
+		return "file.write"
+	case strings.HasPrefix(text, "/run "):
+		return "terminal.run"
+	case strings.HasPrefix(text, "/search "):
+		return "web.search"
+	case strings.HasPrefix(text, "/schedule "):
+		return "schedule.manage"
+	default:
+		return ""
+	}
 }
 
 func lastConversationMessage(messages []agentcore.Message) agentcore.Message {

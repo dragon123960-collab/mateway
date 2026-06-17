@@ -404,7 +404,13 @@ func TestHandle_GraphTask_RunsGraphLifecycle(t *testing.T) {
 
 func TestHandle_NewTaskCreatesGraphLifecycle(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.Model = staticTextModel{text: "graph answer"}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"answer directly",
+		"answer",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"answer directly","acceptance":"answered"}`,
+	), text: "graph answer"}
 	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 
 	resp, err := rt.Handle(t.Context(), inbound("cli:graph-new", "answer directly"))
@@ -426,7 +432,7 @@ func TestHandle_NewTaskCreatesGraphLifecycle(t *testing.T) {
 	if task.Graph == nil || len(task.Graph.Nodes) != 1 {
 		t.Fatalf("expected single-node graph, got %#v", task.Graph)
 	}
-	if task.Graph.Nodes[0].Type != session.NodeTypeModel || task.Graph.Nodes[0].Status != session.NodeStatusCompleted {
+	if task.Graph.Nodes[0].Type != session.NodeTypeSubtask || task.Graph.Nodes[0].Status != session.NodeStatusCompleted {
 		t.Fatalf("expected completed model node, got %#v", task.Graph.Nodes[0])
 	}
 }
@@ -441,23 +447,26 @@ func TestHandle_PlannerFailureFallsBackToModelGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Failed {
-		t.Fatalf("fallback graph should complete, got %#v", resp)
+	if !resp.Failed {
+		t.Fatalf("planner failure should fail instead of falling back, got %#v", resp)
 	}
 
 	state := loadState(t, rt, "cli:graph-fallback")
 	task := state.Tasks[0]
-	if task.Graph == nil || len(task.Graph.Nodes) != 1 {
-		t.Fatalf("expected fallback single-node graph, got %#v", task.Graph)
-	}
-	if task.Execution.Mode != "task_graph" {
-		t.Fatalf("expected task_graph execution mode, got %q", task.Execution.Mode)
+	if task.Graph != nil {
+		t.Fatalf("planner failure should not attach fallback graph, got %#v", task.Graph)
 	}
 }
 
 func TestHandle_ModelNodeDoesNotRunGlobalToolLoop(t *testing.T) {
 	rt := newTestRuntime(t)
-	rt.Model = staticPlannerModel{json: `{"goal":"call tool","risk":"low","nodes":[{"id":"answer","type":"model","goal":"answer with no tool loop"}],"task_acceptance":"answer"}`}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"call tool",
+		"answer",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"answer with no tool loop","acceptance":"answer"}`,
+	)}
 	rt.Pool.agents["main"] = agentcore.NewAgent(toolCallingModel{}, rt.Tools)
 	rt.ContractModel = contractJSONModel{json: `{"summary":"call tool","requires_tools":false,"required_tools":[],"required_evidence":[],"expected_outcome":"answer","completion_policy":"answer directly"}`}
 

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,31 +40,62 @@ func (rt Runtime) ensureGraphForTask(
 		return nil
 	}
 
-	execModel := rt.modelForMessage(msg)
-	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, execModel, trace)
 	profileID := rt.profileIDForMessage(msg)
 	discoveredSkills := skillsForRuntimeContext(rt.Config, profileID)
 	agentRegistry := rt.Tools
 	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
 		agentRegistry = agent.Tools
 	}
-	if invalid := validateContractTools(contract, agentRegistry, discoveredSkills); !invalid.IsValid() {
-		return fmt.Errorf("task contract references unavailable tools or skills: %s", invalidContractBlockerENWithRegistries(contract, invalid, agentRegistry, rt.Tools))
+
+	plan, contract, planErr := rt.planTaskGraphUnified(ctx, task, userText, rt.Model, agentRegistry, discoveredSkills, trace)
+	if planErr != nil {
+		return fmt.Errorf("planner failed: %w", planErr)
 	}
 
-	var graph session.TaskGraph
-	planned, err := rt.planTaskGraph(ctx, task, userText, rt.Model, discoveredSkills, trace)
-	if err == nil {
-		graph = planned
-	} else {
+	graph, convErr := convertTaskGraphPlan(plan, task.ID)
+	if convErr != nil {
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":    "graph_planner_fallback",
+				"type":    "graph_plan_conversion_failed",
 				"task_id": task.ID,
-				"error":   err.Error(),
+				"error":   convErr.Error(),
 			})
 		}
-		graph = fallbackGraphFromContract(task, contract, userText)
+		return fmt.Errorf("planner produced invalid graph: %w", convErr)
+	}
+
+	workspace := strings.TrimSpace(rt.Config.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(rt.Config.App.Home, "workspace")
+	}
+	contract = repairContractSkillUsage(contract, discoveredSkills)
+	contract = readSelectedSkillBodies(contract, discoveredSkills, workspace, profileID)
+	contract = augmentContractWithSkillPlanItems(contract, discoveredSkills)
+	traceSelectedSkillBodies(trace, contract)
+
+	strategy := classifyContractStrategy(task.Goal, userText, contract)
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":           "task_contract_strategy",
+			"task_id":        task.ID,
+			"strategy":       string(strategy),
+			"summary":        contract.Summary,
+			"requires_tools": contract.RequiresTools,
+		})
+		_ = trace.write(map[string]any{
+			"type":              "task_contract_created",
+			"task_id":           task.ID,
+			"summary":           contract.Summary,
+			"requires_tools":    contract.RequiresTools,
+			"required_tools":    contract.RequiredTools,
+			"required_skills":   requiredSkillsWithoutBody(contract.RequiredSkills),
+			"required_evidence": contract.RequiredEvidence,
+			"expected_outcome":  contract.ExpectedOutcome,
+		})
+	}
+
+	if invalid := validateContractTools(contract, agentRegistry, discoveredSkills); !invalid.IsValid() {
+		return fmt.Errorf("task contract references unavailable tools or skills: %s", invalidContractBlockerENWithRegistries(contract, invalid, agentRegistry, rt.Tools))
 	}
 
 	if errs := session.ValidateTaskGraph(&graph); !errs.IsValid() {

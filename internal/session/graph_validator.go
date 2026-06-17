@@ -81,6 +81,7 @@ func validateNodeFields(g *TaskGraph) GraphValidationErrors {
 		}
 
 		t := strings.TrimSpace(n.Type)
+		mode := strings.TrimSpace(n.Mode)
 
 		if strings.TrimSpace(n.Goal) == "" {
 			if t != NodeTypeHumanReview && t != NodeTypeHumanConfirm {
@@ -100,6 +101,13 @@ func validateNodeFields(g *TaskGraph) GraphValidationErrors {
 		if !IsValidNodeType(t) {
 			errs = append(errs, GraphValidationError{
 				Message: fmt.Sprintf("invalid node type %q", t),
+				NodeID:  id,
+			})
+		}
+
+		if mode != "" && !IsValidNodeMode(mode) {
+			errs = append(errs, GraphValidationError{
+				Message: fmt.Sprintf("invalid node mode %q", mode),
 				NodeID:  id,
 			})
 		}
@@ -140,6 +148,14 @@ func validateNodeFields(g *TaskGraph) GraphValidationErrors {
 			if skill == "" {
 				errs = append(errs, GraphValidationError{
 					Message: "skill node missing executor or input.skill",
+					NodeID:  id,
+				})
+			}
+
+		case NodeTypeSubtask:
+			if mode == "" {
+				errs = append(errs, GraphValidationError{
+					Message: "subtask node missing mode",
 					NodeID:  id,
 				})
 			}
