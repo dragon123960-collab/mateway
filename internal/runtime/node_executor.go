@@ -83,13 +83,15 @@ func (rt Runtime) executeModelNode(
 	userText string,
 	trace *traceRecorder,
 ) error {
-	model := rt.Model
+	model := rt.modelForMessage(msg)
 	systemPrompt := buildNodeSystemPrompt(node, g)
+	content := renderModelNodeInput(g, node, userText)
+	input := userAgentMessage(content, msg.Parts)
 
 	reply, err := model.Next(ctx, agentcore.Context{
 		SystemPrompt: systemPrompt,
 		Messages: []agentcore.Message{
-			{Role: agentcore.RoleUser, Content: node.Goal},
+			input,
 		},
 	})
 	if err != nil {
@@ -106,6 +108,17 @@ func (rt Runtime) executeModelNode(
 		return nil
 	}
 
+	state.Messages = redactMessagesForStorage(append(state.Messages, input, reply))
+	if reply.Usage != nil {
+		usage := session.Usage{}
+		addUsage(&usage, usageFromMessages([]agentcore.Message{reply}))
+		addUsage(&state.Usage, usage)
+		writeUsageTrace(trace, usage)
+	}
+	if node.Output == nil {
+		node.Output = make(map[string]any)
+	}
+	node.Output["text"] = redactSecretString(reply.Content)
 	node.ResultSummary = summarize(reply.Content)
 	rt.verifyAndTraceNode(ctx, g.ID, node, trace)
 	return nil
@@ -185,7 +198,7 @@ func (rt Runtime) executeToolNode(
 		TraceID:   traceID(trace),
 		TracePath: tracePath(trace),
 		ToolName:  executor,
-		Summary:   summarize(result.Content),
+		Summary:   summarizeToolEvidence(result),
 	})
 
 	if blocked {
@@ -547,6 +560,7 @@ func (rt Runtime) executeHumanNode(
 	if question == "" {
 		question = "Please review and confirm."
 	}
+	question = strings.TrimSpace(question + "\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.")
 
 	state.Pending = &session.PendingAction{
 		Kind:     kind,
@@ -619,6 +633,77 @@ func buildNodeSystemPrompt(node *session.TaskGraphNode, g *session.TaskGraph) st
 	sb.WriteString("Provide a concise result. Do not mention the graph structure unless relevant to your output.\n")
 	_ = g
 	return sb.String()
+}
+
+func renderNodeDependencyContext(g *session.TaskGraph, node *session.TaskGraphNode) string {
+	if g == nil || node == nil || len(node.Depends) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("Completed dependency results:\n")
+	for _, depID := range node.Depends {
+		dep := g.NodeByID(depID)
+		if dep == nil || dep.Status != session.NodeStatusCompleted {
+			continue
+		}
+		result := strings.TrimSpace(dep.ResultSummary)
+		if text, ok := dep.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
+			result = strings.TrimSpace(text)
+		}
+		if result == "" {
+			continue
+		}
+		sb.WriteString("- ")
+		sb.WriteString(dep.ID)
+		sb.WriteString(": ")
+		sb.WriteString(result)
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func renderModelNodeInput(g *session.TaskGraph, node *session.TaskGraphNode, userText string) string {
+	var sb strings.Builder
+	sb.WriteString("Current node goal:\n")
+	sb.WriteString(strings.TrimSpace(node.Goal))
+	if strings.TrimSpace(userText) != "" {
+		sb.WriteString("\n\nOriginal user request:\n")
+		sb.WriteString(strings.TrimSpace(userText))
+	}
+	if dependencyContext := renderNodeDependencyContext(g, node); dependencyContext != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(dependencyContext)
+	}
+	sb.WriteString("\n\nProduce only the output needed to satisfy this node's goal and acceptance criteria.")
+	return strings.TrimSpace(sb.String())
+}
+
+func summarizeToolEvidence(result agentcore.ToolResult) string {
+	parts := []string{}
+	if text := strings.TrimSpace(redactSecretString(result.Content)); text != "" {
+		parts = append(parts, text)
+	} else if !result.IsError && strings.TrimSpace(fmt.Sprint(result.Evidence["command"])) != "" {
+		parts = append(parts, "command completed successfully with no output")
+	}
+	evidence := redactMapEvidence(result.Evidence)
+	for _, key := range []string{
+		"path", "bytes", "sha256", "content_preview",
+		"command", "decision", "policy_classification", "elapsed_ms", "deadline_ms", "output_truncated", "workdir",
+	} {
+		value, ok := evidence[key]
+		if !ok || value == nil {
+			continue
+		}
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text == "" {
+			continue
+		}
+		parts = append(parts, key+"="+text)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return trimAndTruncateRunesWithSuffix(strings.Join(parts, "; "), 480)
 }
 
 func cloneStringAnyMap(m map[string]any) map[string]any {

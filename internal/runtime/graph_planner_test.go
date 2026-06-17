@@ -18,6 +18,17 @@ func (m staticPlannerModel) Next(_ context.Context, _ agentcore.Context) (agentc
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.json}, nil
 }
 
+type plannerVerifierModel struct {
+	planJSON string
+}
+
+func (m plannerVerifierModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "verification judge") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"criteria satisfied","missing":[],"confidence":"high"}`}, nil
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.planJSON}, nil
+}
+
 func TestParseGraphPlannerOutput_SimpleModel(t *testing.T) {
 	raw := `{"goal":"answer question","risk":"low","nodes":[{"id":"answer","type":"model","goal":"answer the question"}],"task_acceptance":"correct answer"}`
 	out, err := parseGraphPlannerOutput(raw)
@@ -267,6 +278,60 @@ func TestConvertPlannerOutput_InputsOutputsToMap(t *testing.T) {
 	}
 }
 
+func TestConvertPlannerOutput_StructuredToolInput(t *testing.T) {
+	out := GraphPlannerOutput{
+		Goal: "write file",
+		Risk: "medium",
+		Nodes: []GraphPlannerNode{
+			{
+				ID:       "write",
+				Type:     "tool",
+				Goal:     "write hello file",
+				Executor: "file.write",
+				Input: map[string]any{
+					"path":    "/tmp/hello.txt",
+					"content": "hello task graph",
+				},
+			},
+		},
+	}
+	g, err := convertPlannerOutput(out, "task-structured")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	input := g.Nodes[0].Input
+	if input["path"] != "/tmp/hello.txt" || input["content"] != "hello task graph" {
+		t.Fatalf("structured input not preserved: %#v", input)
+	}
+}
+
+func TestConvertPlannerOutput_ArgsAliasForToolInput(t *testing.T) {
+	out := GraphPlannerOutput{
+		Goal: "run command",
+		Risk: "medium",
+		Nodes: []GraphPlannerNode{
+			{
+				ID:       "run",
+				Type:     "tool",
+				Goal:     "run script",
+				Executor: "terminal.run",
+				Args: map[string]any{
+					"command":         "bash /tmp/script.sh",
+					"timeout_seconds": float64(30),
+				},
+			},
+		},
+	}
+	g, err := convertPlannerOutput(out, "task-args")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	input := g.Nodes[0].Input
+	if input["command"] != "bash /tmp/script.sh" || input["timeout_seconds"] != float64(30) {
+		t.Fatalf("args alias not preserved: %#v", input)
+	}
+}
+
 func TestConvertPlannerOutput_DependsNormalization(t *testing.T) {
 	out := GraphPlannerOutput{
 		Goal: "test",
@@ -420,6 +485,9 @@ func TestRenderGraphPlannerPrompt_IncludesTools(t *testing.T) {
 	if !strings.Contains(prompt, "test goal") {
 		t.Fatal("expected user goal in prompt")
 	}
+	if !strings.Contains(prompt, "Required input keys: path, content") {
+		t.Fatal("expected tool required input keys in prompt")
+	}
 }
 
 func TestRenderGraphPlannerPrompt_UserTextDiffers(t *testing.T) {
@@ -438,12 +506,26 @@ func TestRenderGraphPlannerPrompt_UserTextSameAsGoal(t *testing.T) {
 	}
 }
 
+func TestRenderGraphPlannerPrompt_HumanConfirmationRule(t *testing.T) {
+	rt := newTestRuntime(t)
+	prompt := renderGraphPlannerPrompt("write file after approval", "write file after approval", rt.Tools, nil)
+	for _, want := range []string{
+		"confirmation, approval, review, or permission",
+		"human_confirm or human_review",
+		"never use a model node to ask for approval",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestGraphPlannerOutput_JSONRoundTrip(t *testing.T) {
 	original := GraphPlannerOutput{
 		Goal: "test",
 		Risk: "low",
 		Nodes: []GraphPlannerNode{
-			{ID: "n1", Type: "model", Goal: "answer", Depends: nil, Executor: "", Inputs: []string{"a"}, Outputs: []string{"b"}, Acceptance: "done"},
+			{ID: "n1", Type: "model", Goal: "answer", Depends: nil, Executor: "", Input: map[string]any{"context": "a"}, Outputs: []string{"b"}, Acceptance: "done"},
 		},
 		TaskAcceptance: "task is done",
 	}
@@ -457,6 +539,9 @@ func TestGraphPlannerOutput_JSONRoundTrip(t *testing.T) {
 	}
 	if parsed.Goal != original.Goal || len(parsed.Nodes) != 1 || parsed.Nodes[0].Acceptance != "done" {
 		t.Fatal("JSON round-trip failed")
+	}
+	if parsed.Nodes[0].Input["context"] != "a" {
+		t.Fatalf("structured input round-trip failed: %#v", parsed.Nodes[0].Input)
 	}
 }
 

@@ -1,82 +1,71 @@
-# 00：Task Graph Runtime 总开发文档
+# 00 架构总览
 
-更新：2026-06-15
+## 状态
 
-## 给 OpenCode 的阅读方式
+这是 Mateway 最终主线的 TaskGraph Runtime 设计。它替代旧的 contract/checklist/global loop 心智模型。代码实现过程中可以存在过渡结构，但新的开发应朝这个设计收敛，不为旧语义新增兼容层。
 
-每次开发只需要读两个文档：
+## 目标
 
-1. 本文档：理解整体架构、边界和阶段顺序。
-2. 当前阶段文档：只实现该文档 TODO。
-
-不要从后续阶段文档推断额外工作。当前阶段没有列出的改动，一律不做。
-
-## 架构目标
-
-Task Graph 是 Mateway 的主线替换式架构。旧机制是当前仓库已有实现和迁移参考，不作为新架构运行时回退路径。
-
-所有任务最终进入同一条 graph lifecycle：
+把 Mateway 建成一个 local-first agent runtime kernel：
 
 ```text
-inbound message
-  -> task lifecycle
-  -> graph planner
-  -> TaskGraph validation
-  -> scheduler
-  -> atomic node executor
-  -> node verifier
-  -> task verifier
-  -> graph finalizer
-  -> final answer or blocker
+入站消息 -> Planner -> TaskGraph -> Scheduler -> Node Executor -> Verifier -> Finalizer -> Memory Observe
 ```
 
-任务复杂度由 graph 形态表达：
+Node 是可验收子任务。工具调用只是 node 内部的 action，应写入 trace/evidence，不默认提升成 graph node。
 
-- 简单问答：一个 `model` node。
-- 简单安全动作：少量 atomic `tool` / `model` nodes。
-- 复杂任务：多节点 graph，由 scheduler 按依赖推进。
-- 高风险任务：graph 内插入 `human_review` / `human_confirm` node。
+## 核心原则
 
-## 全局边界
+- Planner 一次输出 task acceptance 和 subtask graph。
+- `TaskContract` 语义并入 Planner 输出，不再新增第二个规划阶段。
+- 复杂子任务由 node-local ReAct 执行。
+- completed 且 verified 的 node 永不重跑。
+- Verifier 决定是否完成；工具成功只是 evidence，不等于 node 成功。
+- Trace 是事实链。
+- Session 是恢复快照。
+- Memory 是任务和节点完成后的蒸馏结果，不是 trace dump。
+- TaskGraph 表达单个任务内部的 DAG。
+- Task Lineage Tree 表达历史任务之间的父子、分支和从某个 node/evidence 继续。
+- Memory Tree/Graph 可以作为未来长期知识索引方向，但不进入本轮 runtime 主状态。
+- Session 不做 tree；它保持轻量运行态和恢复态。
+- Mateway 可以作为 Electron、Bot、CLI、外部调度系统的 runtime kernel。
+- 未来可以加入本地 agent node 作为 executor 角色，但不做分布式 multi-agent orchestration。
 
-- Channel 只做 I/O，不做 graph routing。
-- Gateway 只做会话路由、去重和发送，不做业务级 agent routing。
-- Runtime 拥有 task/graph lifecycle。
-- Tool policy、路径校验、secret redaction 是硬边界。
-- Skill name 不是 tool name。
-- 不引入 multi-agent supervisor、subagent spawning、旧实验包或 heavy workflow platform。
+## 状态层边界
+
+```text
+TaskGraph
+  单个任务内部的执行 DAG：依赖、并行、验收、恢复。
+
+Task Lineage Tree
+  历史任务之间的关系：fork、继续、从旧 node/evidence 派生。
+
+Memory Tree / Memory Graph
+  长期知识结构：用户偏好、项目事实、主体-关系-客体、经验沉淀。
+
+Session
+  当前对话和恢复快照：messages、active task、pending action、latest graph state。
+
+Trace
+  append-only 事实账本：planner、node、tool、verifier、finalizer、memory observe。
+```
+
+不要把这些层混成一个 Git-like object store。Mateway 可以借用 Git 的不可变日志、引用、分支思想，但不要实现完整 content-addressed tree database。
+
+## 当前代码现实
+
+当前代码已经有 graph skeleton、node status、scheduler helper、node executor、verifier、finalizer、trace 和 graph memory summary。它也仍然保留旧 contract/checklist/global loop 假设和一些 tool-node-oriented 测试。后续实现可以删除或重写旧测试，不需要为了旧语义保留冗余兼容。
+
+## 非目标
+
+- 不做 heavy workflow platform。
+- 不做 distributed workflow engine。
+- 不做 multi-tenant company scheduler。
+- 不做 distributed multi-agent supervisor 或 subagent spawning。
+- 不做 gateway 业务级 routing layer。
 - 不新增 `terminal.run` 之外的命令执行工具。
+- 不把 Session 做成任务树、知识树或 Git-like store。
 
-## 阶段顺序
+## OpenCode 使用方式
 
-1. [01：Inbound Message 与任务续接入口](./01-inbound-message.md)
-2. [02：TaskGraph Model 与 Validator](./02-graph-model.md)
-3. [03：Graph Planner 与提示词](./03-graph-planner.md)
-4. [04：Scheduler](./04-scheduler.md)
-5. [05：Atomic Node Executor](./05-node-executor.md)
-6. [06：Node Verifier 与 Task Verifier](./06-verifier.md)
-7. [07：Graph Finalizer](./07-finalizer.md)
-8. [08：Trace / Session / Recovery](./08-trace-session-recovery.md)
-9. [09：Memory 集成](./09-memory-integration.md)
-10. [10：Runtime 主路径替换](./10-runtime-replacement.md)
-11. [11：真实模型端到端 Dogfood](./11-real-model-dogfood.md)
-
-配套参考：
-
-- [01A：任务续接状态机](./01a-continuation-state-machine.md)
-- [Graph-Native Skill Registration](../graph-native-skill-registration/README.md)
-
-## Prompt 规则
-
-- 不是每个阶段都有 prompt。
-- deterministic runtime logic 不写 prompt，例如阶段 01 Inbound Message。
-- 需要模型参与的阶段才写 prompt，例如阶段 03 Graph Planner、阶段 05 中的 `model` node executor。
-- Prompt 必须服务结构化输出，不让模型决定 runtime 调度、policy 或安全边界。
-
-## 开发规则
-
-- 每个阶段必须包含 focused tests。
-- 保留旧机制测试作为迁移保护线，但不代表可回退到旧 runtime。
-- 每次改动保持仓库可测试。
-- 阶段完成后由 Codex 按该阶段文档 review。
-- 阶段 10 必须按 10A-10E 分段开发和 review，不能一次性替换 `Runtime.Handle` 或删除旧主循环。
+实现时先读本文件，再读一个编号阶段文档。只实现该阶段 TODO checklist，不要从未来阶段的背景描述里推断额外重构。

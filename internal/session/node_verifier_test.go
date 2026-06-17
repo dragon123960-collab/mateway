@@ -463,6 +463,21 @@ func TestVerifyTaskGraph_PendingAndRunning(t *testing.T) {
 	}
 }
 
+func TestVerifyTaskGraph_BlockedNodeTakesPriorityOverPendingDownstream(t *testing.T) {
+	g := &TaskGraph{
+		ID:     "g-blocked-pending",
+		TaskID: "t-blocked-pending",
+		Nodes: []TaskGraphNode{
+			{ID: "write", Type: NodeTypeTool, Goal: "write file", Status: NodeStatusBlocked, Executor: "file.write", FailureReason: "policy denied"},
+			{ID: "summarize", Type: NodeTypeModel, Goal: "summarize", Status: NodeStatusPending, Depends: []string{"write"}},
+		},
+	}
+	result := VerifyTaskGraph(g)
+	if result.Status != GraphStatusBlocked {
+		t.Fatalf("expected blocked to take priority over pending downstream, got %q", result.Status)
+	}
+}
+
 func TestVerifyNode_PendingNode_ReturnsPending(t *testing.T) {
 	node := &TaskGraphNode{
 		ID:     "n1",

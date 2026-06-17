@@ -62,6 +62,7 @@ func TestRedactSecretStringKeepsRequiredSecretDeclarationIntact(t *testing.T) {
 }
 
 func TestRuntimeTraceRedactsToolResultSecrets(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -89,6 +90,7 @@ func TestRuntimeTraceRedactsToolResultSecrets(t *testing.T) {
 }
 
 func TestRuntimeTaskStepSummaryRedactsSecrets(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
@@ -120,6 +122,7 @@ func TestRuntimeTaskStepSummaryRedactsSecrets(t *testing.T) {
 }
 
 func TestRuntimeNextModelTurnSeesRedactedToolResult(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)

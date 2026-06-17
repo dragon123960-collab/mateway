@@ -57,6 +57,18 @@ func TestParseModelVerifierOutput_Failed(t *testing.T) {
 	}
 }
 
+func TestParseModelVerifierOutput_MissingString(t *testing.T) {
+	raw := `{"status":"blocked","reason":"need more evidence","missing":"file content preview","confidence":"medium"}`
+	node := &session.TaskGraphNode{ID: "n1", Type: session.NodeTypeTool}
+	result := parseModelVerifierOutput(raw, node)
+	if result.Status != session.VerificationBlocked {
+		t.Fatalf("expected blocked, got %q", result.Status)
+	}
+	if len(result.Missing) != 1 || result.Missing[0] != "file content preview" {
+		t.Fatalf("expected string missing to be preserved, got %#v", result.Missing)
+	}
+}
+
 func TestParseModelVerifierOutput_Blocked(t *testing.T) {
 	raw := `{"status":"blocked","reason":"cannot determine if output satisfies criteria","confidence":"low"}`
 	node := &session.TaskGraphNode{ID: "n1", Type: session.NodeTypeModel}

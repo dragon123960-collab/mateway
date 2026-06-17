@@ -57,15 +57,19 @@ Agent profiles 可以设置：
 
 ```text
 workspace/skills/<skill_name>/SKILL.md
+workspace/skills/<skill_name>/.mateway/metadata.yaml
+workspace/agents/<agent_id>/skills/<skill_name>/SKILL.md
+workspace/agents/<agent_id>/skills/<skill_name>/.mateway/metadata.yaml
 ```
 
 它们应保持为技能，而非嵌入到 runtime 代码中。Runtime 代码拥有硬边界；技能拥有用户可编辑的工作流指导。
 
-执行提示上下文是有门的：
+技能发现和执行以本地注册为准：
 
-- 规划阶段可以发现 skill header
-- contract 可以选择所需技能
-- 执行阶段只接收已选技能或显式的 skill/workflow 上下文
+- 只有带 `.mateway/metadata.yaml` 的 skill 才参与发现和执行。
+- Planner 读取 metadata 摘要，用于判断 skill 是否适合作为 subtask node。
+- Node Executor 只有在 skill node 被选中后才读取对应 `SKILL.md`。
+- Skill 名称不是 tool 名称；真实工具调用仍受 node allowed tools、tool policy 和 trace 约束。
 
 ## Secrets
 

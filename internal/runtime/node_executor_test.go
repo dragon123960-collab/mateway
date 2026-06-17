@@ -135,6 +135,64 @@ func TestExecuteNode_ToolNode_Success(t *testing.T) {
 	}
 }
 
+func TestExecuteNode_ToolNodeEvidenceIncludesStructuredFields(t *testing.T) {
+	rt := newTestRuntime(t)
+	tmpDir := t.TempDir()
+	target := filepath.Join(tmpDir, "input.txt")
+	g := newTestGraph(session.TaskGraphNode{
+		ID:       "write-input",
+		Type:     session.NodeTypeTool,
+		Goal:     "write input file",
+		Status:   session.NodeStatusPending,
+		Executor: "file.write",
+		Input: map[string]any{
+			"path":    target,
+			"content": "alpha beta\ngamma delta\nepsilon",
+		},
+	})
+	node := g.NodeByID("write-input")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "write file"), &session.State{}, g, node, "write file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q: %s", node.Status, node.FailureReason)
+	}
+	if len(node.EvidenceRefs) != 1 {
+		t.Fatalf("expected 1 evidence ref, got %d", len(node.EvidenceRefs))
+	}
+	summary := node.EvidenceRefs[0].Summary
+	for _, want := range []string{"path=" + target, "bytes=30", "sha256=", "content_preview=alpha beta"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("expected evidence summary to contain %q, got %q", want, summary)
+		}
+	}
+}
+
+func TestSummarizeToolEvidenceIncludesTerminalCommandWithoutOutput(t *testing.T) {
+	summary := summarizeToolEvidence(agentcore.ToolResult{
+		Content: "",
+		Evidence: map[string]any{
+			"command":               "mkdir -p /tmp/example",
+			"decision":              "allowed",
+			"policy_classification": "safe",
+			"elapsed_ms":            int64(12),
+			"output_truncated":      false,
+		},
+	})
+	for _, want := range []string{
+		"command completed successfully with no output",
+		"command=mkdir -p /tmp/example",
+		"decision=allowed",
+		"elapsed_ms=12",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("expected summary to contain %q, got %q", want, summary)
+		}
+	}
+}
+
 func TestExecuteNode_ToolNode_UnknownTool(t *testing.T) {
 	rt := newTestRuntime(t)
 	g := newTestGraph(session.TaskGraphNode{
@@ -450,8 +508,11 @@ func TestExecuteNode_HumanReview_CreatesPending(t *testing.T) {
 	if state.Pending.NodeID != "review" {
 		t.Fatalf("expected node ID review, got %q", state.Pending.NodeID)
 	}
-	if state.Pending.Question != "please review the deployment plan" {
+	if !strings.Contains(state.Pending.Question, "please review the deployment plan") {
 		t.Fatalf("expected question text, got %q", state.Pending.Question)
+	}
+	if !strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
+		t.Fatalf("expected numeric confirmation guidance, got %q", state.Pending.Question)
 	}
 }
 
@@ -498,8 +559,11 @@ func TestExecuteNode_HumanReview_UsesAcceptanceCriteria(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Pending.Question != "verify output matches requirements" {
+	if !strings.Contains(state.Pending.Question, "verify output matches requirements") {
 		t.Fatalf("expected acceptance criteria as question, got %q", state.Pending.Question)
+	}
+	if !strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
+		t.Fatalf("expected numeric confirmation guidance, got %q", state.Pending.Question)
 	}
 }
 
@@ -737,6 +801,57 @@ func TestBuildToolCallFromNode(t *testing.T) {
 	}
 	if call.ID == "" {
 		t.Fatal("expected non-empty call ID")
+	}
+}
+
+func TestBuildToolCallFromNode_PreservesStructuredArgs(t *testing.T) {
+	node := &session.TaskGraphNode{
+		ID:       "write",
+		Executor: "file.write",
+		Input: map[string]any{
+			"path":    "/tmp/hello.txt",
+			"content": "hello task graph",
+		},
+	}
+	call := buildToolCallFromNode(node, "file.write")
+	if call.Name != "file.write" {
+		t.Fatalf("expected file.write, got %q", call.Name)
+	}
+	if call.Args["path"] != "/tmp/hello.txt" || call.Args["content"] != "hello task graph" {
+		t.Fatalf("structured args not preserved: %#v", call.Args)
+	}
+}
+
+func TestRenderModelNodeInputIncludesGoalAndDependencies(t *testing.T) {
+	g := newTestGraph(
+		session.TaskGraphNode{
+			ID:            "run",
+			Type:          session.NodeTypeTool,
+			Status:        session.NodeStatusCompleted,
+			ResultSummary: "3 5 /tmp/input.txt",
+		},
+		session.TaskGraphNode{
+			ID:      "report",
+			Type:    session.NodeTypeModel,
+			Goal:    "Synthesize the run output and present the line/word counts",
+			Depends: []string{"run"},
+		},
+	)
+	node := g.NodeByID("report")
+
+	input := renderModelNodeInput(g, node, "count the file")
+	for _, want := range []string{
+		"Current node goal:",
+		"Synthesize the run output",
+		"Original user request:",
+		"count the file",
+		"Completed dependency results:",
+		"run: 3 5 /tmp/input.txt",
+		"Produce only the output needed",
+	} {
+		if !strings.Contains(input, want) {
+			t.Fatalf("expected model node input to contain %q, got %q", want, input)
+		}
 	}
 }
 

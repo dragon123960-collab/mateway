@@ -235,15 +235,15 @@ func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVeri
 	case anyAwaiting:
 		result.Status = GraphStatusAwaitingInput
 		result.Reason = "one or more nodes require human input"
-	case anyPending:
-		result.Status = GraphStatusRunning
-		result.Reason = "one or more nodes are still pending or running"
-	case anyBlocked && !anyFailed:
-		result.Status = GraphStatusBlocked
-		result.Reason = "one or more nodes are blocked"
 	case anyFailed:
 		result.Status = GraphStatusFailed
 		result.Reason = fmt.Sprintf("verification failed for nodes: %s", strings.Join(result.MissingNodes, ", "))
+	case anyBlocked:
+		result.Status = GraphStatusBlocked
+		result.Reason = "one or more nodes are blocked"
+	case anyPending:
+		result.Status = GraphStatusRunning
+		result.Reason = "one or more nodes are still pending or running"
 	case allPassed:
 		result.Status = GraphStatusCompleted
 	}

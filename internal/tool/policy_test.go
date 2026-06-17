@@ -459,6 +459,33 @@ func TestFileWriteAllowsRedactedContent(t *testing.T) {
 	}
 }
 
+func TestFileWriteEvidenceIncludesHashAndPreview(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	target := filepath.Join(home, "note.txt")
+	content := "hello task graph\n"
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": content},
+	})
+	if result.IsError {
+		t.Fatalf("expected file write success, got %#v", result)
+	}
+	if result.Evidence["path"] != target {
+		t.Fatalf("expected path evidence %q, got %#v", target, result.Evidence["path"])
+	}
+	if result.Evidence["bytes"] != len(content) {
+		t.Fatalf("expected bytes evidence %d, got %#v", len(content), result.Evidence["bytes"])
+	}
+	if result.Evidence["sha256"] == "" {
+		t.Fatalf("expected sha256 evidence, got %#v", result.Evidence)
+	}
+	if result.Evidence["content_preview"] != strings.TrimSpace(content) {
+		t.Fatalf("expected content preview, got %#v", result.Evidence["content_preview"])
+	}
+}
+
 func TestFileWriteAllowsConfigYamlReplacement(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}

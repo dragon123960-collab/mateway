@@ -118,15 +118,34 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		phase = tracePhaseFollowupExecute
 	}
 
-	trace.setIdentity(map[string]any{"task_id": task.ID})
+	profile := rt.Pool.ProfileForMessage(msg)
+	trace.setIdentity(map[string]any{"agent_id": profile.ID, "task_id": task.ID})
 	_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "effective_text": userText})
 	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})
 
-	if task.Graph != nil && len(task.Graph.Nodes) > 0 {
-		return rt.runGraphTask(ctx, msg, &state, task, userText, trace)
+	if err := rt.ensureGraphForTask(ctx, msg, &state, task, userText, trace); err != nil {
+		state.BlockActiveTask("failed")
+		if saveErr := rt.saveState(&state, trace); saveErr != nil {
+			return Response{}, saveErr
+		}
+		text := friendlyRuntimeError(rt.Config, msg, err)
+		resp := Response{
+			Reply: channel.OutboundMessage{
+				Channel:  msg.Channel,
+				ThreadID: msg.ThreadID,
+				Text:     text,
+				Style:    channel.StyleError,
+			},
+			TraceID:   trace.id,
+			TracePath: trace.path,
+			Failed:    true,
+		}
+		_ = trace.write(map[string]any{"type": "graph_bootstrap_failed", "task_id": task.ID, "error": err.Error()})
+		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
+		return resp, nil
 	}
 
-	return rt.runTask(ctx, msg, &state, task, userText, phase, trace)
+	return rt.runGraphTask(ctx, msg, &state, task, userText, trace)
 }
 
 func (rt Runtime) runGraphTask(
@@ -208,345 +227,9 @@ func (rt Runtime) runGraphTask(
 
 	}
 
-	vr := session.VerifyTaskGraph(g)
+	vr := session.VerifyTaskGraphWithContract(g, task.Execution.Contract)
 
 	return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
-}
-
-func (rt Runtime) runTask(ctx context.Context, msg channel.InboundMessage, state *session.State, task *session.TaskNode, userText string, phase string, trace *traceRecorder) (Response, error) {
-	messages, compactStats, err := prepareMessagesForModel(state.Messages)
-	if err != nil {
-		_ = trace.write(map[string]any{
-			"type":         "context_budget_exceeded",
-			"before_chars": compactStats.BeforeChars,
-			"after_chars":  compactStats.AfterChars,
-			"error":        err.Error(),
-		})
-		state.BlockActiveTask("failed")
-		if saveErr := rt.saveState(state, trace); saveErr != nil {
-			return Response{}, saveErr
-		}
-		resp := Response{
-			Reply: channel.OutboundMessage{
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Text:     runtimeText(rt.Config, msg, "runtime.context_budget_exceeded", nil),
-				Style:    channel.StyleError,
-			},
-			TraceID:   trace.id,
-			TracePath: trace.path,
-			Failed:    true,
-		}
-		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
-		return resp, nil
-	}
-	writeCompactTrace(trace, "model_input_compacted", compactStats)
-	if strings.TrimSpace(userText) != "" || len(msg.Parts) > 0 {
-		messages = append(messages, userAgentMessage(userText, msg.Parts))
-	}
-
-	agent := rt.Pool.AgentForMessage(msg)
-	if agent == nil {
-		agent = agentcore.NewAgent(rt.Model, rt.Tools)
-	}
-	profile := rt.Pool.ProfileForMessage(msg)
-	trace.setIdentity(map[string]any{
-		"agent_id": profile.ID,
-		"task_id":  task.ID,
-	})
-	contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
-	strategy := classifyContractStrategy(task.Goal, userText, contract)
-	discoveredSkills := skillsForRuntimeContext(rt.Config, profile.ID)
-	if invalid := validateContractTools(contract, rt.Tools, discoveredSkills); !invalid.IsValid() {
-		blocker := invalidContractBlockerText(contract, invalid, msg)
-		_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
-		state.BlockActiveTask("failed")
-		addInvalidContractExecutionEvent(state, task.ID, invalid)
-		if saveErr := rt.saveState(state, trace); saveErr != nil {
-			return Response{}, saveErr
-		}
-		_ = trace.write(map[string]any{"type": "reply", "text": blocker, "style": channel.StyleError})
-		return Response{
-			Reply: channel.OutboundMessage{
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Text:     blocker,
-				Style:    channel.StyleError,
-			},
-			TraceID:   trace.id,
-			TracePath: trace.path,
-			Failed:    true,
-		}, nil
-	}
-	if phase == tracePhaseExecute && state.Pending == nil && !taskHasTracePhase(task, tracePhasePlanReview) && shouldPauseForTaskPlan(contract, strategy) {
-		state.Pending = &session.PendingAction{
-			Kind:     session.PendingKindTaskPlanConfirm,
-			TaskID:   task.ID,
-			Question: "1 execute, 2 replan",
-		}
-		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhasePlanReview, MessageID: msg.ID})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, err
-		}
-		_ = trace.write(map[string]any{"type": "task_plan_review", "task_id": task.ID, "required_tools": contract.RequiredTools, "required_skills": contract.RequiredSkills, "plan_item_count": len(contract.PlanItems)})
-		return Response{
-			Reply: channel.OutboundMessage{
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Text:     renderTaskPlanForReview(contract, userText),
-				Style:    channel.StyleInputRequired,
-			},
-			TraceID:   trace.id,
-			TracePath: trace.path,
-		}, nil
-	}
-	systemPrompt := prependTaskFocus(buildRuntimeSystemContextForTask(rt.Config, profile, userText, contract), task, userText)
-	if contractContext := renderTaskContractContext(contract); contractContext != "" {
-		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + contractContext)
-	}
-	if phase != tracePhasePlanReview && len(contract.PlanItems) > 0 && strategy != contractStrategyDirect {
-		rt.emitProgress(msg, *state, task.ID, taskExecutionEventCount(*state, task.ID), channel.ProgressStep{
-			Title:   "plan",
-			Status:  "running",
-			Summary: renderTaskPlanForExecution(contract, userText),
-		})
-	}
-	systemPrompt = appendPreviousTaskContext(systemPrompt, *state, task.ID, userText)
-	if strings.Contains(systemPrompt, "Continuity judgment:") {
-		tasks := recentPreviousTasks(*state, task.ID, 3)
-		var taskIDs []string
-		for _, t := range tasks {
-			taskIDs = append(taskIDs, t.ID)
-		}
-		_ = trace.write(map[string]any{
-			"type":             "task_recall_context_injected",
-			"prior_task_count": len(tasks),
-			"prior_task_ids":   taskIDs,
-		})
-	}
-	contextMessages := rt.Hooks.contextMessages(ctx, ContextHookInput{
-		Message:  msg,
-		State:    *state,
-		TaskID:   task.ID,
-		UserText: userText,
-		Profile:  profile,
-	}, trace)
-	if len(contextMessages) > 0 {
-		messages = append(messages, contextMessages...)
-	}
-	modelCfg := rt.Pool.ModelConfigForMessage(msg)
-	_ = trace.write(map[string]any{
-		"type":                   "model_route_selected",
-		"model":                  modelCfg.Model,
-		"model_name":             modelCfg.Name,
-		"provider":               modelCfg.Provider,
-		"context_window_tokens":  modelCfg.ContextWindow,
-		"max_output_tokens":      modelCfg.MaxTokensValue(),
-		"context_budget_enabled": rt.Config.Execution.ContextBudget.EnabledValue(),
-	})
-	var budgetResults []contextBudgetResult
-	agent.Model = budgetedModel{
-		inner:          agent.Model,
-		config:         rt.Config,
-		modelConfig:    modelCfg,
-		trace:          trace,
-		state:          *state,
-		taskID:         task.ID,
-		results:        &budgetResults,
-		defaultVisible: rt.Config.Execution.ContextBudget.DefaultVisibleValue(),
-	}
-	agent.SystemPrompt = systemPrompt
-	agent.Messages = messages
-	agent.MaxParallelTools = maxParallelTools(rt.Config)
-	agent.MaxIterations = maxIterations(rt.Config)
-	runCtx, stopActivityWatch, activityTimedOut := rt.withActivityWatchdog(ctx, trace, task.ID)
-	defer stopActivityWatch()
-	agentHooks := rt.hooksForState(state, msg, task.ID, userText, trace, nil, discoveredSkills)
-	agent.Hooks = agentHooks
-	result, err := agent.Continue(runCtx)
-	if err != nil {
-		state.BlockActiveTask("failed")
-		if saveErr := rt.saveState(state, trace); saveErr != nil {
-			return Response{}, saveErr
-		}
-		if activityTimedOut() {
-			text := runtimeText(rt.Config, msg, "runtime.activity_timeout", nil)
-			resp := rt.reply(msg, renderPartialReply(rt.Config, msg, text), channel.StylePartial)
-			resp.Reply.Progress = progressStepsForTask(*state, task.ID)
-			resp.TraceID = trace.id
-			resp.TracePath = trace.path
-			resp.Failed = true
-			_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
-			return resp, nil
-		}
-		text := friendlyRuntimeError(rt.Config, msg, err)
-		resp := Response{
-			Reply: channel.OutboundMessage{
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Text:     text,
-				Style:    channel.StyleError,
-				Progress: progressStepsForTask(*state, task.ID),
-			},
-			TraceID:   trace.id,
-			TracePath: trace.path,
-			Failed:    true,
-		}
-		_ = trace.write(map[string]any{"type": "model_error", "error": err.Error(), "friendly": text})
-		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
-		return resp, nil
-	}
-
-	state.Messages = redactMessagesForStorage(result.Messages)
-	finalText := redactSecretString(result.FinalText)
-	usage := usageFromMessages(result.Messages)
-	addUsage(&usage, usageFromBudgetResults(budgetResults))
-	addUsage(&state.Usage, usage)
-	writeUsageTrace(trace, usage)
-	taskCompleted := false
-	contractUnsatisfied := false
-	var classification FinalClassification
-	if state.Pending == nil {
-		contract := taskContractFromState(*state, task.ID)
-		currentTask := taskFromState(*state, task.ID)
-		// Re-derive the unavailable tool check and followup count from the
-		// task itself, so the post-loop classification does not depend on
-		// any state the hook passed back through a pointer.
-		unavailable := checkUnavailableContractTools(rt, msg, contract)
-		classification = EvaluateFinal(FinalInput{
-			Contract:         contract,
-			Task:             currentTask,
-			FinalText:        finalText,
-			StopReason:       result.StopReason,
-			UnavailableTools: unavailable,
-			AgentRegistry:    agentToolsForMessage(rt, msg),
-			FullRegistry:     rt.Tools,
-			FollowupCount:    countContractFollowupEvents(currentTask),
-			MaxFollowups:     rt.Config.Execution.MaxContractFollowupsValue(),
-		})
-		switch classification.State {
-		case "completed":
-			completeNoToolPlanItems(state, task.ID, finalText)
-			state.CompleteActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
-			updateSessionSummary(state, task.ID, finalText, "completed", trace)
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "completed", Status: "completed", Summary: summarize(finalText)})
-			taskCompleted = true
-		case "await_user_input":
-			state.AwaitUserInputActiveTaskWithSummary(summarize(finalText), trace.id, trace.path)
-			updateSessionSummary(state, task.ID, finalText, "await_user_input", trace)
-			state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: "await_user_input", Status: "await_user_input", Summary: summarize(finalText)})
-			_ = trace.write(map[string]any{"type": "await_user_input", "task_id": task.ID, "status": "await_user_input"})
-		case "failed":
-			switch classification.BlockerKind {
-			case completionBlockerStopReason:
-				state.BlockActiveTask("failed")
-				state.AddExecutionEvent(task.ID, session.ExecutionEvent{Type: result.StopReason, Status: "failed", Summary: result.StopReason, Evidence: map[string]any{"iterations": result.Iterations}})
-				_ = trace.write(map[string]any{"type": result.StopReason, "task_id": task.ID, "status": "failed", "iterations": result.Iterations})
-			default:
-				contractUnsatisfied = true
-				state.BlockActiveTask("failed")
-				followupAttempts := countContractFollowupEvents(currentTask)
-				evidence := buildBlockedTaskEvidence(classification, followupAttempts)
-				state.AddExecutionEvent(task.ID, session.ExecutionEvent{
-					Type:     "task_contract_unsatisfied",
-					Status:   "failed",
-					Summary:  classification.BlockerReason,
-					Evidence: evidence,
-				})
-				// The hook already wrote contract_tool_unavailable or
-				// task_contract_followup_limit to the trace when it forced
-				// the loop to stop. The post-loop only records the task
-				// state change as a single task_contract_unsatisfied
-				// execution event; no parallel _post trace event.
-			}
-		}
-	}
-	if contractUnsatisfied && classification.BlockerText != "" {
-		finalText = strings.TrimSpace(finalText)
-		if finalText != "" {
-			finalText = finalText + classification.BlockerText
-		} else {
-			finalText = classification.BlockerText
-		}
-	}
-	if err := rt.saveState(state, trace); err != nil {
-		return Response{}, err
-	}
-
-	var learningResult *memory.LearningResult
-	if taskCompleted {
-		home := rt.home()
-		observe := rt.Hooks.observe(ctx, ObserveHookInput{
-			Kind:       "task_completed",
-			Home:       home,
-			SessionKey: state.Key,
-			State:      *state,
-			TaskID:     task.ID,
-			FinalText:  finalText,
-			TraceID:    trace.id,
-			TracePath:  trace.path,
-			Skills:     memorySkills(discoveredSkills),
-			UserText:   userText,
-		}, trace)
-		learningResult = observe.LearningResult
-		if learningResult != nil {
-			_ = trace.write(map[string]any{
-				"type":            "self_learning",
-				"diary_path":      learningResult.DiaryPath,
-				"reflection_path": learningResult.ReflectionPath,
-				"proposal_id":     proposalID(learningResult.Proposal),
-			})
-			if learningResult.Proposal != nil {
-				state.Pending = &session.PendingAction{
-					Kind:       "memory_proposal_review",
-					TaskID:     task.ID,
-					ProposalID: learningResult.Proposal.ID,
-					Question:   "1 save, 2 ignore",
-				}
-				if err := rt.saveState(state, trace); err != nil {
-					return Response{}, err
-				}
-			}
-		}
-	}
-	text := redactSecretString(rt.Hooks.response(ctx, ResponseHookInput{RawText: finalText, LearningResult: learningResult}, trace))
-	var followUps []channel.OutboundMessage
-	if learningResult != nil && learningResult.Proposal != nil {
-		followUps = append(followUps, channel.OutboundMessage{
-			Channel:  msg.Channel,
-			ThreadID: msg.ThreadID,
-			Text:     renderMemoryProposalReview(rt.Config, msg, *learningResult.Proposal),
-			Style:    channel.StyleMemoryProposalReview,
-		})
-	}
-	if learningResult == nil || learningResult.Proposal == nil {
-		if nudge, err := memory.PendingProposalNudge(rt.home(), state.Key, time.Now(), rt.memoryProposalNudgeOptions(msg)); err == nil && nudge != "" {
-			text = strings.TrimSpace(text) + "\n\n" + nudge
-			_ = trace.write(map[string]any{"type": "memory_proposal_nudge", "text": nudge})
-		}
-	}
-	style := channel.MessageStyle("")
-	failed := result.StopReason != "" || (state.Pending == nil && classification.State == "failed")
-	if failed && style == "" {
-		style = channel.StylePartial
-	}
-	resp := Response{
-		Reply: channel.OutboundMessage{
-			Channel:  msg.Channel,
-			ThreadID: msg.ThreadID,
-			Text:     text,
-			Style:    style,
-		},
-		FollowUps: followUps,
-		TraceID:   trace.id,
-		TracePath: trace.path,
-		Failed:    failed,
-	}
-	_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
-	for _, followUp := range followUps {
-		_ = trace.write(map[string]any{"type": "follow_up_reply", "text": followUp.Text, "style": followUp.Style})
-	}
-	return resp, nil
 }
 
 func renderPartialReply(cfg *config.Root, msg channel.InboundMessage, text string) string {
@@ -1073,6 +756,8 @@ func friendlyRuntimeError(cfg *config.Root, msg channel.InboundMessage, err erro
 		return runtimeText(cfg, msg, "runtime.error.missing_api_key", nil)
 	case strings.Contains(lower, "all models failed"):
 		return runtimeText(cfg, msg, "runtime.error.all_models_failed", nil)
+	case strings.Contains(lower, "task contract references unavailable tools or skills"):
+		return raw
 	default:
 		return runtimeText(cfg, msg, "runtime.error.generic", nil)
 	}

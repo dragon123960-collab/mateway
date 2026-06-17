@@ -178,6 +178,28 @@ func TestFinalizeGraph_BlockedUnverifiedCriteria(t *testing.T) {
 	}
 }
 
+func TestFinalizeGraph_FailedUsesGraphVerificationReason(t *testing.T) {
+	g := &TaskGraph{
+		ID:     "g9",
+		TaskID: "t9",
+		Nodes: []TaskGraphNode{
+			{ID: "answer", Type: NodeTypeModel, Goal: "answer", Status: NodeStatusCompleted, ResultSummary: "done", Acceptance: Acceptance{Verified: true}},
+		},
+	}
+	vr := GraphVerificationResult{
+		Status:       GraphStatusFailed,
+		Reason:       "task contract unsatisfied",
+		MissingNodes: []string{"file.write"},
+	}
+	result := FinalizeGraph(g, vr)
+	if result.Status != FinalizeFailed {
+		t.Fatalf("expected failed, got %q", result.Status)
+	}
+	if !strings.Contains(result.ReplyText, "file.write") {
+		t.Fatalf("reply should mention missing item, got %q", result.ReplyText)
+	}
+}
+
 func TestFinalizeGraph_CompletedSkipsEmptySummary(t *testing.T) {
 	g := &TaskGraph{
 		ID:     "g9",

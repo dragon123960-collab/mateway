@@ -6,34 +6,34 @@
 
 [English](./README.md) | [中文](./README.zh.md)
 
-**Mateway is a local-first Go agent runtime for real workspaces. It turns a user task into a lightweight contract, runs a small transcript-driven tool loop, and finishes only when the required evidence is present or a concrete blocker is known.**
+**Mateway is a local-first agent runtime kernel for real workspaces and domain applications. It turns a user task into a TaskGraph of verifiable subtasks, runs node-local model/tool/skill execution, and finishes only when the graph evidence satisfies the task or a concrete blocker is known.**
 
-It is intentionally not a heavy workflow platform. The project is about loop engineering: keeping the core AgentCore loop small while adding reliability through contracts, tool boundaries, editable skills, white-box memory, and traceable evidence.
+It is intentionally not a heavy workflow platform. The project is about loop engineering: moving from one long global ReAct loop to a graph of recoverable subtask nodes, while keeping tool boundaries, editable skills, white-box memory, and traceable evidence.
 
 ```text
-message -> task contract/checklist -> selected skill preflight
-        -> AgentCore ReAct loop -> tool evidence
-        -> completion evaluator -> final answer or blocker
+message -> Planner -> TaskGraph -> Scheduler
+        -> node-local execution -> verifier
+        -> finalizer -> memory observe
 ```
 
 ## What Makes It Different
 
-- **Task contracts, not blind chatting.** Action tasks carry required tools, expected evidence, selected skills, and plan items. The runtime uses that checklist to decide whether the task is done.
-- **Transcript-driven execution.** Mateway does not mechanically replay a PlanExecute graph or DAG. The model still acts through a normal ReAct loop, while hooks and the evaluator keep it honest.
-- **Editable skills.** Skills live as local `SKILL.md` files under the workspace. Planning can select relevant skills, but skill names never become tool names; real work still uses tools such as `file.read`, `file.write`, `terminal.run`, `web.search`, and `web.fetch`.
+- **TaskGraph planning, not blind chatting.** Planner produces task acceptance and a graph of verifiable subtask nodes.
+- **Node-local ReAct.** Complex nodes can run a bounded local ReAct loop, while simple nodes use direct model calls and deterministic work can use scripts/tools.
+- **Editable skills.** Skills live as registered local packages with `SKILL.md` and `.mateway/metadata.yaml`. Planner can bind a skill to a node, but tool calls remain node-internal actions/evidence.
 - **White-box memory.** Long-term memory is Markdown with YAML frontmatter, plus proposals and audit trails. The agent can suggest durable memory, but the user decides what gets committed.
 - **Trace ledger.** Runs produce JSONL traces with model turns, tool calls, evidence, hook events, timing, token diagnostics, and secret redaction.
 - **Small local runtime.** CLI, Feishu, Weixin, scheduled jobs, and tests share the same runtime instead of separate agent stacks.
 
 ## Current Capabilities
 
-- CLI entrypoint: `mateway ask`
+- CLI entrypoints: `mateway ask`, `mateway chat`, and `mateway tui`
 - Feishu WebSocket gateway and native Weixin iLink Bot channel
 - Built-in tools: `file.read`, `file.write`, `file.edit`, `file.delete`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, `schedule.manage`, `task.search`, `task.resume`, and `toolresult.read`
 - Tool policy with destructive terminal command blocking, path validation, and secret redaction
-- Task plan review for complex or risky work
+- TaskGraph runtime foundations: planner, graph state, node execution, verifier, finalizer, and recovery-oriented trace
 - Context budgeting, compacted tool output, and raw output retrieval by `raw_ref`
-- Multi-agent profile foundations with channel bindings, agent-specific skills, and agent-scoped memory
+- Multi-agent profile foundations with channel bindings, agent-specific skills, agent-scoped memory, and future local agent node roles
 - Memory proposal, lint, search, index rebuild, and learning heartbeat commands
 
 `terminal.run` is the only command execution tool. It can inject secrets through `env_secrets`; traces record only secret ids and environment variable names, never secret values.
@@ -63,7 +63,10 @@ Try the CLI:
 ```bash
 ./build/mateway ask "Read README.md and summarize this project."
 ./build/mateway ask "Inspect the current project directory and identify the runtime entrypoint."
+./build/mateway chat
 ```
+
+`mateway chat` opens the interactive terminal UI when the current terminal supports it, and falls back to the classic line-based REPL with `--classic`. Use `mateway tui` to start the TUI directly.
 
 `mateway init` creates the local home under `~/.mateway/`:
 
@@ -79,21 +82,23 @@ run/         runtime locks and channel state
 
 ## Documentation
 
-- [Architecture](./docs/architecture.md) describes package boundaries and the small-runtime design.
-- [Configuration](./docs/configuration.md) explains local paths, models, channels, skills, memory, and security settings.
+- [Architecture](./docs/architecture.md) describes package boundaries and the runtime-kernel design.
+- [TaskGraph Runtime](./docs/task-graph-runtime.md) describes the final TaskGraph architecture.
 - [Execution Flow](./docs/execution-flow.md) follows a task from user message to final answer or blocker.
+- [Embedding And App Runtime](./docs/embedding-and-app-runtime.md) explains how applications can use Mateway as a local agent kernel.
+- [Configuration](./docs/configuration.md) explains local paths, models, channels, skills, memory, and security settings.
 - [Roadmap](./docs/roadmap.md) records the current direction and non-goals.
 
 Development scratch notes live in `dev-notes/` and are intentionally short-lived.
 
 ## Design Boundaries
 
-Mateway does not aim to become a workflow platform. Current non-goals:
+Mateway does not aim to become a distributed workflow platform. Current non-goals:
 
-- No PlanExecute framework.
-- No DAG runtime.
-- No multi-agent supervisor or subagent spawning.
+- No heavy workflow platform or distributed workflow engine.
+- No multi-tenant company scheduler.
+- No distributed multi-agent supervisor or subagent spawning.
 - No gateway business routing layer.
 - No command execution tool besides `terminal.run`.
 
-The future direction is deeper loop engineering: better planning contracts, tighter execution context, stronger evidence evaluation, safer terminal isolation, and more useful skill/memory crystallization.
+Mateway can support local agent nodes as execution roles, but external schedulers and company-level orchestration should call it as a runtime kernel rather than live inside it.

@@ -22,7 +22,7 @@ func (m *finalizerCountingModel) Next(context.Context, agentcore.Context) (agent
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
 }
 
-func TestFinalizeGraph_Completed_UsesModelForFinalAnswer(t *testing.T) {
+func TestFinalizeGraph_Completed_UsesLastModelNodeForFinalAnswer(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Model = staticTextModel{text: "All configs loaded successfully. The application is ready."}
 
@@ -39,8 +39,8 @@ func TestFinalizeGraph_Completed_UsesModelForFinalAnswer(t *testing.T) {
 	if result.Status != session.FinalizeCompleted {
 		t.Fatalf("expected completed, got %q", result.Status)
 	}
-	if !strings.Contains(result.ReplyText, "All configs loaded successfully") {
-		t.Fatalf("expected model-generated final answer, got %q", result.ReplyText)
+	if result.ReplyText != "3 entries found" {
+		t.Fatalf("expected final answer from completed model node, got %q", result.ReplyText)
 	}
 	if result.KeepTask {
 		t.Fatal("completed should not keep task")
@@ -160,11 +160,43 @@ func TestFinalizeAndRespond_AwaitingInput_CreatesPendingAction(t *testing.T) {
 	if state.Pending.NodeID != "review" {
 		t.Fatalf("pending NodeID=%q, want review", state.Pending.NodeID)
 	}
+	if state.Pending.Kind != session.PendingKindHumanReview {
+		t.Fatalf("pending Kind=%q, want human review", state.Pending.Kind)
+	}
+	if !strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
+		t.Fatalf("reply should include numeric confirmation guidance, got %q", resp.Reply.Text)
+	}
 	if state.ActiveTask != "t1" {
 		t.Fatal("awaiting_input should keep ActiveTask")
 	}
 	if resp.Reply.Style != channel.StyleInputRequired {
 		t.Fatalf("expected input_required style, got %q", resp.Reply.Style)
+	}
+}
+
+func TestFinalizeAndRespond_AwaitingHumanConfirmCreatesConfirmPending(t *testing.T) {
+	rt := newTestRuntime(t)
+	msg := inbound("cli:test", "hi")
+	state := &session.State{Key: "cli:test", ActiveTask: "t1"}
+
+	g := &session.TaskGraph{
+		ID:     "g-await-confirm",
+		TaskID: "t1",
+		Nodes: []session.TaskGraphNode{
+			{ID: "confirm", Type: session.NodeTypeHumanConfirm, Goal: "approve write", Status: session.NodeStatusAwaitingInput},
+		},
+	}
+
+	vr := session.VerifyTaskGraph(g)
+	resp, err := rt.FinalizeAndRespond(t.Context(), msg, state, g, vr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != session.PendingKindHumanConfirm {
+		t.Fatalf("expected human confirm pending, got %#v", state.Pending)
+	}
+	if !strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
+		t.Fatalf("reply should include numeric confirmation guidance, got %q", resp.Reply.Text)
 	}
 }
 
@@ -232,8 +264,8 @@ func TestFinalizeAndRespond_Blocked_GraphBlockedTrace(t *testing.T) {
 	if resp.Reply.Style != channel.StyleError {
 		t.Fatalf("expected error style, got %q", resp.Reply.Style)
 	}
-	if resp.Failed {
-		t.Fatal("blocked response should not be marked Failed")
+	if !resp.Failed {
+		t.Fatal("blocked response should be marked Failed")
 	}
 }
 
@@ -367,6 +399,83 @@ func TestHandle_GraphTask_RunsGraphLifecycle(t *testing.T) {
 	}
 	if updated.ActiveTask != "" {
 		t.Fatalf("ActiveTask should be cleared, got %q", updated.ActiveTask)
+	}
+}
+
+func TestHandle_NewTaskCreatesGraphLifecycle(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "graph answer"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
+
+	resp, err := rt.Handle(t.Context(), inbound("cli:graph-new", "answer directly"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("new graph task should complete, got %#v", resp)
+	}
+	if resp.Reply.Text != "graph answer" {
+		t.Fatalf("expected direct model node reply, got %q", resp.Reply.Text)
+	}
+
+	state := loadState(t, rt, "cli:graph-new")
+	if len(state.Tasks) != 1 {
+		t.Fatalf("expected one task, got %#v", state.Tasks)
+	}
+	task := state.Tasks[0]
+	if task.Graph == nil || len(task.Graph.Nodes) != 1 {
+		t.Fatalf("expected single-node graph, got %#v", task.Graph)
+	}
+	if task.Graph.Nodes[0].Type != session.NodeTypeModel || task.Graph.Nodes[0].Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed model node, got %#v", task.Graph.Nodes[0])
+	}
+}
+
+func TestHandle_PlannerFailureFallsBackToModelGraph(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "fallback answer"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"fallback","requires_tools":false,"required_tools":[],"required_evidence":[],"expected_outcome":"fallback answer","completion_policy":"answer directly"}`}
+
+	resp, err := rt.Handle(t.Context(), inbound("cli:graph-fallback", "simple fallback"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("fallback graph should complete, got %#v", resp)
+	}
+
+	state := loadState(t, rt, "cli:graph-fallback")
+	task := state.Tasks[0]
+	if task.Graph == nil || len(task.Graph.Nodes) != 1 {
+		t.Fatalf("expected fallback single-node graph, got %#v", task.Graph)
+	}
+	if task.Execution.Mode != "task_graph" {
+		t.Fatalf("expected task_graph execution mode, got %q", task.Execution.Mode)
+	}
+}
+
+func TestHandle_ModelNodeDoesNotRunGlobalToolLoop(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticPlannerModel{json: `{"goal":"call tool","risk":"low","nodes":[{"id":"answer","type":"model","goal":"answer with no tool loop"}],"task_acceptance":"answer"}`}
+	rt.Pool.agents["main"] = agentcore.NewAgent(toolCallingModel{}, rt.Tools)
+	rt.ContractModel = contractJSONModel{json: `{"summary":"call tool","requires_tools":false,"required_tools":[],"required_evidence":[],"expected_outcome":"answer","completion_policy":"answer directly"}`}
+
+	resp, err := rt.Handle(t.Context(), inbound("cli:no-loop", "try tool call"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatalf("model node should complete without global tool loop failure, got %#v", resp)
+	}
+
+	state := loadState(t, rt, "cli:no-loop")
+	task := state.Tasks[0]
+	if len(task.Steps) != 0 {
+		t.Fatalf("graph model node should not create legacy task steps, got %#v", task.Steps)
+	}
+	if task.Graph == nil || task.Graph.Nodes[0].Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed graph node, got %#v", task.Graph)
 	}
 }
 

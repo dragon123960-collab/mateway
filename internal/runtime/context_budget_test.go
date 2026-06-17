@@ -147,6 +147,7 @@ func TestTraceSummaryContextBudgetTelemetry(t *testing.T) {
 }
 
 func TestRuntimeBudgetsEveryModelTurn(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "terminal.run", content: strings.Repeat("search result\n", 1200)})
@@ -180,6 +181,7 @@ func TestRuntimeBudgetsEveryModelTurn(t *testing.T) {
 }
 
 func TestRuntimeModelSeesFilteredTools(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	cfg := rt.Config
 	cfg.Execution.ContextBudget.MaxVisibleTools = 2

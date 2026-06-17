@@ -132,6 +132,19 @@ func finalizeFailed(g *TaskGraph, vr GraphVerificationResult) GraphFinalizeResul
 			failures = append(failures, fmt.Sprintf("- %s: %s", n.ID, reason))
 		}
 	}
+	if len(failures) == 0 {
+		for _, id := range vr.MissingNodes {
+			if strings.TrimSpace(id) != "" {
+				failures = append(failures, fmt.Sprintf("- %s: acceptance or task contract not satisfied", id))
+			}
+		}
+	}
+	if len(failures) == 0 && strings.TrimSpace(vr.Reason) != "" {
+		failures = append(failures, "- "+vr.Reason)
+	}
+	if len(failures) == 0 {
+		failures = append(failures, "- graph verification failed")
+	}
 
 	reply := "Task failed:\n" + strings.Join(failures, "\n")
 

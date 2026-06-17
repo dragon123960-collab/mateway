@@ -181,13 +181,14 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 	case "execute":
 		state.Pending = nil
 		state.ActiveTask = task.ID
+		task.Graph = nil
 		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhaseExecute, MessageID: msg.ID})
-		if err := rt.saveState(state, trace); err != nil {
+		if err := rt.ensureGraphForTask(ctx, msg, state, task, task.Goal, trace); err != nil {
 			return Response{}, true, err
 		}
 		_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "control_text": msg.Text, "effective_task_goal": task.Goal})
 		_ = trace.write(map[string]any{"type": "task_plan_confirmed", "task_id": task.ID, "control_text": msg.Text, "effective_task_goal": task.Goal})
-		resp, err := rt.runTask(ctx, msg, state, task, task.Goal, tracePhaseExecute, trace)
+		resp, err := rt.runGraphTask(ctx, msg, state, task, task.Goal, trace)
 		return resp, true, err
 	case "replan":
 		if pending.ReplanCount >= 5 {

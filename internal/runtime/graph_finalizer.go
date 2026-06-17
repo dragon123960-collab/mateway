@@ -38,16 +38,26 @@ func (rt Runtime) finalizeGraph(
 
 	result := session.FinalizeGraph(g, vr)
 
+	if result.Status == session.FinalizeCompleted {
+		if direct := directSingleModelResult(g); direct != "" {
+			result.ReplyText = direct
+		} else if direct := lastCompletedModelResult(g); direct != "" {
+			result.ReplyText = direct
+		}
+	}
+
 	if result.Status == session.FinalizeCompleted && rt.Model != nil {
 		prompt := renderFinalizerPrompt(g, vr)
 		finalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		reply, err := rt.Model.Next(finalCtx, agentcore.Context{
-			SystemPrompt: finalizerSystemPrompt,
-			Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
-		})
-		if err == nil && strings.TrimSpace(reply.Content) != "" {
-			result.ReplyText = strings.TrimSpace(reply.Content)
+		if directSingleModelResult(g) == "" && lastCompletedModelResult(g) == "" {
+			reply, err := rt.Model.Next(finalCtx, agentcore.Context{
+				SystemPrompt: finalizerSystemPrompt,
+				Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
+			})
+			if err == nil && strings.TrimSpace(reply.Content) != "" {
+				result.ReplyText = strings.TrimSpace(reply.Content)
+			}
 		}
 	}
 
@@ -72,6 +82,39 @@ func (rt Runtime) finalizeGraph(
 	}
 
 	return result
+}
+
+func directSingleModelResult(g *session.TaskGraph) string {
+	if g == nil || len(g.Nodes) != 1 {
+		return ""
+	}
+	n := g.Nodes[0]
+	if n.Type != session.NodeTypeModel || n.Status != session.NodeStatusCompleted {
+		return ""
+	}
+	if text, ok := n.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(n.ResultSummary)
+}
+
+func lastCompletedModelResult(g *session.TaskGraph) string {
+	if g == nil {
+		return ""
+	}
+	for i := len(g.Nodes) - 1; i >= 0; i-- {
+		n := g.Nodes[i]
+		if n.Type != session.NodeTypeModel || n.Status != session.NodeStatusCompleted {
+			continue
+		}
+		if text, ok := n.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+		if strings.TrimSpace(n.ResultSummary) != "" {
+			return strings.TrimSpace(n.ResultSummary)
+		}
+	}
+	return ""
 }
 
 func (rt Runtime) FinalizeAndRespond(
@@ -114,6 +157,9 @@ func (rt Runtime) FinalizeAndRespond(
 
 	case session.FinalizeAwaitingInput:
 		ensurePendingForGraph(state, g)
+		if state.Pending != nil && strings.TrimSpace(state.Pending.Question) != "" {
+			result.ReplyText = state.Pending.Question
+		}
 		summary := summarize(result.ReplyText)
 		state.AwaitUserInputActiveTaskWithSummary(summary, traceID(trace), tracePath(trace))
 
@@ -144,7 +190,7 @@ func (rt Runtime) FinalizeAndRespond(
 		_ = trace.write(map[string]any{"type": "reply", "text": text, "style": string(style)})
 	}
 
-	failed := result.Status == session.FinalizeFailed
+	failed := result.Status == session.FinalizeFailed || result.Status == session.FinalizeBlocked
 
 	return Response{
 		Reply: channel.OutboundMessage{
@@ -212,21 +258,40 @@ func ensurePendingForGraph(state *session.State, g *session.TaskGraph) {
 		return
 	}
 
-	var awaitingNodeID string
+	var awaitingNode *session.TaskGraphNode
 	for _, n := range g.Nodes {
 		if n.Status == session.NodeStatusAwaitingInput {
-			awaitingNodeID = n.ID
+			awaitingNode = &n
 			break
 		}
 	}
 
+	question := "Please provide input to continue the task."
+	kind := session.PendingKindHumanReview
+	if awaitingNode != nil {
+		question = strings.TrimSpace(firstNonEmpty(awaitingNode.Acceptance.Criteria, awaitingNode.Goal, question))
+		if awaitingNode.Type == session.NodeTypeHumanConfirm || awaitingNode.Type == session.NodeTypeHumanReview {
+			question = strings.TrimSpace(question + "\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.")
+		}
+		if awaitingNode.Type == session.NodeTypeHumanConfirm {
+			kind = session.PendingKindHumanConfirm
+		}
+	}
+
 	state.Pending = &session.PendingAction{
-		Kind:     session.PendingKindHumanReview,
+		Kind:     kind,
 		TaskID:   g.TaskID,
 		GraphID:  g.ID,
-		NodeID:   awaitingNodeID,
-		Question: "Please provide input to continue the task.",
+		NodeID:   nodeID(awaitingNode),
+		Question: question,
 	}
+}
+
+func nodeID(node *session.TaskGraphNode) string {
+	if node == nil {
+		return ""
+	}
+	return node.ID
 }
 
 func mapReplyStyle(finalizerStyle string) channel.MessageStyle {

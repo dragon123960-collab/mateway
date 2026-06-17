@@ -19,14 +19,16 @@ type GraphPlannerOutput struct {
 }
 
 type GraphPlannerNode struct {
-	ID         string   `json:"id"`
-	Type       string   `json:"type"`
-	Goal       string   `json:"goal"`
-	Depends    []string `json:"depends,omitempty"`
-	Executor   string   `json:"executor,omitempty"`
-	Inputs     []string `json:"inputs,omitempty"`
-	Outputs    []string `json:"outputs,omitempty"`
-	Acceptance string   `json:"acceptance,omitempty"`
+	ID         string         `json:"id"`
+	Type       string         `json:"type"`
+	Goal       string         `json:"goal"`
+	Depends    []string       `json:"depends,omitempty"`
+	Executor   string         `json:"executor,omitempty"`
+	Input      map[string]any `json:"input,omitempty"`
+	Args       map[string]any `json:"args,omitempty"`
+	Inputs     []string       `json:"inputs,omitempty"`
+	Outputs    []string       `json:"outputs,omitempty"`
+	Acceptance string         `json:"acceptance,omitempty"`
 }
 
 func (rt Runtime) planTaskGraph(
@@ -134,7 +136,7 @@ func convertPlannerOutput(output GraphPlannerOutput, taskID string) (session.Tas
 			Status:   session.NodeStatusPending,
 			Depends:  normalizeDepends(pn.Depends),
 			Executor: strings.TrimSpace(pn.Executor),
-			Input:    stringSliceToMap(pn.Inputs),
+			Input:    plannerNodeInput(pn),
 			Output:   stringSliceToMap(pn.Outputs),
 			Acceptance: session.Acceptance{
 				Criteria: strings.TrimSpace(pn.Acceptance),
@@ -246,6 +248,34 @@ func stringSliceToMap(ss []string) map[string]any {
 		return nil
 	}
 	return m
+}
+
+func plannerNodeInput(pn GraphPlannerNode) map[string]any {
+	if len(pn.Input) > 0 {
+		return clonePlannerMap(pn.Input)
+	}
+	if len(pn.Args) > 0 {
+		return clonePlannerMap(pn.Args)
+	}
+	return stringSliceToMap(pn.Inputs)
+}
+
+func clonePlannerMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func extractJSONBlock(raw string) string {

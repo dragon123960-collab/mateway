@@ -24,7 +24,10 @@ Rules:
 - For simple fact/QA tasks, emit a single "model" node.
 - For tool tasks, emit "tool" nodes followed by a "model" node that synthesizes results.
 - For high-risk tasks (file writes, deletes, production deployments), insert "human_review" or "human_confirm" nodes.
+- If the user explicitly asks for confirmation, approval, review, or permission before an action, the graph MUST include a "human_confirm" or "human_review" node before that action. A "model" node must not ask the user for approval.
 - Skill names are NOT tool names. Put skill references in executor or input.skill, never claim a skill name is a tool name.
+- Tool nodes MUST include an "input" object whose keys match the selected tool schema exactly.
+- Do NOT use free-form tool args such as {"goal": "..."} unless the tool schema actually requires "goal".
 - Do NOT decide parallelism; the runtime handles that.
 - Risk must be one of "low", "medium", or "high".
 - IDs should be short descriptive labels (lowercase, no spaces).
@@ -40,7 +43,7 @@ Output schema:
       "goal": "collect repository files",
       "depends": [],
       "executor": "file.read",
-      "inputs": ["workspace path"],
+      "input": {"path": "/absolute/path/to/file"},
       "outputs": ["file summary"],
       "acceptance": "repository files are collected and summarized"
     },
@@ -49,7 +52,7 @@ Output schema:
       "type": "model",
       "goal": "analyze collected files",
       "depends": ["collect-files"],
-      "inputs": ["file summary"],
+      "input": {"context": "file summary"},
       "outputs": ["analysis result"],
       "acceptance": "analysis covers key architectural patterns"
     }
@@ -69,8 +72,10 @@ func renderGraphPlannerPrompt(goal, userText string, tools *agentcore.ToolRegist
 	b.WriteString("\n\nGuidance:\n")
 	b.WriteString("- Break the task into atomic nodes with dependencies.\n")
 	b.WriteString("- Use exact tool names from Available tools below as executors for tool nodes.\n")
+	b.WriteString("- For every tool node, fill input with exact JSON keys required by that tool schema.\n")
 	b.WriteString("- For simple Q&A, emit a single model node.\n")
 	b.WriteString("- For high-risk operations, include human_review or human_confirm nodes.\n")
+	b.WriteString("- If the user asks for confirmation, approval, review, or permission before an action, include a human_confirm or human_review node before that action; never use a model node to ask for approval.\n")
 
 	if len(skills) > 0 {
 		b.WriteString("\nAvailable skills:\n")
@@ -96,10 +101,16 @@ func renderGraphPlannerPrompt(goal, userText string, tools *agentcore.ToolRegist
 	b.WriteString("\nAvailable tools:\n")
 	for _, tool := range toolsForContract(tools) {
 		contract := agentcore.ContractFor(tool)
+		schema := tool.Schema()
 		b.WriteString("- ")
 		b.WriteString(tool.Name())
 		b.WriteString(": ")
 		b.WriteString(tool.Description())
+		if len(schema.Required) > 0 {
+			b.WriteString(" Required input keys: ")
+			b.WriteString(strings.Join(schema.Required, ", "))
+			b.WriteString(".")
+		}
 		if strings.TrimSpace(contract.WhenToUse) != "" {
 			b.WriteString(" Use: ")
 			b.WriteString(contract.WhenToUse)

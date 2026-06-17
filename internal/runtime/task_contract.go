@@ -1496,6 +1496,23 @@ func invalidContractBlockerText(contract session.TaskContract, v contractToolVal
 	return invalidContractBlockerEN(contract, v)
 }
 
+func invalidContractBlockerENWithRegistries(contract session.TaskContract, v contractToolValidation, agentRegistry, fullRegistry *agentcore.ToolRegistry) string {
+	if len(v.InvalidTools) == 0 || agentRegistry == nil {
+		return invalidContractBlockerEN(contract, v)
+	}
+	withReasons := v
+	withReasons.InvalidTools = make([]string, 0, len(v.InvalidTools))
+	for _, name := range v.InvalidTools {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		reason := availabilityReason(name, agentRegistry, fullRegistry)
+		withReasons.InvalidTools = append(withReasons.InvalidTools, name+" ("+reason+")")
+	}
+	return invalidContractBlockerEN(contract, withReasons)
+}
+
 func traceSelectedSkillBodies(trace *traceRecorder, contract session.TaskContract) {
 	if trace == nil {
 		return

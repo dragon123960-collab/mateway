@@ -160,6 +160,7 @@ func TestShouldPauseForTaskPlanReviewRequiredPauses(t *testing.T) {
 // --- Integration test: trace records contract strategy ---
 
 func TestRuntimeTraceRecordsContractStrategy(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	t.Run("direct", func(t *testing.T) {
 		rt := newTestRuntime(t)
 		rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Mateway is a local agent runtime."}, rt.Tools)
@@ -242,6 +243,7 @@ func TestRuntimeTraceRecordsContractStrategy(t *testing.T) {
 // --- Integration test: existing contract validation/skill-aware replan still works ---
 
 func TestContractStrategyDoesNotBreakExistingValidation(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
@@ -386,6 +388,7 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 	// Tool task contract: requires_tools=true with plan_items (tool execution
 	// list) and required_evidence (acceptance list).
 	rt.ContractModel = contractJSONModel{json: `{"summary":"check weather","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"today weather with source/date"}],"plan_items":[{"id":"plan-1","title":"search current weather","status":"pending","tool":"web.search","criteria":"collect today weather with source/date"}],"expected_outcome":"weather summary","completion_policy":"final answer must cite web.search evidence"}`}
+	rt.Model = plannerVerifierModel{planJSON: `{"goal":"check weather","risk":"low","nodes":[{"id":"search","type":"tool","goal":"search current weather","executor":"web.search","input":{"query":"weather today"},"outputs":["weather evidence"],"acceptance":"weather evidence returned"},{"id":"answer","type":"model","goal":"summarize weather","depends":["search"],"input":{"context":"weather evidence"},"outputs":["weather summary"],"acceptance":"summary cites weather evidence"}],"task_acceptance":"weather summary cites web.search evidence"}`}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:6a-auto", "check weather today"))
 	if err != nil {
@@ -431,7 +434,7 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 		t.Fatalf("auto_contract required_evidence must include web.search weather entry, got %+v", contract.RequiredEvidence)
 	}
 
-	// The web.search tool must have been called (auto-execute).
+	// The web.search tool must have been called from graph planner input.
 	var calledSearch bool
 	for _, step := range task.Steps {
 		if strings.EqualFold(step.Tool, "web.search") {
@@ -464,6 +467,7 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 // rendered plan shows both the tool execution list (plan_items) and the
 // acceptance list (required_evidence).
 func TestUniversalPlanShapeReviewRequiredShowsToolListAndAcceptance(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "web.search", content: "search data"})

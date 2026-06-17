@@ -116,6 +116,7 @@ func countTraceEvent(events []map[string]any, eventType string) int {
 // skill in required_skills, but the gate should NOT require reading it before
 // terminal.run (since the guidance skill has no specific execution tool).
 func TestDeliveryFixtureGuidanceSkillNotGated(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	rt := newTestRuntime(t)
 	rt.Config.App.Home = home
@@ -195,6 +196,7 @@ Guidance for assessing search results. No CLI helper.
 // a CLI-stage skill DOES block terminal.run until the SKILL.md is read.
 // This is the universal-mechanism regression the Phase B review asked for.
 func TestDeliveryFixtureExecutionSkillGatedUntilRead(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	rt := newTestRuntime(t)
 	rt.Config.App.Home = home
@@ -315,6 +317,7 @@ Use `+"`cloud-doc publish --markdown-file <path>`"+` to upload.
 // a "task_contract_skills_selected" event that mentions the execution skill,
 // proving the contract stage selected the skill before the runtime gated on it.
 func TestDeliveryFixtureContractStrategySelectsSkills(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	rt := newTestRuntime(t)
 	rt.Config.App.Home = home
@@ -448,6 +451,7 @@ Guidance only.
 // the step order (file.write before terminal.run) and the final reply
 // contains the published URL/path, with no fake audit evidence list.
 func TestDeliveryFixtureLocalArtifactBeforeRemotePublish(t *testing.T) {
+	skipLegacyAgentLoopTest(t)
 	home := t.TempDir()
 	rt := newTestRuntime(t)
 	rt.Config.App.Home = home

@@ -116,9 +116,28 @@ func parseModelVerifierOutput(raw string, node *session.TaskGraphNode) session.N
 		return conservativeBlocked(node, "model verifier produced no valid JSON")
 	}
 
-	var out modelVerifyOutput
-	if err := json.Unmarshal([]byte(jsonText), &out); err != nil {
+	var rawFields map[string]any
+	if err := json.Unmarshal([]byte(jsonText), &rawFields); err != nil {
 		return conservativeBlocked(node, fmt.Sprintf("model verifier output not valid JSON: %v", err))
+	}
+	out := modelVerifyOutput{
+		Status:     asString(rawFields["status"]),
+		Reason:     asString(rawFields["reason"]),
+		Confidence: asString(rawFields["confidence"]),
+	}
+	if raw, ok := rawFields["missing"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if v != "" {
+				out.Missing = []string{v}
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok && s != "" {
+					out.Missing = append(out.Missing, s)
+				}
+			}
+		}
 	}
 
 	status := normalizeVerifierStatus(out.Status)
@@ -148,6 +167,16 @@ func conservativeBlocked(node *session.TaskGraphNode, reason string) session.Nod
 		Missing:    missing,
 		Confidence: "low",
 	}
+}
+
+func asString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
 }
 
 func normalizeVerifierStatus(s string) string {
