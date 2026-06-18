@@ -7,18 +7,22 @@ import (
 )
 
 type NodeVerificationResult struct {
-	Status       string        // passed | failed | blocked | needs_input
-	Reason       string        // human-readable explanation
-	Missing      []string      // missing evidence or criteria
-	EvidenceRefs []EvidenceRef // supporting evidence
-	Confidence   string        // low | medium | high (from model verifier)
+	Status                 string        // passed | retry | failed | blocked | needs_input | replan | pending
+	Reason                 string        // human-readable explanation
+	Missing                []string      // missing evidence or criteria
+	EvidenceRefs           []EvidenceRef // supporting evidence
+	Confidence             string        // low | medium | high (from model verifier)
+	Retryable              bool          // whether the same node can be retried
+	FeedbackForNextAttempt string        // compact feedback injected into the next attempt
 }
 
 const (
 	VerificationPassed     = "passed"
+	VerificationRetry      = "retry"
 	VerificationFailed     = "failed"
 	VerificationBlocked    = "blocked"
 	VerificationNeedsInput = "needs_input"
+	VerificationReplan     = "replan"
 	VerificationPending    = "pending"
 )
 
@@ -32,6 +36,13 @@ func VerifyNode(node *TaskGraphNode) NodeVerificationResult {
 	}
 	if node.Status == NodeStatusAwaitingInput {
 		return NodeVerificationResult{Status: VerificationNeedsInput, Reason: "waiting for human input"}
+	}
+	if node.Status == NodeStatusNeedsReplan {
+		reason := node.FailureReason
+		if reason == "" {
+			reason = "node needs local replan"
+		}
+		return NodeVerificationResult{Status: VerificationReplan, Reason: reason}
 	}
 
 	if node.Status == NodeStatusBlocked {
@@ -50,7 +61,7 @@ func VerifyNode(node *TaskGraphNode) NodeVerificationResult {
 	}
 
 	hasResult := node.FailureReason != "" || node.ResultSummary != "" || len(node.EvidenceRefs) > 0
-	isTerminal := node.Status == NodeStatusCompleted || node.Status == NodeStatusFailed
+	isTerminal := node.Status == NodeStatusCompleted || node.Status == NodeStatusFailed || node.Status == NodeStatusNeedsReplan
 	if !hasResult && !isTerminal {
 		return NodeVerificationResult{Status: VerificationPending, Reason: "node has not been executed or produced no result"}
 	}
@@ -74,9 +85,11 @@ func verifyToolNode(node *TaskGraphNode) NodeVerificationResult {
 		if strings.Contains(strings.ToLower(node.FailureReason), "timed out") ||
 			strings.Contains(strings.ToLower(node.FailureReason), "deadline") {
 			return NodeVerificationResult{
-				Status:  VerificationFailed,
-				Reason:  node.FailureReason,
-				Missing: []string{"tool did not complete within deadline"},
+				Status:                 VerificationRetry,
+				Reason:                 node.FailureReason,
+				Missing:                []string{"tool did not complete within deadline"},
+				Retryable:              true,
+				FeedbackForNextAttempt: node.FailureReason,
 			}
 		}
 		return NodeVerificationResult{
@@ -117,11 +130,94 @@ func verifyModelNode(node *TaskGraphNode) NodeVerificationResult {
 			Missing: []string{"model result"},
 		}
 	}
+	if looksLikeUnfinishedNodeOutput(summary) {
+		return NodeVerificationResult{
+			Status:                 VerificationFailed,
+			Reason:                 "node output appears unfinished or requests a tool/input instead of satisfying the node goal",
+			Missing:                []string{"completed node result"},
+			Confidence:             "hard",
+			Retryable:              true,
+			FeedbackForNextAttempt: "Produce the completed result for this node. Do not output tool-call markup, future intentions, or requests for missing input unless the node is explicitly a human input node.",
+		}
+	}
+	if blockedToolEvidence(node) {
+		return NodeVerificationResult{
+			Status:     VerificationBlocked,
+			Reason:     "node contains blocked tool evidence",
+			Missing:    []string{"allowed tool path or user confirmation/configuration change"},
+			Confidence: "hard",
+		}
+	}
+	if unresolvedFailedToolEvidence(node, summary) {
+		return NodeVerificationResult{
+			Status:                 VerificationFailed,
+			Reason:                 "node has only failed tool evidence and did not produce an independent completed result",
+			Missing:                []string{"successful tool evidence or completed node result"},
+			Confidence:             "hard",
+			Retryable:              true,
+			FeedbackForNextAttempt: "Retry the node using an allowed safe approach, or report a concrete blocker instead of treating the failed tool result as completed work.",
+		}
+	}
 
 	return NodeVerificationResult{
 		Status:       VerificationPassed,
 		EvidenceRefs: node.EvidenceRefs,
 	}
+}
+
+func blockedToolEvidence(node *TaskGraphNode) bool {
+	if node == nil {
+		return false
+	}
+	for _, ref := range node.EvidenceRefs {
+		if ref.Kind == "tool" && ref.Blocked {
+			return true
+		}
+	}
+	return false
+}
+
+func unresolvedFailedToolEvidence(node *TaskGraphNode, summary string) bool {
+	if node == nil || len(node.EvidenceRefs) == 0 {
+		return false
+	}
+	failedTools := 0
+	successTools := 0
+	for _, ref := range node.EvidenceRefs {
+		if ref.Kind != "tool" {
+			continue
+		}
+		if ref.IsError {
+			failedTools++
+			continue
+		}
+		successTools++
+	}
+	if failedTools == 0 || successTools > 0 {
+		return false
+	}
+	return true
+}
+
+func looksLikeUnfinishedNodeOutput(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"<tool_call",
+		"</tool_call>",
+		"\"tool\":",
+		"\"tool_name\":",
+		"\"function\":",
+		"\"params\":",
+		"\"arguments\":",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func verifySkillNode(node *TaskGraphNode) NodeVerificationResult {
@@ -165,6 +261,17 @@ func ApplyNodeVerification(node *TaskGraphNode, result NodeVerificationResult) {
 		if result.Reason != "" && node.Acceptance.Reason == "" {
 			node.Acceptance.Reason = result.Reason
 		}
+	case VerificationRetry:
+		node.Status = NodeStatusRetrying
+		if result.Reason != "" {
+			node.FailureReason = result.Reason
+		}
+		if result.FeedbackForNextAttempt != "" {
+			if node.Input == nil {
+				node.Input = map[string]any{}
+			}
+			node.Input["attempt_feedback"] = result.FeedbackForNextAttempt
+		}
 	case VerificationFailed:
 		if node.Status != NodeStatusBlocked && node.Status != NodeStatusCompleted && node.Status != NodeStatusSkipped {
 			node.Status = NodeStatusFailed
@@ -174,6 +281,11 @@ func ApplyNodeVerification(node *TaskGraphNode, result NodeVerificationResult) {
 		}
 	case VerificationBlocked:
 		node.Status = NodeStatusBlocked
+		if result.Reason != "" {
+			node.FailureReason = result.Reason
+		}
+	case VerificationReplan:
+		node.Status = NodeStatusNeedsReplan
 		if result.Reason != "" {
 			node.FailureReason = result.Reason
 		}
@@ -197,6 +309,8 @@ func VerifyTaskGraph(g *TaskGraph) GraphVerificationResult {
 }
 
 func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVerificationResult {
+	_ = contract // Compatibility parameter: graph-native verification is driven by node acceptance.
+
 	result := GraphVerificationResult{
 		Status:      GraphStatusCompleted,
 		NodeResults: make(map[string]NodeVerificationResult, len(g.Nodes)),
@@ -215,6 +329,9 @@ func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVeri
 
 		switch nr.Status {
 		case VerificationPassed:
+		case VerificationRetry:
+			allPassed = false
+			anyPending = true
 		case VerificationFailed:
 			allPassed = false
 			anyFailed = true
@@ -222,6 +339,10 @@ func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVeri
 		case VerificationBlocked:
 			allPassed = false
 			anyBlocked = true
+		case VerificationReplan:
+			allPassed = false
+			anyFailed = true
+			result.MissingNodes = append(result.MissingNodes, n.ID)
 		case VerificationNeedsInput:
 			allPassed = false
 			anyAwaiting = true
@@ -256,15 +377,6 @@ func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVeri
 		}
 	}
 
-	if contract != nil && result.Status == GraphStatusCompleted {
-		missing := validateContractAgainstNodes(contract, g)
-		if len(missing) > 0 {
-			result.Status = GraphStatusFailed
-			result.Reason = fmt.Sprintf("task contract unsatisfied: missing %s", strings.Join(missing, ", "))
-			result.MissingNodes = missing
-		}
-	}
-
 	return result
 }
 
@@ -276,32 +388,4 @@ func findUnverifiedCriteriaNodes(g *TaskGraph) []string {
 		}
 	}
 	return unverified
-}
-
-func validateContractAgainstNodes(contract *TaskContract, g *TaskGraph) []string {
-	var missing []string
-	completedTools := make(map[string]bool)
-
-	for _, n := range g.Nodes {
-		if (n.Type == NodeTypeTool || n.Type == NodeTypeSubtask) && n.Status == NodeStatusCompleted {
-			completedTools[n.Executor] = true
-			for _, t := range n.AllowedTools {
-				completedTools[t] = true
-			}
-		}
-	}
-
-	for _, tool := range contract.RequiredTools {
-		if !completedTools[tool] {
-			missing = append(missing, "tool:"+tool)
-		}
-	}
-
-	for _, evidence := range contract.RequiredEvidence {
-		if evidence.Tool != "" && !completedTools[evidence.Tool] {
-			missing = append(missing, "evidence:"+evidence.Tool)
-		}
-	}
-
-	return missing
 }

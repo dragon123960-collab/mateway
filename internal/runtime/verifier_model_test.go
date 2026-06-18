@@ -326,6 +326,24 @@ func TestModelVerifier_TruncatedOutput_ConservativeBlocked(t *testing.T) {
 	}
 }
 
+func TestRenderModelVerifierPromptIncludesNodeOutputText(t *testing.T) {
+	node := &session.TaskGraphNode{
+		ID:            "n1",
+		Type:          session.NodeTypeModel,
+		Goal:          "write report",
+		ResultSummary: "short summary",
+		Output:        map[string]any{"text": "full final report body"},
+		Acceptance:    session.Acceptance{Criteria: "report body present"},
+	}
+	prompt := renderModelVerifierPrompt(node)
+	if !strings.Contains(prompt, "Node Output Text: full final report body") {
+		t.Fatalf("prompt missing node output text:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Do not fail solely because trace display was truncated") {
+		t.Fatalf("prompt missing truncation guidance:\n%s", prompt)
+	}
+}
+
 type detectExecutionTool struct {
 	detected *bool
 }

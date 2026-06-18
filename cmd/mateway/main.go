@@ -244,6 +244,13 @@ func run(args []string) error {
 		fmt.Println("reply_ms:", summary.ReplyDurationMS)
 		fmt.Println("total_ms:", summary.TotalDurationMS)
 		fmt.Println("model_requests:", summary.ModelRequests)
+		fmt.Printf("model_calls: start=%d end=%d failed=%d skipped=%d\n", summary.ModelCallStarts, summary.ModelCallEnds, summary.ModelCallFailures, summary.ModelCallSkips)
+		if stages := summary.ModelStageNames(); len(stages) > 0 {
+			for _, stage := range stages {
+				stats := summary.ModelStages[stage]
+				fmt.Printf("model_stage.%s: start=%d end=%d failed=%d skipped=%d\n", stage, stats.Starts, stats.Ends, stats.Failures, stats.Skips)
+			}
+		}
 		fmt.Println("input_tokens:", summary.InputTokens)
 		fmt.Println("output_tokens:", summary.OutputTokens)
 		fmt.Println("total_tokens:", summary.TotalTokens)

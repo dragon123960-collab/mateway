@@ -15,6 +15,42 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func startNodeAttempt(trace *traceRecorder, g *session.TaskGraph, node *session.TaskGraphNode) {
+	if node.Attempts > 0 {
+		node.ResultSummary = ""
+		node.Output = nil
+		node.EvidenceRefs = nil
+		node.FailureReason = ""
+		node.Acceptance.Verified = false
+		node.Acceptance.Reason = ""
+		node.VerifiedAt = time.Time{}
+	}
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":      "node_started",
+			"task_id":   g.TaskID,
+			"graph_id":  g.ID,
+			"node_id":   node.ID,
+			"node_type": node.Type,
+			"node_mode": node.Mode,
+			"attempt":   node.Attempts + 1,
+			"goal":      node.Goal,
+		})
+	}
+	node.TransitionTo(session.NodeStatusRunning)
+}
+
+func writeNodeEvent(trace *traceRecorder, g *session.TaskGraph, node *session.TaskGraphNode, evt map[string]any) {
+	if trace == nil {
+		return
+	}
+	evt["task_id"] = g.TaskID
+	evt["graph_id"] = g.ID
+	evt["node_id"] = node.ID
+	evt["attempt"] = node.Attempts
+	_ = trace.write(evt)
+}
+
 func (rt Runtime) executeNode(
 	ctx context.Context,
 	msg channel.InboundMessage,
@@ -24,20 +60,7 @@ func (rt Runtime) executeNode(
 	userText string,
 	trace *traceRecorder,
 ) error {
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":      "node_execute_start",
-			"graph_id":  g.ID,
-			"node_id":   node.ID,
-			"node_type": node.Type,
-			"goal":      node.Goal,
-		})
-	}
-
-	node.Status = session.NodeStatusRunning
-	node.Attempts++
-	node.UpdatedAt = time.Now()
-
+	startNodeAttempt(trace, g, node)
 	return rt.executeNodeRun(ctx, msg, state, g, node, userText, trace)
 }
 
@@ -50,11 +73,27 @@ func (rt Runtime) executeNodeRun(
 	userText string,
 	trace *traceRecorder,
 ) error {
+	// Mode-based dispatch (Phase 03).
+	if mode := strings.TrimSpace(node.Mode); mode != "" {
+		switch mode {
+		case session.NodeModeDirect:
+			return rt.executeDirectNode(ctx, msg, state, g, node, userText, trace)
+		case session.NodeModeReact:
+			return rt.executeReactNode(ctx, msg, state, g, node, userText, trace)
+		case session.NodeModeSkill:
+			return rt.executeSkillNode(ctx, msg, state, g, node, userText, trace)
+		case session.NodeModeTool, session.NodeModeScript:
+			return rt.executeToolNode(ctx, msg, state, g, node, trace)
+		case session.NodeModeHuman:
+			return rt.executeHumanNode(ctx, msg, state, g, node, trace)
+		default:
+			return rt.markUnsupportedNode(node, g, trace, fmt.Sprintf("unsupported mode %q", mode))
+		}
+	}
+
+	// Type-based dispatch supports persisted/test graphs created before Mode was required.
 	switch node.Type {
 	case session.NodeTypeModel, session.NodeTypeSubtask:
-		// TODO(task-graph-runtime): subtask/react nodes should run node-local
-		// ReAct with allowed_tools constraint. For now they execute as single
-		// model calls (stub for phase 01).
 		return rt.executeModelNode(ctx, msg, state, g, node, userText, trace)
 	case session.NodeTypeTool:
 		return rt.executeToolNode(ctx, msg, state, g, node, trace)
@@ -63,18 +102,34 @@ func (rt Runtime) executeNodeRun(
 	case session.NodeTypeHumanReview, session.NodeTypeHumanConfirm:
 		return rt.executeHumanNode(ctx, msg, state, g, node, trace)
 	default:
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = fmt.Sprintf("unknown node type %q", node.Type)
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
-		return nil
+		return rt.markUnsupportedNode(node, g, trace, fmt.Sprintf("unknown node type %q", node.Type))
 	}
+}
+
+func (rt Runtime) markUnsupportedNode(
+	node *session.TaskGraphNode,
+	g *session.TaskGraph,
+	trace *traceRecorder,
+	reason string,
+) error {
+	node.SetFailed(reason)
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":  "node_failed",
+		"error": reason,
+	})
+	return nil
+}
+
+func (rt Runtime) traceNodeFailed(
+	trace *traceRecorder,
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	reason string,
+) {
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":  "node_failed",
+		"error": reason,
+	})
 }
 
 func (rt Runtime) executeModelNode(
@@ -87,29 +142,33 @@ func (rt Runtime) executeModelNode(
 	trace *traceRecorder,
 ) error {
 	model := rt.modelForMessage(msg)
-	systemPrompt := buildNodeSystemPrompt(node, g)
+	systemPrompt := rt.buildNodeSystemPromptForMessage(msg, node, g)
 	content := renderModelNodeInput(g, node, userText)
 	input := userAgentMessage(content, msg.Parts)
+	messages := append(rt.nodeContextMessages(ctx, msg, state, g, userText, trace), input)
 
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_start",
+		"model_stage": "node_model",
+	})
 	reply, err := model.Next(ctx, agentcore.Context{
 		SystemPrompt: systemPrompt,
-		Messages: []agentcore.Message{
-			input,
-		},
+		Messages:     messages,
 	})
 	if err != nil {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = err.Error()
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    err.Error(),
-			})
-		}
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":        "model_call_failed",
+			"model_stage": "node_model",
+			"error":       err.Error(),
+		})
+		node.SetFailed(err.Error())
+		rt.traceNodeFailed(trace, g, node, err.Error())
 		return nil
 	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_end",
+		"model_stage": "node_model",
+	})
 
 	state.Messages = redactMessagesForStorage(append(state.Messages, input, reply))
 	if reply.Usage != nil {
@@ -131,8 +190,199 @@ func (rt Runtime) executeModelNode(
 			}
 		}
 	}
-	rt.verifyAndTraceNode(ctx, g.ID, node, trace)
+	rt.verifyAndTraceNode(ctx, g, node, trace)
 	return nil
+}
+
+func (rt Runtime) executeDirectNode(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	userText string,
+	trace *traceRecorder,
+) error {
+	model := rt.modelForMessage(msg)
+	systemPrompt := rt.buildNodeSystemPromptForMessage(msg, node, g)
+	content := renderModelNodeInput(g, node, userText)
+	input := userAgentMessage(content, msg.Parts)
+	messages := append(rt.nodeContextMessages(ctx, msg, state, g, userText, trace), input)
+
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_start",
+		"model_stage": "node_direct",
+	})
+	reply, err := model.Next(ctx, agentcore.Context{
+		SystemPrompt: systemPrompt,
+		Messages:     messages,
+		// Direct mode: no tools exposed to the model. If the model still
+		// emits tool calls, we ignore them and use the final text — direct
+		// mode is intentionally permissive about model misbehavior so the
+		// node does not fall back to a global tool loop.
+		Tools: nil,
+	})
+	if err != nil {
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":        "model_call_failed",
+			"model_stage": "node_direct",
+			"error":       err.Error(),
+		})
+		node.SetFailed(err.Error())
+		rt.traceNodeFailed(trace, g, node, err.Error())
+		return nil
+	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_end",
+		"model_stage": "node_direct",
+	})
+
+	state.Messages = redactMessagesForStorage(append(state.Messages, input, reply))
+	if reply.Usage != nil {
+		usage := session.Usage{}
+		addUsage(&usage, usageFromMessages([]agentcore.Message{reply}))
+		addUsage(&state.Usage, usage)
+		writeUsageTrace(trace, usage)
+	}
+	if node.Output == nil {
+		node.Output = make(map[string]any)
+	}
+	node.Output["text"] = redactSecretString(reply.Content)
+	node.ResultSummary = summarize(reply.Content)
+	if node.ResultSummary == "" && len(reply.ToolCalls) > 0 {
+		// Model returned tool calls despite direct mode. The executor
+		// did not run them, so we surface the request as a brief
+		// result summary and continue to verifier.
+		for _, tc := range reply.ToolCalls {
+			if tc.Name != "" {
+				node.ResultSummary = fmt.Sprintf("direct mode ignored tool call: %s", tc.Name)
+				break
+			}
+		}
+	}
+	rt.verifyAndTraceNode(ctx, g, node, trace)
+	return nil
+}
+
+func (rt Runtime) executeReactNode(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	userText string,
+	trace *traceRecorder,
+) error {
+	model := rt.modelForMessage(msg)
+	systemPrompt := rt.buildNodeSystemPromptForMessage(msg, node, g)
+	content := renderModelNodeInput(g, node, userText)
+	input := userAgentMessage(content, msg.Parts)
+	messages := append(rt.nodeContextMessages(ctx, msg, state, g, userText, trace), input)
+
+	toolsReg := filterAllowedTools(rt.Tools, node.AllowedTools)
+
+	hooks := agentcore.Hooks{
+		BeforeToolCall: func(_ context.Context, btc agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
+			writeNodeEvent(trace, g, node, map[string]any{
+				"type":      "node_tool_call",
+				"tool":      btc.ToolCall.Name,
+				"tool_args": redactPayload(cloneStringAnyMap(btc.ToolCall.Args)),
+			})
+			return rt.applyBeforeToolCall(ctx, btc.Message, btc.ToolCall, btc.Tool, state, g.TaskID, trace)
+		},
+		AfterToolCall: func(_ context.Context, atc agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
+			node.EvidenceRefs = append(node.EvidenceRefs, session.EvidenceRef{
+				Kind:      "tool",
+				TraceID:   traceID(trace),
+				TracePath: tracePath(trace),
+				ToolName:  atc.ToolCall.Name,
+				Summary:   summarizeToolEvidence(atc.ToolResult),
+				IsError:   atc.ToolResult.IsError,
+				Blocked:   toolResultBlocked(atc.ToolResult),
+			})
+			writeNodeEvent(trace, g, node, map[string]any{
+				"type":     "node_tool_result",
+				"tool":     atc.ToolCall.Name,
+				"is_error": atc.ToolResult.IsError,
+				"summary":  summarizeToolEvidence(atc.ToolResult),
+			})
+			return rt.applyAfterToolCall(ctx, atc.Message, atc.ToolCall, atc.Tool, atc.ToolResult, state, g.TaskID, trace), nil
+		},
+		ToolTimeout: func(tec agentcore.ToolExecutionContext) time.Duration {
+			return runtimeToolTimeout(rt.Config, tec.ToolCall.Name)
+		},
+		ToolRetryBudget: func(tec agentcore.ToolExecutionContext) int {
+			return runtimeToolRetryBudget(rt.Config, tec.ToolCall.Name)
+		},
+	}
+
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_start",
+		"model_stage": "node_react",
+	})
+	result, err := agentcore.Run(ctx, agentcore.Config{
+		SystemPrompt:  systemPrompt,
+		Model:         model,
+		Tools:         toolsReg,
+		Hooks:         hooks,
+		MaxIterations: maxNodeIterations(rt.Config),
+	}, messages)
+	if err != nil {
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":        "model_call_failed",
+			"model_stage": "node_react",
+			"error":       err.Error(),
+		})
+		node.SetFailed(err.Error())
+		rt.traceNodeFailed(trace, g, node, err.Error())
+		return nil
+	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_end",
+		"model_stage": "node_react",
+	})
+
+	state.Messages = append(state.Messages, redactMessagesForStorage(result.Messages)...)
+	if node.Output == nil {
+		node.Output = make(map[string]any)
+	}
+	node.Output["text"] = redactSecretString(result.FinalText)
+	node.ResultSummary = summarize(result.FinalText)
+	if node.ResultSummary == "" && len(node.EvidenceRefs) > 0 {
+		node.ResultSummary = fmt.Sprintf("react node produced %d tool evidence refs", len(node.EvidenceRefs))
+	}
+	rt.verifyAndTraceNode(ctx, g, node, trace)
+	return nil
+}
+
+func filterAllowedTools(reg *agentcore.ToolRegistry, allowed []string) *agentcore.ToolRegistry {
+	if reg == nil {
+		return agentcore.NewToolRegistry()
+	}
+	if len(allowed) == 0 {
+		return reg
+	}
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		allowedSet[strings.TrimSpace(name)] = true
+	}
+	filtered := agentcore.NewToolRegistry()
+	for _, tool := range reg.List() {
+		if allowedSet[tool.Name()] {
+			filtered.Register(tool)
+		}
+	}
+	return filtered
+}
+
+func maxNodeIterations(cfg *config.Root) int {
+	if cfg == nil {
+		return 8
+	}
+	if cfg.Execution.MaxIterations != nil && *cfg.Execution.MaxIterations > 0 {
+		return *cfg.Execution.MaxIterations
+	}
+	return 8
 }
 
 func (rt Runtime) executeToolNode(
@@ -145,44 +395,24 @@ func (rt Runtime) executeToolNode(
 ) error {
 	executor := strings.TrimSpace(node.Executor)
 	if executor == "" {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = "tool node has no executor"
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
+		node.SetFailed("tool node has no executor")
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
 
 	tool, ok := rt.Tools.Get(executor)
 	if !ok {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = fmt.Sprintf("tool %q not found in registry", executor)
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
+		node.SetFailed(fmt.Sprintf("tool %q not found in registry", executor))
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
 
 	call := buildToolCallFromNode(node, executor)
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":      "node_tool_call",
-			"graph_id":  g.ID,
-			"node_id":   node.ID,
-			"tool":      executor,
-			"tool_args": redactPayload(cloneStringAnyMap(call.Args)),
-		})
-	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":      "node_tool_call",
+		"tool":      executor,
+		"tool_args": redactPayload(cloneStringAnyMap(call.Args)),
+	})
 
 	synthMsg := agentcore.Message{
 		Role:      agentcore.RoleAssistant,
@@ -191,18 +421,17 @@ func (rt Runtime) executeToolNode(
 
 	result, blocked, err := rt.executeSingleTool(ctx, synthMsg, call, tool, state, g.TaskID, trace)
 	if err != nil {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = err.Error()
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    err.Error(),
-			})
-		}
+		node.SetFailed(err.Error())
+		rt.traceNodeFailed(trace, g, node, err.Error())
 		return nil
 	}
+
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":     "node_tool_result",
+		"tool":     executor,
+		"is_error": result.IsError,
+		"summary":  summarizeToolEvidence(result),
+	})
 
 	node.EvidenceRefs = append(node.EvidenceRefs, session.EvidenceRef{
 		Kind:      "tool",
@@ -210,31 +439,29 @@ func (rt Runtime) executeToolNode(
 		TracePath: tracePath(trace),
 		ToolName:  executor,
 		Summary:   summarizeToolEvidence(result),
+		IsError:   result.IsError,
+		Blocked:   blocked || toolResultBlocked(result),
 	})
 
 	if blocked {
-		node.Status = session.NodeStatusBlocked
-		node.FailureReason = result.Content
-	} else if result.IsError {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = summarize(result.Content)
-	} else {
-		node.ResultSummary = summarize(result.Content)
-		rt.verifyAndTraceNode(ctx, g.ID, node, trace)
-		return nil
-	}
-
-	if trace != nil {
-		_ = trace.write(map[string]any{
+		node.SetBlocked(result.Content)
+		writeNodeEvent(trace, g, node, map[string]any{
 			"type":     "node_execute_result",
-			"graph_id": g.ID,
-			"node_id":  node.ID,
 			"status":   node.Status,
 			"tool":     executor,
 			"is_error": result.IsError,
 			"summary":  node.ResultSummary,
 		})
+		return nil
 	}
+	if result.IsError {
+		node.SetFailed(summarize(result.Content))
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
+		return nil
+	}
+
+	node.ResultSummary = summarize(result.Content)
+	rt.verifyAndTraceNode(ctx, g, node, trace)
 	return nil
 }
 
@@ -411,16 +638,8 @@ func (rt Runtime) executeSkillNode(
 
 	skillName := strings.TrimSpace(node.Executor)
 	if skillName == "" {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = "skill node has no executor"
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
+		node.SetFailed("skill node has no executor")
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
 
@@ -430,73 +649,176 @@ func (rt Runtime) executeSkillNode(
 		if regErr != nil {
 			reason = regErr.Error()
 		}
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = reason
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
+		node.SetFailed(reason)
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
 
 	if strings.EqualFold(registered.Granularity, "workflow") {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = fmt.Sprintf("skill %q has granularity=workflow and cannot be executed as a single node; it must be split into atomic nodes by the planner", skillName)
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
+		node.SetFailed(fmt.Sprintf("skill %q has granularity=workflow and cannot be executed as a single node; it must be split into atomic nodes by the planner", skillName))
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
 
 	data, err := os.ReadFile(registered.Path)
 	if err != nil {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = fmt.Sprintf("failed to read skill %q at %q: %v", skillName, registered.Path, err)
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    node.FailureReason,
-			})
-		}
+		node.SetFailed(fmt.Sprintf("failed to read skill %q at %q: %v", skillName, registered.Path, err))
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
 
-	skillInstruction := string(data)
-	systemPrompt := buildNodeSystemPrompt(node, g) + "\n\n--- Skill Instruction ---\n" + skillInstruction
+	meta, _ := readSkillMeta(registered.Path)
+	if len(node.AllowedTools) == 0 && len(meta.Graph.AllowedTools) > 0 {
+		node.AllowedTools = append([]string(nil), meta.Graph.AllowedTools...)
+	}
+	skillType := meta.Graph.Type
+	skillType = strings.TrimSpace(strings.ToLower(skillType))
 
+	switch skillType {
+	case "react":
+		return rt.executeSkillAsReact(ctx, msg, state, g, node, trace, model, string(data))
+	case "script":
+		node.SetBlocked(fmt.Sprintf("skill %q has graph.type=script; deterministic script execution is not implemented in Phase 03", skillName))
+		rt.traceNodeFailed(trace, g, node, node.FailureReason)
+		return nil
+	default:
+		return rt.executeSkillAsPrompt(ctx, msg, state, g, node, trace, model, string(data))
+	}
+}
+
+func (rt Runtime) executeSkillAsPrompt(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	trace *traceRecorder,
+	model agentcore.Model,
+	skillInstruction string,
+) error {
+	systemPrompt := rt.buildNodeSystemPromptForMessage(msg, node, g) + "\n\n--- Skill Instruction ---\n" + skillInstruction
+	input := userAgentMessage(node.Goal, msg.Parts)
+	messages := append(rt.nodeContextMessages(ctx, msg, state, g, node.Goal, trace), input)
+
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_start",
+		"model_stage": "skill_prompt",
+	})
 	reply, err := model.Next(ctx, agentcore.Context{
 		SystemPrompt: systemPrompt,
-		Messages: []agentcore.Message{
-			{Role: agentcore.RoleUser, Content: node.Goal},
-		},
+		Messages:     messages,
 	})
 	if err != nil {
-		node.Status = session.NodeStatusFailed
-		node.FailureReason = err.Error()
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":     "node_execute_failed",
-				"graph_id": g.ID,
-				"node_id":  node.ID,
-				"error":    err.Error(),
-			})
-		}
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":        "model_call_failed",
+			"model_stage": "skill_prompt",
+			"error":       err.Error(),
+		})
+		node.SetFailed(err.Error())
+		rt.traceNodeFailed(trace, g, node, err.Error())
 		return nil
 	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_end",
+		"model_stage": "skill_prompt",
+	})
 
+	state.Messages = redactMessagesForStorage(append(state.Messages, input, reply))
+	if node.Output == nil {
+		node.Output = make(map[string]any)
+	}
+	node.Output["text"] = redactSecretString(reply.Content)
 	node.ResultSummary = summarize(reply.Content)
-	rt.verifyAndTraceNode(ctx, g.ID, node, trace)
+	rt.verifyAndTraceNode(ctx, g, node, trace)
+	return nil
+}
+
+func (rt Runtime) executeSkillAsReact(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	trace *traceRecorder,
+	model agentcore.Model,
+	skillInstruction string,
+) error {
+	systemPrompt := rt.buildNodeSystemPromptForMessage(msg, node, g) + "\n\n--- Skill Instruction ---\n" + skillInstruction
+	input := userAgentMessage(node.Goal, msg.Parts)
+	messages := append(rt.nodeContextMessages(ctx, msg, state, g, node.Goal, trace), input)
+	toolsReg := filterAllowedTools(rt.Tools, node.AllowedTools)
+
+	hooks := agentcore.Hooks{
+		BeforeToolCall: func(_ context.Context, btc agentcore.BeforeToolCallContext) (agentcore.BeforeToolCallResult, error) {
+			writeNodeEvent(trace, g, node, map[string]any{
+				"type":      "node_tool_call",
+				"tool":      btc.ToolCall.Name,
+				"tool_args": redactPayload(cloneStringAnyMap(btc.ToolCall.Args)),
+			})
+			return rt.applyBeforeToolCall(ctx, btc.Message, btc.ToolCall, btc.Tool, state, g.TaskID, trace)
+		},
+		AfterToolCall: func(_ context.Context, atc agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
+			node.EvidenceRefs = append(node.EvidenceRefs, session.EvidenceRef{
+				Kind:      "tool",
+				TraceID:   traceID(trace),
+				TracePath: tracePath(trace),
+				ToolName:  atc.ToolCall.Name,
+				Summary:   summarizeToolEvidence(atc.ToolResult),
+				IsError:   atc.ToolResult.IsError,
+				Blocked:   toolResultBlocked(atc.ToolResult),
+			})
+			writeNodeEvent(trace, g, node, map[string]any{
+				"type":     "node_tool_result",
+				"tool":     atc.ToolCall.Name,
+				"is_error": atc.ToolResult.IsError,
+				"summary":  summarizeToolEvidence(atc.ToolResult),
+			})
+			return rt.applyAfterToolCall(ctx, atc.Message, atc.ToolCall, atc.Tool, atc.ToolResult, state, g.TaskID, trace), nil
+		},
+		ToolTimeout: func(tec agentcore.ToolExecutionContext) time.Duration {
+			return runtimeToolTimeout(rt.Config, tec.ToolCall.Name)
+		},
+		ToolRetryBudget: func(tec agentcore.ToolExecutionContext) int {
+			return runtimeToolRetryBudget(rt.Config, tec.ToolCall.Name)
+		},
+	}
+
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_start",
+		"model_stage": "skill_react",
+	})
+	result, err := agentcore.Run(ctx, agentcore.Config{
+		SystemPrompt:  systemPrompt,
+		Model:         model,
+		Tools:         toolsReg,
+		Hooks:         hooks,
+		MaxIterations: maxNodeIterations(rt.Config),
+	}, messages)
+	if err != nil {
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":        "model_call_failed",
+			"model_stage": "skill_react",
+			"error":       err.Error(),
+		})
+		node.SetFailed(err.Error())
+		rt.traceNodeFailed(trace, g, node, err.Error())
+		return nil
+	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":        "model_call_end",
+		"model_stage": "skill_react",
+	})
+
+	state.Messages = append(state.Messages, redactMessagesForStorage(result.Messages)...)
+	if node.Output == nil {
+		node.Output = make(map[string]any)
+	}
+	node.Output["text"] = redactSecretString(result.FinalText)
+	node.ResultSummary = summarize(result.FinalText)
+	if node.ResultSummary == "" && len(node.EvidenceRefs) > 0 {
+		node.ResultSummary = fmt.Sprintf("skill node produced %d tool evidence refs", len(node.EvidenceRefs))
+	}
+	rt.verifyAndTraceNode(ctx, g, node, trace)
 	return nil
 }
 
@@ -526,22 +848,40 @@ func findRegisteredSkill(cfg *config.Root, name string) (*discoveredSkill, error
 
 type graphSkillMeta struct {
 	Graph struct {
-		Granularity string `yaml:"granularity"`
+		Granularity  string   `yaml:"granularity"`
+		Type         string   `yaml:"type"`
+		AllowedTools []string `yaml:"allowed_tools"`
 	} `yaml:"graph"`
 }
 
 func readGraphGranularityFromMeta(skillMdPath string) (string, error) {
+	meta, err := readSkillMeta(skillMdPath)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(meta.Graph.Granularity), nil
+}
+
+func readGraphTypeFromMeta(skillMdPath string) (string, error) {
+	meta, err := readSkillMeta(skillMdPath)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(meta.Graph.Type), nil
+}
+
+func readSkillMeta(skillMdPath string) (graphSkillMeta, error) {
 	dir := filepath.Dir(skillMdPath)
 	metadataPath := filepath.Join(dir, ".mateway", "metadata.yaml")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
-		return "", err
+		return graphSkillMeta{}, err
 	}
 	var meta graphSkillMeta
 	if err := yaml.Unmarshal(data, &meta); err != nil {
-		return "", err
+		return graphSkillMeta{}, err
 	}
-	return strings.TrimSpace(meta.Graph.Granularity), nil
+	return meta, nil
 }
 
 func hasMetadataYAML(skillMdPath string) bool {
@@ -584,15 +924,11 @@ func (rt Runtime) executeHumanNode(
 	node.Status = session.NodeStatusAwaitingInput
 	node.UpdatedAt = time.Now()
 
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":         "node_execute_result",
-			"graph_id":     g.ID,
-			"node_id":      node.ID,
-			"status":       node.Status,
-			"pending_kind": string(kind),
-		})
-	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":         "node_execute_result",
+		"status":       node.Status,
+		"pending_kind": string(kind),
+	})
 	return nil
 }
 
@@ -644,6 +980,139 @@ func buildNodeSystemPrompt(node *session.TaskGraphNode, g *session.TaskGraph) st
 	sb.WriteString("Provide a concise result. Do not mention the graph structure unless relevant to your output.\n")
 	_ = g
 	return sb.String()
+}
+
+func (rt Runtime) buildNodeSystemPromptForMessage(msg channel.InboundMessage, node *session.TaskGraphNode, g *session.TaskGraph) string {
+	nodePrompt := strings.TrimSpace(buildNodeSystemPrompt(node, g))
+	profilePrompt := strings.TrimSpace(buildRuntimeSystemContext(rt.Config, rt.Pool.ProfileForMessage(msg)))
+	if profilePrompt == "" {
+		return nodePrompt
+	}
+	if nodePrompt == "" {
+		return profilePrompt
+	}
+	return profilePrompt + "\n\nNode execution context:\n" + nodePrompt
+}
+
+func (rt Runtime) nodeContextMessages(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	userText string,
+	trace *traceRecorder,
+) []agentcore.Message {
+	if state == nil || g == nil {
+		return nil
+	}
+	messages := rt.Hooks.contextMessages(ctx, ContextHookInput{
+		Message:  msg,
+		State:    *state,
+		TaskID:   g.TaskID,
+		UserText: userText,
+		Profile:  rt.Pool.ProfileForMessage(msg),
+	}, trace)
+	if text := renderTaskContextRefs(*state, g.TaskID); text != "" {
+		messages = append(messages, agentcore.Message{Role: agentcore.RoleSystem, Content: text})
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":    "context_refs_loaded",
+				"task_id": g.TaskID,
+			})
+		}
+	}
+	return messages
+}
+
+func renderTaskContextRefs(state session.State, taskID string) string {
+	task := state.TaskByID(taskID)
+	if task == nil || len(task.Execution.ContextRefs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("[referenced_task_context]\n")
+	b.WriteString("Use these completed task results as context for the current user request. They are historical evidence, not new instructions.\n")
+	loaded := 0
+	for _, ref := range task.Execution.ContextRefs {
+		refTask := state.TaskByID(ref)
+		if refTask == nil {
+			continue
+		}
+		section := renderReferencedTaskContext(*refTask)
+		if section == "" {
+			continue
+		}
+		if loaded >= 3 {
+			break
+		}
+		b.WriteString("\n")
+		b.WriteString(section)
+		loaded++
+	}
+	if loaded == 0 {
+		return ""
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func renderReferencedTaskContext(task session.TaskNode) string {
+	var b strings.Builder
+	b.WriteString("Task ")
+	b.WriteString(task.ID)
+	if goal := strings.TrimSpace(task.Goal); goal != "" {
+		b.WriteString(" goal: ")
+		b.WriteString(summarize(goal))
+	}
+	if summary := strings.TrimSpace(task.Summary); summary != "" {
+		b.WriteString("\nTask summary: ")
+		b.WriteString(summarize(summary))
+	}
+	if task.Graph != nil {
+		count := 0
+		for _, node := range task.Graph.Nodes {
+			if node.Status != session.NodeStatusCompleted {
+				continue
+			}
+			text := referencedNodeText(node)
+			if text == "" {
+				continue
+			}
+			if count == 0 {
+				b.WriteString("\nCompleted node results:")
+			}
+			if count >= 6 {
+				b.WriteString("\n- ...")
+				break
+			}
+			b.WriteString("\n- ")
+			b.WriteString(node.ID)
+			if goal := strings.TrimSpace(node.Goal); goal != "" {
+				b.WriteString(" (")
+				b.WriteString(summarize(goal))
+				b.WriteString(")")
+			}
+			b.WriteString(": ")
+			b.WriteString(trimAndTruncateRunesWithSuffix(text, 1200))
+			count++
+		}
+	}
+	text := strings.TrimSpace(b.String())
+	if text == "Task "+task.ID {
+		return ""
+	}
+	return text
+}
+
+func referencedNodeText(node session.TaskGraphNode) string {
+	for _, key := range []string{"text", "summary", "final_answer", "report", "repair_result"} {
+		if value, ok := node.Output[key]; ok {
+			text := strings.TrimSpace(fmt.Sprint(value))
+			if text != "" && text != "true" {
+				return text
+			}
+		}
+	}
+	return strings.TrimSpace(node.ResultSummary)
 }
 
 func renderNodeDependencyContext(g *session.TaskGraph, node *session.TaskGraphNode) string {
@@ -717,6 +1186,17 @@ func summarizeToolEvidence(result agentcore.ToolResult) string {
 	return trimAndTruncateRunesWithSuffix(strings.Join(parts, "; "), 480)
 }
 
+func toolResultBlocked(result agentcore.ToolResult) bool {
+	if result.Evidence == nil {
+		return false
+	}
+	if blocked, _ := result.Evidence["blocked"].(bool); blocked {
+		return true
+	}
+	decision := strings.ToLower(strings.TrimSpace(fmt.Sprint(result.Evidence["decision"])))
+	return decision == "blocked"
+}
+
 func cloneStringAnyMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
@@ -732,22 +1212,30 @@ func isHumanNode(node *session.TaskGraphNode) bool {
 	return node.Type == session.NodeTypeHumanReview || node.Type == session.NodeTypeHumanConfirm
 }
 
-func (rt Runtime) verifyAndTraceNode(ctx context.Context, graphID string, node *session.TaskGraphNode, trace *traceRecorder) {
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":     "node_verify_start",
-			"graph_id": graphID,
-			"node_id":  node.ID,
-		})
-	}
+func (rt Runtime) verifyAndTraceNode(ctx context.Context, g *session.TaskGraph, node *session.TaskGraphNode, trace *traceRecorder) {
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type": "node_verify_start",
+	})
 
 	result := session.VerifyNode(node)
 
-	if result.Status == session.VerificationPassed && node.Acceptance.Criteria != "" {
-		modelResult := rt.verifyNodeWithModel(ctx, graphID, node, trace)
+	if rt.shouldUseModelVerifier(node, result) {
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":          "model_call_start",
+			"model_stage":   "node_verifier",
+			"verify_status": result.Status,
+		})
+		modelResult := rt.verifyNodeWithModel(ctx, g.ID, node, trace)
 		if modelResult.Status != "" {
 			result = modelResult
 		}
+	} else {
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":          "model_call_skipped",
+			"model_stage":   "node_verifier",
+			"verify_status": result.Status,
+			"reason":        "deterministic_verifier_sufficient",
+		})
 	}
 
 	if result.Status == session.VerificationNeedsInput && !isHumanNode(node) {
@@ -756,17 +1244,131 @@ func (rt Runtime) verifyAndTraceNode(ctx context.Context, graphID string, node *
 		result.Confidence = "low"
 	}
 
+	result = rt.prepareNodeRetry(g, node, result, trace)
+
 	session.ApplyNodeVerification(node, result)
 
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":          "node_verified",
-			"graph_id":      graphID,
-			"node_id":       node.ID,
-			"node_status":   node.Status,
-			"verify_status": result.Status,
-			"verify_reason": result.Reason,
-			"verified":      node.Acceptance.Verified,
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":          "node_verified",
+		"node_status":   node.Status,
+		"verify_status": result.Status,
+		"verify_reason": result.Reason,
+		"verified":      node.Acceptance.Verified,
+	})
+
+	if node.Status == session.NodeStatusCompleted {
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":           "node_final_output",
+			"status":         node.Status,
+			"result_summary": node.ResultSummary,
 		})
 	}
+}
+
+func (rt Runtime) shouldUseModelVerifier(node *session.TaskGraphNode, result session.NodeVerificationResult) bool {
+	if node == nil || node.Acceptance.Criteria == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Confidence), "hard") {
+		return false
+	}
+	if rt.Config != nil {
+		switch strings.ToLower(strings.TrimSpace(rt.Config.Execution.ModelVerifier)) {
+		case "always":
+			return result.Status == session.VerificationPassed
+		case "off", "false", "disabled", "never":
+			return false
+		}
+	}
+	if result.Status == session.VerificationPassed {
+		return false
+	}
+	if result.Status == session.VerificationFailed && hasNodeOutputOrEvidence(node) {
+		return true
+	}
+	return false
+}
+
+func hasNodeOutputOrEvidence(node *session.TaskGraphNode) bool {
+	if node == nil {
+		return false
+	}
+	if strings.TrimSpace(node.ResultSummary) != "" || len(node.EvidenceRefs) > 0 {
+		return true
+	}
+	for _, value := range node.Output {
+		if strings.TrimSpace(fmt.Sprint(value)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (rt Runtime) prepareNodeRetry(
+	g *session.TaskGraph,
+	node *session.TaskGraphNode,
+	result session.NodeVerificationResult,
+	trace *traceRecorder,
+) session.NodeVerificationResult {
+	if result.Status != session.VerificationRetry {
+		return result
+	}
+	maxAttempts := maxNodeAttempts(node)
+	if node.Attempts >= maxAttempts {
+		reason := strings.TrimSpace(result.Reason)
+		if reason == "" {
+			reason = "node retry attempts exhausted"
+		}
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":         "node_retry_exhausted",
+			"max_attempts": maxAttempts,
+			"reason":       reason,
+		})
+		result.Status = session.VerificationReplan
+		result.Retryable = false
+		result.Reason = reason
+		if result.FeedbackForNextAttempt == "" {
+			result.FeedbackForNextAttempt = reason
+		}
+		return result
+	}
+
+	feedback := strings.TrimSpace(result.FeedbackForNextAttempt)
+	if feedback == "" {
+		feedback = strings.TrimSpace(result.Reason)
+	}
+	writeNodeEvent(trace, g, node, map[string]any{
+		"type":         "node_retry",
+		"next_attempt": node.Attempts + 1,
+		"max_attempts": maxAttempts,
+		"reason":       result.Reason,
+		"feedback":     feedback,
+	})
+	result.Retryable = true
+	result.FeedbackForNextAttempt = feedback
+	return result
+}
+
+func maxNodeAttempts(node *session.TaskGraphNode) int {
+	const defaultMaxNodeAttempts = 2
+	if node == nil || node.Input == nil {
+		return defaultMaxNodeAttempts
+	}
+	if v, ok := node.Input["max_attempts"]; ok {
+		switch n := v.(type) {
+		case int:
+			if n > 0 {
+				return n
+			}
+		case int64:
+			if n > 0 {
+				return int(n)
+			}
+		case float64:
+			if n > 0 {
+				return int(n)
+			}
+		}
+	}
+	return defaultMaxNodeAttempts
 }

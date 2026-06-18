@@ -377,6 +377,78 @@ func TestValidateTaskGraph_HumanWithGoal(t *testing.T) {
 	}
 }
 
+func TestValidateTaskGraph_ValidTypeModeCombos(t *testing.T) {
+	combos := []struct {
+		nodeType string
+		mode     string
+	}{
+		{NodeTypeSubtask, NodeModeDirect},
+		{NodeTypeSubtask, NodeModeReact},
+		{NodeTypeSkill, NodeModeSkill},
+		{NodeTypeTool, NodeModeTool},
+		{NodeTypeTool, NodeModeScript},
+		{NodeTypeHumanReview, NodeModeHuman},
+		{NodeTypeHumanConfirm, NodeModeHuman},
+		{NodeTypeModel, ""},
+		{NodeTypeTool, ""},
+	}
+	for _, c := range combos {
+		t.Run(c.nodeType+"/"+c.mode, func(t *testing.T) {
+			g := &TaskGraph{
+				ID: "g", TaskID: "t", Status: GraphStatusPlanned,
+				Nodes: []TaskGraphNode{
+					{ID: "n1", Type: c.nodeType, Mode: c.mode, Goal: "test", Status: NodeStatusPending,
+						Executor: "file.read", Input: map[string]any{"skill": "/x/y"}},
+				},
+			}
+			errs := ValidateTaskGraph(g)
+			if !errs.IsValid() {
+				t.Fatalf("expected valid combo, got: %v", errs)
+			}
+		})
+	}
+}
+
+func TestValidateTaskGraph_InvalidTypeModeCombos(t *testing.T) {
+	combos := []struct {
+		nodeType string
+		mode     string
+	}{
+		{NodeTypeHumanConfirm, NodeModeReact},
+		{NodeTypeHumanReview, NodeModeDirect},
+		{NodeTypeSubtask, NodeModeSkill},
+		{NodeTypeTool, NodeModeReact},
+		{NodeTypeSkill, NodeModeDirect},
+	}
+	for _, c := range combos {
+		t.Run(c.nodeType+"/"+c.mode, func(t *testing.T) {
+			g := &TaskGraph{
+				ID: "g", TaskID: "t", Status: GraphStatusPlanned,
+				Nodes: []TaskGraphNode{
+					{ID: "n1", Type: c.nodeType, Mode: c.mode, Goal: "test", Status: NodeStatusPending},
+				},
+			}
+			errs := ValidateTaskGraph(g)
+			if errs.IsValid() {
+				t.Fatalf("%s/%s should be rejected", c.nodeType, c.mode)
+			}
+		})
+	}
+}
+
+func TestValidateTaskGraph_UnknownMode(t *testing.T) {
+	g := &TaskGraph{
+		ID: "g", TaskID: "t", Status: GraphStatusPlanned,
+		Nodes: []TaskGraphNode{
+			{ID: "n1", Type: NodeTypeSubtask, Mode: "bogus", Goal: "test", Status: NodeStatusPending},
+		},
+	}
+	errs := ValidateTaskGraph(g)
+	if errs.IsValid() {
+		t.Fatal("expected error for unknown mode")
+	}
+}
+
 func TestValidateTaskGraph_PreservesInput(t *testing.T) {
 	original := &TaskGraph{
 		ID:     "g21",
@@ -544,6 +616,168 @@ func TestJSONRoundTrip_AcceptanceEvidence(t *testing.T) {
 	}
 	if len(node.EvidenceRefs) != 2 || node.EvidenceRefs[1].Summary != "read 100 lines" {
 		t.Fatalf("evidence refs not round-tripped: %+v", node.EvidenceRefs)
+	}
+}
+
+func TestTransitionTo_RunningIncrementsAttempts(t *testing.T) {
+	n := &TaskGraphNode{ID: "n1", Status: NodeStatusPending, Attempts: 0}
+	n.TransitionTo(NodeStatusRunning)
+	if n.Status != NodeStatusRunning {
+		t.Fatalf("expected running, got %q", n.Status)
+	}
+	if n.Attempts != 1 {
+		t.Fatalf("expected attempts=1, got %d", n.Attempts)
+	}
+	n.TransitionTo(NodeStatusRunning)
+	if n.Attempts != 2 {
+		t.Fatalf("expected attempts=2, got %d", n.Attempts)
+	}
+}
+
+func TestTransitionTo_VerifyingKeepsAttempts(t *testing.T) {
+	n := &TaskGraphNode{ID: "n1", Status: NodeStatusRunning, Attempts: 1}
+	n.TransitionTo(NodeStatusVerifying)
+	if n.Status != NodeStatusVerifying {
+		t.Fatalf("expected verifying, got %q", n.Status)
+	}
+	if n.Attempts != 1 {
+		t.Fatalf("attempts should not change, got %d", n.Attempts)
+	}
+}
+
+func TestSetCompleted_Verified(t *testing.T) {
+	n := &TaskGraphNode{ID: "n1", Status: NodeStatusRunning, Acceptance: Acceptance{Criteria: "check"}}
+	n.SetCompleted(true, "criteria met")
+	if n.Status != NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q", n.Status)
+	}
+	if !n.Acceptance.Verified {
+		t.Fatal("verified should be true")
+	}
+	if n.Acceptance.Reason != "criteria met" {
+		t.Fatalf("reason: %q", n.Acceptance.Reason)
+	}
+	if n.VerifiedAt.IsZero() {
+		t.Fatal("verified_at should be set")
+	}
+}
+
+func TestSetCompleted_Unverified(t *testing.T) {
+	n := &TaskGraphNode{ID: "n1", Status: NodeStatusRunning}
+	n.SetCompleted(false, "")
+	if n.Status != NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q", n.Status)
+	}
+	if n.Acceptance.Verified {
+		t.Fatal("verified should be false")
+	}
+	if !n.VerifiedAt.IsZero() {
+		t.Fatal("verified_at should not be set when not verified")
+	}
+}
+
+func TestSetFailed(t *testing.T) {
+	n := &TaskGraphNode{ID: "n1", Status: NodeStatusRunning}
+	n.SetFailed("something broke")
+	if n.Status != NodeStatusFailed {
+		t.Fatalf("expected failed, got %q", n.Status)
+	}
+	if n.FailureReason != "something broke" {
+		t.Fatalf("failure_reason: %q", n.FailureReason)
+	}
+}
+
+func TestSetBlocked(t *testing.T) {
+	n := &TaskGraphNode{ID: "n1", Status: NodeStatusRunning}
+	n.SetBlocked("permission denied")
+	if n.Status != NodeStatusBlocked {
+		t.Fatalf("expected blocked, got %q", n.Status)
+	}
+	if n.FailureReason != "permission denied" {
+		t.Fatalf("failure_reason: %q", n.FailureReason)
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	for _, s := range []string{NodeStatusCompleted, NodeStatusFailed, NodeStatusBlocked, NodeStatusSkipped} {
+		n := &TaskGraphNode{Status: s}
+		if !n.IsTerminal() {
+			t.Fatalf("%s should be terminal", s)
+		}
+	}
+	for _, s := range []string{NodeStatusPending, NodeStatusReady, NodeStatusRunning, NodeStatusVerifying, NodeStatusRetrying, NodeStatusNeedsReplan, NodeStatusAwaitingInput} {
+		n := &TaskGraphNode{Status: s}
+		if n.IsTerminal() {
+			t.Fatalf("%s should not be terminal", s)
+		}
+	}
+}
+
+func TestIsActive(t *testing.T) {
+	for _, s := range []string{NodeStatusRunning, NodeStatusVerifying, NodeStatusRetrying} {
+		n := &TaskGraphNode{Status: s}
+		if !n.IsActive() {
+			t.Fatalf("%s should be active", s)
+		}
+	}
+	for _, s := range []string{NodeStatusPending, NodeStatusReady, NodeStatusCompleted, NodeStatusFailed, NodeStatusBlocked, NodeStatusNeedsReplan, NodeStatusAwaitingInput} {
+		n := &TaskGraphNode{Status: s}
+		if n.IsActive() {
+			t.Fatalf("%s should not be active", s)
+		}
+	}
+}
+
+func TestValidTypeModeCombos(t *testing.T) {
+	if !IsValidTypeModeCombo(NodeTypeSubtask, NodeModeDirect) {
+		t.Fatal("subtask/direct should be valid")
+	}
+	if !IsValidTypeModeCombo(NodeTypeHumanConfirm, NodeModeHuman) {
+		t.Fatal("human_confirm/human should be valid")
+	}
+	if IsValidTypeModeCombo(NodeTypeHumanConfirm, NodeModeReact) {
+		t.Fatal("human_confirm/react should be invalid")
+	}
+	if !IsValidTypeModeCombo(NodeTypeTool, "") {
+		t.Fatal("tool with empty mode should be valid (backward compat)")
+	}
+}
+
+func TestJSONRoundTrip_NewStatusesAndModes(t *testing.T) {
+	node := TaskGraphNode{
+		ID:            "n1",
+		Type:          NodeTypeSubtask,
+		Mode:          NodeModeReact,
+		Goal:          "analyze",
+		Status:        NodeStatusVerifying,
+		Attempts:      2,
+		ResultSummary: "partial",
+		AllowedTools:  []string{"file.read", "terminal.run"},
+		EvidenceRefs:  []EvidenceRef{{Kind: "tool", ToolName: "file.read", Summary: "read 10 files"}},
+		Acceptance:    Acceptance{Criteria: "complete", Verified: false},
+	}
+	data, err := json.Marshal(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded TaskGraphNode
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Mode != NodeModeReact {
+		t.Fatalf("mode not preserved: %q", loaded.Mode)
+	}
+	if loaded.Status != NodeStatusVerifying {
+		t.Fatalf("status not preserved: %q", loaded.Status)
+	}
+	if loaded.Attempts != 2 {
+		t.Fatalf("attempts not preserved: %d", loaded.Attempts)
+	}
+	if len(loaded.AllowedTools) != 2 {
+		t.Fatalf("allowed_tools not preserved: %v", loaded.AllowedTools)
+	}
+	if len(loaded.EvidenceRefs) != 1 || loaded.EvidenceRefs[0].ToolName != "file.read" {
+		t.Fatalf("evidence_refs not preserved: %v", loaded.EvidenceRefs)
 	}
 }
 

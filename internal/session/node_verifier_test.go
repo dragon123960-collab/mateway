@@ -84,8 +84,11 @@ func TestVerifyNode_ToolNode_TimedOut(t *testing.T) {
 		FailureReason: "tool timed out after 30s",
 	}
 	result := VerifyNode(node)
-	if result.Status != VerificationFailed {
-		t.Fatalf("expected failed for timeout, got %q", result.Status)
+	if result.Status != VerificationRetry {
+		t.Fatalf("expected retry for timeout, got %q", result.Status)
+	}
+	if !result.Retryable {
+		t.Fatal("expected timeout to be retryable")
 	}
 	if len(result.Missing) == 0 || !strings.Contains(result.Missing[0], "deadline") {
 		t.Fatalf("expected deadline missing entry, got %v", result.Missing)
@@ -147,6 +150,108 @@ func TestVerifyNode_ModelNode_Passed(t *testing.T) {
 	result := VerifyNode(node)
 	if result.Status != VerificationPassed {
 		t.Fatalf("expected passed, got %q: %s", result.Status, result.Reason)
+	}
+}
+
+func TestVerifyNode_ModelNode_UnfinishedToolCallTextFails(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "answer",
+		Type:          NodeTypeSubtask,
+		Goal:          "compose final answer",
+		Status:        NodeStatusCompleted,
+		ResultSummary: `I will call web.search to gather the data. <tool_call>web.search("query")`,
+		Acceptance:    Acceptance{Criteria: "final answer produced"},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationFailed {
+		t.Fatalf("expected failed for unfinished tool-call text, got %q: %s", result.Status, result.Reason)
+	}
+	if !result.Retryable {
+		t.Fatal("unfinished output should be retryable")
+	}
+	if !strings.Contains(result.Reason, "unfinished") {
+		t.Fatalf("reason should mention unfinished output, got %q", result.Reason)
+	}
+}
+
+func TestVerifyNode_ModelNode_FailedToolEvidenceOnlyFails(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "verify-script",
+		Type:          NodeTypeSubtask,
+		Goal:          "verify script",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "destructive terminal command is blocked",
+		EvidenceRefs: []EvidenceRef{
+			{Kind: "tool", ToolName: "terminal.run", Summary: "destructive terminal command is blocked", IsError: true},
+		},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationFailed {
+		t.Fatalf("expected failed for failed tool evidence only, got %q: %s", result.Status, result.Reason)
+	}
+	if !result.Retryable {
+		t.Fatal("failed tool evidence should be retryable")
+	}
+	if result.Confidence != "hard" {
+		t.Fatalf("failed tool evidence should be hard verifier result, got %q", result.Confidence)
+	}
+}
+
+func TestVerifyNode_ModelNode_FailedToolEvidenceWithExplanationStillFails(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "create-script",
+		Type:          NodeTypeSubtask,
+		Goal:          "create script",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "The requested file could not be created because the path policy rejected the write. No partial file was created.",
+		EvidenceRefs: []EvidenceRef{
+			{Kind: "tool", ToolName: "file.write", Summary: "path is outside allowed roots", IsError: true},
+		},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationFailed {
+		t.Fatalf("expected failed for failed tool evidence despite explanatory text, got %q: %s", result.Status, result.Reason)
+	}
+	if result.Confidence != "hard" {
+		t.Fatalf("expected hard verifier result, got %q", result.Confidence)
+	}
+}
+
+func TestVerifyNode_ModelNode_BlockedToolEvidenceBlocks(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "create-script",
+		Type:          NodeTypeSubtask,
+		Goal:          "create script",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "The requested path is blocked by policy.",
+		EvidenceRefs: []EvidenceRef{
+			{Kind: "tool", ToolName: "terminal.run", Summary: "path is outside allowed roots", IsError: true, Blocked: true},
+		},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationBlocked {
+		t.Fatalf("expected blocked for blocked tool evidence, got %q: %s", result.Status, result.Reason)
+	}
+	if result.Confidence != "hard" {
+		t.Fatalf("expected hard verifier result, got %q", result.Confidence)
+	}
+}
+
+func TestVerifyNode_ModelNode_FailedThenSuccessfulToolEvidencePasses(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "verify-script",
+		Type:          NodeTypeSubtask,
+		Goal:          "verify script",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "script verified successfully",
+		EvidenceRefs: []EvidenceRef{
+			{Kind: "tool", ToolName: "terminal.run", Summary: "first attempt timed out", IsError: true},
+			{Kind: "tool", ToolName: "terminal.run", Summary: "script verified successfully", IsError: false},
+		},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationPassed {
+		t.Fatalf("expected passed after successful tool evidence, got %q: %s", result.Status, result.Reason)
 	}
 }
 
@@ -598,7 +703,7 @@ func TestVerifyNode_ModelNode_CriteriaNotVerified(t *testing.T) {
 	}
 }
 
-func TestVerifyTaskGraph_WithContract_Unsatisfied(t *testing.T) {
+func TestVerifyTaskGraph_WithContract_UnsatisfiedDoesNotOverrideGraph(t *testing.T) {
 	g := &TaskGraph{
 		ID:     "g1",
 		TaskID: "t1",
@@ -611,11 +716,11 @@ func TestVerifyTaskGraph_WithContract_Unsatisfied(t *testing.T) {
 		RequiredEvidence: []TaskEvidenceContract{{Kind: "tool", Tool: "file.read", Description: "read file"}},
 	}
 	result := VerifyTaskGraphWithContract(g, contract)
-	if result.Status != GraphStatusFailed {
-		t.Fatalf("expected failed for unsatisfied contract, got %q", result.Status)
+	if result.Status != GraphStatusCompleted {
+		t.Fatalf("graph-native verification should not be failed by legacy contract, got %q: %s", result.Status, result.Reason)
 	}
-	if !strings.Contains(result.Reason, "file.read") {
-		t.Fatalf("reason should mention missing tool, got %q", result.Reason)
+	if len(result.MissingNodes) != 0 {
+		t.Fatalf("legacy contract gaps should not be surfaced as missing graph nodes, got %v", result.MissingNodes)
 	}
 }
 

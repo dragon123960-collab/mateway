@@ -251,6 +251,97 @@ ContextRefs
 - 保留 `tool` mode 作为确定性特例，但不要让它成为默认 planner 产物。
 - 不要为了旧测试保留 parallel tool-node chain 的兼容层。
 
+#### TODO 5.1：清理 runtime 测试中的 legacy AgentCore loop 假设
+
+已经完成：
+
+- 删除所有直接调用 `skipLegacyAgentLoopTest(t)` 的旧 runtime 测试。
+- 删除 `skipLegacyAgentLoopTest` helper 本身。
+- 删除范围包括：
+  - `internal/runtime/runtime_test.go`
+  - `internal/runtime/delivery_regression_test.go`
+  - `internal/runtime/contract_strategy_test.go`
+  - `internal/runtime/context_budget_test.go`
+  - `internal/runtime/redact_test.go`
+- 这些测试覆盖的是旧的“全局 AgentCore loop + checklist/tool chain”语义；保留 skipped 测试会误导后续开发和 review。
+- 新行为必须通过 TaskGraph/node-local executor 的测试重新建立，不再保留旧 skipped 回归基线。
+
+#### TODO 5.2：planner failure 不走旧 contract fallback
+
+已经完成：
+
+- `internal/runtime/graph_bootstrap.go` 在 unified planner 失败时返回 concrete error，不再调用 `ensureTaskContract`，不再构造 fallback graph。
+- 删除 `fallbackGraphFromContract` / `fallbackNodesFromContract` 和对应 `graph_bootstrap_test.go`。
+- 保留并通过已有守卫测试：
+  - `TestRuntimeHandle_PlannerFailureDoesNotUseContractFallback`
+  - `TestHandle_PlannerFailureFallsBackToModelGraph`
+- 主线原则：旧 `TaskContract` 只能作为 planner 输出的 acceptance/compat bridge，不是 planner failure fallback。
+
+#### TODO 5.3：planner 单元测试不再依赖“并行 tool 链”假设
+
+需要审计的测试：
+
+- `internal/runtime/graph_planner_test.go::TestConvertPlannerOutput_ToolNodes`：当前断言 planner 能产出 1 个 tool node + 1 个 model node 的两节点图。这条仍然有效（tool mode 是支持的确定性特例），但测试名要让人一眼看出“tool 节点是特例，不是默认形态”。建议在测试注释里写明：
+  - 这是 `type=tool/mode=tool` 的特例；
+  - 默认形态是 `type=subtask/mode=react`，tool 调用发生在 node 内部，落到 `EvidenceRefs`。
+- `internal/runtime/graph_planner_test.go::TestConvertPlannerOutput_*Human*`：human_confirm / human_review 节点继续是 `type=human_*/mode=human`，不混入 tool 节点。
+- `internal/runtime/graph_planner_test.go::TestPlanGraphWithModel_SimpleQA`：单一 model 节点是默认最小形态，1 个节点，不拆成多个 tool 节点。
+
+子任务：
+
+- 给 `TestConvertPlannerOutput_ToolNodes` 加注释，明确这是“特例 tool 节点”测试。
+- 检查其它 `TestConvertPlannerOutput_*` 测试中是否还有 “n tool nodes 链式串联” 形态；如果有，拆成“n 个 subtask/react node 串联 + tool evidence 写在各自 node 的 EvidenceRefs”。
+- 不要为了“让旧测试通过”而引入 parallel tool-node chain 的兼容层。
+
+#### TODO 5.4：executor / verifier 的 “ToolNode_” 测试范围
+
+已经存在且需要保留语义（这些不是“旧语义”，而是 `type=tool/mode=tool` 特例的执行 + 验收测试）：
+
+- `internal/runtime/node_executor_test.go::TestExecuteNode_ToolNode_*`（Success / EvidenceIncludesStructuredFields / UnknownTool / EmptyExecutor / FailingTool / IncrementsAttempts / WithTrace_DoesNotCrash / ObserveCreatesStep / EvidenceHasElapsed / CriteriaUnmet_Blocked / NoCriteria_Completes）：这些测试 node 都是 `Type: NodeTypeTool, Executor: <tool>`，只测单 node + 单 tool 调用的执行和 evidence 写入，是 tool-mode 特例的正确测试，必须保留。
+- `internal/session/node_verifier_test.go::TestVerifyNode_ToolNode_*`：同上，测 verifier 对 tool node 的 evidence 验收。
+
+子任务：
+
+- 确认这批测试没有任何一个断言“多 tool 节点 = 1 个任务的全部节点”；如果有，标记改写。
+- 在 `node_executor_test.go` 顶部加一段注释，把 “ToolNode_*” 系列与 “react node 内含 tool evidence” 系列区分清楚，避免后续 reviewer 把特例当成通用路径。
+
+#### TODO 5.5：scheduler / recovery 测试不再以 tool 节点链为 ready 计算输入
+
+需要审计：
+
+- `internal/session/scheduler_test.go` 里的多 node 用例：是否还有“把每个 tool 调用当独立 node、靠 depends 形成链”的写法。如果有，改为：
+  - 链的中间节点改为 `type=subtask/mode=react` 或 `type=model/mode=react`；
+  - tool 调用体现在下游 node 的 `Inputs` 或 `EvidenceRefs` 里。
+- `internal/session/graph_recovery_test.go`：已经在 TODO 4 中覆盖了 completed verified / running / verifying / retrying / awaiting_input / failed / blocked 的恢复语义；继续保留 tool / model / human 三种 type 混用的 fixture，但不允许出现“链式 tool 节点”作为 fixture 主体。
+
+子任务：
+
+- 走查 `scheduler_test.go` 的 multi-node fixture，把“链式 tool 节点”改写为“链式 react/node 节点 + tool evidence”。
+- 走查 `graph_recovery_test.go` 的 multi-node fixture，保证恢复语义测试不依赖“多 tool 节点 = 完整任务”这种旧假设。
+
+## 实现状态（截至当前 commit）
+
+下表是 `fix/doc-review-corrections` 分支当前实际落地情况，用于让 reviewer 知道哪些 TODO 已可用、哪些仍是设计意图。
+
+| TODO | 状态 | 主要落点 |
+|------|------|---------|
+| TODO 1 graph node 持久化字段 | 已完成 | `internal/session/graph.go` 新增 `NodeStatusVerifying` / `NodeStatusRetrying`、`NodeModeTool` / `NodeModeScript` / `NodeModeHuman`；`TaskGraphNode` 已能序列化和反序列化 `type` / `mode` / `attempts` / `result_summary` / `evidence_refs` / `failure_reason` / `acceptance.verified` / `verified_at`。 |
+| TODO 2 type/mode validation | 已完成 | `internal/session/graph_validator.go::validateNodeFields` 新增 `IsValidTypeModeCombo` 校验；`internal/session/graph_test.go` 新增 `TestValidateTaskGraph_ValidTypeModeCombos` / `TestValidateTaskGraph_InvalidTypeModeCombos` / `TestValidateTaskGraph_UnknownMode`。 |
+| TODO 3 状态流转 helper | 已完成 | `internal/session/graph.go` 新增 `TransitionTo` / `SetCompleted` / `SetFailed` / `SetBlocked` / `IsTerminal` / `IsActive`；`internal/session/graph_test.go` 新增 `TestTransitionTo_RunningIncrementsAttempts` / `TestTransitionTo_VerifyingKeepsAttempts` / `TestSetCompleted_Verified` / `TestSetCompleted_Unverified` / `TestSetFailed`。 |
+| TODO 4 recovery normalize | 已完成 | `internal/session/graph_recovery.go::RecoverRunningNodes` 扩展为：running / retrying → pending、verifying 保持 verifying 且不丢 result/evidence、completed 且未 verified → verifying、completed 且 verified → 保持 completed、awaiting_input → 保持、failed / blocked → 不变。`internal/session/graph_recovery_test.go` 新增 `TestRecoverRunningNodes_VerifyingStaysVerifying` / `TestRecoverRunningNodes_RetryingBecomesPending` / `TestRecoverRunningNodes_CompletedUnverifiedBecomesVerifying` / `TestRecoverRunningNodes_CompletedVerifiedStaysCompleted` / `TestRecoverRunningNodes_AwaitingInputPreserved` / `TestRecoverRunningNodes_FailedBlockedNotChanged`。`internal/session/scheduler.go::UpdateGraphStatus` 把 verifying / retrying 计入 active 集合，避免 ready 误判。 |
+| TODO 5 清理 tool-node 旧语义 | 已完成本阶段范围 | 已删除所有 `skipLegacyAgentLoopTest(t)` 旧测试和 helper；planner failure 不再走旧 contract fallback；skill node 测试改为 `type=skill/mode=skill`；scheduler 依赖改为 `completed + verified` 才解锁；保留 `ToolNode_*` 作为 `type=tool/mode=tool` 确定性特例测试。 |
+
+代码基线命令：
+
+```bash
+go test ./internal/session/ ./internal/runtime/
+```
+
+当前结果（在本分支上）：
+
+- `go test ./internal/session ./internal/runtime`：通过。
+- `go test ./...`：通过。
+
 ## 主链路接入要求
 
 完成本阶段后，最小主链路必须能做到：
@@ -302,16 +393,20 @@ Planner output
 - dev-notes/task-graph-runtime/10-integration-gates.md
 - dev-notes/task-graph-runtime/02-node-model-and-state-machine.md
 
-只实现 Phase 02。
+只实现 Phase 02 当前未完成的部分（参考“实现状态”表）。
 
 TODO checklist:
-- [ ] 审计并补齐 graph node 的持久化字段：type/mode/attempts/result/evidence/failure/acceptance。
-- [ ] 增加或收紧 type/mode validation，并为合法、非法组合补测试。
-- [ ] 集中状态流转语义，避免 scheduler/recovery/verifier 各自手写冲突状态。
-- [ ] 增加 recovery normalization 测试，覆盖 completed verified、running、awaiting_input、failed、blocked。
-- [ ] 改写或删除“每个 tool call 都是 graph node”的旧测试。
+- [x] 审计并补齐 graph node 的持久化字段：type/mode/attempts/result/evidence/failure/acceptance。已落 `internal/session/graph.go` 与对应 round-trip 测试。
+- [x] 增加或收紧 type/mode validation，并为合法、非法组合补测试。已落 `internal/session/graph_validator.go` + `TestValidateTaskGraph_ValidTypeModeCombos` / `InvalidTypeModeCombos` / `UnknownMode`。
+- [x] 集中状态流转语义，避免 scheduler/recovery/verifier 各自手写冲突状态。已落 `TransitionTo` / `SetCompleted` / `SetFailed` / `SetBlocked` / `IsTerminal` / `IsActive`，并同步 `UpdateGraphStatus`。
+- [x] 增加 recovery normalization 测试，覆盖 completed verified、running、verifying、retrying、awaiting_input、failed、blocked。已落 `internal/session/graph_recovery_test.go` 6 个新用例。
+- [x] TODO 5.1：清理所有 `skipLegacyAgentLoopTest(t)` 旧测试和 helper，不留 skipped 残骸。
+- [ ] TODO 5.3：给 `TestConvertPlannerOutput_ToolNodes` 加注释说明这是 `type=tool/mode=tool` 特例，并把其它把“链式 tool 节点”当完整任务的 planner 单元测试改写为“链式 react/node 节点 + tool evidence”。
+- [ ] TODO 5.5：审计 `scheduler_test.go` 和 `graph_recovery_test.go` 的 multi-node fixture，把“链式 tool 节点”改写为“链式 react/node 节点 + tool evidence”，保证 ready 计算和恢复语义不再依赖旧假设。
+- [x] planner failure 不再走旧 contract fallback；已删除 fallback graph helper 和测试，保留 planner failure 不 attach graph 的守卫测试。
+- [ ] 在 `node_executor_test.go` 顶部加注释，区分 “ToolNode_* 特例” 与 “react node 内部 tool evidence” 两类测试。
 
 必须包含 `internal/session` 和 `internal/runtime` 的测试。
 不要实现 Phase 03 executor、Phase 04 local replan、Phase 08 parallelism，也不要增加任何旧语义 fallback。
 如果现有字段命名和本文档冲突，先停止并报告，不要自行猜。
-```
+CI 基线：`go test ./internal/session ./internal/runtime` 和 `go test ./...` 必须通过。

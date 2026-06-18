@@ -2,10 +2,12 @@ package config
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
+	initassets "github.com/dongping/mateway/assets"
 	"github.com/dongping/mateway/internal/agenttemplate"
 	"gopkg.in/yaml.v3"
 )
@@ -34,6 +36,9 @@ func EnsureDefaultConfigFilesWithAssets(home, assetsDir string) error {
 		if err := writeFileIfMissing(path, file.Content); err != nil {
 			return err
 		}
+	}
+	if err := ensureDefaultSkillMetadata(loader.Home); err != nil {
+		return err
 	}
 	mainAgentFiles := agenttemplate.CoreFiles(agenttemplate.Profile{ID: "main", Name: "Main Assistant"})
 	files := []templateFile{
@@ -74,8 +79,67 @@ func EnsureDefaultConfigFilesWithAssets(home, assetsDir string) error {
 	return nil
 }
 
+func ensureDefaultSkillMetadata(home string) error {
+	skillsRoot := filepath.Join(home, "workspace", "skills")
+	entries, err := os.ReadDir(skillsRoot)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		skillDir := filepath.Join(skillsRoot, entry.Name())
+		if _, err := os.Stat(filepath.Join(skillDir, "SKILL.md")); err != nil {
+			continue
+		}
+		metadataPath := filepath.Join(skillDir, ".mateway", "metadata.yaml")
+		if _, err := os.Stat(metadataPath); err == nil {
+			continue
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(metadataPath), 0o755); err != nil {
+			return err
+		}
+		content := defaultSkillMetadataYAML(entry.Name())
+		if err := os.WriteFile(metadataPath, []byte(content), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func defaultSkillMetadataYAML(name string) string {
+	graphType := "prompt"
+	allowedTools := ""
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "fresh-search":
+		graphType = "react"
+		allowedTools = `  allowed_tools:
+    - web.search
+    - web.fetch
+`
+	}
+	return fmt.Sprintf(`adapter_version: "2"
+source: "builtin"
+installed_at: "2026-06-17T00:00:00Z"
+tool_runtime: "mateway"
+graph:
+  mode: "adapted"
+  type: %q
+  stage: "execution"
+  granularity: "subtask"
+%s`, graphType, allowedTools)
+}
+
 type initAssetSource struct {
-	Dir string
+	Dir      string
+	FS       fs.FS
+	Embedded bool
 }
 
 func resolveInitAssetSource(override string) (initAssetSource, error) {
@@ -93,6 +157,11 @@ func resolveInitAssetSource(override string) (initAssetSource, error) {
 			return initAssetSource{Dir: clean}, nil
 		}
 		tried = append(tried, clean)
+	}
+	if strings.TrimSpace(override) == "" && strings.TrimSpace(os.Getenv("MATEWAY_ASSETS_DIR")) == "" {
+		if source, err := embeddedInitAssetSource(); err == nil {
+			return source, nil
+		}
 	}
 	return initAssetSource{}, fmt.Errorf("mateway init assets not found; set --assets-dir or MATEWAY_ASSETS_DIR, or run from a release archive containing assets/init (tried: %s)", strings.Join(tried, ", "))
 }
@@ -147,7 +216,37 @@ func validInitAssetDir(dir string) bool {
 	return true
 }
 
+func embeddedInitAssetSource() (initAssetSource, error) {
+	sub, err := fs.Sub(initassets.InitFS, "init")
+	if err != nil {
+		return initAssetSource{}, err
+	}
+	source := initAssetSource{FS: sub, Embedded: true}
+	if !validInitAssetFS(source.FS) {
+		return initAssetSource{}, fmt.Errorf("embedded init assets are incomplete")
+	}
+	return source, nil
+}
+
+func validInitAssetFS(source fs.FS) bool {
+	for _, rel := range []string{
+		filepath.ToSlash(filepath.Join("config", "config.yaml")),
+		filepath.ToSlash(filepath.Join("config", "channels", "feishu.yaml")),
+		filepath.ToSlash(filepath.Join("workspace", "skills", "software-install", "SKILL.md")),
+		filepath.ToSlash(filepath.Join("workspace", "memory", "README.md")),
+	} {
+		info, err := fs.Stat(source, rel)
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 func (s initAssetSource) files() ([]templateFile, error) {
+	if s.FS != nil {
+		return s.fsFiles()
+	}
 	var out []templateFile
 	for _, rootName := range []string{"config", "workspace"} {
 		root := filepath.Join(s.Dir, rootName)
@@ -176,12 +275,42 @@ func (s initAssetSource) files() ([]templateFile, error) {
 }
 
 func (s initAssetSource) read(rel string) ([]byte, error) {
+	if s.FS != nil {
+		data, err := fs.ReadFile(s.FS, filepath.ToSlash(rel))
+		if err != nil {
+			return nil, fmt.Errorf("read init asset %s: %w", rel, err)
+		}
+		return data, nil
+	}
 	path := filepath.Join(s.Dir, rel)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read init asset %s: %w", rel, err)
 	}
 	return data, nil
+}
+
+func (s initAssetSource) fsFiles() ([]templateFile, error) {
+	var out []templateFile
+	for _, rootName := range []string{"config", "workspace"} {
+		if err := fs.WalkDir(s.FS, rootName, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			data, err := fs.ReadFile(s.FS, path)
+			if err != nil {
+				return err
+			}
+			out = append(out, templateFile{RelPath: filepath.FromSlash(path), Content: string(data)})
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func agentSkillsReadme() string {

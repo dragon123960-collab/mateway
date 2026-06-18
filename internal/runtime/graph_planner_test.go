@@ -62,90 +62,13 @@ func (m plannerVerifierModel) Next(_ context.Context, ctx agentcore.Context) (ag
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"criteria satisfied","missing":[],"confidence":"high"}`}, nil
 	}
 	if strings.Contains(ctx.SystemPrompt, "TaskGraphPlan") || strings.Contains(ctx.SystemPrompt, "sub-task") {
-		return agentcore.Message{Role: agentcore.RoleAssistant, Content: convertOldPlannerJSONToUnified(m.planJSON)}, nil
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.planJSON}, nil
 	}
 	text := m.text
 	if text == "" {
 		text = m.planJSON
 	}
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: text}, nil
-}
-
-func convertOldPlannerJSONToUnified(old string) string {
-	old = strings.TrimSpace(old)
-	if old == "" {
-		return old
-	}
-	var planCheck TaskGraphPlan
-	if err := json.Unmarshal([]byte(old), &planCheck); err == nil && planCheck.Task.Goal != "" {
-		return old
-	}
-	var parsed GraphPlannerOutput
-	if err := json.Unmarshal([]byte(old), &parsed); err != nil {
-		return old
-	}
-	nodes := make([]map[string]any, len(parsed.Nodes))
-	for i, pn := range parsed.Nodes {
-		node := map[string]any{
-			"id":         pn.ID,
-			"goal":       pn.Goal,
-			"depends":    pn.Depends,
-			"acceptance": pn.Acceptance,
-		}
-		t := strings.TrimSpace(pn.Type)
-		switch t {
-		case "model":
-			node["type"] = "subtask"
-			node["mode"] = "direct"
-		case "tool":
-			node["type"] = "subtask"
-			node["mode"] = "react"
-			if pn.Executor != "" {
-				node["allowed_tools"] = []string{pn.Executor}
-			}
-		case "skill":
-			node["type"] = "subtask"
-			node["mode"] = "skill"
-			node["skill"] = pn.Executor
-		case "human_confirm", "human_review":
-			node["type"] = t
-		default:
-			node["type"] = t
-		}
-		if pn.Outputs != nil {
-			node["outputs"] = pn.Outputs
-		}
-		if pn.Input != nil {
-			node["input"] = pn.Input
-		} else if pn.Args != nil {
-			node["input"] = pn.Args
-		} else if pn.Inputs != nil {
-			node["inputs"] = pn.Inputs
-		}
-		if pn.Executor != "" {
-			node["executor"] = pn.Executor
-		}
-		nodes[i] = node
-	}
-	unified := map[string]any{
-		"task": map[string]any{
-			"goal":       parsed.Goal,
-			"risk":       parsed.Risk,
-			"acceptance": parsed.TaskAcceptance,
-			"required_capabilities": map[string]any{
-				"tools":       []string{},
-				"skills":      []string{},
-				"human_gates": []string{},
-			},
-			"final_output": map[string]any{
-				"text":       true,
-				"structured": []string{},
-			},
-		},
-		"nodes": nodes,
-	}
-	data, _ := json.Marshal(unified)
-	return string(data)
 }
 
 func TestParseGraphPlannerOutput_SimpleModel(t *testing.T) {
@@ -999,8 +922,44 @@ func TestConvertTaskGraphPlan_HumanConfirmNode(t *testing.T) {
 	if confirmNode.Type != session.NodeTypeHumanConfirm {
 		t.Fatalf("expected human_confirm, got %q", confirmNode.Type)
 	}
-	if confirmNode.Mode != "" {
-		t.Fatalf("human nodes should have empty mode, got %q", confirmNode.Mode)
+	if confirmNode.Mode != session.NodeModeHuman {
+		t.Fatalf("human nodes should use human mode, got %q", confirmNode.Mode)
+	}
+}
+
+func TestConvertTaskGraphPlan_NormalizesHumanMode(t *testing.T) {
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{
+			Goal:       "review risky action",
+			Risk:       "high",
+			Acceptance: "user confirmed",
+			FinalOutput: TaskPlanFinalOutput{
+				Text: true,
+			},
+		},
+		Nodes: []TaskPlanNode{
+			{
+				ID:         "human-confirm-plan",
+				Type:       "human_confirm",
+				Mode:       "direct",
+				Goal:       "confirm before writing",
+				Acceptance: "user confirms",
+			},
+		},
+	}
+	g, err := convertTaskGraphPlan(plan, "task-human-normalize")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	if len(g.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(g.Nodes))
+	}
+	n := g.Nodes[0]
+	if n.Type != session.NodeTypeHumanConfirm {
+		t.Fatalf("node type: %q", n.Type)
+	}
+	if n.Mode != session.NodeModeHuman {
+		t.Fatalf("human mode should be normalized to %q, got %q", session.NodeModeHuman, n.Mode)
 	}
 }
 
@@ -1292,7 +1251,7 @@ func TestValidatePlanTools_UnknownSkillInNode(t *testing.T) {
 			RequiredCapabilities: TaskPlanCapabilities{},
 		},
 		Nodes: []TaskPlanNode{
-			{ID: "n1", Type: "subtask", Mode: "skill", Goal: "x", Skill: "nonexistent-skill", Acceptance: "done"},
+			{ID: "n1", Type: "skill", Mode: "skill", Goal: "x", Skill: "nonexistent-skill", Acceptance: "done"},
 		},
 	}
 	errs := validatePlanTools(plan, rt.Tools, nil)
@@ -1301,6 +1260,96 @@ func TestValidatePlanTools_UnknownSkillInNode(t *testing.T) {
 	}
 	if !strings.Contains(errs.Error(), "unknown skill") {
 		t.Fatalf("expected 'unknown skill' error, got: %v", errs)
+	}
+}
+
+func TestValidatePlanTools_WorkflowSkillCannotBeSingleNode(t *testing.T) {
+	rt := newTestRuntime(t)
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{Goal: "use workflow skill", Risk: "low"},
+		Nodes: []TaskPlanNode{
+			{ID: "n1", Type: "skill", Mode: "skill", Goal: "run workflow", Skill: "workflow-skill", Acceptance: "done"},
+		},
+	}
+	errs := validatePlanTools(plan, rt.Tools, []discoveredSkill{{
+		Name:        "workflow-skill",
+		Granularity: "workflow",
+		Stage:       "execution",
+	}})
+	if errs.IsValid() {
+		t.Fatal("expected error for workflow skill used as a single skill node")
+	}
+	if !strings.Contains(errs.Error(), "granularity=workflow") {
+		t.Fatalf("expected granularity error, got: %v", errs)
+	}
+}
+
+func TestValidatePlanTools_PlanningSkillCannotBeExecuted(t *testing.T) {
+	rt := newTestRuntime(t)
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{Goal: "use planning skill", Risk: "low"},
+		Nodes: []TaskPlanNode{
+			{ID: "n1", Type: "skill", Mode: "skill", Goal: "run planning skill", Skill: "planning-skill", Acceptance: "done"},
+		},
+	}
+	errs := validatePlanTools(plan, rt.Tools, []discoveredSkill{{
+		Name:        "planning-skill",
+		Granularity: "subtask",
+		Stage:       "planning",
+	}})
+	if errs.IsValid() {
+		t.Fatal("expected error for planning skill used as an executable skill node")
+	}
+	if !strings.Contains(errs.Error(), "stage=planning") {
+		t.Fatalf("expected stage error, got: %v", errs)
+	}
+}
+
+func TestValidatePlanTools_SkillAllowedToolsMustRespectMetadata(t *testing.T) {
+	rt := newTestRuntime(t)
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{Goal: "use skill", Risk: "low"},
+		Nodes: []TaskPlanNode{
+			{ID: "n1", Type: "skill", Mode: "skill", Goal: "run skill", Skill: "source-skill", AllowedTools: []string{"web.search", "terminal.run"}, Acceptance: "done"},
+		},
+	}
+	errs := validatePlanTools(plan, rt.Tools, []discoveredSkill{{
+		Name:         "source-skill",
+		Granularity:  "subtask",
+		Stage:        "execution",
+		AllowedTools: []string{"web.search"},
+	}})
+	if errs.IsValid() {
+		t.Fatal("expected error for skill node allowed_tools outside metadata")
+	}
+	if !strings.Contains(errs.Error(), "not allowed by skill metadata") {
+		t.Fatalf("expected metadata allowed_tools error, got: %v", errs)
+	}
+}
+
+func TestTaskContractFromPlan_SkillNodeDoesNotRequireSkillMDReadEvidence(t *testing.T) {
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{
+			Goal:       "use skill",
+			Acceptance: "skill result accepted",
+			RequiredCapabilities: TaskPlanCapabilities{
+				Skills: []string{"source-skill"},
+			},
+		},
+		Nodes: []TaskPlanNode{
+			{ID: "n1", Type: "skill", Mode: "skill", Goal: "run skill", Skill: "source-skill", Acceptance: "skill completed"},
+		},
+	}
+	contract := taskContractFromPlan(plan)
+	for _, item := range contract.PlanItems {
+		if item.Tool == "file.read" {
+			t.Fatalf("skill node should not be converted into SKILL.md file.read plan item: %#v", item)
+		}
+	}
+	for _, evidence := range contract.RequiredEvidence {
+		if evidence.Tool == "file.read" {
+			t.Fatalf("skill node should not require SKILL.md file.read evidence: %#v", evidence)
+		}
 	}
 }
 
@@ -1313,7 +1362,7 @@ func TestConvertTaskGraphPlan_PersistsSkillInInput(t *testing.T) {
 			FinalOutput:          TaskPlanFinalOutput{Text: true},
 		},
 		Nodes: []TaskPlanNode{
-			{ID: "n1", Type: "subtask", Mode: "skill", Goal: "run skill", Skill: "repo-analyzer", Acceptance: "done"},
+			{ID: "n1", Type: "skill", Mode: "skill", Goal: "run skill", Skill: "repo-analyzer", Acceptance: "done"},
 		},
 	}
 	g, err := convertTaskGraphPlan(plan, "task-skill")
@@ -1331,11 +1380,41 @@ func TestConvertTaskGraphPlan_PersistsSkillInInput(t *testing.T) {
 	if skillVal != "repo-analyzer" {
 		t.Fatalf("expected skill='repo-analyzer', got %v", skillVal)
 	}
+	if n.Type != session.NodeTypeSkill || n.Mode != session.NodeModeSkill || n.Executor != "repo-analyzer" {
+		t.Fatalf("skill node not normalized correctly: type=%q mode=%q executor=%q", n.Type, n.Mode, n.Executor)
+	}
+}
+
+func TestConvertTaskGraphPlanWithSkills_InheritsSkillAllowedTools(t *testing.T) {
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{
+			Goal:        "use skill",
+			Risk:        "low",
+			FinalOutput: TaskPlanFinalOutput{Text: true},
+		},
+		Nodes: []TaskPlanNode{
+			{ID: "n1", Type: "subtask", Mode: "react", Goal: "run skill", Skill: "source-evaluation", Acceptance: "done"},
+		},
+	}
+	g, err := convertTaskGraphPlanWithSkills(plan, "task-skill-tools", []discoveredSkill{{
+		Name:         "source-evaluation",
+		AllowedTools: []string{"file.read"},
+	}})
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	n := g.Nodes[0]
+	if n.Type != session.NodeTypeSkill || n.Mode != session.NodeModeSkill || n.Executor != "source-evaluation" {
+		t.Fatalf("skill node not normalized correctly: %#v", n)
+	}
+	if len(n.AllowedTools) != 1 || n.AllowedTools[0] != "file.read" {
+		t.Fatalf("expected skill allowed tools inherited, got %v", n.AllowedTools)
+	}
 }
 
 func TestRenderUnifiedPlannerPrompt_IncludesSections(t *testing.T) {
 	rt := newTestRuntime(t)
-	prompt := renderUnifiedPlannerPrompt("test goal", "", rt.Tools, nil)
+	prompt := renderUnifiedPlannerPrompt("test goal", "", "", rt.Tools, nil)
 	for _, want := range []string{
 		"User task:",
 		"test goal",
@@ -1354,9 +1433,23 @@ func TestRenderUnifiedPlannerPrompt_IncludesSections(t *testing.T) {
 
 func TestRenderUnifiedPlannerPrompt_UserTextDiffers(t *testing.T) {
 	rt := newTestRuntime(t)
-	prompt := renderUnifiedPlannerPrompt("goal", "current message", rt.Tools, nil)
+	prompt := renderUnifiedPlannerPrompt("goal", "current message", "", rt.Tools, nil)
 	if !strings.Contains(prompt, "Current user message:") {
 		t.Fatal("expected Current user message section")
+	}
+}
+
+func TestRenderUnifiedPlannerPrompt_IncludesPlannerContext(t *testing.T) {
+	rt := newTestRuntime(t)
+	prompt := renderUnifiedPlannerPrompt("answer name", "你叫什么", "From soul.md:\n你是 小代", rt.Tools, nil)
+	if !strings.Contains(prompt, "Planner context:") {
+		t.Fatal("expected planner context section")
+	}
+	if !strings.Contains(prompt, "你是 小代") {
+		t.Fatalf("expected planner context to include profile identity, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Do not treat it as completed evidence") {
+		t.Fatalf("expected planner context boundary guidance, got:\n%s", prompt)
 	}
 }
 
@@ -1435,7 +1528,7 @@ func TestPlanTaskGraphUnified_Integration(t *testing.T) {
 	}`
 	rt := newTestRuntime(t)
 	task := &session.TaskNode{ID: "task-integration", Goal: "analyze repo"}
-	plan, contract, err := rt.planTaskGraphUnified(t.Context(), task, "analyze repo", staticPlannerModel{json: json}, rt.Tools, nil, nil)
+	plan, contract, err := rt.planTaskGraphUnified(t.Context(), task, "analyze repo", "", staticPlannerModel{json: json}, rt.Tools, nil, nil)
 	if err != nil {
 		t.Fatalf("planTaskGraphUnified failed: %v", err)
 	}

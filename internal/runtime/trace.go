@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
@@ -17,6 +18,7 @@ type traceRecorder struct {
 	path    string
 	base    map[string]any
 	onWrite func()
+	mu      sync.Mutex
 }
 
 func newTraceRecorder(cfg *config.Root) (*traceRecorder, error) {
@@ -36,6 +38,8 @@ func (r *traceRecorder) setIdentity(values map[string]any) {
 	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.base == nil {
 		r.base = map[string]any{}
 	}
@@ -74,6 +78,8 @@ func (r *traceRecorder) write(payload map[string]any) error {
 	if r == nil {
 		return nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.onWrite != nil {
 		r.onWrite()
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
@@ -47,12 +46,17 @@ func (rt Runtime) ensureGraphForTask(
 		agentRegistry = agent.Tools
 	}
 
-	plan, contract, planErr := rt.planTaskGraphUnified(ctx, task, userText, rt.Model, agentRegistry, discoveredSkills, trace)
+	plannerContext := buildRuntimeSystemContextForTask(rt.Config, rt.Pool.ProfileForMessage(msg), userText, session.TaskContract{})
+	plan, contract, planErr := rt.planTaskGraphUnified(ctx, task, userText, plannerContext, rt.Model, agentRegistry, discoveredSkills, trace)
+
+	if _, isValidationErr := planErr.(*PlanValidationError); isValidationErr {
+		return fmt.Errorf("planner validation failed: %w", planErr)
+	}
 	if planErr != nil {
 		return fmt.Errorf("planner failed: %w", planErr)
 	}
 
-	graph, convErr := convertTaskGraphPlan(plan, task.ID)
+	g, convErr := convertTaskGraphPlanWithSkills(plan, task.ID, discoveredSkills)
 	if convErr != nil {
 		if trace != nil {
 			_ = trace.write(map[string]any{
@@ -98,78 +102,30 @@ func (rt Runtime) ensureGraphForTask(
 		return fmt.Errorf("task contract references unavailable tools or skills: %s", invalidContractBlockerENWithRegistries(contract, invalid, agentRegistry, rt.Tools))
 	}
 
-	if errs := session.ValidateTaskGraph(&graph); !errs.IsValid() {
+	if errs := session.ValidateTaskGraph(&g); !errs.IsValid() {
 		return fmt.Errorf("graph validation failed: %s", errs.Error())
 	}
 
-	task.Graph = &graph
+	task.Graph = &g
 	state.SetTaskContract(task.ID, contract)
-	frame := state.EnsureExecutionFrame(task.ID)
-	if frame != nil {
-		frame.Mode = "task_graph"
-		frame.Status = "running"
-	}
+	taskFrame(trace, task)
+	return rt.saveState(state, trace)
+}
+
+func taskFrame(trace *traceRecorder, task *session.TaskNode) {
+	frame := &task.Execution
+	frame.Mode = "task_graph"
+	frame.Status = "running"
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":     "graph_attached",
 			"task_id":  task.ID,
-			"graph_id": graph.ID,
-			"nodes":    len(graph.Nodes),
+			"graph_id": task.Graph.ID,
+			"nodes":    len(task.Graph.Nodes),
 		})
 	}
-	return rt.saveState(state, trace)
 }
 
 func (rt Runtime) profileIDForMessage(msg channel.InboundMessage) string {
 	return strings.TrimSpace(rt.Pool.ProfileForMessage(msg).ID)
-}
-
-func fallbackGraphFromContract(task *session.TaskNode, contract session.TaskContract, userText string) session.TaskGraph {
-	now := time.Now()
-	nodes := fallbackNodesFromContract(contract, task.Goal, userText, now)
-	return session.TaskGraph{
-		ID:        "graph-" + task.ID,
-		TaskID:    task.ID,
-		Status:    session.GraphStatusPlanned,
-		Nodes:     nodes,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
-
-func fallbackNodesFromContract(contract session.TaskContract, goal, userText string, now time.Time) []session.TaskGraphNode {
-	modelID := "answer"
-	modelGoal := firstNonEmpty(contract.ExpectedOutcome, contract.Summary, userText, goal)
-	if contract.RequiresTools || len(contract.RequiredTools) > 0 || contractHasToolPlanItems(contract) {
-		modelID = "synthesize"
-		modelGoal = firstNonEmpty(
-			contract.ExpectedOutcome,
-			contract.Summary,
-			"explain that graph planning failed before executable tool inputs could be derived",
-			userText,
-			goal,
-		)
-	}
-	modelNode := session.TaskGraphNode{
-		ID:        modelID,
-		Type:      session.NodeTypeModel,
-		Goal:      modelGoal,
-		Status:    session.NodeStatusPending,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	if contract.RequiresTools || len(contract.RequiredTools) > 0 || contractHasToolPlanItems(contract) {
-		modelNode.Status = session.NodeStatusBlocked
-		modelNode.FailureReason = "graph planning failed before executable tool inputs could be derived"
-	}
-	return []session.TaskGraphNode{modelNode}
-}
-
-func contractHasToolPlanItems(contract session.TaskContract) bool {
-	for _, item := range contract.PlanItems {
-		if strings.TrimSpace(item.Tool) != "" {
-			return true
-		}
-	}
-	return false
 }

@@ -17,7 +17,9 @@ const modelVerifierSystemPrompt = `You are a verification judge for a task graph
 - You must ONLY judge the output against the criteria. Do not execute tools, suggest actions, or modify the graph.
 - You must output a valid JSON object exactly as specified. No extra text outside the JSON.
 - If the output clearly satisfies the criteria, status must be "passed".
-- If the output clearly fails the criteria, status must be "failed".
+- If the output likely can be fixed by retrying the same node with clearer instructions, status must be "retry".
+- If the output clearly fails and retrying the same node is unlikely to help, status must be "failed".
+- If the node appears to need a different plan, skill, or decomposition, status must be "replan".
 - If you cannot determine pass/fail from the available evidence, status must be "blocked".
 - If the node needs human input to proceed, status must be "needs_input".
 - Provide a brief "reason" explaining your decision.
@@ -26,10 +28,12 @@ const modelVerifierSystemPrompt = `You are a verification judge for a task graph
 - Do not let the absence of evidence become a false "passed". When in doubt, be conservative.`
 
 type modelVerifyOutput struct {
-	Status     string   `json:"status"`
-	Reason     string   `json:"reason"`
-	Missing    []string `json:"missing,omitempty"`
-	Confidence string   `json:"confidence"`
+	Status                 string   `json:"status"`
+	Reason                 string   `json:"reason"`
+	Missing                []string `json:"missing,omitempty"`
+	Confidence             string   `json:"confidence"`
+	Retryable              bool     `json:"retryable,omitempty"`
+	FeedbackForNextAttempt string   `json:"feedback_for_next_attempt,omitempty"`
 }
 
 func (rt Runtime) verifyNodeWithModel(
@@ -95,6 +99,9 @@ func renderModelVerifierPrompt(node *session.TaskGraphNode) string {
 	if node.ResultSummary != "" {
 		sb.WriteString(fmt.Sprintf("Result Summary: %s\n", node.ResultSummary))
 	}
+	if output := verifierNodeOutputText(node); output != "" {
+		sb.WriteString(fmt.Sprintf("Node Output Text: %s\n", output))
+	}
 	if len(node.EvidenceRefs) > 0 {
 		sb.WriteString("Evidence:\n")
 		for i, ref := range node.EvidenceRefs {
@@ -106,8 +113,24 @@ func renderModelVerifierPrompt(node *session.TaskGraphNode) string {
 	}
 	sb.WriteString(fmt.Sprintf("\nNode Type: %s\n", node.Type))
 	sb.WriteString(fmt.Sprintf("Attempts: %d\n", node.Attempts))
+	sb.WriteString("\nIf the visible text includes a storage or trace truncation marker, evaluate the available final output and evidence. Do not fail solely because trace display was truncated; request retry only when the acceptance criteria cannot be judged from the node output/evidence.\n")
 	sb.WriteString("\nOutput a JSON object with: status, reason, missing, confidence.\n")
 	return sb.String()
+}
+
+func verifierNodeOutputText(node *session.TaskGraphNode) string {
+	if node == nil || len(node.Output) == 0 {
+		return ""
+	}
+	for _, key := range []string{"text", "summary", "final_answer", "report", "repair_result"} {
+		if value, ok := node.Output[key]; ok {
+			text := strings.TrimSpace(fmt.Sprint(value))
+			if text != "" && text != "true" {
+				return trimAndTruncateRunesWithSuffix(text, 12000)
+			}
+		}
+	}
+	return ""
 }
 
 func parseModelVerifierOutput(raw string, node *session.TaskGraphNode) session.NodeVerificationResult {
@@ -124,7 +147,9 @@ func parseModelVerifierOutput(raw string, node *session.TaskGraphNode) session.N
 		Status:     asString(rawFields["status"]),
 		Reason:     asString(rawFields["reason"]),
 		Confidence: asString(rawFields["confidence"]),
+		Retryable:  asBool(rawFields["retryable"]),
 	}
+	out.FeedbackForNextAttempt = asString(rawFields["feedback_for_next_attempt"])
 	if raw, ok := rawFields["missing"]; ok {
 		switch v := raw.(type) {
 		case string:
@@ -148,11 +173,13 @@ func parseModelVerifierOutput(raw string, node *session.TaskGraphNode) session.N
 	confidence := normalizeConfidence(out.Confidence)
 
 	return session.NodeVerificationResult{
-		Status:       status,
-		Reason:       strings.TrimSpace(out.Reason),
-		Missing:      out.Missing,
-		Confidence:   confidence,
-		EvidenceRefs: node.EvidenceRefs,
+		Status:                 status,
+		Reason:                 strings.TrimSpace(out.Reason),
+		Missing:                out.Missing,
+		Confidence:             confidence,
+		EvidenceRefs:           node.EvidenceRefs,
+		Retryable:              out.Retryable || status == session.VerificationRetry,
+		FeedbackForNextAttempt: firstNonEmpty(out.FeedbackForNextAttempt, strings.TrimSpace(out.Reason)),
 	}
 }
 
@@ -179,17 +206,34 @@ func asString(v any) string {
 	return fmt.Sprint(v)
 }
 
+func asBool(v any) bool {
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	if s, ok := v.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "true", "yes", "1":
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeVerifierStatus(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	switch s {
 	case "passed":
 		return session.VerificationPassed
+	case "retry":
+		return session.VerificationRetry
 	case "failed":
 		return session.VerificationFailed
 	case "blocked":
 		return session.VerificationBlocked
 	case "needs_input":
 		return session.VerificationNeedsInput
+	case "replan":
+		return session.VerificationReplan
 	default:
 		return ""
 	}

@@ -30,7 +30,10 @@ func allDepsSatisfied(g *TaskGraph, n *TaskGraphNode) bool {
 		if depNode == nil {
 			return false
 		}
-		if depNode.Status != NodeStatusCompleted && depNode.Status != NodeStatusSkipped {
+		if depNode.Status == NodeStatusSkipped {
+			continue
+		}
+		if depNode.Status != NodeStatusCompleted || !depNode.Acceptance.Verified {
 			return false
 		}
 	}
@@ -53,7 +56,7 @@ func UpdateGraphStatus(g *TaskGraph) string {
 		case NodeStatusAwaitingInput:
 			hasAwaitingInput = true
 			allDone = false
-		case NodeStatusRunning, NodeStatusReady:
+		case NodeStatusRunning, NodeStatusReady, NodeStatusVerifying, NodeStatusRetrying:
 			hasRunningOrReady = true
 			allDone = false
 		case NodeStatusBlocked:
@@ -62,8 +65,16 @@ func UpdateGraphStatus(g *TaskGraph) string {
 		case NodeStatusFailed:
 			hasFailed = true
 			allDone = false
+		case NodeStatusNeedsReplan:
+			hasFailed = true
+			allDone = false
 		case NodeStatusPending:
 			allDone = false
+		case NodeStatusCompleted:
+			if !g.Nodes[i].Acceptance.Verified {
+				hasRunningOrReady = true
+				allDone = false
+			}
 		}
 	}
 

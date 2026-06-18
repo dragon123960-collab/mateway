@@ -340,6 +340,7 @@ func (rt Runtime) planTaskGraphUnified(
 	ctx context.Context,
 	task *session.TaskNode,
 	userText string,
+	plannerContext string,
 	model agentcore.Model,
 	tools *agentcore.ToolRegistry,
 	skills []discoveredSkill,
@@ -355,7 +356,7 @@ func (rt Runtime) planTaskGraphUnified(
 		})
 	}
 
-	prompt := renderUnifiedPlannerPrompt(task.Goal, userText, tools, skills)
+	prompt := renderUnifiedPlannerPrompt(task.Goal, userText, plannerContext, tools, skills)
 	plan, rawJSON, err := planWithUnifiedPlanner(ctx, model, prompt, task.ID, trace)
 	if err != nil {
 		if trace != nil {
@@ -399,11 +400,26 @@ func (rt Runtime) planTaskGraphUnified(
 func planWithUnifiedPlanner(ctx context.Context, model agentcore.Model, prompt, taskID string, trace *traceRecorder) (TaskGraphPlan, string, error) {
 	graphCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":        "model_call_start",
+			"model_stage": "planner",
+			"task_id":     taskID,
+		})
+	}
 	reply, err := model.Next(graphCtx, agentcore.Context{
 		SystemPrompt: unifiedPlannerSystemPrompt,
 		Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
 	})
 	if err != nil {
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":        "model_call_failed",
+				"model_stage": "planner",
+				"task_id":     taskID,
+				"error":       err.Error(),
+			})
+		}
 		return TaskGraphPlan{}, "", err
 	}
 	raw := reply.Content
@@ -413,6 +429,11 @@ func planWithUnifiedPlanner(ctx context.Context, model agentcore.Model, prompt, 
 			"type":          "unified_planner_raw_output",
 			"task_id":       taskID,
 			"output_length": len(raw),
+		})
+		_ = trace.write(map[string]any{
+			"type":        "model_call_end",
+			"model_stage": "planner",
+			"task_id":     taskID,
 		})
 	}
 
@@ -462,18 +483,39 @@ func normalizeTaskGraphPlan(plan TaskGraphPlan) TaskGraphPlan {
 }
 
 func convertTaskGraphPlan(plan TaskGraphPlan, taskID string) (session.TaskGraph, error) {
+	return convertTaskGraphPlanWithSkills(plan, taskID, nil)
+}
+
+func convertTaskGraphPlanWithSkills(plan TaskGraphPlan, taskID string, skills []discoveredSkill) (session.TaskGraph, error) {
 	now := time.Now()
 	nodes := make([]session.TaskGraphNode, len(plan.Nodes))
+	skillByName := discoveredSkillsByName(skills)
 	for i, pn := range plan.Nodes {
 		id := normalizeGraphNodeID(pn.ID, i)
 		nodeType := normalizePlanNodeType(pn)
-		nodeMode := determineNodeMode(pn)
+		nodeMode := determineNodeModeForType(pn, nodeType)
 		nodeInput := planNodeInput(pn)
+		executor := strings.TrimSpace(pn.Executor)
+		allowedTools := cleanStringSlice(pn.AllowedTools)
 		if skill := strings.TrimSpace(pn.Skill); skill != "" {
 			if nodeInput == nil {
 				nodeInput = make(map[string]any)
 			}
 			nodeInput["skill"] = skill
+			nodeType = session.NodeTypeSkill
+			nodeMode = session.NodeModeSkill
+			executor = skill
+			if len(allowedTools) == 0 {
+				if discovered, ok := skillByName[strings.ToLower(skill)]; ok {
+					allowedTools = append([]string(nil), discovered.AllowedTools...)
+				}
+			}
+		}
+		if risk := strings.TrimSpace(pn.Risk); risk != "" {
+			if nodeInput == nil {
+				nodeInput = make(map[string]any)
+			}
+			nodeInput["risk"] = normalizeRisk(risk)
 		}
 		nodes[i] = session.TaskGraphNode{
 			ID:           id,
@@ -482,10 +524,10 @@ func convertTaskGraphPlan(plan TaskGraphPlan, taskID string) (session.TaskGraph,
 			Goal:         strings.TrimSpace(pn.Goal),
 			Status:       session.NodeStatusPending,
 			Depends:      normalizeDepends(pn.Depends),
-			Executor:     strings.TrimSpace(pn.Executor),
+			Executor:     executor,
 			Input:        nodeInput,
 			Output:       stringSliceToMap(pn.Outputs),
-			AllowedTools: cleanStringSlice(pn.AllowedTools),
+			AllowedTools: allowedTools,
 			Acceptance: session.Acceptance{
 				Criteria: strings.TrimSpace(pn.Acceptance),
 			},
@@ -510,9 +552,23 @@ func convertTaskGraphPlan(plan TaskGraphPlan, taskID string) (session.TaskGraph,
 	return g, nil
 }
 
+func discoveredSkillsByName(skills []discoveredSkill) map[string]discoveredSkill {
+	out := make(map[string]discoveredSkill, len(skills))
+	for _, skill := range skills {
+		name := strings.ToLower(strings.TrimSpace(skill.Name))
+		if name == "" {
+			continue
+		}
+		out[name] = skill
+	}
+	return out
+}
+
 func normalizePlanNodeType(pn TaskPlanNode) string {
 	t := strings.ToLower(strings.TrimSpace(pn.Type))
 	switch t {
+	case "skill":
+		return session.NodeTypeSkill
 	case "subtask":
 		return session.NodeTypeSubtask
 	case "human_confirm":
@@ -525,15 +581,30 @@ func normalizePlanNodeType(pn TaskPlanNode) string {
 }
 
 func determineNodeMode(pn TaskPlanNode) string {
+	return determineNodeModeForType(pn, normalizePlanNodeType(pn))
+}
+
+func determineNodeModeForType(pn TaskPlanNode, nodeType string) string {
 	mode := strings.TrimSpace(pn.Mode)
-	if mode != "" {
-		return mode
-	}
-	t := strings.ToLower(strings.TrimSpace(pn.Type))
-	switch t {
-	case "human_confirm", "human_review":
-		return ""
+	switch nodeType {
+	case session.NodeTypeSkill:
+		return session.NodeModeSkill
+	case session.NodeTypeHumanConfirm, session.NodeTypeHumanReview:
+		return session.NodeModeHuman
+	case session.NodeTypeTool:
+		if mode == session.NodeModeScript {
+			return session.NodeModeScript
+		}
+		return session.NodeModeTool
+	case session.NodeTypeSubtask, session.NodeTypeModel:
+		if mode == session.NodeModeDirect || mode == session.NodeModeReact {
+			return mode
+		}
+		return session.NodeModeReact
 	default:
+		if mode != "" {
+			return mode
+		}
 		return session.NodeModeReact
 	}
 }
@@ -581,9 +652,6 @@ func taskContractFromPlan(plan TaskGraphPlan) session.TaskContract {
 			requiredTools = append(requiredTools, pn.Executor)
 			requiredToolsSet[pn.Executor] = true
 		}
-		if pn.Skill != "" {
-			tool = "file.read"
-		}
 		if tool != "" && pn.Acceptance != "" {
 			evidenceItems = append(evidenceItems, session.TaskEvidenceContract{
 				Tool:        tool,
@@ -626,8 +694,14 @@ func validatePlanTools(plan TaskGraphPlan, tools *agentcore.ToolRegistry, skills
 		return nil
 	}
 	skillNames := make(map[string]bool)
+	skillByName := make(map[string]discoveredSkill)
 	for _, s := range skills {
-		skillNames[strings.ToLower(strings.TrimSpace(s.Name))] = true
+		name := strings.ToLower(strings.TrimSpace(s.Name))
+		if name == "" {
+			continue
+		}
+		skillNames[name] = true
+		skillByName[name] = s
 	}
 	var errs session.GraphValidationErrors
 	for i, pn := range plan.Nodes {
@@ -701,14 +775,56 @@ func validatePlanTools(plan TaskGraphPlan, tools *agentcore.ToolRegistry, skills
 			continue
 		}
 		id := normalizeGraphNodeID(pn.ID, i)
-		if !skillNames[strings.ToLower(skill)] {
+		skillKey := strings.ToLower(skill)
+		discovered, ok := skillByName[skillKey]
+		if !ok {
 			errs = append(errs, session.GraphValidationError{
 				Message: fmt.Sprintf("node references unknown skill %q", skill),
 				NodeID:  id,
 			})
+			continue
+		}
+		if strings.EqualFold(discovered.Granularity, "workflow") {
+			errs = append(errs, session.GraphValidationError{
+				Message: fmt.Sprintf("skill %q has granularity=workflow and cannot be used as a single skill node", skill),
+				NodeID:  id,
+			})
+		}
+		if strings.EqualFold(discovered.Stage, "planning") {
+			errs = append(errs, session.GraphValidationError{
+				Message: fmt.Sprintf("skill %q has stage=planning and cannot be executed as a skill node", skill),
+				NodeID:  id,
+			})
+		}
+		if len(discovered.AllowedTools) > 0 {
+			allowed := stringSet(discovered.AllowedTools)
+			for _, toolName := range pn.AllowedTools {
+				toolName = strings.TrimSpace(toolName)
+				if toolName == "" {
+					continue
+				}
+				if !allowed[toolName] {
+					errs = append(errs, session.GraphValidationError{
+						Message: fmt.Sprintf("skill %q node allowed_tools includes %q, which is not allowed by skill metadata", skill, toolName),
+						NodeID:  id,
+					})
+				}
+			}
 		}
 	}
 	return errs
+}
+
+func stringSet(values []string) map[string]bool {
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		out[value] = true
+	}
+	return out
 }
 
 func cleanStringSlice(ss []string) []string {

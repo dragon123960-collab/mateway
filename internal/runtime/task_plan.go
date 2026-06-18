@@ -82,10 +82,8 @@ func looksLikeSameTaskFollowup(text string, task session.TaskNode) bool {
 	if lower == "" {
 		return false
 	}
-	for _, marker := range []string{"/new", "new task", "新任务", "另一个", "另外", "unrelated"} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
+	if isNewTaskSignal(lower) {
+		return false
 	}
 	target := strings.ToLower(task.Goal + " " + task.Summary)
 	if task.Execution.Contract != nil {
@@ -103,11 +101,6 @@ func looksLikeSameTaskFollowup(text string, task session.TaskNode) bool {
 	if overlap > 0 {
 		return true
 	}
-	for _, marker := range []string{"继续", "接着", "再", "also", "same", "that", "它", "这个"} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
 	return false
 }
 
@@ -117,7 +110,7 @@ func meaningfulTokens(text string) []string {
 	})
 	stop := map[string]bool{
 		"the": true, "a": true, "an": true, "and": true, "or": true, "to": true, "it": true, "this": true,
-		"that": true, "please": true, "继续": true, "再": true, "一下": true,
+		"that": true, "please": true,
 		"list": true, "read": true, "file": true, "files": true, "every": true, "under": true,
 	}
 	var out []string

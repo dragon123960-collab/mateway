@@ -136,10 +136,59 @@ func RecoverRunningNodes(g *TaskGraph) {
 		return
 	}
 	for i := range g.Nodes {
-		if g.Nodes[i].Status == NodeStatusRunning {
+		switch g.Nodes[i].Status {
+		case NodeStatusRunning, NodeStatusRetrying:
+			if requiresRecoveryConfirmation(&g.Nodes[i]) {
+				g.Nodes[i].Status = NodeStatusAwaitingInput
+				if strings.TrimSpace(g.Nodes[i].FailureReason) == "" {
+					g.Nodes[i].FailureReason = "node was interrupted during a high-risk action and requires confirmation before retry"
+				}
+				continue
+			}
 			g.Nodes[i].Status = NodeStatusPending
+		case NodeStatusVerifying:
+			// Keep verifying — node has produced result/evidence that must be preserved.
+			// The verifier will re-evaluate on next runtime tick.
+		case NodeStatusCompleted:
+			if !g.Nodes[i].Acceptance.Verified {
+				g.Nodes[i].Status = NodeStatusVerifying
+			}
+		case NodeStatusNeedsReplan:
+			// Preserve the marker so the runtime can apply the local replan
+			// decision instead of retrying the original failed node.
 		}
 	}
+}
+
+func requiresRecoveryConfirmation(n *TaskGraphNode) bool {
+	if n == nil {
+		return false
+	}
+	if n.Type == NodeTypeHumanConfirm || n.Type == NodeTypeHumanReview {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(n.Mode), NodeModeHuman) {
+		return true
+	}
+	for _, key := range []string{"risk", "mutation", "human_gate", "requires_human_confirmation"} {
+		value, ok := n.Input[key]
+		if !ok {
+			continue
+		}
+		switch v := value.(type) {
+		case bool:
+			if v {
+				return true
+			}
+		case string:
+			text := strings.ToLower(strings.TrimSpace(v))
+			switch text {
+			case "high", "dangerous", "guarded_mutation", "mutation", "true", "yes", "required", "confirm":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func findNodesByStatus(g *TaskGraph, status string) []string {

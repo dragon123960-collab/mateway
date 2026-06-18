@@ -46,6 +46,25 @@ Task Lineage = 历史任务之间的 fork/continue 关系
 - CLI/TUI 是否能显示 graph/node 状态，而不是只显示 contract/checklist。
 - Task Lineage 字段是否和 Session tree 边界清楚。
 
+## 当前实现状态
+
+本阶段已完成最小闭环：
+
+- `internal/runtime.runGraphTask` 在执行前调用 `session.RecoverRunningNodes`，然后写入 `graph_recovery_normalized` trace event。
+- node 级关键 trace event 通过 `writeNodeEvent` 保证带 `task_id`、`graph_id`、`node_id`、`attempt`。
+- session store 会持久化 `TaskGraph`、node 状态、attempts、result summary、evidence refs、acceptance、pending action。
+- `running` / `retrying` node 恢复为 `pending`，`verifying` 保留结果和 evidence，`completed + verified` 不重跑。
+- `awaiting_input`、`failed`、`blocked` 恢复后不自动调度。
+- high-risk / mutation / human-gate node 如果在 `running` 或 `retrying` 中断，恢复为 `awaiting_input`，避免静默重放真实动作。
+- TUI task sidebar 优先展示 graph/node 状态；旧 contract 只作为 task acceptance 兼容提示。
+
+本阶段仍不做：
+
+- Session tree / Memory tree / Git-like object store。
+- 从历史 completed task 直接改写旧 graph。
+- 真正的长期 task browser 索引。
+- 自动创建 repair/synthesis node。
+
 ## Trace 契约
 
 Graph 相关事件必须带：

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -428,7 +429,16 @@ func TestExecuteNode_SkillNode_MetadataWorkflow_SKILLMDAtomic(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, ".mateway"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".mateway", "metadata.yaml"), []byte("adapter_version: \"1\"\nsource: test\ngraph:\n  granularity: workflow\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".mateway", "metadata.yaml"), []byte(`adapter_version: "2"
+source: "test"
+installed_at: "2026-06-17T00:00:00Z"
+tool_runtime: "mateway"
+graph:
+  mode: "adapted"
+  type: "prompt"
+  stage: "execution"
+  granularity: "workflow"
+`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: conflicting\ngranularity: atomic\n---\n# Conflicting"), 0o644); err != nil {
@@ -905,6 +915,150 @@ func TestExecuteNode_ModelNode_UsesSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestExecuteNode_DirectNodeIncludesAgentProfilePrompt(t *testing.T) {
+	var capturedSystemPrompt string
+	var callCount int
+	captureModel := captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		callCount++
+		if callCount == 1 {
+			capturedSystemPrompt = c.SystemPrompt
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "我是小代。"}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"identity answered","confidence":"high"}`}, nil
+	}}
+	rt := newTestRuntime(t)
+	rt.Model = captureModel
+	profileDir := filepath.Join(rt.home(), "workspace", "agents", "main")
+	if err := os.MkdirAll(profileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "soul.md"), []byte("# Soul\n\n你是 小代，也是用户的个人 AI 工作助理。"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer-name",
+		Type:   session.NodeTypeSubtask,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer your name",
+		Status: session.NodeStatusPending,
+		Acceptance: session.Acceptance{
+			Criteria: "answer with the assistant name",
+		},
+	})
+	node := g.NodeByID("answer-name")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "你叫什么"), &session.State{}, g, node, "你叫什么", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(capturedSystemPrompt, "你是 小代") {
+		t.Fatalf("system prompt should include agent soul identity, got:\n%s", capturedSystemPrompt)
+	}
+	if !strings.Contains(capturedSystemPrompt, "answer your name") {
+		t.Fatal("system prompt missing node goal")
+	}
+}
+
+func TestExecuteNode_DirectNodeIncludesContextHookMessages(t *testing.T) {
+	var capturedMessages []agentcore.Message
+	var callCount int
+	captureModel := captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		callCount++
+		if callCount == 1 {
+			capturedMessages = append([]agentcore.Message(nil), c.Messages...)
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "use remembered preference"}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"preference used","confidence":"high"}`}, nil
+	}}
+	rt := newTestRuntime(t)
+	rt.Model = captureModel
+	rt.Hooks.Providers = append([]HookProvider{testContextHookProvider{text: "Relevant memory snippets:\n- user prefers bullet points"}}, rt.Hooks.Providers...)
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer",
+		Type:   session.NodeTypeSubtask,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer with remembered preference",
+		Status: session.NodeStatusPending,
+		Acceptance: session.Acceptance{
+			Criteria: "uses remembered preference",
+		},
+	})
+	node := g.NodeByID("answer")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "use my preference"), &session.State{}, g, node, "use my preference", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capturedMessages) == 0 {
+		t.Fatal("expected model messages")
+	}
+	if capturedMessages[0].Role != agentcore.RoleSystem || !strings.Contains(capturedMessages[0].Content, "user prefers bullet points") {
+		t.Fatalf("expected context hook system message first, got %#v", capturedMessages)
+	}
+}
+
+func TestExecuteNode_DirectNodeIncludesReferencedTaskContext(t *testing.T) {
+	var capturedMessages []agentcore.Message
+	var callCount int
+	captureModel := captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		callCount++
+		if callCount == 1 {
+			capturedMessages = append([]agentcore.Message(nil), c.Messages...)
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "历史结果说明 runtime 负责调度任务图。"}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"context used","confidence":"high"}`}, nil
+	}}
+	rt := newTestRuntime(t)
+	rt.Model = captureModel
+
+	historyGraph := &session.TaskGraph{
+		ID:     "g-history",
+		TaskID: "task-history",
+		Status: session.GraphStatusCompleted,
+		Nodes: []session.TaskGraphNode{{
+			ID:            "inspect",
+			Type:          session.NodeTypeSubtask,
+			Mode:          session.NodeModeDirect,
+			Goal:          "inspect runtime package",
+			Status:        session.NodeStatusCompleted,
+			ResultSummary: "runtime 负责调度 TaskGraph 并执行 node",
+			Output:        map[string]any{"text": "runtime 负责调度 TaskGraph 并执行 node"},
+			Acceptance:    session.Acceptance{Verified: true},
+		}},
+	}
+	currentGraph := newTestGraph(session.TaskGraphNode{
+		ID:     "summarize",
+		Type:   session.NodeTypeSubtask,
+		Mode:   session.NodeModeDirect,
+		Goal:   "summarize previous result",
+		Status: session.NodeStatusPending,
+		Acceptance: session.Acceptance{
+			Criteria: "uses previous task result",
+		},
+	})
+	state := &session.State{Tasks: []session.TaskNode{
+		{ID: "task-history", Goal: "inspect runtime", Status: "completed", Summary: "runtime package inspected", Graph: historyGraph},
+		{ID: currentGraph.TaskID, Goal: "summarize previous result", Status: "running", Graph: currentGraph, Execution: session.ExecutionFrame{ContextRefs: []string{"task-history"}}},
+	}}
+	node := currentGraph.NodeByID("summarize")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "基于刚才的结果总结一句话"), state, currentGraph, node, "基于刚才的结果总结一句话", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var combined strings.Builder
+	for _, msg := range capturedMessages {
+		combined.WriteString(msg.Content)
+		combined.WriteString("\n")
+	}
+	text := combined.String()
+	if !strings.Contains(text, "[referenced_task_context]") || !strings.Contains(text, "runtime 负责调度 TaskGraph") {
+		t.Fatalf("expected referenced task context in model messages, got:\n%s", text)
+	}
+}
+
 func TestExecuteNode_ToolNode_EvidenceHasElapsed(t *testing.T) {
 	rt := newTestRuntime(t)
 	g := newTestGraph(session.TaskGraphNode{
@@ -1022,6 +1176,7 @@ func TestExecuteSingleTool_RetrySuccessAfterTimeout(t *testing.T) {
 
 func TestExecuteNode_ToolNode_CriteriaUnmet_Blocked(t *testing.T) {
 	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
 	rt.Model = staticTextModel{text: `{"status":"blocked","reason":"output does not mention build instructions","missing":["build instructions"],"confidence":"low"}`}
 
 	g := newTestGraph(session.TaskGraphNode{
@@ -1051,6 +1206,44 @@ func TestExecuteNode_ToolNode_CriteriaUnmet_Blocked(t *testing.T) {
 	}
 	if !strings.Contains(node.FailureReason, "build instructions") {
 		t.Fatalf("failure reason should mention criteria, got %q", node.FailureReason)
+	}
+}
+
+func TestExecuteNode_ToolNode_DefaultVerifierSkipsModelWhenDeterministicPasses(t *testing.T) {
+	rt := newTestRuntime(t)
+	modelCalled := false
+	rt.Model = captureModel{next: func(_ context.Context, _ agentcore.Context) (agentcore.Message, error) {
+		modelCalled = true
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"blocked","reason":"should not run","confidence":"low"}`}, nil
+	}}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:       "readme",
+		Type:     session.NodeTypeTool,
+		Goal:     "read README",
+		Status:   session.NodeStatusPending,
+		Executor: "file.read",
+		Acceptance: session.Acceptance{
+			Criteria: "must contain build instructions",
+		},
+	})
+	node := g.NodeByID("readme")
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("# Project"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	node.Input = map[string]any{"path": filepath.Join(tmpDir, "README.md")}
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modelCalled {
+		t.Fatal("default verifier should not call model when deterministic verification passes")
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q", node.Status)
 	}
 }
 
@@ -1085,6 +1278,7 @@ func TestExecuteNode_ToolNode_NoCriteria_Completes(t *testing.T) {
 
 func TestExecuteNode_ModelNode_NeedsInputConvertedToBlocked(t *testing.T) {
 	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
 	rt.Model = staticTextModel{text: `{"status":"needs_input","reason":"need human to confirm this output","confidence":"medium"}`}
 
 	g := newTestGraph(session.TaskGraphNode{
@@ -1133,6 +1327,707 @@ func TestExecuteNode_HumanNode_NeedsInputPreserved(t *testing.T) {
 	}
 }
 
+func TestRunGraphTask_NodeVerifierRetryThenPasses(t *testing.T) {
+	var executeCalls int
+	var verifyCalls int
+	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
+	rt.Model = captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		if c.SystemPrompt == modelVerifierSystemPrompt {
+			verifyCalls++
+			if verifyCalls == 1 {
+				return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"retry","reason":"missing detail","retryable":true,"feedback_for_next_attempt":"include detail","confidence":"medium"}`}, nil
+			}
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"detail included","confidence":"high"}`}, nil
+		}
+		executeCalls++
+		if executeCalls == 1 {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: "too short"}, nil
+		}
+		if !strings.Contains(c.SystemPrompt, "include detail") {
+			t.Fatalf("expected retry feedback in next attempt prompt, got %q", c.SystemPrompt)
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "answer with detail"}, nil
+	}}
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer",
+		Type:   session.NodeTypeModel,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+		Acceptance: session.Acceptance{
+			Criteria: "include detail",
+		},
+	})
+	task := &session.TaskNode{ID: g.TaskID, Goal: "answer", Graph: g}
+	state := &session.State{Tasks: []session.TaskNode{*task}, ActiveTask: task.ID}
+	trace := newTestTraceRecorder(t)
+
+	if _, err := rt.runGraphTask(t.Context(), inbound("cli:test", "answer"), state, &state.Tasks[0], "answer", trace); err != nil {
+		t.Fatal(err)
+	}
+	node := state.Tasks[0].Graph.NodeByID("answer")
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed after retry, got %q: %s", node.Status, node.FailureReason)
+	}
+	if node.Attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", node.Attempts)
+	}
+	if !node.Acceptance.Verified {
+		t.Fatal("expected node verified")
+	}
+}
+
+func TestRunGraphTask_NodeVerifierRetryExhausted(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
+	rt.Model = captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		if c.SystemPrompt == modelVerifierSystemPrompt {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"retry","reason":"still missing","retryable":true,"confidence":"medium"}`}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "incomplete"}, nil
+	}}
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer",
+		Type:   session.NodeTypeModel,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+		Input:  map[string]any{"max_attempts": 2},
+		Acceptance: session.Acceptance{
+			Criteria: "must pass verifier",
+		},
+	})
+	task := &session.TaskNode{ID: g.TaskID, Goal: "answer", Graph: g}
+	state := &session.State{Tasks: []session.TaskNode{*task}, ActiveTask: task.ID}
+	trace := newTestTraceRecorder(t)
+
+	if _, err := rt.runGraphTask(t.Context(), inbound("cli:test", "answer"), state, &state.Tasks[0], "answer", trace); err != nil {
+		t.Fatal(err)
+	}
+	if node := state.Tasks[0].Graph.NodeByID("answer"); node != nil {
+		t.Fatalf("expected exhausted node to be replaced by local replan, got status %q", node.Status)
+	}
+	repair := state.Tasks[0].Graph.NodeByID("repair-answer")
+	if repair == nil {
+		t.Fatalf("expected repair node after local replan, nodes=%v", state.Tasks[0].Graph.NodeIDs())
+	}
+	if repair.Status != session.NodeStatusFailed {
+		t.Fatalf("expected bounded repair failure after retry exhaustion, got %q", repair.Status)
+	}
+	if repair.Attempts != 2 {
+		t.Fatalf("expected 2 repair attempts, got %d", repair.Attempts)
+	}
+	events := readTraceFile(t, trace.path)
+	if !traceHasEvent(events, "node_retry_exhausted") {
+		t.Fatal("expected node_retry_exhausted trace event")
+	}
+	if !traceHasEvent(events, "local_replan_applied") {
+		t.Fatal("expected local_replan_applied trace event")
+	}
+	if !traceHasEvent(events, "local_replan_limit_reached") {
+		t.Fatal("expected local_replan_limit_reached trace event")
+	}
+	if session.ReadyNodes(state.Tasks[0].Graph, 1) != nil {
+		t.Fatalf("failed repair node should not be ready again")
+	}
+}
+
+func TestExecuteNode_DirectMode_SingleModelCall(t *testing.T) {
+	var callCount int
+	model := captureModel{next: func(_ context.Context, _ agentcore.Context) (agentcore.Message, error) {
+		callCount++
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "direct answer"}, nil
+	}}
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "data"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer",
+		Type:   session.NodeTypeModel,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("answer")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 model call, got %d", callCount)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q", node.Status)
+	}
+	if node.ResultSummary == "" {
+		t.Fatal("expected result summary")
+	}
+}
+
+func TestExecuteNode_DirectMode_IgnoresToolCallsFromModel(t *testing.T) {
+	var toolInvocations int
+	tool := &countingTool{name: "file.read", content: "data", calls: &toolInvocations}
+	model := captureModel{next: func(_ context.Context, _ agentcore.Context) (agentcore.Message, error) {
+		return agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "",
+			ToolCalls: []agentcore.ToolCall{{
+				ID:   "call_1",
+				Name: "file.read",
+				Args: map[string]any{"path": "/etc/passwd"},
+			}},
+		}, nil
+	}}
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(tool)
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer",
+		Type:   session.NodeTypeModel,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("answer")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("direct mode should not fail when model returns tool calls, got %q: %s", node.Status, node.FailureReason)
+	}
+	if toolInvocations != 0 {
+		t.Fatalf("direct mode must not invoke tools, got %d invocations", toolInvocations)
+	}
+	if !strings.Contains(node.ResultSummary, "ignored tool call") {
+		t.Fatalf("expected summary to mention ignored tool call, got %q", node.ResultSummary)
+	}
+	if len(node.EvidenceRefs) != 0 {
+		t.Fatalf("direct mode should not produce evidence refs, got %d", len(node.EvidenceRefs))
+	}
+}
+
+func TestExecuteNode_DirectMode_NoToolRegistryInteraction(t *testing.T) {
+	var toolsSeen []string
+	model := captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		for _, t := range c.Tools {
+			toolsSeen = append(toolsSeen, t.Name())
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "ok"}, nil
+	}}
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "data"})
+	rt.Tools.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "answer",
+		Type:   session.NodeTypeModel,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("answer")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toolsSeen) != 0 {
+		t.Fatalf("expected no tools in direct mode, got %v", toolsSeen)
+	}
+}
+
+func TestExecuteNode_ReactMode_UsesAgentCoreLoop(t *testing.T) {
+	model := newReactStepModel(
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "let me read the file",
+			ToolCalls: []agentcore.ToolCall{{
+				ID:   "tc-1",
+				Name: "file.read",
+				Args: map[string]any{"path": "/tmp/x"},
+			}},
+		},
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "the file says: hello",
+		},
+	)
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "hello"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:           "react",
+		Type:         session.NodeTypeSubtask,
+		Mode:         session.NodeModeReact,
+		Goal:         "read and summarize",
+		Status:       session.NodeStatusPending,
+		AllowedTools: []string{"file.read"},
+	})
+	node := g.NodeByID("react")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.calls != 2 {
+		t.Fatalf("expected 2 model calls (1 tool call + 1 final), got %d", model.calls)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q: %s", node.Status, node.FailureReason)
+	}
+	if node.ResultSummary == "" {
+		t.Fatal("expected result summary")
+	}
+}
+
+func TestExecuteNode_ReactMode_AllowedToolsFilter(t *testing.T) {
+	model := newReactStepModel(
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "calling allowed",
+			ToolCalls: []agentcore.ToolCall{{
+				ID:   "tc-1",
+				Name: "file.read",
+				Args: map[string]any{"path": "/tmp/x"},
+			}},
+		},
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "done",
+		},
+	)
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "hello"})
+	rt.Tools.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:           "react",
+		Type:         session.NodeTypeSubtask,
+		Mode:         session.NodeModeReact,
+		Goal:         "use only file.read",
+		Status:       session.NodeStatusPending,
+		AllowedTools: []string{"file.read"},
+	})
+	node := g.NodeByID("react")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(model.toolsSeen) < 1 {
+		t.Fatal("expected at least one model call")
+	}
+	for _, tools := range model.toolsSeen {
+		for _, toolName := range tools {
+			if toolName == "terminal.run" {
+				t.Fatalf("terminal.run should not be visible in allowed_tools filter, got %v", tools)
+			}
+		}
+	}
+}
+
+func TestExecuteNode_ReactMode_ToolCallsBecomeEvidence(t *testing.T) {
+	model := newReactStepModel(
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "reading",
+			ToolCalls: []agentcore.ToolCall{{
+				ID:   "tc-1",
+				Name: "file.read",
+				Args: map[string]any{"path": "/tmp/x"},
+			}},
+		},
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "got the contents",
+		},
+	)
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "raw content"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:           "react",
+		Type:         session.NodeTypeSubtask,
+		Mode:         session.NodeModeReact,
+		Goal:         "read and report",
+		Status:       session.NodeStatusPending,
+		AllowedTools: []string{"file.read"},
+	})
+	node := g.NodeByID("react")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(node.EvidenceRefs) != 1 {
+		t.Fatalf("expected 1 evidence ref, got %d", len(node.EvidenceRefs))
+	}
+	if node.EvidenceRefs[0].ToolName != "file.read" {
+		t.Fatalf("expected tool name file.read, got %q", node.EvidenceRefs[0].ToolName)
+	}
+	if node.EvidenceRefs[0].Kind != "tool" {
+		t.Fatalf("expected kind=tool, got %q", node.EvidenceRefs[0].Kind)
+	}
+}
+
+func TestExecuteNode_ReactMode_ToolPolicyStillApplies(t *testing.T) {
+	model := newReactStepModel(
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "trying",
+			ToolCalls: []agentcore.ToolCall{{
+				ID:   "tc-1",
+				Name: "file.read",
+				Args: map[string]any{"path": "/etc/passwd"},
+			}},
+		},
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "got it",
+		},
+	)
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:           "react",
+		Type:         session.NodeTypeSubtask,
+		Mode:         session.NodeModeReact,
+		Goal:         "try to read",
+		Status:       session.NodeStatusPending,
+		AllowedTools: []string{"file.read"},
+	})
+	node := g.NodeByID("react")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(node.EvidenceRefs) != 1 {
+		t.Fatalf("expected 1 evidence ref (policy+redaction pipeline runs even for react), got %d", len(node.EvidenceRefs))
+	}
+	if node.EvidenceRefs[0].ToolName != "file.read" {
+		t.Fatalf("expected tool name file.read, got %q", node.EvidenceRefs[0].ToolName)
+	}
+}
+
+func TestExecuteNode_ReactMode_NoAllowedTools_RunsAsLoop(t *testing.T) {
+	model := newReactStepModel(
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "answering directly",
+		},
+	)
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "ok"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "react",
+		Type:   session.NodeTypeSubtask,
+		Mode:   session.NodeModeReact,
+		Goal:   "answer without tools",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("react")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.calls != 1 {
+		t.Fatalf("expected 1 model call (no tools needed), got %d", model.calls)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed, got %q", node.Status)
+	}
+}
+
+func TestExecuteNode_NodeStartedTraceEvent(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "answer"}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "n1",
+		Type:   session.NodeTypeModel,
+		Mode:   session.NodeModeDirect,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("n1")
+
+	tmpDir := t.TempDir()
+	traceFile := filepath.Join(tmpDir, "trace.jsonl")
+	trace := &traceRecorder{id: "test-trace", path: traceFile, base: map[string]any{}}
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !node.Acceptance.Verified {
+		t.Fatal("expected verified")
+	}
+
+	data, err := os.ReadFile(traceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var foundNodeStarted, foundTaskID, foundGraphID, foundNodeID, foundAttempt bool
+	for _, line := range lines {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			t.Fatalf("bad json: %v", err)
+		}
+		if payload["type"] == "node_started" {
+			foundNodeStarted = true
+			if _, ok := payload["task_id"]; ok {
+				foundTaskID = true
+			}
+			if _, ok := payload["graph_id"]; ok {
+				foundGraphID = true
+			}
+			if _, ok := payload["node_id"]; ok {
+				foundNodeID = true
+			}
+			if _, ok := payload["attempt"]; ok {
+				foundAttempt = true
+			}
+		}
+	}
+	if !foundNodeStarted {
+		t.Fatal("expected node_started event in trace")
+	}
+	if !foundTaskID {
+		t.Fatal("expected task_id in node_started event")
+	}
+	if !foundGraphID {
+		t.Fatal("expected graph_id in node_started event")
+	}
+	if !foundNodeID {
+		t.Fatal("expected node_id in node_started event")
+	}
+	if !foundAttempt {
+		t.Fatal("expected attempt in node_started event")
+	}
+}
+
+func TestExecuteNode_ReactMode_ToolTraceHasRequiredFields(t *testing.T) {
+	model := newReactStepModel(
+		agentcore.Message{
+			Role:    agentcore.RoleAssistant,
+			Content: "reading",
+			ToolCalls: []agentcore.ToolCall{{
+				ID: "tc-1", Name: "file.read", Args: map[string]any{"path": "/tmp/x"},
+			}},
+		},
+		agentcore.Message{Role: agentcore.RoleAssistant, Content: "done"},
+	)
+	rt := newTestRuntime(t)
+	rt.Model = model
+	rt.Tools.Register(runtimeNamedTool{name: "file.read", content: "data"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID: "react", Type: session.NodeTypeSubtask, Mode: session.NodeModeReact,
+		Goal: "read", Status: session.NodeStatusPending, AllowedTools: []string{"file.read"},
+	})
+	node := g.NodeByID("react")
+
+	tmpDir := t.TempDir()
+	traceFile := filepath.Join(tmpDir, "trace.jsonl")
+	trace := &traceRecorder{id: "tt", path: traceFile, base: map[string]any{}}
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(traceFile)
+	if err != nil {
+		t.Fatalf("failed to read trace file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	requiredFields := []string{"task_id", "graph_id", "node_id", "attempt"}
+	for _, eventType := range []string{"node_tool_call", "node_tool_result"} {
+		found := false
+		for _, line := range lines {
+			var evt map[string]any
+			if err := json.Unmarshal([]byte(line), &evt); err != nil {
+				t.Fatalf("bad trace json: %v", err)
+			}
+			if evt["type"] != eventType {
+				continue
+			}
+			found = true
+			for _, f := range requiredFields {
+				if _, ok := evt[f]; !ok {
+					t.Fatalf("%s missing field %q", eventType, f)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected %s event in trace", eventType)
+		}
+	}
+}
+
+func TestExecuteNode_ToolNode_ToolTraceHasRequiredFields(t *testing.T) {
+	rt := newTestRuntime(t)
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "README.md"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID: "readme", Type: session.NodeTypeTool, Goal: "read",
+		Status: session.NodeStatusPending, Executor: "file.read",
+		Input: map[string]any{"path": filepath.Join(tmpDir, "README.md")},
+	})
+	node := g.NodeByID("readme")
+
+	traceFile := filepath.Join(tmpDir, "trace.jsonl")
+	trace := &traceRecorder{id: "tt", path: traceFile, base: map[string]any{}}
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(traceFile)
+	if err != nil {
+		t.Fatalf("failed to read trace file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	requiredFields := []string{"task_id", "graph_id", "node_id", "attempt"}
+	for _, eventType := range []string{"node_tool_call", "node_tool_result"} {
+		found := false
+		for _, line := range lines {
+			var evt map[string]any
+			if err := json.Unmarshal([]byte(line), &evt); err != nil {
+				t.Fatalf("bad trace json: %v", err)
+			}
+			if evt["type"] != eventType {
+				continue
+			}
+			found = true
+			for _, f := range requiredFields {
+				if _, ok := evt[f]; !ok {
+					t.Fatalf("%s missing field %q", eventType, f)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected %s event in trace", eventType)
+		}
+	}
+}
+
+func TestExecuteNode_UsesTransitionTo_IncrementsAttempts(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "ok"}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:       "n1",
+		Type:     session.NodeTypeModel,
+		Mode:     session.NodeModeDirect,
+		Goal:     "answer",
+		Status:   session.NodeStatusPending,
+		Attempts: 0,
+	})
+	node := g.NodeByID("n1")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Attempts != 1 {
+		t.Fatalf("expected attempts=1 (incremented by TransitionTo), got %d", node.Attempts)
+	}
+}
+
+func TestExecuteNode_UnknownMode_FailsConcretely(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "ok"}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "n1",
+		Type:   session.NodeTypeModel,
+		Mode:   "unsupported_mode",
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("n1")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != session.NodeStatusFailed {
+		t.Fatalf("expected failed for unsupported mode, got %q", node.Status)
+	}
+	if !strings.Contains(node.FailureReason, "unsupported mode") {
+		t.Fatalf("expected reason to mention unsupported mode, got %q", node.FailureReason)
+	}
+}
+
+func TestExecuteNode_ScriptMode_DelegatesToToolExecutor(t *testing.T) {
+	rt := newTestRuntime(t)
+	tmpDir := t.TempDir()
+	target := filepath.Join(tmpDir, "script.txt")
+	rt.Tools.Register(runtimeNamedTool{name: "script.run", content: "ran"})
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:       "script-node",
+		Type:     session.NodeTypeTool,
+		Mode:     session.NodeModeScript,
+		Goal:     "run script",
+		Status:   session.NodeStatusPending,
+		Executor: "script.run",
+		Input:    map[string]any{"path": target},
+	})
+	node := g.NodeByID("script-node")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed for script mode, got %q: %s", node.Status, node.FailureReason)
+	}
+}
+
+func TestExecuteNode_ModeEmptyTypeDispatchStillWorks(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "model answer"}
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:     "mode-empty",
+		Type:   session.NodeTypeModel,
+		Goal:   "answer",
+		Status: session.NodeStatusPending,
+	})
+	node := g.NodeByID("mode-empty")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "hi"), &session.State{}, g, node, "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Status != session.NodeStatusCompleted {
+		t.Fatalf("expected completed via type dispatch, got %q", node.Status)
+	}
+}
+
 type errorModel struct{}
 
 func (m errorModel) Next(context.Context, agentcore.Context) (agentcore.Message, error) {
@@ -1145,6 +2040,63 @@ type captureModel struct {
 
 func (m captureModel) Next(ctx context.Context, c agentcore.Context) (agentcore.Message, error) {
 	return m.next(ctx, c)
+}
+
+type testContextHookProvider struct {
+	text string
+}
+
+func (p testContextHookProvider) Name() string { return "test_context" }
+
+func (p testContextHookProvider) ContextHook(context.Context, ContextHookInput) (ContextHookResult, error) {
+	return ContextHookResult{SystemContextSections: []ContextSection{{
+		Name:    "test_context",
+		Source:  "test",
+		Content: p.text,
+	}}}, nil
+}
+
+type reactStepModel struct {
+	responses []agentcore.Message
+	calls     int
+	toolsSeen [][]string
+}
+
+func (m *reactStepModel) Next(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+	toolNames := make([]string, 0, len(c.Tools))
+	for _, t := range c.Tools {
+		toolNames = append(toolNames, t.Name())
+	}
+	m.toolsSeen = append(m.toolsSeen, toolNames)
+	if m.calls >= len(m.responses) {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "fallback final"}, nil
+	}
+	resp := m.responses[m.calls]
+	m.calls++
+	return resp, nil
+}
+
+func newReactStepModel(responses ...agentcore.Message) *reactStepModel {
+	return &reactStepModel{responses: responses}
+}
+
+type countingTool struct {
+	name    string
+	content string
+	calls   *int
+}
+
+func (t *countingTool) Name() string        { return t.name }
+func (t *countingTool) Description() string { return "counting test tool" }
+func (t *countingTool) Schema() agentcore.Schema {
+	return agentcore.Schema{}
+}
+func (t *countingTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
+func (t *countingTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.ToolResult {
+	if t.calls != nil {
+		*t.calls++
+	}
+	return agentcore.ToolResult{ToolCallID: call.ID, Content: t.content, Evidence: map[string]any{"called": true}}
 }
 
 func newTestTraceRecorder(t *testing.T) *traceRecorder {
@@ -1174,11 +2126,23 @@ func newTestRuntimeWithWorkspace(t *testing.T) (Runtime, string) {
 
 func createRegisteredSkill(t *testing.T, workspace, name, granularity, body string) string {
 	t.Helper()
+	if granularity == "atomic" {
+		granularity = "subtask"
+	}
 	dir := filepath.Join(workspace, "skills", name)
 	if err := os.MkdirAll(filepath.Join(dir, ".mateway"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	metaContent := fmt.Sprintf("adapter_version: \"1\"\nsource: test\ngraph:\n  granularity: %s\n", granularity)
+	metaContent := fmt.Sprintf(`adapter_version: "2"
+source: "test"
+installed_at: "2026-06-17T00:00:00Z"
+tool_runtime: "mateway"
+graph:
+  mode: "adapted"
+  type: "prompt"
+  stage: "execution"
+  granularity: "%s"
+`, granularity)
 	if err := os.WriteFile(filepath.Join(dir, ".mateway", "metadata.yaml"), []byte(metaContent), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,7 @@ Return only one JSON object. Do not execute tools. Do not write narrative outsid
 The contract has two parts:
   1. Tool execution list (plan_items) — always required, even for simple Q&A. Each plan_items entry is one logical action; plan_items[].criteria is the per-step acceptance condition.
   2. Acceptance list (required_evidence) — required for tool/action tasks, may be omitted/empty for direct Q&A. Each required_evidence.description is the global acceptance condition.
-Together they form the universal "tool execution list + acceptance list" shape: every task always has a plan (plan_items); tool/action tasks also carry an acceptance list (required_evidence) against which the completion evaluator judges the task done.
+Together they form the universal "tool execution list + acceptance list" shape: every task always has a plan (plan_items); tool/action tasks also carry an acceptance list (required_evidence) that legacy contract validation and trace readers can inspect.
 Use English JSON keys and concise English values.
 Use the same natural language as the user for user-visible string values: summary, expected_outcome, completion_policy, required_evidence.description, plan_items.title, and plan_items.criteria.
 Preserve the user's target exactly. Do not reinterpret a server/service/process status request as a software release or project status request.
@@ -336,7 +336,7 @@ func parseTaskContract(raw string) (session.TaskContract, error) {
 		// Slice 6A universal plan shape: every task carries at least one
 		// plan_items entry, even direct Q&A. The model's contract may omit
 		// plan_items for plain Q&A; fall back to a single empty-tool item
-		// so completion evaluator and trace readers see a plan.
+		// so legacy contract validation and trace readers see a plan.
 		contract.PlanItems = fallbackPlanItems(firstNonEmpty(contract.Summary, contract.ExpectedOutcome), contract.RequiresTools, contract.RequiredTools)
 	}
 	if contract.RequiresTools && len(contract.RequiredTools) == 0 {
@@ -1021,63 +1021,6 @@ func acceptedTools(task session.TaskNode) map[string]bool {
 		}
 	}
 	return out
-}
-
-func taskContractFollowup(missing []string) string {
-	if len(missing) == 0 {
-		return "Missing: task contract evidence. Next required action: call the smallest appropriate tool or state blocker."
-	}
-	return fmt.Sprintf("Missing: %s. Next required action: call %s or state blocker.", strings.Join(missing, "; "), nextToolForMissing(missing, session.TaskContract{}))
-}
-
-func taskContractFollowupWithGuidance(missing []string, failures map[string]FailureInfo, contract session.TaskContract, accepted map[string]bool) string {
-	if len(missing) == 0 {
-		return "Missing: task contract evidence. Next required action: call the smallest appropriate tool or state blocker."
-	}
-	var parts []string
-	for _, m := range missing {
-		info, ok := lookupFailureGuidance(m, failures)
-		if ok && info.Guidance != "" {
-			parts = append(parts, m+" — "+info.Guidance)
-		} else {
-			parts = append(parts, m)
-		}
-	}
-	for _, skill := range contract.RequiredSkills {
-		name := strings.TrimSpace(skill.Name)
-		if name == "" {
-			continue
-		}
-		if requiredSkillReadCompleted(contract, skill) {
-			parts = append(parts, fmt.Sprintf("skill:%s read", name))
-		} else {
-			parts = append(parts, fmt.Sprintf("skill:%s needs file.read SKILL.md", name))
-		}
-	}
-	return fmt.Sprintf("Missing: %s. Next required action: call %s or state blocker.", strings.Join(parts, "; "), nextToolForMissing(missing, contract))
-}
-
-func nextToolForMissing(missing []string, contract session.TaskContract) string {
-	for _, item := range contract.PlanItems {
-		status := normalizePlanStatus(item.Status)
-		if status != "" && status != "pending" && status != "running" {
-			continue
-		}
-		if tool := strings.TrimSpace(item.Tool); tool != "" {
-			return tool
-		}
-	}
-	for _, m := range missing {
-		if tool := toolNameFromMissing(m); tool != "" {
-			return tool
-		}
-	}
-	for _, evidence := range contract.RequiredEvidence {
-		if tool := strings.TrimSpace(evidence.Tool); tool != "" {
-			return tool
-		}
-	}
-	return "the smallest appropriate tool"
 }
 
 func requiredSkillReadCompleted(contract session.TaskContract, skill session.RequiredSkill) bool {

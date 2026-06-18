@@ -28,7 +28,9 @@ Planner 不生成工具调用序列。它生成可验收子任务、依赖关系
 
 ## 3. TaskGraph And Scheduler
 
-Runtime 校验 Planner 输出后持久化 TaskGraph。Scheduler 根据 `depends + status` 计算 ready nodes。第一版使用本地调度；后续可开启 `max_parallel_nodes` 进行本地并发。
+Runtime 校验 Planner 输出后持久化 TaskGraph。Scheduler 根据 `depends + status` 计算 ready nodes，并按 `execution.max_parallel_nodes` 做本地并发调度。
+
+并发调度保持 local-first：selected nodes 在独立 session/graph sandbox 中执行，完成后由主 runtime 合并 node result、messages、usage、pending action 和 task step 增量。High-risk、human、mutation node 默认保守独占批次。
 
 Completed and verified nodes are never rerun. Pending nodes only run when all dependencies completed or skipped.
 

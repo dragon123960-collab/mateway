@@ -23,6 +23,7 @@ const finalizerSystemPrompt = `You are a task finalizer. Summarize the completed
 
 func (rt Runtime) finalizeGraph(
 	ctx context.Context,
+	msg channel.InboundMessage,
 	g *session.TaskGraph,
 	vr session.GraphVerificationResult,
 	trace *traceRecorder,
@@ -39,9 +40,9 @@ func (rt Runtime) finalizeGraph(
 	result := session.FinalizeGraph(g, vr)
 
 	if result.Status == session.FinalizeCompleted {
-		if direct := directSingleModelResult(g); direct != "" {
+		if direct := directSingleNodeResult(g); direct != "" {
 			result.ReplyText = direct
-		} else if direct := lastCompletedModelResult(g); direct != "" {
+		} else if direct := finalCompletedNodeResult(g); direct != "" {
 			result.ReplyText = direct
 		}
 	}
@@ -50,14 +51,44 @@ func (rt Runtime) finalizeGraph(
 		prompt := renderFinalizerPrompt(g, vr)
 		finalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		if directSingleModelResult(g) == "" && lastCompletedModelResult(g) == "" {
+		if directSingleNodeResult(g) == "" && finalCompletedNodeResult(g) == "" {
+			if trace != nil {
+				_ = trace.write(map[string]any{
+					"type":        "model_call_start",
+					"model_stage": "finalizer",
+					"graph_id":    g.ID,
+					"task_id":     g.TaskID,
+				})
+			}
 			reply, err := rt.Model.Next(finalCtx, agentcore.Context{
-				SystemPrompt: finalizerSystemPrompt,
+				SystemPrompt: rt.finalizerSystemPromptForMessage(msg),
 				Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
 			})
 			if err == nil && strings.TrimSpace(reply.Content) != "" {
 				result.ReplyText = strings.TrimSpace(reply.Content)
 			}
+			if trace != nil {
+				eventType := "model_call_end"
+				payload := map[string]any{
+					"type":        eventType,
+					"model_stage": "finalizer",
+					"graph_id":    g.ID,
+					"task_id":     g.TaskID,
+				}
+				if err != nil {
+					payload["type"] = "model_call_failed"
+					payload["error"] = err.Error()
+				}
+				_ = trace.write(payload)
+			}
+		} else if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":        "model_call_skipped",
+				"model_stage": "finalizer",
+				"graph_id":    g.ID,
+				"task_id":     g.TaskID,
+				"reason":      "direct_final_node_result",
+			})
 		}
 	}
 
@@ -84,37 +115,69 @@ func (rt Runtime) finalizeGraph(
 	return result
 }
 
-func directSingleModelResult(g *session.TaskGraph) string {
+func (rt Runtime) finalizerSystemPromptForMessage(msg channel.InboundMessage) string {
+	profilePrompt := strings.TrimSpace(buildRuntimeSystemContext(rt.Config, rt.Pool.ProfileForMessage(msg)))
+	if profilePrompt == "" {
+		return finalizerSystemPrompt
+	}
+	return profilePrompt + "\n\nFinalizer context:\n" + finalizerSystemPrompt
+}
+
+func directSingleNodeResult(g *session.TaskGraph) string {
 	if g == nil || len(g.Nodes) != 1 {
 		return ""
 	}
 	n := g.Nodes[0]
-	if n.Type != session.NodeTypeModel || n.Status != session.NodeStatusCompleted {
+	if !isFinalAnswerNode(n) || n.Status != session.NodeStatusCompleted {
 		return ""
 	}
+	return nodeResultText(n)
+}
+
+func finalCompletedNodeResult(g *session.TaskGraph) string {
+	if g == nil {
+		return ""
+	}
+	downstream := make(map[string]bool)
+	for _, n := range g.Nodes {
+		for _, dep := range n.Depends {
+			downstream[dep] = true
+		}
+	}
+	var candidate *session.TaskGraphNode
+	for i := len(g.Nodes) - 1; i >= 0; i-- {
+		n := &g.Nodes[i]
+		if downstream[n.ID] || !isFinalAnswerNode(*n) || n.Status != session.NodeStatusCompleted {
+			continue
+		}
+		if nodeResultText(*n) == "" {
+			continue
+		}
+		if candidate != nil {
+			return ""
+		}
+		candidate = n
+	}
+	if candidate == nil {
+		return ""
+	}
+	return nodeResultText(*candidate)
+}
+
+func isFinalAnswerNode(n session.TaskGraphNode) bool {
+	switch n.Type {
+	case session.NodeTypeModel, session.NodeTypeSubtask, session.NodeTypeSkill:
+		return true
+	default:
+		return false
+	}
+}
+
+func nodeResultText(n session.TaskGraphNode) string {
 	if text, ok := n.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
 		return strings.TrimSpace(text)
 	}
 	return strings.TrimSpace(n.ResultSummary)
-}
-
-func lastCompletedModelResult(g *session.TaskGraph) string {
-	if g == nil {
-		return ""
-	}
-	for i := len(g.Nodes) - 1; i >= 0; i-- {
-		n := g.Nodes[i]
-		if n.Type != session.NodeTypeModel || n.Status != session.NodeStatusCompleted {
-			continue
-		}
-		if text, ok := n.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
-			return strings.TrimSpace(text)
-		}
-		if strings.TrimSpace(n.ResultSummary) != "" {
-			return strings.TrimSpace(n.ResultSummary)
-		}
-	}
-	return ""
 }
 
 func (rt Runtime) FinalizeAndRespond(
@@ -125,7 +188,7 @@ func (rt Runtime) FinalizeAndRespond(
 	vr session.GraphVerificationResult,
 	trace *traceRecorder,
 ) (Response, error) {
-	result := rt.finalizeGraph(ctx, g, vr, trace)
+	result := rt.finalizeGraph(ctx, msg, g, vr, trace)
 
 	switch result.Status {
 	case session.FinalizeCompleted:
@@ -220,6 +283,14 @@ func taskMemoryObserve(
 	if graphTask != nil && graphTask.Graph != nil {
 		graphSummary = session.BuildGraphMemorySummary(graphTask.Graph, graphTask.Goal)
 	}
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":     "memory_observe_start",
+			"kind":     kind,
+			"task_id":  taskID,
+			"graph_id": graphIDFromSummary(graphSummary),
+		})
+	}
 	observe := rt.Hooks.observe(ctx, ObserveHookInput{
 		Kind:         kind,
 		Home:         home,
@@ -234,7 +305,10 @@ func taskMemoryObserve(
 	if observe.LearningResult != nil {
 		if trace != nil {
 			_ = trace.write(map[string]any{
-				"type":            "self_learning",
+				"type":            "memory_written",
+				"kind":            kind,
+				"task_id":         taskID,
+				"graph_id":        graphIDFromSummary(graphSummary),
 				"diary_path":      observe.LearningResult.DiaryPath,
 				"reflection_path": observe.LearningResult.ReflectionPath,
 			})
@@ -248,6 +322,13 @@ func taskMemoryObserve(
 			}
 		}
 	}
+}
+
+func graphIDFromSummary(summary *session.GraphMemorySummary) string {
+	if summary == nil {
+		return ""
+	}
+	return summary.GraphID
 }
 
 func ensurePendingForGraph(state *session.State, g *session.TaskGraph) {

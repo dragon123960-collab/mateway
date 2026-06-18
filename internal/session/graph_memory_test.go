@@ -10,8 +10,10 @@ func TestBuildGraphMemorySummary(t *testing.T) {
 		ID: "g1", TaskID: "t1", Status: GraphStatusCompleted,
 		Nodes: []TaskGraphNode{
 			{ID: "read", Type: NodeTypeTool, Goal: "read file", Status: NodeStatusCompleted, Executor: "file.read", ResultSummary: "file contents", Attempts: 1, EvidenceRefs: []EvidenceRef{{Kind: "tool", ToolName: "file.read"}}},
-			{ID: "analyze", Type: NodeTypeModel, Goal: "analyze", Status: NodeStatusCompleted, ResultSummary: "analysis done", Attempts: 2},
+			{ID: "analyze", Type: NodeTypeModel, Mode: NodeModeDirect, Goal: "analyze", Status: NodeStatusCompleted, ResultSummary: "analysis done", Attempts: 2, Output: map[string]any{"summary": "analysis done"}, Acceptance: Acceptance{Verified: true, Reason: "ok"}},
 			{ID: "deploy", Type: NodeTypeTool, Goal: "deploy", Status: NodeStatusFailed, Executor: "terminal.run", FailureReason: "permission denied", Attempts: 3},
+			{ID: "browser", Type: NodeTypeSkill, Mode: NodeModeSkill, Goal: "browse", Status: NodeStatusCompleted, Executor: "agent-browser", ResultSummary: "browsed", Attempts: 1},
+			{ID: "review", Type: NodeTypeHumanReview, Goal: "review", Status: NodeStatusAwaitingInput},
 		},
 	}
 
@@ -28,8 +30,8 @@ func TestBuildGraphMemorySummary(t *testing.T) {
 	if summary.Status != GraphStatusCompleted {
 		t.Fatalf("expected completed, got %q", summary.Status)
 	}
-	if len(summary.Nodes) != 3 {
-		t.Fatalf("expected 3 nodes, got %d", len(summary.Nodes))
+	if len(summary.Nodes) != 5 {
+		t.Fatalf("expected 5 nodes, got %d", len(summary.Nodes))
 	}
 
 	n1 := summary.Nodes[0]
@@ -47,6 +49,12 @@ func TestBuildGraphMemorySummary(t *testing.T) {
 	if n2.Attempts != 2 {
 		t.Fatalf("expected attempts=2, got %d", n2.Attempts)
 	}
+	if n2.Mode != NodeModeDirect || n2.VerifierStatus != VerificationPassed || n2.VerifierReason != "ok" {
+		t.Fatalf("node 1 metadata mismatch: %+v", n2)
+	}
+	if n2.Output["summary"] != "analysis done" {
+		t.Fatalf("structured output missing: %+v", n2.Output)
+	}
 
 	n3 := summary.Nodes[2]
 	if n3.Status != NodeStatusFailed || n3.FailureReason != "permission denied" {
@@ -54,6 +62,18 @@ func TestBuildGraphMemorySummary(t *testing.T) {
 	}
 	if n3.Attempts != 3 {
 		t.Fatalf("expected attempts=3, got %d", n3.Attempts)
+	}
+	if len(summary.FailedNodes) != 1 || summary.FailedNodes[0] != "deploy" {
+		t.Fatalf("failed nodes = %#v", summary.FailedNodes)
+	}
+	if len(summary.RetriedNodes) != 2 || summary.RetriedNodes[0] != "analyze" || summary.RetriedNodes[1] != "deploy" {
+		t.Fatalf("retried nodes = %#v", summary.RetriedNodes)
+	}
+	if len(summary.BlockedNodes) != 1 || summary.BlockedNodes[0] != "review" {
+		t.Fatalf("blocked nodes = %#v", summary.BlockedNodes)
+	}
+	if len(summary.Skills) != 1 || summary.Skills[0].Name != "agent-browser" || summary.Skills[0].NodeID != "browser" {
+		t.Fatalf("skills = %#v", summary.Skills)
 	}
 }
 

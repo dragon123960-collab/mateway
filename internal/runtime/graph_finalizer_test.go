@@ -3,9 +3,13 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/channel"
@@ -35,7 +39,7 @@ func TestFinalizeGraph_Completed_UsesLastModelNodeForFinalAnswer(t *testing.T) {
 		},
 	}
 	vr := session.VerifyTaskGraph(g)
-	result := rt.finalizeGraph(t.Context(), g, vr, nil)
+	result := rt.finalizeGraph(t.Context(), channel.InboundMessage{}, g, vr, nil)
 	if result.Status != session.FinalizeCompleted {
 		t.Fatalf("expected completed, got %q", result.Status)
 	}
@@ -44,6 +48,55 @@ func TestFinalizeGraph_Completed_UsesLastModelNodeForFinalAnswer(t *testing.T) {
 	}
 	if result.KeepTask {
 		t.Fatal("completed should not keep task")
+	}
+}
+
+func TestFinalizeGraph_Completed_UsesFinalSinkSubtaskResult(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "should not be called"}
+
+	g := &session.TaskGraph{
+		ID:     "g-sink",
+		TaskID: "t-sink",
+		Nodes: []session.TaskGraphNode{
+			{ID: "read-readme", Type: session.NodeTypeSubtask, Mode: session.NodeModeReact, Goal: "read README", Status: session.NodeStatusCompleted, ResultSummary: "README details", Output: map[string]any{"text": "README details"}, Acceptance: session.Acceptance{Verified: true}},
+			{ID: "read-architecture", Type: session.NodeTypeSubtask, Mode: session.NodeModeReact, Goal: "read architecture", Status: session.NodeStatusCompleted, ResultSummary: "Architecture details", Output: map[string]any{"text": "Architecture details"}, Acceptance: session.Acceptance{Verified: true}},
+			{ID: "synthesize", Type: session.NodeTypeSubtask, Mode: session.NodeModeDirect, Goal: "synthesize final answer", Depends: []string{"read-readme", "read-architecture"}, Status: session.NodeStatusCompleted, ResultSummary: "Final synthesis", Output: map[string]any{"text": "- README details\n- Architecture details"}, Acceptance: session.Acceptance{Verified: true}},
+		},
+	}
+	vr := session.VerifyTaskGraph(g)
+	result := rt.finalizeGraph(t.Context(), channel.InboundMessage{}, g, vr, nil)
+	if result.Status != session.FinalizeCompleted {
+		t.Fatalf("expected completed, got %q", result.Status)
+	}
+	if result.ReplyText != "- README details\n- Architecture details" {
+		t.Fatalf("expected final sink subtask output, got %q", result.ReplyText)
+	}
+}
+
+func TestFinalizeGraph_Completed_MultipleSinkNodesUseModelFinalizer(t *testing.T) {
+	var callCount int
+	rt := newTestRuntime(t)
+	rt.Model = &finalizerCountingModel{calls: &callCount, text: "combined final answer"}
+
+	g := &session.TaskGraph{
+		ID:     "g-multiple-sinks",
+		TaskID: "t-multiple-sinks",
+		Nodes: []session.TaskGraphNode{
+			{ID: "summary-a", Type: session.NodeTypeSubtask, Mode: session.NodeModeDirect, Goal: "write summary a", Status: session.NodeStatusCompleted, ResultSummary: "A", Output: map[string]any{"text": "A"}, Acceptance: session.Acceptance{Verified: true}},
+			{ID: "summary-b", Type: session.NodeTypeSubtask, Mode: session.NodeModeDirect, Goal: "write summary b", Status: session.NodeStatusCompleted, ResultSummary: "B", Output: map[string]any{"text": "B"}, Acceptance: session.Acceptance{Verified: true}},
+		},
+	}
+	vr := session.VerifyTaskGraph(g)
+	result := rt.finalizeGraph(t.Context(), channel.InboundMessage{}, g, vr, nil)
+	if result.Status != session.FinalizeCompleted {
+		t.Fatalf("expected completed, got %q", result.Status)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected model finalizer for multiple sinks, got %d calls", callCount)
+	}
+	if result.ReplyText != "combined final answer" {
+		t.Fatalf("expected model finalizer output, got %q", result.ReplyText)
 	}
 }
 
@@ -60,12 +113,48 @@ func TestFinalizeGraph_Blocked_NoModelCall(t *testing.T) {
 		},
 	}
 	vr := session.VerifyTaskGraph(g)
-	result := rt.finalizeGraph(t.Context(), g, vr, nil)
+	result := rt.finalizeGraph(t.Context(), channel.InboundMessage{}, g, vr, nil)
 	if callCount > 0 {
 		t.Fatal("model should not be called for blocked graph")
 	}
 	if result.Status != session.FinalizeBlocked {
 		t.Fatalf("expected blocked, got %q", result.Status)
+	}
+}
+
+func TestFinalizeGraph_ModelFinalizerIncludesAgentProfilePrompt(t *testing.T) {
+	var capturedSystemPrompt string
+	rt := newTestRuntime(t)
+	rt.Model = captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		capturedSystemPrompt = c.SystemPrompt
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "最终回答"}, nil
+	}}
+	profileDir := filepath.Join(rt.home(), "workspace", "agents", "main")
+	if err := os.MkdirAll(profileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "soul.md"), []byte("# Soul\n\n你是 小代，也是用户的个人 AI 工作助理。"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &session.TaskGraph{
+		ID:     "g-finalizer-profile",
+		TaskID: "t-finalizer-profile",
+		Nodes: []session.TaskGraphNode{
+			{ID: "read-a", Type: session.NodeTypeTool, Goal: "read a", Status: session.NodeStatusCompleted, ResultSummary: "A", EvidenceRefs: []session.EvidenceRef{{Kind: "tool", Summary: "A"}}, Acceptance: session.Acceptance{Verified: true}},
+			{ID: "read-b", Type: session.NodeTypeTool, Goal: "read b", Status: session.NodeStatusCompleted, ResultSummary: "B", EvidenceRefs: []session.EvidenceRef{{Kind: "tool", Summary: "B"}}, Acceptance: session.Acceptance{Verified: true}},
+		},
+	}
+	vr := session.VerifyTaskGraph(g)
+	result := rt.finalizeGraph(t.Context(), inbound("cli:test", "summarize"), g, vr, nil)
+	if result.ReplyText != "最终回答" {
+		t.Fatalf("expected model finalizer reply, got %q", result.ReplyText)
+	}
+	if !strings.Contains(capturedSystemPrompt, "你是 小代") {
+		t.Fatalf("finalizer system prompt should include agent soul identity, got:\n%s", capturedSystemPrompt)
+	}
+	if !strings.Contains(capturedSystemPrompt, "task finalizer") {
+		t.Fatalf("finalizer system prompt missing finalizer rules, got:\n%s", capturedSystemPrompt)
 	}
 }
 
@@ -79,7 +168,7 @@ func TestFinalizeGraph_Failed_RecordsFailure(t *testing.T) {
 		},
 	}
 	vr := session.VerifyTaskGraph(g)
-	result := rt.finalizeGraph(t.Context(), g, vr, nil)
+	result := rt.finalizeGraph(t.Context(), channel.InboundMessage{}, g, vr, nil)
 	if result.Status != session.FinalizeFailed {
 		t.Fatalf("expected failed, got %q", result.Status)
 	}
@@ -266,6 +355,56 @@ func TestFinalizeAndRespond_Blocked_GraphBlockedTrace(t *testing.T) {
 	}
 	if !resp.Failed {
 		t.Fatal("blocked response should be marked Failed")
+	}
+}
+
+func TestFinalizeAndRespond_Completed_ObservesGraphMemory(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "Done."}
+	msg := inbound("cli:test", "hi")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("use skill")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-memory",
+		TaskID: task.ID,
+		Status: session.GraphStatusCompleted,
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:            "skill",
+				Type:          session.NodeTypeSkill,
+				Mode:          session.NodeModeSkill,
+				Goal:          "search",
+				Status:        session.NodeStatusCompleted,
+				Executor:      "fresh-search",
+				Attempts:      2,
+				ResultSummary: "found sources",
+				Acceptance:    session.Acceptance{Verified: true},
+			},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	vr := session.VerifyTaskGraph(task.Graph)
+	resp, err := rt.FinalizeAndRespond(t.Context(), msg, state, task.Graph, vr, trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Failed {
+		t.Fatal("completed memory observe should not fail response")
+	}
+	events := readTraceFile(t, trace.path)
+	if !traceHasEvent(events, "memory_observe_start") || !traceHasEvent(events, "memory_written") {
+		t.Fatalf("missing memory observe trace events: %#v", events)
+	}
+	data, err := os.ReadFile(filepath.Join(rt.home(), "observe", "skill_usage", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"skill_node_id":"skill"`) || !strings.Contains(text, `"name":"fresh-search"`) || !strings.Contains(text, `"node_result":"found sources"`) {
+		t.Fatalf("skill usage missing graph/node result:\n%s", text)
 	}
 }
 
@@ -668,9 +807,9 @@ func TestGraphAwareContinuation_AwaitingInputNewTaskNotOverridden(t *testing.T) 
 	task := &session.TaskNode{ID: "t1", Goal: "review task", Status: "await_user_input", Graph: g}
 	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
 
-	d := graphAwareContinuation(state, "build a docker image from scratch", task)
+	d := graphAwareContinuation(state, "/new build a docker image from scratch", task)
 	if d.Action != ActionNewGraph {
-		t.Fatalf("awaiting_input with new task should be new_graph, got %q", d.Action)
+		t.Fatalf("awaiting_input with explicit /new should be new_graph, got %q", d.Action)
 	}
 }
 
@@ -761,9 +900,9 @@ func TestGraphAwareContinuation_PendingGraphNewTaskNotOverridden(t *testing.T) {
 	}}
 	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
 
-	d := graphAwareContinuation(state, "build a docker image from scratch", task)
+	d := graphAwareContinuation(state, "/new build a docker image from scratch", task)
 	if d.Action != ActionNewGraph {
-		t.Fatalf("pending graph with new task should be new_graph, got %q", d.Action)
+		t.Fatalf("pending graph with explicit /new should be new_graph, got %q", d.Action)
 	}
 }
 
@@ -786,6 +925,7 @@ func TestExecuteNode_ModelNodeWithCriteria_CallsModelTwiceAndVerifies(t *testing
 	var callCount int
 	var verifierPrompt string
 	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
 	rt.Model = captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
 		callCount++
 		if callCount == 1 {
@@ -857,11 +997,364 @@ func TestRunGraphTask_ProducesSchedulerTraceEvents(t *testing.T) {
 
 	events := readTraceFile(t, trace.path)
 
-	required := []string{"graph_schedule_tick", "node_scheduled", "node_execute_start", "node_verified", "graph_finalized"}
+	required := []string{"graph_schedule_tick", "scheduler_tick", "node_ready", "node_scheduled", "node_started", "node_verified", "node_completed", "graph_finalized"}
 	for _, eventType := range required {
 		if !traceHasEvent(events, eventType) {
 			t.Fatalf("missing trace event: %s", eventType)
 		}
+	}
+}
+
+func TestRunGraphTask_MaxParallelNodesSelectsReadyBatch(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.MaxParallelNodes = 2
+	rt.Model = staticTextModel{text: "done"}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("parallel graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-parallel",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{ID: "a", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer a", Status: session.NodeStatusPending},
+			{ID: "b", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer b", Status: session.NodeStatusPending},
+			{ID: "c", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer c", Status: session.NodeStatusPending},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := readTraceFile(t, trace.path)
+	firstTick := firstTraceEvent(t, events, "scheduler_tick")
+	selected := stringSliceFromTrace(firstTick["selected_nodes"])
+	waiting := stringSliceFromTrace(firstTick["waiting_nodes"])
+	if len(selected) != 2 || !containsAll(selected, "a", "b") {
+		t.Fatalf("expected first tick to select a and b, got %#v in %#v", selected, firstTick)
+	}
+	if len(waiting) != 1 || waiting[0] != "c" {
+		t.Fatalf("expected c waiting in first tick, got %#v in %#v", waiting, firstTick)
+	}
+	if !traceHasSchedulerWaitingFor(events, "c", "max_parallel_nodes") {
+		t.Fatalf("expected scheduler_waiting for c due max_parallel_nodes, events=%#v", events)
+	}
+	for _, nodeID := range []string{"a", "b", "c"} {
+		node := task.Graph.NodeByID(nodeID)
+		if node == nil || node.Status != session.NodeStatusCompleted || !node.Acceptance.Verified {
+			t.Fatalf("expected node %s completed verified, got %#v", nodeID, node)
+		}
+	}
+}
+
+func TestRunGraphTask_MaxParallelNodesExecutesNodesConcurrently(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.MaxParallelNodes = 2
+	rt.Model = newBarrierModel(2, "done")
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("parallel graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-parallel-exec",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{ID: "a", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer a", Status: session.NodeStatusPending},
+			{ID: "b", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer b", Status: session.NodeStatusPending},
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		trace := newTestTraceRecorder(t)
+		_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parallel nodes did not enter model calls concurrently")
+	}
+}
+
+func TestRunGraphTask_MaxParallelNodesDefaultSerial(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "done"}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("serial graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-serial",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{ID: "a", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer a", Status: session.NodeStatusPending},
+			{ID: "b", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer b", Status: session.NodeStatusPending},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstTick := firstTraceEvent(t, readTraceFile(t, trace.path), "scheduler_tick")
+	selected := stringSliceFromTrace(firstTick["selected_nodes"])
+	waiting := stringSliceFromTrace(firstTick["waiting_nodes"])
+	if len(selected) != 1 || selected[0] != "a" {
+		t.Fatalf("expected default first tick to select only a, got %#v", selected)
+	}
+	if len(waiting) != 1 || waiting[0] != "b" {
+		t.Fatalf("expected b waiting by default, got %#v", waiting)
+	}
+}
+
+func TestRunGraphTask_ParallelSensitiveNodeRunsAlone(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.MaxParallelNodes = 3
+	rt.Model = staticTextModel{text: "done"}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("sensitive graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-sensitive",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{ID: "write", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "write file", Status: session.NodeStatusPending, Input: map[string]any{"mutation": true}},
+			{ID: "review", Type: session.NodeTypeHumanConfirm, Mode: session.NodeModeHuman, Goal: "confirm", Status: session.NodeStatusPending},
+			{ID: "read", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "read", Status: session.NodeStatusPending},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstTick := firstTraceEvent(t, readTraceFile(t, trace.path), "scheduler_tick")
+	selected := stringSliceFromTrace(firstTick["selected_nodes"])
+	waiting := stringSliceFromTrace(firstTick["waiting_nodes"])
+	if len(selected) != 1 || selected[0] != "write" {
+		t.Fatalf("expected sensitive write node to run alone, got selected=%#v tick=%#v", selected, firstTick)
+	}
+	if !containsAll(waiting, "review", "read") {
+		t.Fatalf("expected review and read waiting behind sensitive node, got %#v", waiting)
+	}
+}
+
+func TestRunGraphTask_RetryExhaustedAppliesLocalReplan(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
+	rt.Model = retryThenPassRepairModel{}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("replan graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-replan",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:     "analyze",
+				Type:   session.NodeTypeModel,
+				Mode:   session.NodeModeDirect,
+				Goal:   "produce overbroad analysis",
+				Status: session.NodeStatusPending,
+				Acceptance: session.Acceptance{
+					Criteria: "force retry until local replan",
+				},
+			},
+			{
+				ID:      "final",
+				Type:    session.NodeTypeModel,
+				Mode:    session.NodeModeDirect,
+				Goal:    "final",
+				Status:  session.NodeStatusPending,
+				Depends: []string{"analyze"},
+			},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := readTraceFile(t, trace.path)
+	if !traceHasEvent(events, "node_retry_exhausted") {
+		t.Fatal("expected node_retry_exhausted")
+	}
+	if !traceHasEvent(events, "local_replan_applied") {
+		t.Fatal("expected local_replan_applied")
+	}
+	if task.Graph.NodeByID("analyze") != nil || task.Graph.NodeByID("final") != nil {
+		t.Fatalf("expected failed node and downstream pending node replaced, nodes=%v", task.Graph.NodeIDs())
+	}
+	repair := task.Graph.NodeByID("repair-analyze")
+	if repair == nil {
+		t.Fatalf("expected repair-analyze node, nodes=%v", task.Graph.NodeIDs())
+	}
+	if repair.Status != session.NodeStatusCompleted || !repair.Acceptance.Verified {
+		t.Fatalf("expected repair node completed verified, got %#v", repair)
+	}
+}
+
+func TestRunGraphTask_DirectFailureAppliesLocalReplan(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.ModelVerifier = "always"
+	rt.Model = failThenPassRepairModel{}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("replan failed graph")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-failed-replan",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:     "analyze",
+				Type:   session.NodeTypeModel,
+				Mode:   session.NodeModeDirect,
+				Goal:   "analyze all packages",
+				Status: session.NodeStatusPending,
+				Acceptance: session.Acceptance{
+					Criteria: "must cover every package",
+				},
+			},
+			{
+				ID:      "final",
+				Type:    session.NodeTypeModel,
+				Mode:    session.NodeModeDirect,
+				Goal:    "final",
+				Status:  session.NodeStatusPending,
+				Depends: []string{"analyze"},
+			},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := readTraceFile(t, trace.path)
+	if traceHasEvent(events, "node_retry_exhausted") {
+		t.Fatal("direct verifier failure should not masquerade as retry exhaustion")
+	}
+	if !traceHasEvent(events, "local_replan_applied") {
+		t.Fatal("expected local_replan_applied")
+	}
+	if task.Graph.NodeByID("analyze") != nil || task.Graph.NodeByID("final") != nil {
+		t.Fatalf("expected failed node and downstream pending node replaced, nodes=%v", task.Graph.NodeIDs())
+	}
+	repair := task.Graph.NodeByID("repair-analyze")
+	if repair == nil {
+		t.Fatalf("expected repair-analyze node, nodes=%v", task.Graph.NodeIDs())
+	}
+	if repair.Status != session.NodeStatusCompleted || !repair.Acceptance.Verified {
+		t.Fatalf("expected repair node completed verified, got %#v", repair)
+	}
+}
+
+func TestLocalReplanReplacementNodePreservesReactTools(t *testing.T) {
+	node := &session.TaskGraphNode{
+		ID:            "summarize-runtime-file",
+		Type:          session.NodeTypeSubtask,
+		Mode:          session.NodeModeReact,
+		Goal:          "summarize runtime file",
+		Status:        session.NodeStatusFailed,
+		Depends:       []string{"read-files"},
+		AllowedTools:  []string{"file.read", "terminal.run"},
+		FailureReason: "verifier rejected missing file evidence",
+		Input: map[string]any{
+			"local_replan_depth": 1,
+		},
+	}
+
+	repair := localReplanReplacementNode(node)
+	if repair.Mode != session.NodeModeReact {
+		t.Fatalf("repair mode = %q, want %q", repair.Mode, session.NodeModeReact)
+	}
+	if strings.Join(repair.AllowedTools, ",") != "file.read,terminal.run" {
+		t.Fatalf("repair allowed tools = %v", repair.AllowedTools)
+	}
+	if strings.Join(repair.Depends, ",") != "read-files" {
+		t.Fatalf("repair depends = %v", repair.Depends)
+	}
+	if depth := localReplanDepth(&repair); depth != 2 {
+		t.Fatalf("repair depth = %d, want 2", depth)
+	}
+}
+
+func TestRunGraphTask_NodeTraceEventsIncludeRequiredIDs(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "done"}
+	msg := inbound("cli:test", "run graph task")
+
+	state := &session.State{Key: "cli:test"}
+	task := state.StartTask("trace required ids")
+	state.ActiveTask = task.ID
+	task.Graph = &session.TaskGraph{
+		ID:     "g-required",
+		TaskID: task.ID,
+		Status: session.GraphStatusPlanned,
+		Nodes: []session.TaskGraphNode{
+			{ID: "n1", Type: session.NodeTypeModel, Mode: session.NodeModeDirect, Goal: "answer", Status: session.NodeStatusPending},
+		},
+	}
+
+	trace := newTestTraceRecorder(t)
+	_, err := rt.runGraphTask(t.Context(), msg, state, task, "run graph task", trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := readTraceFile(t, trace.path)
+	for _, event := range events {
+		eventType, _ := event["type"].(string)
+		switch eventType {
+		case "node_scheduled", "node_started", "node_verify_start", "node_verified", "node_final_output":
+			assertTraceField(t, event, "task_id")
+			assertTraceField(t, event, "graph_id")
+			assertTraceField(t, event, "node_id")
+			if _, ok := event["attempt"]; !ok {
+				t.Fatalf("%s missing attempt: %#v", eventType, event)
+			}
+		}
+	}
+	if !traceHasEvent(events, "graph_recovery_normalized") {
+		t.Fatal("missing graph_recovery_normalized trace event")
+	}
+}
+
+func assertTraceField(t *testing.T, event map[string]any, key string) {
+	t.Helper()
+	if strings.TrimSpace(fmt.Sprint(event[key])) == "" {
+		t.Fatalf("%s missing %s: %#v", event["type"], key, event)
 	}
 }
 
@@ -872,6 +1365,119 @@ func traceHasEvent(events []map[string]any, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func firstTraceEvent(t *testing.T, events []map[string]any, eventType string) map[string]any {
+	t.Helper()
+	for _, e := range events {
+		if typ, _ := e["type"].(string); typ == eventType {
+			return e
+		}
+	}
+	t.Fatalf("missing trace event: %s", eventType)
+	return nil
+}
+
+func stringSliceFromTrace(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func containsAll(values []string, wants ...string) bool {
+	seen := map[string]bool{}
+	for _, v := range values {
+		seen[v] = true
+	}
+	for _, want := range wants {
+		if !seen[want] {
+			return false
+		}
+	}
+	return true
+}
+
+func traceHasSchedulerWaitingFor(events []map[string]any, nodeID, reason string) bool {
+	for _, event := range events {
+		if typ, _ := event["type"].(string); typ != "scheduler_waiting" {
+			continue
+		}
+		if event["node_id"] == nodeID && event["reason"] == reason {
+			return true
+		}
+	}
+	return false
+}
+
+type barrierModel struct {
+	text    string
+	needed  int
+	entered int
+	mu      sync.Mutex
+	release chan struct{}
+	once    sync.Once
+}
+
+type retryThenPassRepairModel struct{}
+
+func (m retryThenPassRepairModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "verification judge") {
+		user := ""
+		if len(ctx.Messages) > 0 {
+			user = ctx.Messages[len(ctx.Messages)-1].Content
+		}
+		if strings.Contains(user, "Repair and complete") || strings.Contains(user, "repair_result") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"repair accepted","missing":[],"confidence":"high"}`}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"retry","reason":"needs smaller output","missing":["concise result"],"confidence":"high","feedback_for_next_attempt":"make it concise"}`}, nil
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "node output"}, nil
+}
+
+type failThenPassRepairModel struct{}
+
+func (m failThenPassRepairModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "verification judge") {
+		user := ""
+		if len(ctx.Messages) > 0 {
+			user = ctx.Messages[len(ctx.Messages)-1].Content
+		}
+		if strings.Contains(user, "Repair and complete") || strings.Contains(user, "repair_result") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"repair accepted","missing":[],"confidence":"high"}`}, nil
+		}
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"failed","reason":"missing most package coverage","missing":["package coverage"],"confidence":"high"}`}, nil
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: "node output"}, nil
+}
+
+func newBarrierModel(needed int, text string) *barrierModel {
+	return &barrierModel{needed: needed, text: text, release: make(chan struct{})}
+}
+
+func (m *barrierModel) Next(ctx context.Context, _ agentcore.Context) (agentcore.Message, error) {
+	m.mu.Lock()
+	m.entered++
+	if m.entered >= m.needed {
+		m.once.Do(func() { close(m.release) })
+	}
+	m.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return agentcore.Message{}, ctx.Err()
+	case <-m.release:
+	}
+	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.text}, nil
 }
 
 func readTraceFile(t *testing.T, path string) []map[string]any {

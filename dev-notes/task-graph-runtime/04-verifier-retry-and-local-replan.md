@@ -322,8 +322,32 @@ TODO checklist:
 - [ ] 将 verifier 的 retryable failure 接入 node retry，并把 feedback 传给下一次 attempt。
 - [ ] max attempts exhausted 后必须进入 failed/blocked/replan request，不能无限重新调度。
 - [ ] 增加最小 local replan entrypoint：替换 failed node 和 downstream pending nodes，保留 completed upstream nodes。
-- [ ] 确保 finalizer/task verifier 在 nodes completed 后仍检查 task acceptance。
+- [ ] 确保 finalizer/task verifier 在 nodes completed 后检查 graph-native task/node acceptance；旧 `TaskContract` 只能作为兼容展示/上下文，不得覆盖 graph 完成状态。
 
-必须包含 retry success、retry exhausted、local replan 保留 upstream completed nodes、task acceptance repair/blocker 的测试。
+必须包含 retry success、retry exhausted、local replan 保留 upstream completed nodes、graph-native task acceptance/blocker 的测试。
 不要重写 entire graph，不要增加 distributed scheduling，不要保留旧 finalization 语义。
 ```
+
+## 实现状态（截至当前 commit）
+
+| TODO | 状态 | 主要落点 |
+|------|------|---------|
+| TODO 1 NodeVerifierResult | 已完成 | `session.NodeVerificationResult` 增加 `retry` / `replan` 状态、`Retryable`、`FeedbackForNextAttempt`。`verifyNodeWithModel` 支持解析 `retry`、`replan`、`retryable`、`feedback_for_next_attempt`。 |
+| TODO 2 verifier failure -> node retry | 已完成 | `runtime.verifyAndTraceNode` 调用 `prepareNodeRetry`；retryable verifier result 写 `node_retry` trace，并把 feedback 写入 `node.Input["attempt_feedback"]`。下一次 attempt 会通过 node input 进入 node-local prompt。 |
+| TODO 3 attempts exhausted | 已完成 | `maxNodeAttempts` 默认 2，可用 node input `max_attempts` 覆盖。耗尽后写 `node_retry_exhausted` trace，并把结果转为 `failed`，scheduler 不再调度该 node。 |
+| TODO 4 local replan 最小入口 | 已完成最小闭环 | `session.ApplyLocalReplan` 替换 failed/blocked node 和依赖它的 downstream pending nodes，保留 completed verified upstream 和 blocked/awaiting_input nodes；结果必须通过 `ValidateTaskGraph`。`runtime.applyLocalReplanWithTrace` 写 `local_replan_start` / `local_replan_applied` / `local_replan_failed`。暂不接真实 Planner。 |
+| TODO 5 task acceptance repair path | 已完成 graph-native 收口 | `VerifyTaskGraphWithContract` 保留 `TaskContract` 兼容参数，但 graph 状态只由 node status、node acceptance 和 graph-native task acceptance 决定；旧 contract 不再把 completed graph 改成 failed/blocker。repair/synthesis node 仍留给后续扩展，本阶段不自动生成。 |
+
+测试基线：
+
+- `go test ./internal/session`：通过。
+- `go test ./internal/runtime ./internal/session`：通过。
+- `go test ./...`：通过。
+
+新增/更新测试覆盖：
+
+- `TestRunGraphTask_NodeVerifierRetryThenPasses`
+- `TestRunGraphTask_NodeVerifierRetryExhausted`
+- `TestApplyLocalReplan_PreservesCompletedUpstream`
+- `TestApplyLocalReplan_DoesNotBypassBlockedDownstream`
+- `TestVerifyNode_ToolNode_TimedOut`

@@ -12,17 +12,21 @@ import (
 	"time"
 
 	"github.com/dongping/mateway/internal/config"
-	"github.com/dongping/mateway/internal/secret"
 	"gopkg.in/yaml.v3"
 )
 
 type Skill struct {
-	Name        string
-	Description string
-	Stage       string
-	Priority    string
-	Path        string
-	Scope       string
+	Name         string
+	Description  string
+	Stage        string
+	GraphType    string
+	Granularity  string
+	AllowedTools []string
+	Inputs       []string
+	Outputs      []string
+	Priority     string
+	Path         string
+	Scope        string
 }
 
 type SearchResult struct {
@@ -59,11 +63,47 @@ type InstallResult struct {
 }
 
 type Metadata struct {
-	AdapterVersion string    `yaml:"adapter_version"`
-	Source         string    `yaml:"source"`
-	InstalledAt    time.Time `yaml:"installed_at"`
-	ToolRuntime    string    `yaml:"tool_runtime"`
-	Notes          []string  `yaml:"notes,omitempty"`
+	AdapterVersion string        `yaml:"adapter_version"`
+	Source         string        `yaml:"source"`
+	InstalledAt    time.Time     `yaml:"installed_at"`
+	ToolRuntime    string        `yaml:"tool_runtime"`
+	Notes          []string      `yaml:"notes,omitempty"`
+	Graph          GraphMetadata `yaml:"graph"`
+}
+
+type GraphMetadata struct {
+	Mode         string   `yaml:"mode"`
+	Type         string   `yaml:"type"`
+	Stage        string   `yaml:"stage"`
+	Granularity  string   `yaml:"granularity"`
+	Inputs       []string `yaml:"inputs,omitempty"`
+	Outputs      []string `yaml:"outputs,omitempty"`
+	AllowedTools []string `yaml:"allowed_tools,omitempty"`
+	SafetyNotes  []string `yaml:"safety_notes,omitempty"`
+}
+
+type RegisterInput struct {
+	Workspace string
+	Path      string
+	Name      string
+	Source    string
+	Force     bool
+}
+
+type RegisterResult struct {
+	Name         string
+	Path         string
+	MetadataPath string
+}
+
+type DoctorReport struct {
+	Orphans []OrphanSkill
+}
+
+type OrphanSkill struct {
+	Name   string
+	Path   string
+	Reason string
 }
 
 func List(workspace string) ([]Skill, error) {
@@ -161,7 +201,7 @@ func Install(input InstallInput) (InstallResult, error) {
 	if name == "" {
 		return InstallResult{}, fmt.Errorf("skill name is required")
 	}
-	if err := secret.RejectIfSecretLike(string(data), "SKILL.md"); err != nil {
+	if err := ValidateSkillContent("SKILL.md", string(data)); err != nil {
 		return InstallResult{}, err
 	}
 	target := filepath.Join(workspace, "skills", name, "SKILL.md")
@@ -176,16 +216,14 @@ func Install(input InstallInput) (InstallResult, error) {
 	if err := os.WriteFile(target, data, 0o644); err != nil {
 		return InstallResult{}, err
 	}
-	metadataPath, err := writeMetadata(filepath.Dir(target), Metadata{
-		AdapterVersion: "1",
-		Source:         source,
-		InstalledAt:    time.Now().UTC(),
-		ToolRuntime:    "mateway",
+	metadataPath, err := WriteMetadata(filepath.Dir(target), DefaultMetadata(DefaultMetadataInput{
+		Source: source,
+		Header: header,
 		Notes: []string{
 			"Original SKILL.md is preserved. Mateway-specific adaptation lives in this metadata directory.",
 			"Use terminal.run for command execution; use file.read/write/delete for local files; use secret.set and terminal.run.env_secrets for credentials.",
 		},
-	})
+	}))
 	if err != nil {
 		return InstallResult{}, err
 	}
@@ -205,10 +243,16 @@ func ReadMetadata(skillDir string) (Metadata, bool, error) {
 	if err := yaml.Unmarshal(data, &metadata); err != nil {
 		return Metadata{}, false, err
 	}
+	if err := ValidateMetadata(metadata); err != nil {
+		return Metadata{}, true, err
+	}
 	return metadata, true, nil
 }
 
-func writeMetadata(skillDir string, metadata Metadata) (string, error) {
+func WriteMetadata(skillDir string, metadata Metadata) (string, error) {
+	if err := ValidateMetadata(metadata); err != nil {
+		return "", err
+	}
 	dir := filepath.Join(skillDir, ".mateway")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -219,6 +263,181 @@ func writeMetadata(skillDir string, metadata Metadata) (string, error) {
 		return "", err
 	}
 	return path, os.WriteFile(path, data, 0o644)
+}
+
+type DefaultMetadataInput struct {
+	Source string
+	Header Skill
+	Notes  []string
+}
+
+func DefaultMetadata(input DefaultMetadataInput) Metadata {
+	stage := strings.TrimSpace(input.Header.Stage)
+	if !validMetadataValue(stage, "planning", "execution", "synthesis") {
+		stage = "execution"
+	}
+	graphType := "prompt"
+	allowedTools := []string(nil)
+	switch strings.ToLower(strings.TrimSpace(input.Header.Name)) {
+	case "fresh-search":
+		graphType = "react"
+		allowedTools = []string{"web.search", "web.fetch"}
+	}
+	return Metadata{
+		AdapterVersion: "2",
+		Source:         firstNonEmpty(input.Source, "local"),
+		InstalledAt:    time.Now().UTC(),
+		ToolRuntime:    "mateway",
+		Notes:          input.Notes,
+		Graph: GraphMetadata{
+			Mode:         "adapted",
+			Type:         graphType,
+			Stage:        stage,
+			Granularity:  "subtask",
+			AllowedTools: allowedTools,
+		},
+	}
+}
+
+func Register(input RegisterInput) (RegisterResult, error) {
+	workspace := cleanWorkspace(input.Workspace)
+	target, err := resolveRegisterTarget(workspace, input.Path, input.Name)
+	if err != nil {
+		return RegisterResult{}, err
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return RegisterResult{}, err
+	}
+	if err := ValidateSkillContent(target, string(data)); err != nil {
+		return RegisterResult{}, err
+	}
+	skillDir := filepath.Dir(target)
+	metadataPath := filepath.Join(skillDir, ".mateway", "metadata.yaml")
+	if _, err := os.Stat(metadataPath); err == nil && !input.Force {
+		return RegisterResult{}, fmt.Errorf("skill metadata already exists for %s; use force to overwrite", target)
+	} else if err != nil && !os.IsNotExist(err) {
+		return RegisterResult{}, err
+	}
+	header := ParseHeader(string(data))
+	name := sanitizeName(firstNonEmpty(input.Name, header.Name, filepath.Base(skillDir)))
+	if name == "" {
+		return RegisterResult{}, fmt.Errorf("skill name is required")
+	}
+	source := strings.TrimSpace(input.Source)
+	if source == "" {
+		source = "local"
+	}
+	written, err := WriteMetadata(skillDir, DefaultMetadata(DefaultMetadataInput{
+		Source: source,
+		Header: header,
+		Notes: []string{
+			"Registered from an existing local SKILL.md.",
+		},
+	}))
+	if err != nil {
+		return RegisterResult{}, err
+	}
+	return RegisterResult{Name: name, Path: target, MetadataPath: written}, nil
+}
+
+func Doctor(workspace string) (DoctorReport, error) {
+	workspace = cleanWorkspace(workspace)
+	var report DoctorReport
+	for _, root := range []string{
+		filepath.Join(workspace, "agents", "main", "skills"),
+		filepath.Join(workspace, "skills"),
+	} {
+		orphans, err := doctorRoot(root)
+		if err != nil {
+			return DoctorReport{}, err
+		}
+		report.Orphans = append(report.Orphans, orphans...)
+	}
+	return report, nil
+}
+
+func doctorRoot(root string) ([]OrphanSkill, error) {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []OrphanSkill
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		skillPath := filepath.Join(root, entry.Name(), "SKILL.md")
+		if _, err := os.Stat(skillPath); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		if _, ok, err := ReadMetadata(filepath.Dir(skillPath)); err != nil {
+			out = append(out, OrphanSkill{Name: entry.Name(), Path: skillPath, Reason: err.Error()})
+		} else if !ok {
+			out = append(out, OrphanSkill{Name: entry.Name(), Path: skillPath, Reason: "missing .mateway/metadata.yaml"})
+		}
+	}
+	return out, nil
+}
+
+func ValidateMetadata(metadata Metadata) error {
+	if strings.TrimSpace(metadata.AdapterVersion) == "" {
+		return fmt.Errorf("metadata adapter_version is required")
+	}
+	if strings.TrimSpace(metadata.Source) == "" {
+		return fmt.Errorf("metadata source is required")
+	}
+	if strings.TrimSpace(metadata.ToolRuntime) != "mateway" {
+		return fmt.Errorf("metadata tool_runtime must be mateway")
+	}
+	graph := metadata.Graph
+	if !validMetadataValue(graph.Mode, "native", "adapted", "legacy") {
+		return fmt.Errorf("metadata graph.mode must be native, adapted, or legacy")
+	}
+	if !validMetadataValue(graph.Type, "prompt", "react", "script") {
+		return fmt.Errorf("metadata graph.type must be prompt, react, or script")
+	}
+	if !validMetadataValue(graph.Stage, "planning", "execution", "synthesis") {
+		return fmt.Errorf("metadata graph.stage must be planning, execution, or synthesis")
+	}
+	if !validMetadataValue(graph.Granularity, "subtask", "workflow") {
+		return fmt.Errorf("metadata graph.granularity must be subtask or workflow")
+	}
+	return nil
+}
+
+func validMetadataValue(value string, allowed ...string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, item := range allowed {
+		if value == item {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveRegisterTarget(workspace, path, name string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path != "" {
+		info, err := os.Stat(path)
+		if err != nil {
+			return "", err
+		}
+		if info.IsDir() {
+			path = filepath.Join(path, "SKILL.md")
+		}
+		return filepath.Abs(filepath.Clean(path))
+	}
+	name = sanitizeName(name)
+	if name == "" {
+		return "", fmt.Errorf("skill path or name is required")
+	}
+	return filepath.Join(workspace, "skills", name, "SKILL.md"), nil
 }
 
 func ParseHeader(text string) Skill {
@@ -285,6 +504,16 @@ func listRoot(root, scope string) ([]Skill, error) {
 		}
 		item.Path = path
 		item.Scope = scope
+		metadata, ok, err := ReadMetadata(filepath.Dir(path))
+		if err != nil || !ok {
+			continue
+		}
+		item.Stage = firstNonEmpty(metadata.Graph.Stage, item.Stage)
+		item.GraphType = metadata.Graph.Type
+		item.Granularity = metadata.Graph.Granularity
+		item.AllowedTools = append([]string(nil), metadata.Graph.AllowedTools...)
+		item.Inputs = append([]string(nil), metadata.Graph.Inputs...)
+		item.Outputs = append([]string(nil), metadata.Graph.Outputs...)
 		out = append(out, item)
 	}
 	return out, nil
@@ -336,6 +565,15 @@ func sanitizeName(name string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-_")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func defaultCatalogs() []config.SkillCatalogConfig {

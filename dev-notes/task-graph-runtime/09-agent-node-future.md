@@ -206,3 +206,20 @@ TODO checklist:
 不要实现 multi-agent、subagent spawning、distributed scheduler、worker queue 或 gateway business routing。
 如果看起来需要改代码，先停止并报告，不要直接编辑。
 ```
+
+## 当前检查结果
+
+截至 2026-06-17：
+
+- 当前 schema 未允许 `type=agent`，runtime 也不依赖 agent node。
+- 本阶段未新增 agent node executor、supervisor、subagent spawning、worker queue、distributed scheduler 或 gateway business routing。
+- 稳定文档和 README 已表达：
+  - Mateway 可在未来支持 local agent node 作为执行角色；
+  - distributed multi-agent orchestration、multi-tenant scheduler、company-level workflow platform 不属于 Mateway core。
+- `rg` 检查未发现旧的 “no DAG runtime / 无 DAG runtime” 表述。
+- `supervisor/subagent/distributed/multi-tenant/worker queue` 等命中均处在非目标、边界说明或未来方向文档中，不是核心代码实现。
+
+结论：
+
+- Phase 09 当前不需要代码改动。
+- 后续如果要实现 local agent node，必须作为 Node Executor 的一种本地 mode/type 扩展，并继续复用 TaskGraph status、verifier、trace、session recovery、tool policy 和 memory observe。

@@ -117,7 +117,7 @@ func TestDetermineContinuation_AwaitUserInput_ExplicitNewTask(t *testing.T) {
 			makeTask("task-1", "build authentication", "await_user_input"),
 		},
 	}
-	for _, text := range []string{"/new", "new task please", "新任务", "start fresh"} {
+	for _, text := range []string{"/new", "/new write tests for parser"} {
 		dec := determineContinuation(state, text)
 		if dec.Action != ActionNewGraph {
 			t.Fatalf("text=%q: expected new_graph, got %s", text, dec.Action)
@@ -125,7 +125,7 @@ func TestDetermineContinuation_AwaitUserInput_ExplicitNewTask(t *testing.T) {
 	}
 }
 
-func TestDetermineContinuation_AwaitUserInput_UnrelatedAction(t *testing.T) {
+func TestDetermineContinuation_AwaitUserInput_DefaultResume(t *testing.T) {
 	state := session.State{
 		ActiveTask: "task-1",
 		Tasks: []session.TaskNode{
@@ -133,8 +133,8 @@ func TestDetermineContinuation_AwaitUserInput_UnrelatedAction(t *testing.T) {
 		},
 	}
 	dec := determineContinuation(state, "create a new deployment script for production")
-	if dec.Action != ActionNewGraph {
-		t.Fatalf("expected new_graph for unrelated action, got %s (%s)", dec.Action, dec.Reason)
+	if dec.Action != ActionResumeNode {
+		t.Fatalf("expected resume_node unless /new is explicit, got %s (%s)", dec.Action, dec.Reason)
 	}
 }
 
@@ -186,7 +186,7 @@ func TestDetermineContinuation_RunningTask_ShortConfirmation(t *testing.T) {
 	}
 }
 
-func TestDetermineContinuation_RunningTask_SameTaskFollowup(t *testing.T) {
+func TestDetermineContinuation_RunningTask_DefaultContinue(t *testing.T) {
 	state := session.State{
 		ActiveTask: "task-3",
 		Tasks: []session.TaskNode{
@@ -206,11 +206,11 @@ func TestDetermineContinuation_RunningTask_SameTaskFollowup(t *testing.T) {
 	}
 	dec := determineContinuation(state, "also check dependency versions")
 	if dec.Action != ActionContinueGraph {
-		t.Fatalf("expected continue_graph for same task followup, got %s", dec.Action)
+		t.Fatalf("expected continue_graph by default for running task, got %s", dec.Action)
 	}
 }
 
-func TestDetermineContinuation_RunningTask_UnrelatedAction(t *testing.T) {
+func TestDetermineContinuation_RunningTask_UnrelatedActionContinuesUnlessExplicitNew(t *testing.T) {
 	state := session.State{
 		ActiveTask: "task-3",
 		Tasks: []session.TaskNode{
@@ -218,8 +218,8 @@ func TestDetermineContinuation_RunningTask_UnrelatedAction(t *testing.T) {
 		},
 	}
 	dec := determineContinuation(state, "build a docker image from scratch")
-	if dec.Action != ActionNewGraph {
-		t.Fatalf("expected new_graph for unrelated action, got %s (%s)", dec.Action, dec.Reason)
+	if dec.Action != ActionContinueGraph {
+		t.Fatalf("expected continue_graph unless /new is explicit, got %s (%s)", dec.Action, dec.Reason)
 	}
 }
 
@@ -230,7 +230,7 @@ func TestDetermineContinuation_RunningTask_ExplicitNewTask(t *testing.T) {
 			makeTask("task-3", "analyze code", "running"),
 		},
 	}
-	dec := determineContinuation(state, "new task: write tests for parser")
+	dec := determineContinuation(state, "/new write tests for parser")
 	if dec.Action != ActionNewGraph {
 		t.Fatalf("expected new_graph for explicit new task, got %s", dec.Action)
 	}
@@ -246,6 +246,9 @@ func TestDetermineContinuation_CompletedTask_NotReactivated(t *testing.T) {
 	if dec.Action != ActionNewGraph {
 		t.Fatalf("expected new_graph for completed task, got %s", dec.Action)
 	}
+	if len(dec.ContextRefs) != 1 || dec.ContextRefs[0] != "task-4" {
+		t.Fatalf("expected new graph to carry recent completed task context, got %v", dec.ContextRefs)
+	}
 }
 
 func TestDetermineContinuation_CompletedTask_Reference(t *testing.T) {
@@ -254,14 +257,29 @@ func TestDetermineContinuation_CompletedTask_Reference(t *testing.T) {
 			makeTask("task-4", "setup project structure", "completed"),
 		},
 	}
+	dec := determineContinuation(state, "follow up on the project structure")
+	if dec.Action != ActionReferenceCompleted {
+		t.Fatalf("expected reference_completed, got %s", dec.Action)
+	}
+	if len(dec.ContextRefs) == 0 || dec.ContextRefs[0] != "task-4" {
+		t.Fatalf("expected context refs to contain task-4, got %v", dec.ContextRefs)
+	}
+}
+
+func TestDetermineContinuation_CompletedTask_DefaultCarriesContext(t *testing.T) {
+	state := session.State{
+		Tasks: []session.TaskNode{
+			makeTask("task-4", "setup project structure", "completed"),
+		},
+	}
 	for _, text := range []string{
-		"continue based on the setup",
+		"基于刚才的结果总结一句话",
 		"继续上次的项目设置",
-		"follow up on the project structure",
+		"tell me a story about dragons",
 	} {
 		dec := determineContinuation(state, text)
-		if dec.Action != ActionReferenceCompleted {
-			t.Fatalf("text=%q: expected reference_completed, got %s", text, dec.Action)
+		if dec.Action != ActionNewGraph {
+			t.Fatalf("text=%q: expected new_graph with recent context, got %s", text, dec.Action)
 		}
 		if len(dec.ContextRefs) == 0 || dec.ContextRefs[0] != "task-4" {
 			t.Fatalf("text=%q: expected context refs to contain task-4, got %v", text, dec.ContextRefs)
@@ -279,9 +297,27 @@ func TestDetermineContinuation_CompletedTask_NotReferenced(t *testing.T) {
 	if dec.Action != ActionNewGraph {
 		t.Fatalf("expected new_graph for unrelated text to completed task, got %s", dec.Action)
 	}
+	if len(dec.ContextRefs) != 1 || dec.ContextRefs[0] != "task-4" {
+		t.Fatalf("expected unrelated new graph to still carry recent context, got %v", dec.ContextRefs)
+	}
 }
 
-func TestDetermineContinuation_HistoricalReference(t *testing.T) {
+func TestDetermineContinuation_CompletedTask_ExplicitNewClearsContext(t *testing.T) {
+	state := session.State{
+		Tasks: []session.TaskNode{
+			makeTask("task-4", "setup project", "completed"),
+		},
+	}
+	dec := determineContinuation(state, "/new tell me a story about dragons")
+	if dec.Action != ActionNewGraph {
+		t.Fatalf("expected new_graph for explicit /new, got %s", dec.Action)
+	}
+	if len(dec.ContextRefs) != 0 {
+		t.Fatalf("expected /new to clear context refs, got %v", dec.ContextRefs)
+	}
+}
+
+func TestDetermineContinuation_HistoricalReference_DefaultCarriesContext(t *testing.T) {
 	state := session.State{
 		Tasks: []session.TaskNode{
 			makeTask("task-5", "update dependencies", "completed"),
@@ -294,8 +330,11 @@ func TestDetermineContinuation_HistoricalReference(t *testing.T) {
 		"历史上我们怎么处理的",
 	} {
 		dec := determineContinuation(state, text)
-		if dec.Action != ActionHistoricalSearch {
-			t.Fatalf("text=%q: expected historical_search, got %s", text, dec.Action)
+		if dec.Action != ActionNewGraph {
+			t.Fatalf("text=%q: expected new_graph with recent context, got %s", text, dec.Action)
+		}
+		if len(dec.ContextRefs) != 1 || dec.ContextRefs[0] != "task-6" {
+			t.Fatalf("text=%q: expected latest completed task context, got %v", text, dec.ContextRefs)
 		}
 	}
 }
@@ -320,14 +359,14 @@ func TestDetermineContinuation_EmptyTextNoState(t *testing.T) {
 	}
 }
 
-func TestDetermineContinuation_ClearsActiveTask_ForNewGraph(t *testing.T) {
+func TestDetermineContinuation_ActiveTask_ExplicitNewClearsActiveTask(t *testing.T) {
 	state := session.State{
 		ActiveTask: "task-8",
 		Tasks: []session.TaskNode{
 			makeTask("task-8", "old task", "running"),
 		},
 	}
-	dec := determineContinuation(state, "write a completely new thing unrelated to old task")
+	dec := determineContinuation(state, "/new write a completely new thing unrelated to old task")
 	if dec.Action != ActionNewGraph {
 		t.Fatalf("expected new_graph, got %s", dec.Action)
 	}

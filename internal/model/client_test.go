@@ -3,9 +3,12 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/dongping/mateway/internal/agentcore"
@@ -94,6 +97,54 @@ func TestParseOpenAIChatResultReasoningContent(t *testing.T) {
 	}
 	if result.Usage.InputTokens != 17 || result.Usage.OutputTokens != 16 || result.Usage.TotalTokens != 33 {
 		t.Fatalf("unexpected usage %#v", result.Usage)
+	}
+}
+
+func TestFallbackAgentModelSkipsRecentlyOverloadedModel(t *testing.T) {
+	clearModelCircuit("primary-overloaded")
+	clearModelCircuit("fallback-ok")
+	t.Cleanup(func() {
+		clearModelCircuit("primary-overloaded")
+		clearModelCircuit("fallback-ok")
+	})
+
+	var primaryCalls int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&primaryCalls, 1)
+		w.WriteHeader(529)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"overloaded_error"}}`))
+	}))
+	defer primary.Close()
+
+	var fallbackCalls int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&fallbackCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"fallback ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer fallback.Close()
+
+	model := NewFallbackAgentModel([]config.ModelConfig{
+		{Name: "primary-overloaded", API: "anthropic", APIBase: primary.URL, APIKey: "test", Model: "primary"},
+		{Name: "fallback-ok", API: "anthropic", APIBase: fallback.URL, APIKey: "test", Model: "fallback"},
+	})
+
+	for i := 0; i < 2; i++ {
+		reply, err := model.Next(context.Background(), agentcore.Context{
+			Messages: []agentcore.Message{{Role: agentcore.RoleUser, Content: "hello"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply.Content != "fallback ok" {
+			t.Fatalf("unexpected reply %q", reply.Content)
+		}
+	}
+	if got := atomic.LoadInt32(&primaryCalls); got != 1 {
+		t.Fatalf("expected primary to be skipped after first overload, got %d calls", got)
+	}
+	if got := atomic.LoadInt32(&fallbackCalls); got != 2 {
+		t.Fatalf("expected fallback to handle both calls, got %d calls", got)
 	}
 }
 

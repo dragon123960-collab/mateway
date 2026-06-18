@@ -159,123 +159,6 @@ func TestShouldPauseForTaskPlanReviewRequiredPauses(t *testing.T) {
 	}
 }
 
-// --- Integration test: trace records contract strategy ---
-
-func TestRuntimeTraceRecordsContractStrategy(t *testing.T) {
-	skipLegacyAgentLoopTest(t)
-	t.Run("direct", func(t *testing.T) {
-		rt := newTestRuntime(t)
-		rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "Mateway is a local agent runtime."}, rt.Tools)
-		rt.ContractModel = contractJSONModel{json: `{"summary":"explain Mateway","requires_tools":false,"expected_outcome":"answer"}`}
-
-		resp, err := rt.Handle(context.Background(), inbound("cli:strategy", "explain what Mateway is"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := os.ReadFile(resp.TracePath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		trace := string(data)
-		if !strings.Contains(trace, `"strategy":"direct"`) {
-			t.Fatalf("expected direct strategy in trace, got:\n%s", trace)
-		}
-	})
-
-	t.Run("auto_contract", func(t *testing.T) {
-		rt := newTestRuntime(t)
-		registry := agentcore.NewToolRegistry()
-		registry.Register(runtimeNamedTool{name: "web.search", content: "weather data"})
-		rt.Tools = registry
-		rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-			{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "web.search", Args: map[string]any{"query": "weather"}}}},
-			{Role: agentcore.RoleAssistant, Content: "Weather is clear."},
-		}}, rt.Tools)
-		rt.ContractModel = contractJSONModel{json: `{"summary":"check weather","requires_tools":true,"required_tools":["web.search"],"expected_outcome":"weather info"}`}
-
-		resp, err := rt.Handle(context.Background(), inbound("cli:strategy", "check weather today"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.Reply.Style == channel.StyleInputRequired {
-			t.Fatalf("auto_contract should not show plan review, got style=%q", resp.Reply.Style)
-		}
-		data, err := os.ReadFile(resp.TracePath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		trace := string(data)
-		if !strings.Contains(trace, `"strategy":"auto_contract"`) {
-			t.Fatalf("expected auto_contract strategy in trace, got:\n%s", trace)
-		}
-		if strings.Contains(trace, "task_plan_review") {
-			t.Fatalf("auto_contract should not have plan_review trace event:\n%s", trace)
-		}
-	})
-
-	t.Run("review_required", func(t *testing.T) {
-		rt := newTestRuntime(t)
-		registry := agentcore.NewToolRegistry()
-		registry.Register(runtimeNamedTool{name: "file.write", content: "wrote"})
-		registry.Register(runtimeNamedTool{name: "terminal.run", content: "deployed"})
-		rt.Tools = registry
-		rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-			{Role: agentcore.RoleAssistant, Content: "done"},
-		}}, rt.Tools)
-		rt.ContractModel = contractJSONModel{json: `{"summary":"deploy report","requires_tools":true,"required_tools":["file.write","terminal.run"],"required_evidence":[{"kind":"local_file","tool":"file.write","description":"report"}],"plan_items":[{"id":"plan-1","title":"write report","status":"pending","tool":"file.write","criteria":"write file"},{"id":"plan-2","title":"deploy","status":"pending","tool":"terminal.run","criteria":"deploy"}],"expected_outcome":"deployed","completion_policy":"must deploy"}`}
-
-		resp, err := rt.Handle(context.Background(), inbound("cli:strategy", "create report and deploy to server"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.Reply.Style != channel.StyleInputRequired {
-			t.Fatalf("review_required should show plan review, got style=%q", resp.Reply.Style)
-		}
-		data, err := os.ReadFile(resp.TracePath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		trace := string(data)
-		if !strings.Contains(trace, `"strategy":"review_required"`) {
-			t.Fatalf("expected review_required strategy in trace, got:\n%s", trace)
-		}
-	})
-}
-
-// --- Integration test: existing contract validation/skill-aware replan still works ---
-
-func TestContractStrategyDoesNotBreakExistingValidation(t *testing.T) {
-	skipLegacyAgentLoopTest(t)
-	rt := newTestRuntime(t)
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "terminal.run", content: "service is running"})
-	rt.Tools = registry
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
-			ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": "systemctl status singbox"},
-		}}},
-		{Role: agentcore.RoleAssistant, Content: "service is running."},
-	}}, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"check service status","requires_tools":true,"required_tools":["terminal.run"],"expected_outcome":"status"}`}
-
-	planResp, err := rt.Handle(context.Background(), inbound("cli:valid", "check singbox service status"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if planResp.Reply.Style != channel.StyleInputRequired {
-		t.Fatalf("expected plan review for review_required, got style=%q text=%q", planResp.Reply.Style, planResp.Reply.Text)
-	}
-
-	resp, err := rt.Handle(context.Background(), inbound("cli:valid", "1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Failed {
-		t.Fatalf("expected completion, got failed: %q", resp.Reply.Text)
-	}
-}
-
 // --- Slice 6A: Universal Plan Shape integration tests ---
 
 // TestUniversalPlanShapeDirectHasMinimalContract verifies the Slice 6A
@@ -309,7 +192,7 @@ func TestUniversalPlanShapeDirectHasMinimalContract(t *testing.T) {
 	if task.Execution.Contract == nil {
 		t.Fatal("direct task must still carry a contract (universal plan shape)")
 	}
-	contract := *task.Execution.Contract
+	contract := requireTaskContract(t, task)
 	if len(contract.PlanItems) == 0 {
 		t.Fatal("direct task must have at least one plan_items entry (minimal plan)")
 	}
@@ -378,7 +261,7 @@ Run publisher-cli.
 	if len(state.Tasks) == 0 || state.Tasks[0].Execution.Contract == nil {
 		t.Fatal("direct task must still carry a minimal contract")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 	if contract.RequiresTools || len(contract.RequiredSkills) > 0 {
 		t.Fatalf("direct Q&A should not select execution skills, got requires_tools=%v skills=%+v", contract.RequiresTools, contract.RequiredSkills)
 	}
@@ -404,7 +287,14 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 	// Tool task contract: requires_tools=true with plan_items (tool execution
 	// list) and required_evidence (acceptance list).
 	rt.ContractModel = contractJSONModel{json: `{"summary":"check weather","requires_tools":true,"required_tools":["web.search"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"today weather with source/date"}],"plan_items":[{"id":"plan-1","title":"search current weather","status":"pending","tool":"web.search","criteria":"collect today weather with source/date"}],"expected_outcome":"weather summary","completion_policy":"final answer must cite web.search evidence"}`}
-	rt.Model = plannerVerifierModel{planJSON: `{"goal":"check weather","risk":"low","nodes":[{"id":"search","type":"tool","goal":"search current weather","executor":"web.search","input":{"query":"weather today"},"outputs":["weather evidence"],"acceptance":"weather evidence returned"},{"id":"answer","type":"model","goal":"summarize weather","depends":["search"],"input":{"context":"weather evidence"},"outputs":["weather summary"],"acceptance":"summary cites weather evidence"}],"task_acceptance":"weather summary cites web.search evidence"}`}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"check weather",
+		"weather summary cites web.search evidence",
+		[]string{"web.search"},
+		nil,
+		`{"id":"search","type":"subtask","mode":"react","goal":"search current weather","allowed_tools":["web.search"],"input":{"query":"weather today"},"outputs":["weather evidence"],"acceptance":"weather evidence returned"}`,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"summarize weather","depends":["search"],"input":{"context":"weather evidence"},"outputs":["weather summary"],"acceptance":"summary cites weather evidence"}`,
+	)}
 
 	resp, err := rt.Handle(context.Background(), inbound("cli:6a-auto", "check weather today"))
 	if err != nil {
@@ -425,7 +315,7 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 	if task.Execution.Contract == nil {
 		t.Fatal("auto_contract task must carry a contract")
 	}
-	contract := *task.Execution.Contract
+	contract := requireTaskContract(t, task)
 	// plan_items must include the web.search execution step.
 	var foundSearchItem bool
 	for _, item := range contract.PlanItems {
@@ -475,69 +365,6 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 	}
 }
 
-// TestUniversalPlanShapeReviewRequiredShowsToolListAndAcceptance verifies the
-// Slice 6A invariant: a multi-step delivery task enters plan review and the
-// rendered plan shows both the tool execution list (plan_items) and the
-// acceptance list (required_evidence).
-func TestUniversalPlanShapeReviewRequiredShowsToolListAndAcceptance(t *testing.T) {
-	skipLegacyAgentLoopTest(t)
-	rt := newTestRuntime(t)
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "web.search", content: "search data"})
-	registry.Register(runtimeNamedTool{name: "file.write", content: "wrote /tmp/report.md"})
-	registry.Register(&captureCommandTool{name: "terminal.run", content: `{"url":"https://example.cloud/x"}`})
-	rt.Tools = registry
-
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "deployed"}, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"publish report","requires_tools":true,"required_tools":["web.search","file.write","terminal.run"],"required_evidence":[{"kind":"current_external_fact","tool":"web.search","description":"current data with source/date"},{"kind":"local_file","tool":"file.write","description":"local markdown report written"},{"kind":"remote_publish","tool":"terminal.run","description":"cloud doc URL"}],"plan_items":[{"id":"plan-1","title":"search data","status":"pending","tool":"web.search","criteria":"collect current data"},{"id":"plan-2","title":"write report","status":"pending","tool":"file.write","criteria":"write report.md"},{"id":"plan-3","title":"publish","status":"pending","tool":"terminal.run","criteria":"publish to cloud doc"}],"expected_outcome":"deployed","completion_policy":"must deploy"}`}
-
-	resp, err := rt.Handle(context.Background(), inbound("cli:6a-review", "publish report to cloud doc"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Reply.Style != channel.StyleInputRequired {
-		t.Fatalf("multi-step delivery must pause for plan review, got style=%q text=%q", resp.Reply.Style, resp.Reply.Text)
-	}
-	text := resp.Reply.Text
-	// Tool execution list: every plan_items entry must appear.
-	for _, want := range []string{"search data", "write report", "publish"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("plan review should list tool checklist %q, got:\n%s", want, text)
-		}
-	}
-	// Tool tags: each plan_items tool must appear in the plan.
-	for _, want := range []string{"[web.search]", "[file.write]", "[terminal.run]"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("plan review should tag tool %q, got:\n%s", want, text)
-		}
-	}
-	// Acceptance list: required_evidence descriptions must appear.
-	if !strings.Contains(strings.ToLower(text), "acceptance criteria") {
-		t.Fatalf("plan review should include an acceptance criteria section, got:\n%s", text)
-	}
-	for _, want := range []string{"current data with source/date", "local markdown report written", "cloud doc url"} {
-		if !strings.Contains(strings.ToLower(text), want) {
-			t.Fatalf("plan review should list acceptance %q, got:\n%s", want, text)
-		}
-	}
-
-	// Trace must show review_required strategy and the plan_review event.
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	trace := string(data)
-	if !strings.Contains(trace, `"strategy":"review_required"`) {
-		t.Fatalf("expected review_required strategy in trace, got:\n%s", trace)
-	}
-	if !strings.Contains(trace, `"type":"task_plan_review"`) {
-		t.Fatalf("expected task_plan_review event in trace, got:\n%s", trace)
-	}
-	if !strings.Contains(trace, `"type":"task_contract_created"`) {
-		t.Fatalf("expected task_contract_created in trace, got:\n%s", trace)
-	}
-}
-
 // --- Slice 6B: Planning-Time Selected Skill Read ---
 
 // TestPlanningTimeSkillReadExecutionSkill stores a CLI skill body in the
@@ -576,7 +403,7 @@ Check source authority and recency before using data.
 		"deployed",
 		[]string{"file.read", "terminal.run"},
 		[]string{"my-cli-tool", "source-evaluation"},
-		`{"id":"publish","type":"subtask","mode":"skill","goal":"publish report with my-cli-tool","skill":"my-cli-tool","allowed_tools":["terminal.run"],"acceptance":"cloud doc URL"}`,
+		`{"id":"publish","type":"skill","mode":"skill","goal":"publish report with my-cli-tool","skill":"my-cli-tool","allowed_tools":["terminal.run"],"acceptance":"cloud doc URL"}`,
 	), text: "done"}
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "file.read", content: "skill"})
@@ -606,7 +433,7 @@ Check source authority and recency before using data.
 	if task.Execution.Contract == nil {
 		t.Fatal("contract not found")
 	}
-	contract := *task.Execution.Contract
+	contract := requireTaskContract(t, task)
 
 	var cliSkill, guidanceSkill session.RequiredSkill
 	for _, s := range contract.RequiredSkills {
@@ -675,7 +502,7 @@ Run: other-cli deploy
 		"deployed",
 		[]string{"file.read", "terminal.run"},
 		[]string{"my-cli-tool"},
-		`{"id":"publish","type":"subtask","mode":"skill","goal":"publish with my-cli-tool","skill":"my-cli-tool","allowed_tools":["terminal.run"],"acceptance":"deployed"}`,
+		`{"id":"publish","type":"skill","mode":"skill","goal":"publish with my-cli-tool","skill":"my-cli-tool","allowed_tools":["terminal.run"],"acceptance":"deployed"}`,
 	), text: "done"}
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "file.read", content: "skill"})
@@ -739,7 +566,7 @@ func TestPlanningTimeSkillReadFailedProducesBlocker(t *testing.T) {
 		"deployed",
 		[]string{"terminal.run"},
 		[]string{"missing-skill"},
-		`{"id":"publish","type":"subtask","mode":"skill","goal":"publish with missing-skill","skill":"missing-skill","allowed_tools":["terminal.run"],"acceptance":"deployed"}`,
+		`{"id":"publish","type":"skill","mode":"skill","goal":"publish with missing-skill","skill":"missing-skill","allowed_tools":["terminal.run"],"acceptance":"deployed"}`,
 	)}
 	rt.ContractModel = panicModel{t: t}
 	_ = missingPath
@@ -775,7 +602,7 @@ func configureUnifiedSkillPlan(rt *Runtime, t *testing.T, goal, skillName, answe
 		"completed",
 		tools,
 		[]string{skillName},
-		fmt.Sprintf(`{"id":"run","type":"subtask","mode":"skill","goal":"run %s","skill":"%s","allowed_tools":%s,"acceptance":"completed"}`, skillName, skillName, mustJSON(t, tools)),
+		fmt.Sprintf(`{"id":"run","type":"skill","mode":"skill","goal":"run %s","skill":"%s","allowed_tools":%s,"acceptance":"completed"}`, skillName, skillName, mustJSON(t, tools)),
 	), text: answer}
 	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 	rt.ContractModel = panicModel{t: t}
@@ -803,6 +630,14 @@ func runTaskAndConfirmIfNeeded(t *testing.T, rt Runtime, key, text string) Respo
 		}
 	}
 	return resp
+}
+
+func requireTaskContract(t *testing.T, task session.TaskNode) session.TaskContract {
+	t.Helper()
+	if task.Execution.Contract == nil {
+		t.Fatalf("contract not found for task %s", task.ID)
+	}
+	return *task.Execution.Contract
 }
 
 // TestSkillBodyToRealToolListCLISkill verifies that a CLI-stage skill's body
@@ -841,7 +676,7 @@ After publishing, verify with `+"`my-cli status --id <id>`"+`.
 		"cloud doc URL",
 		[]string{"file.read", "terminal.run"},
 		[]string{"my-cli-tool"},
-		`{"id":"publish","type":"subtask","mode":"skill","goal":"publish via my-cli-tool","skill":"my-cli-tool","allowed_tools":["terminal.run"],"acceptance":"cloud doc URL"}`,
+		`{"id":"publish","type":"skill","mode":"skill","goal":"publish via my-cli-tool","skill":"my-cli-tool","allowed_tools":["terminal.run"],"acceptance":"cloud doc URL"}`,
 	), text: "published to https://cloud.example.com/doc/123"}
 	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 	rt.ContractModel = panicModel{t: t}
@@ -862,7 +697,7 @@ After publishing, verify with `+"`my-cli status --id <id>`"+`.
 	if state.Tasks[0].Execution.Contract == nil {
 		t.Fatal("contract not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	var terminalItems, fileReadItems int
 	var hasSkillTitle bool
@@ -940,7 +775,7 @@ priority: 70
 		"cloud doc URL",
 		[]string{"file.read", "file.write", "terminal.run"},
 		[]string{"doc-publisher"},
-		`{"id":"publish","type":"subtask","mode":"skill","goal":"generate and publish with doc-publisher","skill":"doc-publisher","allowed_tools":["file.write","terminal.run"],"acceptance":"cloud doc URL"}`,
+		`{"id":"publish","type":"skill","mode":"skill","goal":"generate and publish with doc-publisher","skill":"doc-publisher","allowed_tools":["file.write","terminal.run"],"acceptance":"cloud doc URL"}`,
 	), text: "published to https://cloud.example.com/doc/456"}
 	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 	rt.ContractModel = panicModel{t: t}
@@ -958,7 +793,7 @@ priority: 70
 	if len(state.Tasks) == 0 {
 		t.Fatal("task not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	var writeItems, terminalItems int
 	for i := range contract.PlanItems {
@@ -999,14 +834,14 @@ priority: 70
 	)
 	validation := validateTaskContract(contract, task)
 	if !validation.Satisfied {
-		t.Fatalf("completion evaluator should accept real tool evidence, missing: %v", validation.Missing)
+		t.Fatalf("legacy contract validation should accept real tool evidence, missing: %v", validation.Missing)
 	}
 }
 
-// TestSkillBodyCompletionEvaluatorRealEvidence verifies that plan items
-// generated from skill bodies are validated by the completion evaluator
+// TestSkillBodyLegacyContractValidationRealEvidence verifies that plan items
+// generated from skill bodies are validated by legacy contract validation
 // using real tool evidence, with skill names excluded from all tool fields.
-func TestSkillBodyCompletionEvaluatorRealEvidence(t *testing.T) {
+func TestSkillBodyLegacyContractValidationRealEvidence(t *testing.T) {
 	rt := newTestRuntime(t)
 	home := rt.home()
 
@@ -1037,7 +872,7 @@ simple-cli run --task publish
 	if len(state.Tasks) == 0 {
 		t.Fatal("task not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	for _, tool := range contract.RequiredTools {
 		if strings.EqualFold(tool, "simple-cli") {
@@ -1062,7 +897,7 @@ simple-cli run --task publish
 	)
 	validation := validateTaskContract(contract, task)
 	if !validation.Satisfied {
-		t.Fatalf("completion evaluator should find contract satisfied with real tool evidence, missing: %v", validation.Missing)
+		t.Fatalf("legacy contract validation should find contract satisfied with real tool evidence, missing: %v", validation.Missing)
 	}
 
 	for _, step := range task.Steps {
@@ -1119,7 +954,7 @@ deploy-cli upload --file /tmp/report.md
 	if len(state.Tasks) == 0 {
 		t.Fatal("task not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	toolCounts := map[string]int{}
 	for _, item := range contract.PlanItems {
@@ -1177,7 +1012,7 @@ grep "new" /etc/app/config.yaml
 	if len(state.Tasks) == 0 {
 		t.Fatal("task not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	toolCounts := map[string]int{}
 	for _, item := range contract.PlanItems {
@@ -1230,7 +1065,7 @@ curl -s "https://example.com/article/123"
 	if len(state.Tasks) == 0 {
 		t.Fatal("task not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	toolCounts := map[string]int{}
 	for _, item := range contract.PlanItems {
@@ -1297,7 +1132,7 @@ deploy-cli push --file /tmp/output.json
 	if len(state.Tasks) == 0 {
 		t.Fatal("task not found")
 	}
-	contract := *state.Tasks[0].Execution.Contract
+	contract := requireTaskContract(t, state.Tasks[0])
 
 	toolCounts := map[string]int{}
 	for _, item := range contract.PlanItems {

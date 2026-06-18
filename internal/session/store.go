@@ -63,6 +63,7 @@ type ExecutionFrame struct {
 	Status        string           `json:"status,omitempty"`
 	OriginalTask  string           `json:"original_task,omitempty"`
 	Contract      *TaskContract    `json:"contract,omitempty"`
+	ContextRefs   []string         `json:"context_refs,omitempty"`
 	TraceRefs     []TraceRef       `json:"trace_refs,omitempty"`
 	CurrentStepID string           `json:"current_step_id,omitempty"`
 	CurrentNodeID string           `json:"current_node_id,omitempty"`
@@ -470,6 +471,34 @@ func (s *State) AddExecutionEvent(taskID string, event ExecutionEvent) {
 			return
 		}
 	}
+}
+
+func (s *State) SetTaskContextRefs(taskID string, refs []string) {
+	now := time.Now()
+	refs = uniqueNonEmptyStrings(refs)
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.ContextRefs = refs
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *State) AddTraceRef(taskID string, ref TraceRef) {

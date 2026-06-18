@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
@@ -39,6 +40,15 @@ type AgentModel struct {
 	Fallbacks    []Client
 	Vision       []Client
 	SystemPrompt string
+}
+
+const modelCircuitTTL = 45 * time.Second
+
+var modelCircuit = struct {
+	sync.Mutex
+	until map[string]time.Time
+}{
+	until: map[string]time.Time{},
 }
 
 func NewAgentModel(cfg config.ModelConfig) AgentModel {
@@ -124,6 +134,10 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, ag
 		if messagesRequireImage(nativeMessages) && !client.Config.SupportsModality("image") {
 			continue
 		}
+		if isModelCircuitOpen(client.Config.Name, time.Now()) {
+			errors = append(errors, client.Config.Name+": skipped due to recent provider overload")
+			continue
+		}
 		result, fallbackErr := m.generateForClient(ctx, client, system, nativeMessages, textMessages, tools)
 		if fallbackErr == nil {
 			return result, nil
@@ -134,18 +148,81 @@ func (m AgentModel) generateWithFallbacks(ctx context.Context, system string, ag
 }
 
 func (m AgentModel) generateForClient(ctx context.Context, client Client, system string, nativeMessages, textMessages []Message, tools []agentcore.Tool) (GenerateResult, error) {
+	if isModelCircuitOpen(client.Config.Name, time.Now()) {
+		return GenerateResult{}, fmt.Errorf("skipped due to recent provider overload")
+	}
 	if len(tools) > 0 && client.SupportsNativeTools() {
 		result, err := client.GenerateWithTools(ctx, buildNativeSystemPrompt(system, tools), nativeMessages, tools)
 		if err == nil {
+			clearModelCircuit(client.Config.Name)
 			return result, nil
 		}
 		textResult, textErr := client.Generate(ctx, buildTextSystemPrompt(system, tools), textMessages)
 		if textErr == nil {
+			clearModelCircuit(client.Config.Name)
 			return textResult, nil
 		}
+		recordModelCircuitIfTransient(client.Config.Name, err)
+		recordModelCircuitIfTransient(client.Config.Name, textErr)
 		return GenerateResult{}, fmt.Errorf("native tools failed: %v; text fallback failed: %v", err, textErr)
 	}
-	return client.Generate(ctx, buildTextSystemPrompt(system, tools), textMessages)
+	result, err := client.Generate(ctx, buildTextSystemPrompt(system, tools), textMessages)
+	if err == nil {
+		clearModelCircuit(client.Config.Name)
+		return result, nil
+	}
+	recordModelCircuitIfTransient(client.Config.Name, err)
+	return GenerateResult{}, err
+}
+
+func isModelCircuitOpen(name string, now time.Time) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	modelCircuit.Lock()
+	defer modelCircuit.Unlock()
+	until, ok := modelCircuit.until[name]
+	if !ok {
+		return false
+	}
+	if !now.Before(until) {
+		delete(modelCircuit.until, name)
+		return false
+	}
+	return true
+}
+
+func recordModelCircuitIfTransient(name string, err error) {
+	if strings.TrimSpace(name) == "" || !isTransientModelOverload(err) {
+		return
+	}
+	modelCircuit.Lock()
+	defer modelCircuit.Unlock()
+	modelCircuit.until[name] = time.Now().Add(modelCircuitTTL)
+}
+
+func clearModelCircuit(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	modelCircuit.Lock()
+	defer modelCircuit.Unlock()
+	delete(modelCircuit.until, name)
+}
+
+func isTransientModelOverload(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "status=529") ||
+		strings.Contains(text, "overloaded_error") ||
+		strings.Contains(text, "status=429") ||
+		strings.Contains(text, "rate limit") ||
+		strings.Contains(text, "temporarily unavailable") ||
+		strings.Contains(text, "status=503")
 }
 
 func stripImageParts(messages []Message) []Message {

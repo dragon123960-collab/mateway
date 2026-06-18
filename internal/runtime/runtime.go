@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -109,6 +110,16 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	}
 
 	task := state.EnsureTask(msg.Text)
+	if len(decision.ContextRefs) > 0 {
+		state.SetTaskContextRefs(task.ID, decision.ContextRefs)
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":         "context_refs_attached",
+				"task_id":      task.ID,
+				"context_refs": decision.ContextRefs,
+			})
+		}
+	}
 	if task.Goal != userText && state.ActiveTask == task.ID {
 		userText = mergeTaskAndInstruction(task.Goal, userText)
 	}
@@ -124,7 +135,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})
 
 	if err := rt.ensureGraphForTask(ctx, msg, &state, task, userText, trace); err != nil {
-		state.BlockActiveTask("failed")
+		if isTransientBootstrapError(err) {
+			state.AwaitUserInputActiveTaskWithSummary(friendlyRuntimeError(rt.Config, msg, err), trace.id, trace.path)
+		} else {
+			state.BlockActiveTask("failed")
+		}
 		if saveErr := rt.saveState(&state, trace); saveErr != nil {
 			return Response{}, saveErr
 		}
@@ -148,6 +163,18 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	return rt.runGraphTask(ctx, msg, &state, task, userText, trace)
 }
 
+func isTransientBootstrapError(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(raw, "context deadline exceeded") ||
+		strings.Contains(raw, "client.timeout") ||
+		strings.Contains(raw, "temporarily unavailable") ||
+		strings.Contains(raw, "rate limit") ||
+		strings.Contains(raw, "429")
+}
+
 func (rt Runtime) runGraphTask(
 	ctx context.Context,
 	msg channel.InboundMessage,
@@ -159,6 +186,16 @@ func (rt Runtime) runGraphTask(
 	g := task.Graph
 
 	session.RecoverRunningNodes(g)
+	session.UpdateGraphStatus(g)
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":     "graph_recovery_normalized",
+			"graph_id": g.ID,
+			"task_id":  task.ID,
+			"status":   g.Status,
+			"nodes":    graphNodeStatusSnapshot(g),
+		})
+	}
 
 	_ = trace.write(map[string]any{
 		"type":     "graph_lifecycle_start",
@@ -168,61 +205,154 @@ func (rt Runtime) runGraphTask(
 	})
 
 	for {
-		ready := session.ReadyNodes(g, 1)
+		ready := session.ReadyNodes(g, len(g.Nodes))
+		selected, waiting := selectReadyNodeBatch(g, ready, maxParallelNodes(rt.Config))
 
 		_ = trace.write(map[string]any{
 			"type":        "graph_schedule_tick",
 			"graph_id":    g.ID,
 			"task_id":     task.ID,
 			"ready_nodes": ready,
+			"selected":    selected,
+			"waiting":     waiting,
 			"total_nodes": len(g.Nodes),
 		})
-
-		if len(ready) == 0 {
-			break
-		}
-
-		node := g.NodeByID(ready[0])
-		if node == nil {
-			break
-		}
-
-		if node.Status != session.NodeStatusPending {
-			break
-		}
-
 		_ = trace.write(map[string]any{
-			"type":      "node_scheduled",
-			"graph_id":  g.ID,
-			"task_id":   task.ID,
-			"node_id":   node.ID,
-			"node_type": node.Type,
+			"type":               "scheduler_tick",
+			"graph_id":           g.ID,
+			"task_id":            task.ID,
+			"ready_nodes":        ready,
+			"selected_nodes":     selected,
+			"waiting_nodes":      waiting,
+			"max_parallel_nodes": maxParallelNodes(rt.Config),
 		})
+		for _, nodeID := range ready {
+			node := g.NodeByID(nodeID)
+			if node == nil {
+				continue
+			}
+			_ = trace.write(map[string]any{
+				"type":      "node_ready",
+				"graph_id":  g.ID,
+				"task_id":   task.ID,
+				"node_id":   node.ID,
+				"node_type": node.Type,
+				"node_mode": node.Mode,
+				"attempt":   node.Attempts + 1,
+			})
+		}
+		for _, nodeID := range waiting {
+			node := g.NodeByID(nodeID)
+			if node == nil {
+				continue
+			}
+			_ = trace.write(map[string]any{
+				"type":      "scheduler_waiting",
+				"graph_id":  g.ID,
+				"task_id":   task.ID,
+				"node_id":   node.ID,
+				"node_type": node.Type,
+				"node_mode": node.Mode,
+				"attempt":   node.Attempts + 1,
+				"reason":    schedulerWaitingReason(g, node, selected, maxParallelNodes(rt.Config)),
+			})
+		}
 
-		node.Status = session.NodeStatusRunning
-		node.Attempts++
-		node.UpdatedAt = time.Now()
+		if len(selected) == 0 {
+			break
+		}
+
+		for _, nodeID := range selected {
+			node := g.NodeByID(nodeID)
+			if node == nil {
+				continue
+			}
+			if node.Status != session.NodeStatusPending {
+				continue
+			}
+
+			_ = trace.write(map[string]any{
+				"type":      "node_scheduled",
+				"graph_id":  g.ID,
+				"task_id":   task.ID,
+				"node_id":   node.ID,
+				"node_type": node.Type,
+				"node_mode": node.Mode,
+				"attempt":   node.Attempts + 1,
+			})
+
+			startNodeAttempt(trace, g, node)
+		}
 
 		if err := rt.saveState(state, trace); err != nil {
 			return Response{}, err
 		}
 
-		_ = trace.write(map[string]any{
-			"type":      "node_execute_start",
-			"graph_id":  g.ID,
-			"node_id":   node.ID,
-			"node_type": node.Type,
-			"goal":      node.Goal,
-		})
-
-		if err := rt.executeNodeRun(ctx, msg, state, g, node, userText, trace); err != nil {
+		results, err := rt.runSelectedNodes(ctx, msg, state, g, selected, userText, trace)
+		if err != nil {
 			return Response{}, err
 		}
+		for _, result := range results {
+			mergeNodeRunResult(state, g, result)
+			node := g.NodeByID(result.NodeID)
+			if node == nil {
+				continue
+			}
+			if node.Status == session.NodeStatusCompleted {
+				writeNodeEvent(trace, g, node, map[string]any{
+					"type":           "node_completed",
+					"status":         node.Status,
+					"result_summary": node.ResultSummary,
+				})
+			}
+			if node.Status == session.NodeStatusRetrying {
+				node.Status = session.NodeStatusPending
+				_ = trace.write(map[string]any{
+					"type":     "node_retry_scheduled",
+					"graph_id": g.ID,
+					"task_id":  task.ID,
+					"node_id":  node.ID,
+					"attempt":  node.Attempts,
+				})
+			}
+			if shouldApplyLocalReplan(node) {
+				if localReplanDepth(node) >= 1 {
+					node.Status = session.NodeStatusFailed
+					_ = trace.write(map[string]any{
+						"type":     "local_replan_limit_reached",
+						"graph_id": g.ID,
+						"task_id":  task.ID,
+						"node_id":  node.ID,
+						"reason":   node.FailureReason,
+					})
+					session.UpdateGraphStatus(g)
+					if err := rt.saveState(state, trace); err != nil {
+						return Response{}, err
+					}
+					continue
+				}
+				replacement := localReplanReplacementNode(node)
+				if errs := applyLocalReplanWithTrace(g, session.LocalReplanRequest{
+					FailedNodeID:     node.ID,
+					ReplacementNodes: []session.TaskGraphNode{replacement},
+				}, trace); !errs.IsValid() {
+					node.Status = session.NodeStatusFailed
+					node.FailureReason = errs.Error()
+					_ = trace.write(map[string]any{
+						"type":     "local_replan_blocker",
+						"graph_id": g.ID,
+						"task_id":  task.ID,
+						"node_id":  node.ID,
+						"error":    errs.Error(),
+					})
+				}
+			}
 
-		session.UpdateGraphStatus(g)
+			session.UpdateGraphStatus(g)
 
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, err
+			if err := rt.saveState(state, trace); err != nil {
+				return Response{}, err
+			}
 		}
 
 	}
@@ -230,6 +360,375 @@ func (rt Runtime) runGraphTask(
 	vr := session.VerifyTaskGraphWithContract(g, task.Execution.Contract)
 
 	return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
+}
+
+func localReplanReplacementNode(node *session.TaskGraphNode) session.TaskGraphNode {
+	now := time.Now()
+	id := "repair-" + strings.TrimSpace(node.ID)
+	if id == "repair-" {
+		id = fmt.Sprintf("repair-%d", now.UnixNano())
+	}
+	goal := strings.TrimSpace(node.Goal)
+	if goal == "" {
+		goal = "complete the failed node with a smaller, verifiable output"
+	}
+	reason := strings.TrimSpace(node.FailureReason)
+	if reason == "" {
+		reason = "previous node attempt was not accepted by verifier"
+	}
+	mode := session.NodeModeDirect
+	if len(node.AllowedTools) > 0 || strings.TrimSpace(node.Mode) == session.NodeModeReact {
+		mode = session.NodeModeReact
+	}
+	return session.TaskGraphNode{
+		ID:      id,
+		Type:    session.NodeTypeSubtask,
+		Mode:    mode,
+		Goal:    "Repair and complete: " + goal,
+		Status:  session.NodeStatusPending,
+		Depends: append([]string(nil), node.Depends...),
+		Input: map[string]any{
+			"replan_reason":      reason,
+			"local_replan_depth": localReplanDepth(node) + 1,
+		},
+		Output: map[string]any{
+			"repair_result": true,
+		},
+		Acceptance: session.Acceptance{
+			Criteria: "Produces a concise result that directly addresses the original node goal and verifier feedback.",
+		},
+		AllowedTools: append([]string(nil), node.AllowedTools...),
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+}
+
+func shouldApplyLocalReplan(node *session.TaskGraphNode) bool {
+	if node == nil {
+		return false
+	}
+	if node.Status == session.NodeStatusNeedsReplan {
+		return true
+	}
+	if node.Status != session.NodeStatusFailed {
+		return false
+	}
+	switch node.Type {
+	case session.NodeTypeModel, session.NodeTypeSubtask, session.NodeTypeSkill:
+		return true
+	default:
+		return false
+	}
+}
+
+func localReplanDepth(node *session.TaskGraphNode) int {
+	if node == nil || node.Input == nil {
+		return 0
+	}
+	switch v := node.Input["local_replan_depth"].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+type nodeRunResult struct {
+	NodeID       string
+	Node         session.TaskGraphNode
+	Messages     []agentcore.Message
+	Usage        session.Usage
+	Pending      *session.PendingAction
+	TaskStepTail []session.TaskStep
+	Err          error
+}
+
+func (rt Runtime) runSelectedNodes(
+	ctx context.Context,
+	msg channel.InboundMessage,
+	state *session.State,
+	g *session.TaskGraph,
+	selected []string,
+	userText string,
+	trace *traceRecorder,
+) ([]nodeRunResult, error) {
+	results := make([]nodeRunResult, len(selected))
+	var wg sync.WaitGroup
+	for i, nodeID := range selected {
+		node := g.NodeByID(nodeID)
+		if node == nil || node.Status != session.NodeStatusRunning {
+			continue
+		}
+		baseMessages := len(state.Messages)
+		baseTaskSteps := taskStepCount(state, g.TaskID)
+		sandboxState := cloneStateForNodeRun(*state)
+		sandboxGraph := cloneTaskGraph(g)
+		sandboxNode := sandboxGraph.NodeByID(nodeID)
+		if sandboxNode == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int, nodeID string, baseMessages, baseTaskSteps int, runState session.State, runGraph session.TaskGraph, runNode *session.TaskGraphNode) {
+			defer wg.Done()
+			err := rt.executeNodeRun(ctx, msg, &runState, &runGraph, runNode, userText, trace)
+			results[index] = nodeRunResult{
+				NodeID:       nodeID,
+				Node:         *runNode,
+				Messages:     appendedMessages(runState.Messages, baseMessages),
+				Usage:        usageDelta(state.Usage, runState.Usage),
+				Pending:      clonePending(runState.Pending),
+				TaskStepTail: appendedTaskSteps(runState, g.TaskID, baseTaskSteps),
+				Err:          err,
+			}
+		}(i, nodeID, baseMessages, baseTaskSteps, sandboxState, sandboxGraph, sandboxNode)
+	}
+	wg.Wait()
+	for _, result := range results {
+		if result.Err != nil {
+			return results, result.Err
+		}
+	}
+	return results, nil
+}
+
+func mergeNodeRunResult(state *session.State, g *session.TaskGraph, result nodeRunResult) {
+	if state == nil || g == nil || result.NodeID == "" {
+		return
+	}
+	if node := g.NodeByID(result.NodeID); node != nil {
+		*node = result.Node
+	}
+	if len(result.Messages) > 0 {
+		state.Messages = append(state.Messages, result.Messages...)
+	}
+	addUsage(&state.Usage, result.Usage)
+	if result.Pending != nil {
+		state.Pending = result.Pending
+	}
+	for _, step := range result.TaskStepTail {
+		state.AddStep(g.TaskID, step)
+	}
+}
+
+func cloneStateForNodeRun(state session.State) session.State {
+	state.Messages = append([]agentcore.Message(nil), state.Messages...)
+	state.Tasks = append([]session.TaskNode(nil), state.Tasks...)
+	for i := range state.Tasks {
+		state.Tasks[i].Steps = append([]session.TaskStep(nil), state.Tasks[i].Steps...)
+		if state.Tasks[i].Graph != nil {
+			graph := cloneTaskGraph(state.Tasks[i].Graph)
+			state.Tasks[i].Graph = &graph
+		}
+		if state.Tasks[i].Execution.TraceRefs != nil {
+			state.Tasks[i].Execution.TraceRefs = append([]session.TraceRef(nil), state.Tasks[i].Execution.TraceRefs...)
+		}
+		if state.Tasks[i].Execution.Events != nil {
+			state.Tasks[i].Execution.Events = append([]session.ExecutionEvent(nil), state.Tasks[i].Execution.Events...)
+		}
+	}
+	if state.Pending != nil {
+		state.Pending = clonePending(state.Pending)
+	}
+	return state
+}
+
+func cloneTaskGraph(g *session.TaskGraph) session.TaskGraph {
+	if g == nil {
+		return session.TaskGraph{}
+	}
+	clone := *g
+	clone.Nodes = append([]session.TaskGraphNode(nil), g.Nodes...)
+	for i := range clone.Nodes {
+		clone.Nodes[i].Depends = append([]string(nil), clone.Nodes[i].Depends...)
+		clone.Nodes[i].AllowedTools = append([]string(nil), clone.Nodes[i].AllowedTools...)
+		clone.Nodes[i].Input = cloneAnyMap(clone.Nodes[i].Input)
+		clone.Nodes[i].Output = cloneAnyMap(clone.Nodes[i].Output)
+		clone.Nodes[i].EvidenceRefs = append([]session.EvidenceRef(nil), clone.Nodes[i].EvidenceRefs...)
+	}
+	return clone
+}
+
+func cloneAnyMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
+}
+
+func clonePending(pending *session.PendingAction) *session.PendingAction {
+	if pending == nil {
+		return nil
+	}
+	clone := *pending
+	return &clone
+}
+
+func appendedMessages(messages []agentcore.Message, base int) []agentcore.Message {
+	if base < 0 || base >= len(messages) {
+		if base == len(messages) {
+			return nil
+		}
+		return append([]agentcore.Message(nil), messages...)
+	}
+	return append([]agentcore.Message(nil), messages[base:]...)
+}
+
+func taskStepCount(state *session.State, taskID string) int {
+	if state == nil {
+		return 0
+	}
+	if task := state.TaskByID(taskID); task != nil {
+		return len(task.Steps)
+	}
+	return 0
+}
+
+func appendedTaskSteps(state session.State, taskID string, base int) []session.TaskStep {
+	task := state.TaskByID(taskID)
+	if task == nil {
+		return nil
+	}
+	if base < 0 || base >= len(task.Steps) {
+		if base == len(task.Steps) {
+			return nil
+		}
+		return append([]session.TaskStep(nil), task.Steps...)
+	}
+	return append([]session.TaskStep(nil), task.Steps[base:]...)
+}
+
+func usageDelta(base, next session.Usage) session.Usage {
+	return session.Usage{
+		Requests:             next.Requests - base.Requests,
+		InputTokens:          next.InputTokens - base.InputTokens,
+		OutputTokens:         next.OutputTokens - base.OutputTokens,
+		TotalTokens:          next.TotalTokens - base.TotalTokens,
+		EstimatedInputTokens: next.EstimatedInputTokens - base.EstimatedInputTokens,
+		SavedEstimatedTokens: next.SavedEstimatedTokens - base.SavedEstimatedTokens,
+		CompactedMessages:    next.CompactedMessages - base.CompactedMessages,
+		CompactedToolResults: next.CompactedToolResults - base.CompactedToolResults,
+		CacheHits:            next.CacheHits - base.CacheHits,
+		CacheReadTokens:      next.CacheReadTokens - base.CacheReadTokens,
+		CacheWriteTokens:     next.CacheWriteTokens - base.CacheWriteTokens,
+		CacheInputTokens:     next.CacheInputTokens - base.CacheInputTokens,
+		CacheOutputTokens:    next.CacheOutputTokens - base.CacheOutputTokens,
+		Cost:                 next.Cost - base.Cost,
+	}
+}
+
+func graphNodeStatusSnapshot(g *session.TaskGraph) []map[string]any {
+	if g == nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(g.Nodes))
+	for _, n := range g.Nodes {
+		out = append(out, map[string]any{
+			"node_id":  n.ID,
+			"status":   n.Status,
+			"attempts": n.Attempts,
+		})
+	}
+	return out
+}
+
+func maxParallelNodes(cfg *config.Root) int {
+	if cfg == nil {
+		return 1
+	}
+	return cfg.Execution.MaxParallelNodesValue()
+}
+
+func selectReadyNodeBatch(g *session.TaskGraph, ready []string, maxParallel int) ([]string, []string) {
+	if g == nil || maxParallel <= 0 || len(ready) == 0 {
+		return nil, nil
+	}
+	selected := make([]string, 0, minInt(maxParallel, len(ready)))
+	waiting := make([]string, 0, len(ready))
+	hasSensitive := false
+	for _, nodeID := range ready {
+		node := g.NodeByID(nodeID)
+		if node == nil {
+			continue
+		}
+		sensitive := isParallelSensitiveNode(node)
+		if len(selected) >= maxParallel {
+			waiting = append(waiting, nodeID)
+			continue
+		}
+		if sensitive && len(selected) > 0 {
+			waiting = append(waiting, nodeID)
+			continue
+		}
+		if hasSensitive {
+			waiting = append(waiting, nodeID)
+			continue
+		}
+		selected = append(selected, nodeID)
+		if sensitive {
+			hasSensitive = true
+		}
+	}
+	return selected, waiting
+}
+
+func isParallelSensitiveNode(node *session.TaskGraphNode) bool {
+	if node == nil {
+		return true
+	}
+	if node.Type == session.NodeTypeHumanConfirm || node.Type == session.NodeTypeHumanReview || strings.EqualFold(strings.TrimSpace(node.Mode), session.NodeModeHuman) {
+		return true
+	}
+	for _, key := range []string{"risk", "mutation", "human_gate", "requires_human_confirmation"} {
+		value, ok := node.Input[key]
+		if !ok {
+			continue
+		}
+		switch v := value.(type) {
+		case bool:
+			if v {
+				return true
+			}
+		case string:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "high", "dangerous", "guarded_mutation", "mutation", "true", "yes", "required", "confirm":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schedulerWaitingReason(g *session.TaskGraph, node *session.TaskGraphNode, selected []string, maxParallel int) string {
+	if node == nil {
+		return "unknown"
+	}
+	if isParallelSensitiveNode(node) {
+		for _, selectedID := range selected {
+			selectedNode := g.NodeByID(selectedID)
+			if selectedNode != nil && selectedNode.ID != node.ID && isParallelSensitiveNode(selectedNode) {
+				return "parallel_sensitive_node"
+			}
+		}
+		if len(selected) > 0 && selected[0] != node.ID {
+			return "parallel_sensitive_node"
+		}
+	}
+	if len(selected) >= maxParallel {
+		return "max_parallel_nodes"
+	}
+	return "scheduler_batch_limit"
 }
 
 func renderPartialReply(cfg *config.Root, msg channel.InboundMessage, text string) string {

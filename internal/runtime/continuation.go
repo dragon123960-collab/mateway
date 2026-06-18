@@ -34,7 +34,7 @@ type ContinuationDecision struct {
 //  3. Active task blocked/failed → resume_node (explicit signals only) or new_graph
 //  4. Active task running → continue_graph or new_graph
 //  5. Completed task reference → reference_completed
-//  6. Historical task reference → historical_search
+//  6. Recent completed task available → new_graph with context refs
 //  7. Default → new_graph
 //
 // This function is a pure state machine; it must not call LLMs, perform I/O,
@@ -91,13 +91,6 @@ func continuationForActiveTask(text string, task session.TaskNode, state session
 			return ContinuationDecision{
 				Action:   ActionNewGraph,
 				Reason:   "explicit new task signal while awaiting input",
-				UserText: text,
-			}
-		}
-		if needsAction(text) && !looksLikeSameTaskFollowup(text, task) {
-			return ContinuationDecision{
-				Action:   ActionNewGraph,
-				Reason:   "unrelated action while task awaits input",
 				UserText: text,
 			}
 		}
@@ -158,13 +151,6 @@ func continuationForActiveTask(text string, task session.TaskNode, state session
 				UserText: text,
 			}
 		}
-		if needsAction(text) && !looksLikeSameTaskFollowup(text, task) {
-			return ContinuationDecision{
-				Action:   ActionNewGraph,
-				Reason:   "unrelated action while task active",
-				UserText: text,
-			}
-		}
 		return ContinuationDecision{
 			Action:   ActionContinueGraph,
 			TaskID:   task.ID,
@@ -187,11 +173,12 @@ func continuationForCompletedOrHistorical(text string, state session.State) Cont
 		}
 	}
 
-	if looksLikeHistoricalReference(lower) {
+	if completedTask != nil && !isNewTaskSignal(text) {
 		return ContinuationDecision{
-			Action:   ActionHistoricalSearch,
-			Reason:   "historical task reference",
-			UserText: text,
+			Action:      ActionNewGraph,
+			ContextRefs: []string{completedTask.ID},
+			Reason:      "new graph with recent completed task context",
+			UserText:    text,
 		}
 	}
 
@@ -229,41 +216,9 @@ func isResumeSignal(text string) bool {
 
 func isNewTaskSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
-	for _, marker := range []string{
-		"/new", "new task", "新任务", "另一个", "另外", "unrelated",
-		"start over", "start fresh", "restart", "重置", "重新开始",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
+	return lower == "/new" || strings.HasPrefix(lower, "/new ")
 }
 
 func looksLikeCompletedReference(lower string, task session.TaskNode) bool {
-	refMarkers := []string{
-		"continue", "继续", "接着", "上次", "based on",
-		"following up", "follow up", "followup", "继续上次",
-	}
-	for _, marker := range refMarkers {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
 	return looksLikeSameTaskFollowup(strings.TrimSpace(lower), task)
-}
-
-func looksLikeHistoricalReference(lower string) bool {
-	markers := []string{
-		"上一次", "上次的", "之前", "以前", "历史",
-		"previous", "earlier", "before", "history", "recall",
-		"what did i", "what was the", "what were we",
-		"remember", "recall",
-	}
-	for _, marker := range markers {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
 }

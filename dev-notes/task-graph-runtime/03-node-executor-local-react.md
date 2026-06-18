@@ -292,17 +292,57 @@ Planner output -> Session graph -> Scheduler ready node -> Executor direct/react
 - dev-notes/task-graph-runtime/02-node-model-and-state-machine.md
 - dev-notes/task-graph-runtime/03-node-executor-local-react.md
 
-只实现 Phase 03。
+只实现 Phase 03 当前未完成的部分（参考"实现状态"表）。
 
 TODO checklist:
-- [ ] 在 runtime 主链路中，把 scheduler 选出的 ready node 接到 node executor。
-- [ ] 实现 direct node：只能调用模型一次，不能调用工具。
-- [ ] 实现 react node：使用 node-local AgentCore context，并限制 allowed_tools。
-- [ ] 确保 tool call 产生 node-scoped trace/evidence refs，包含 task_id/graph_id/node_id/attempt。
-- [ ] 补齐 skill、human、tool/script、unsupported mode 的路由测试。
-- [ ] 删除或改写依赖 global ReAct fallback 的测试。
+- [x] 在 runtime 主链路中，把 scheduler 选出的 ready node 接到 node executor。已落 `runtime.go::runGraphTask` 调 `executeNodeRun`；`node_scheduled` 事件补齐 `node_mode` 和 `attempt`；进入 executor 前用 `startNodeAttempt` 统一写 `node_started` + `TransitionTo`。
+- [x] 实现 direct node：只能调用模型一次，不能调用工具。已落 `node_executor.go::executeDirectNode`；model 收到的 `Tools: nil`；如果 model 仍返回 tool call，executor 不执行，只把请求写进 result summary。
+- [x] 实现 react node：使用 node-local AgentCore context，并限制 allowed_tools。已落 `executeReactNode` + `filterAllowedTools`；hooks 走 `applyBeforeToolCall` / `applyAfterToolCall`，tool policy / redaction / observe / trace 复用。
+- [x] 确保 tool call 产生 node-scoped trace/evidence refs，包含 task_id/graph_id/node_id/attempt。node-level 事件（`node_tool_call` / `node_tool_result` / `node_failed` / `node_final_output` / `node_started` / `node_verify_start` / `node_verified`）通过 `writeNodeEvent` helper 统一带四字段；`tool_execution_start/end` 是底层工具事件，不带 node 字段属于正常。react node 的 `BeforeToolCall`/`AfterToolCall` 钩子写 `node_tool_call`/`node_tool_result`；tool node 结尾写 `node_tool_result`；执行失败走 `node_failed`（替换旧 `node_execute_failed`）。
+- [x] 补齐 skill、human、tool/script、unsupported mode 的路由测试。`mode=script` 落到 `executeToolNode`；`mode=human` 落到 `executeHumanNode`；`mode=skill` 进行最小 metadata-aware 分派：`graph.type=prompt` 或缺省走 `executeSkillAsPrompt`，`graph.type=react` 走 `executeSkillAsReact`，`graph.type=script` 先返回 blocked 并留给 Phase 06 完整实现；未知 mode 经 `markUnsupportedNode` 返回 `failed` + reason。
+- [x] 删除或改写依赖 global ReAct fallback 的测试。`agentcore.Run` 只在 `executeReactNode` / `executeSkillAsReact` 内调用，不存在“runtime Handle 走全局 loop”的兜底路径；旧 `skipLegacyAgentLoopTest` helper 和直接调用已由 Phase 02 TODO 5.1 清理。
 
 必须包含使用 fake model/tool 的 focused runtime tests。
 不要实现 local replan、parallel scheduling、distributed agents，也不要完整实现 metadata-only skill discovery，除非只是必要 stub。
 遇到 unsupported path 要返回明确 blocked/failed，不要静默映射成 direct mode。
+CI 基线：`go test ./internal/runtime ./internal/session`，两个包全部通过；本阶段没有新增已知失败。
+
+## 实现状态（截至当前 commit）
+
+| TODO | 状态 | 主要落点 |
+|------|------|---------|
+| TODO 1 Scheduler -> Executor 主链路 | 已完成 | `runtime.go::runGraphTask` 在 `ReadyNodes(g, 1)` 拿到 ready node 后调 `executeNodeRun`；`node_scheduled` 事件补齐 `node_mode` 和 `attempt`；进入 executor 前用 `TransitionTo(NodeStatusRunning)`，避免手动重复维护 `Status`/`Attempts`/`UpdatedAt`。`executeNode` 走 test 入口，发 `node_started`。 |
+| TODO 2 direct node 路由 | 已完成 | `node_executor.go::executeDirectNode`：单次 `model.Next` + `Tools: nil`；model 仍返回 tool call 时，executor 不执行，把 tool 名写进 `ResultSummary`（避免静默回退到全局 tool loop）；写 `node.Output["text"]` 与 `ResultSummary`，调 `verifyAndTraceNode`。 |
+| TODO 3 react node 路由 | 已完成 | `node_executor.go::executeReactNode`：用 `filterAllowedTools(rt.Tools, node.AllowedTools)` 构造 node-local registry；`agentcore.Hooks` 把 `BeforeToolCall` / `AfterToolCall` / `ToolTimeout` / `ToolRetryBudget` 接到 runtime 现有 hook 链；`BeforeToolCall` 通过 `writeNodeEvent` 写 `node_tool_call`，`AfterToolCall` 写 `node_tool_result` + `node.EvidenceRefs`；`MaxIterations` 取 `cfg.Execution.MaxIterations`，缺省 8。 |
+| TODO 4 skill/human/tool/script/unsupported 路由 | 已完成最小 metadata-aware 分派 | `executeNodeRun` 先按 `node.Mode` 分发：`direct` / `react` / `skill` / `tool` / `script` / `human`；`script` 复用 `executeToolNode`；`mode=skill` 执行时才读取 `SKILL.md`，并读取 metadata 的 `graph.type`：缺省或 `prompt` 走 `executeSkillAsPrompt`，`react` 走 `executeSkillAsReact`，`script` 暂时 blocked 并留给 Phase 06 完整接入 deterministic script；未知 mode 走 `markUnsupportedNode` 返回 `failed` + reason。Type-based 分发作为 legacy fallback。 |
+| trace 契约闭合 | 已完成 | `node_execute_failed` 改名为 `node_failed`；`verifyAndTraceNode` 在 node completed 时加写 `node_final_output`；`executeToolNode` 的 isError 路径走 `traceNodeFailed` 写 `node_failed`。trace 事件链变为 `node_started` → (`node_tool_call`/`node_tool_result`)* → (`node_failed` 或 `node_final_output`)，外加 `node_verified` 做验证状态标记。 |
+| TODO 5 清理 global ReAct fallback | 已完成（无需删代码） | 全仓搜索 `agentcore.Run` / `Agent.Prompt` / `Agent.Continue`，唯一调用点就是 `executeReactNode` 内的 per-node loop；`Runtime.Handle` -> `ensureGraphForTask` -> `runGraphTask` 链路没有"图失败后回到全局 loop"的兜底。`executeModelNode` 只服务 `Mode` 为空的持久化/测试 graph 分发，不是旧 runtime fallback。`skipLegacyAgentLoopTest` helper 和直接调用已清理。 |
+
+测试基线：
+
+- `go test ./internal/session/ ./internal/runtime/`：通过。
+- 新增 `internal/runtime/node_executor_test.go` 测试覆盖：
+  - `TestExecuteNode_DirectMode_SingleModelCall`
+  - `TestExecuteNode_DirectMode_IgnoresToolCallsFromModel`（用 `countingTool` 验证 direct 不触发 tool）
+  - `TestExecuteNode_DirectMode_NoToolRegistryInteraction`
+  - `TestExecuteNode_ReactMode_UsesAgentCoreLoop`
+  - `TestExecuteNode_ReactMode_AllowedToolsFilter`
+  - `TestExecuteNode_ReactMode_ToolCallsBecomeEvidence`
+  - `TestExecuteNode_ReactMode_ToolPolicyStillApplies`
+  - `TestExecuteNode_ReactMode_NoAllowedTools_RunsAsLoop`
+  - `TestExecuteNode_NodeStartedTraceEvent`
+  - `TestExecuteNode_ReactMode_ToolTraceHasRequiredFields`（react node 的 `node_tool_call`/`node_tool_result` 带四字段）
+  - `TestExecuteNode_ToolNode_ToolTraceHasRequiredFields`（tool node 的 `node_tool_call`/`node_tool_result` 带四字段）
+  - `TestExecuteNode_UsesTransitionTo_IncrementsAttempts`
+  - `TestExecuteNode_UnknownMode_FailsConcretely`
+  - `TestExecuteNode_ScriptMode_DelegatesToToolExecutor`
+  - `TestExecuteNode_ModeEmptyTypeDispatchStillWorks`
+- 旧 `TestRunGraphTask_ProducesSchedulerTraceEvents` 期望的事件名 `node_execute_start` 已改为 `node_started`（Phase 03 统一事件名）。
+
+代码基线命令：
+
+```bash
+go test ./internal/session/ ./internal/runtime/
 ```
+
+不要再引入依赖旧 global loop 的测试；`skipLegacyAgentLoopTest` helper 和直接调用已由 Phase 02 TODO 5.1 清理。

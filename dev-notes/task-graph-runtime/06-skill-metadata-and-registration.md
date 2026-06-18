@@ -286,6 +286,26 @@ registered skills metadata
 - Secret-like or unsafe skill content is rejected during install/register。
 - `go test ./internal/skill ./internal/runtime` 通过。
 
+## 当前实现状态
+
+本阶段已完成最小闭环：
+
+- `internal/skill` 支持 metadata v2 read/write/validation，包含 `graph.mode`、`graph.type`、`graph.stage`、`graph.granularity`、inputs/outputs/allowed tools。
+- `skill.Install` 会写入 `SKILL.md` 和 `.mateway/metadata.yaml`，并复用 secret-like / unsafe prompt marker 校验。
+- `skill.Register` 可将已有本地 `SKILL.md` 注册为 discoverable skill。
+- `skill.Doctor` 可报告缺 metadata 或 metadata invalid 的 orphan skill，默认不写文件。
+- runtime skill discovery 改为 metadata-only：裸 `SKILL.md` 不进入 Planner；缺 sibling `SKILL.md` 的 metadata 也不可发现。
+- agent-scoped skill 在 discovery 顺序中覆盖 shared skill。
+- executor 仍在选中 skill node 后才读取 `SKILL.md`，并按 metadata `graph.type` 路由 prompt/react/script。
+- `mateway init` 会为默认 builtin skills 补 `.mateway/metadata.yaml`。
+
+本阶段仍不做：
+
+- marketplace / remote catalog installer adapter。
+- 完整 JSON Schema engine。
+- heartbeat 静默自动注册 orphan skill。
+- deterministic script skill 的完整执行路径，仍留给后续 skill/script executor 收口。
+
 ## 集成闸门检查
 
 对照 `10-integration-gates.md`，本阶段必须满足：

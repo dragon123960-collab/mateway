@@ -76,6 +76,9 @@ func TestInstallFromLocalSkillFile(t *testing.T) {
 	if metadata.ToolRuntime != "mateway" || !strings.Contains(metadata.Source, "SKILL.md") {
 		t.Fatalf("metadata = %#v", metadata)
 	}
+	if metadata.AdapterVersion != "2" || metadata.Graph.Type != "prompt" || metadata.Graph.Granularity != "subtask" {
+		t.Fatalf("metadata graph fields = %#v", metadata)
+	}
 	if _, err := Install(InstallInput{Workspace: workspace, Source: source}); err == nil {
 		t.Fatal("expected duplicate install error")
 	}
@@ -94,7 +97,77 @@ func TestInstallRejectsPlaintextSecret(t *testing.T) {
 	}
 }
 
+func TestRegisterLocalSkillWritesMetadata(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(workspace, "skills", "copied", "SKILL.md")
+	writeRawSkill(t, path, "copied", "Copied skill.", "execution", "10")
+
+	result, err := Register(RegisterInput{Workspace: workspace, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Name != "copied" || result.MetadataPath == "" {
+		t.Fatalf("register result = %#v", result)
+	}
+	metadata, ok, err := ReadMetadata(filepath.Dir(path))
+	if err != nil || !ok {
+		t.Fatalf("expected metadata after register, ok=%v err=%v", ok, err)
+	}
+	if metadata.Graph.Type != "prompt" || metadata.Graph.Stage != "execution" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestDoctorReportsOrphanWithoutMutating(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(workspace, "skills", "orphan", "SKILL.md")
+	writeRawSkill(t, path, "orphan", "Orphan skill.", "execution", "10")
+
+	report, err := Doctor(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Orphans) != 1 || report.Orphans[0].Name != "orphan" {
+		t.Fatalf("doctor report = %#v", report)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(path), ".mateway", "metadata.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("doctor should not write metadata, err=%v", err)
+	}
+}
+
+func TestMetadataValidationRejectsInvalidGraphType(t *testing.T) {
+	metadata := DefaultMetadata(DefaultMetadataInput{Source: "test"})
+	metadata.Graph.Type = "tool"
+	if err := ValidateMetadata(metadata); err == nil || !strings.Contains(err.Error(), "graph.type") {
+		t.Fatalf("expected graph.type validation error, got %v", err)
+	}
+}
+
+func TestDefaultMetadataFreshSearchUsesReactTools(t *testing.T) {
+	metadata := DefaultMetadata(DefaultMetadataInput{
+		Source: "builtin",
+		Header: Skill{Name: "fresh-search", Description: "Search current sources."},
+	})
+	if metadata.Graph.Type != "react" {
+		t.Fatalf("graph type = %q, want react", metadata.Graph.Type)
+	}
+	if strings.Join(metadata.Graph.AllowedTools, ",") != "web.search,web.fetch" {
+		t.Fatalf("allowed tools = %v", metadata.Graph.AllowedTools)
+	}
+}
+
 func writeSkill(t *testing.T, path, name, description, stage, priority string) {
+	t.Helper()
+	writeRawSkill(t, path, name, description, stage, priority)
+	if _, err := WriteMetadata(filepath.Dir(path), DefaultMetadata(DefaultMetadataInput{
+		Source: "test",
+		Header: Skill{Name: name, Description: description, Stage: stage, Priority: priority},
+	})); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRawSkill(t *testing.T, path, name, description, stage, priority string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)

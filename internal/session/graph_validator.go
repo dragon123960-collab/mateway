@@ -112,6 +112,18 @@ func validateNodeFields(g *TaskGraph) GraphValidationErrors {
 			})
 		}
 
+		if mode != "" && !IsValidTypeModeCombo(t, mode) {
+			valid := ValidModesForType(t)
+			msg := fmt.Sprintf("invalid mode %q for type %q", mode, t)
+			if len(valid) > 0 {
+				msg += fmt.Sprintf(" (valid modes for %s: %s)", t, strings.Join(valid, ", "))
+			}
+			errs = append(errs, GraphValidationError{
+				Message: msg,
+				NodeID:  id,
+			})
+		}
+
 		if !IsValidNodeStatus(n.Status) {
 			errs = append(errs, GraphValidationError{
 				Message: fmt.Sprintf("invalid node status %q", n.Status),

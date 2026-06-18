@@ -32,6 +32,9 @@ const (
 	NodeStatusPending       = "pending"
 	NodeStatusReady         = "ready"
 	NodeStatusRunning       = "running"
+	NodeStatusVerifying     = "verifying"
+	NodeStatusRetrying      = "retrying"
+	NodeStatusNeedsReplan   = "needs_replan"
 	NodeStatusAwaitingInput = "awaiting_input"
 	NodeStatusBlocked       = "blocked"
 	NodeStatusFailed        = "failed"
@@ -43,6 +46,9 @@ var validNodeStatuses = map[string]bool{
 	NodeStatusPending:       true,
 	NodeStatusReady:         true,
 	NodeStatusRunning:       true,
+	NodeStatusVerifying:     true,
+	NodeStatusRetrying:      true,
+	NodeStatusNeedsReplan:   true,
 	NodeStatusAwaitingInput: true,
 	NodeStatusBlocked:       true,
 	NodeStatusFailed:        true,
@@ -76,12 +82,18 @@ const (
 	NodeModeDirect = "direct"
 	NodeModeReact  = "react"
 	NodeModeSkill  = "skill"
+	NodeModeTool   = "tool"
+	NodeModeScript = "script"
+	NodeModeHuman  = "human"
 )
 
 var validNodeModes = map[string]bool{
 	NodeModeDirect: true,
 	NodeModeReact:  true,
 	NodeModeSkill:  true,
+	NodeModeTool:   true,
+	NodeModeScript: true,
+	NodeModeHuman:  true,
 }
 
 func ValidNodeTypes() []string {
@@ -100,7 +112,133 @@ func IsValidNodeMode(s string) bool {
 }
 
 func ValidNodeModes() []string {
-	return []string{NodeModeDirect, NodeModeReact, NodeModeSkill}
+	return []string{NodeModeDirect, NodeModeReact, NodeModeSkill, NodeModeTool, NodeModeScript, NodeModeHuman}
+}
+
+var validTypeModeCombos = map[string]map[string]bool{
+	NodeTypeSubtask: {
+		"":             true,
+		NodeModeDirect: true,
+		NodeModeReact:  true,
+	},
+	NodeTypeSkill: {
+		"":            true,
+		NodeModeSkill: true,
+	},
+	NodeTypeTool: {
+		"":             true,
+		NodeModeTool:   true,
+		NodeModeScript: true,
+	},
+	NodeTypeHumanReview: {
+		"":            true,
+		NodeModeHuman: true,
+	},
+	NodeTypeHumanConfirm: {
+		"":            true,
+		NodeModeHuman: true,
+	},
+	NodeTypeModel: {
+		"":             true,
+		NodeModeDirect: true,
+		NodeModeReact:  true,
+	},
+}
+
+func IsValidTypeModeCombo(nodeType, nodeMode string) bool {
+	nodeType = strings.TrimSpace(nodeType)
+	nodeMode = strings.TrimSpace(nodeMode)
+	if modes, ok := validTypeModeCombos[nodeType]; ok {
+		_, ok := modes[nodeMode]
+		return ok
+	}
+	return false
+}
+
+func ValidModesForType(nodeType string) []string {
+	nodeType = strings.TrimSpace(nodeType)
+	modes, ok := validTypeModeCombos[nodeType]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(modes))
+	for m := range modes {
+		if m != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (n *TaskGraphNode) TransitionTo(newStatus string) {
+	if n == nil {
+		return
+	}
+	now := time.Now()
+
+	switch newStatus {
+	case NodeStatusRunning:
+		n.Attempts++
+	}
+
+	n.Status = newStatus
+	n.UpdatedAt = now
+}
+
+func (n *TaskGraphNode) SetCompleted(verified bool, reason string) {
+	if n == nil {
+		return
+	}
+	now := time.Now()
+	n.Status = NodeStatusCompleted
+	n.Acceptance.Verified = verified
+	n.UpdatedAt = now
+	if reason != "" && n.Acceptance.Reason == "" {
+		n.Acceptance.Reason = reason
+	}
+	if verified {
+		n.VerifiedAt = now
+	}
+}
+
+func (n *TaskGraphNode) SetFailed(reason string) {
+	if n == nil {
+		return
+	}
+	n.Status = NodeStatusFailed
+	n.FailureReason = reason
+	n.UpdatedAt = time.Now()
+}
+
+func (n *TaskGraphNode) SetBlocked(reason string) {
+	if n == nil {
+		return
+	}
+	n.Status = NodeStatusBlocked
+	n.FailureReason = reason
+	n.UpdatedAt = time.Now()
+}
+
+func (n *TaskGraphNode) IsTerminal() bool {
+	if n == nil {
+		return true
+	}
+	switch n.Status {
+	case NodeStatusCompleted, NodeStatusFailed, NodeStatusBlocked, NodeStatusSkipped:
+		return true
+	}
+	return false
+}
+
+func (n *TaskGraphNode) IsActive() bool {
+	if n == nil {
+		return false
+	}
+	switch n.Status {
+	case NodeStatusRunning, NodeStatusVerifying, NodeStatusRetrying:
+		return true
+	}
+	return false
 }
 
 type TaskGraph struct {
@@ -139,6 +277,8 @@ type EvidenceRef struct {
 	TracePath string `json:"trace_path,omitempty"`
 	ToolName  string `json:"tool_name,omitempty"`
 	Summary   string `json:"summary,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
+	Blocked   bool   `json:"blocked,omitempty"`
 }
 
 type Acceptance struct {

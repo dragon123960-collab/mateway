@@ -244,6 +244,24 @@ Memory 只消费 summary，不读取 raw trace dump 作为长期事实。
 - heartbeat/offline distill 方向保留，runtime 不同步抽取关系。
 - `go test ./internal/memory ./internal/runtime` 通过。
 
+## 当前实现状态
+
+本阶段已完成最小闭环：
+
+- `session.GraphMemorySummary` 已包含 graph/task 基本信息、node mode/executor/output/evidence/verifier/selected skill，以及 failed/retried/blocked 分类。
+- `FinalizeAndRespond` 在 completed/failed/blocked 收口时调用 memory observe，并写入 `memory_observe_start`、`memory_written` trace event。
+- memory observe 失败仍通过 hook warning 记录，不改变 task finalization 状态。
+- learning JSONL 包含 graph_id、node_records、failed_nodes、retried_nodes、blocked_nodes。
+- skill usage JSONL 只基于 graph summary 中的 skill node，包含 skill_node_id、graph_id、node_result，并使用 selected skill/executor 名称。
+- 现有 diary、learning JSONL、skill usage JSONL、proposal 机制保持兼容。
+
+本阶段仍不做：
+
+- Tree Memory store。
+- runtime 同步抽取主体-关系-客体。
+- memory 直接触发工具或绕过 policy。
+- Markdown -> JSONL/index 的完整 rebuild engine。
+
 ## 集成闸门检查
 
 对照 `10-integration-gates.md`，本阶段必须满足：

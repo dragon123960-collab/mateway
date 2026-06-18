@@ -72,13 +72,27 @@ func TestReadyNodes_DependencyCompleted(t *testing.T) {
 		ID:     "g2",
 		TaskID: "t2",
 		Nodes: []TaskGraphNode{
-			{ID: "a", Type: NodeTypeTool, Goal: "read", Executor: "file.read", Status: NodeStatusCompleted},
+			{ID: "a", Type: NodeTypeTool, Goal: "read", Executor: "file.read", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: true}},
 			{ID: "b", Type: NodeTypeModel, Goal: "analyze", Depends: []string{"a"}, Status: NodeStatusPending},
 		},
 	}
 	ready := ReadyNodes(g, 10)
 	if len(ready) != 1 || ready[0] != "b" {
 		t.Fatalf("expected [b], got %v", ready)
+	}
+}
+
+func TestReadyNodes_DependencyCompletedButUnverifiedBlocks(t *testing.T) {
+	g := &TaskGraph{
+		ID:     "g-unverified",
+		TaskID: "t-unverified",
+		Nodes: []TaskGraphNode{
+			{ID: "a", Type: NodeTypeModel, Goal: "done", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: false}},
+			{ID: "b", Type: NodeTypeModel, Goal: "dependent", Depends: []string{"a"}, Status: NodeStatusPending},
+		},
+	}
+	if ready := ReadyNodes(g, 10); len(ready) != 0 {
+		t.Fatalf("unverified completed dependency should block, got %v", ready)
 	}
 }
 
@@ -130,7 +144,7 @@ func TestReadyNodes_DiamondGraph(t *testing.T) {
 	}
 
 	// Complete "a" → "b" and "c" become ready
-	g.NodeByID("a").Status = NodeStatusCompleted
+	g.NodeByID("a").SetCompleted(true, "done")
 	ready = ReadyNodes(g, 10)
 	if len(ready) != 2 {
 		t.Fatalf("expected [b c], got %v", ready)
@@ -140,14 +154,14 @@ func TestReadyNodes_DiamondGraph(t *testing.T) {
 	}
 
 	// Complete "b" only → "d" not ready yet (c still pending)
-	g.NodeByID("b").Status = NodeStatusCompleted
+	g.NodeByID("b").SetCompleted(true, "done")
 	ready = ReadyNodes(g, 10)
 	if len(ready) != 1 || ready[0] != "c" {
 		t.Fatalf("expected [c] when only b is done, got %v", ready)
 	}
 
 	// Complete "c" → "d" becomes ready
-	g.NodeByID("c").Status = NodeStatusCompleted
+	g.NodeByID("c").SetCompleted(true, "done")
 	ready = ReadyNodes(g, 10)
 	if len(ready) != 1 || ready[0] != "d" {
 		t.Fatalf("expected [d] when b and c are done, got %v", ready)
@@ -244,7 +258,7 @@ func TestReadyNodes_MixedStatuses(t *testing.T) {
 		ID:     "g8",
 		TaskID: "t8",
 		Nodes: []TaskGraphNode{
-			{ID: "a", Type: NodeTypeTool, Goal: "a", Executor: "tool.x", Status: NodeStatusCompleted},
+			{ID: "a", Type: NodeTypeTool, Goal: "a", Executor: "tool.x", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: true}},
 			{ID: "b", Type: NodeTypeTool, Goal: "b", Executor: "tool.x", Status: NodeStatusSkipped},
 			{ID: "c", Type: NodeTypeModel, Goal: "c", Depends: []string{"a", "b"}, Status: NodeStatusPending},
 			{ID: "d", Type: NodeTypeTool, Goal: "d", Executor: "tool.x", Status: NodeStatusFailed},
@@ -282,8 +296,8 @@ func TestUpdateGraphStatus_AllCompleted(t *testing.T) {
 		ID:     "g1",
 		TaskID: "t1",
 		Nodes: []TaskGraphNode{
-			{ID: "n1", Type: NodeTypeModel, Goal: "x", Status: NodeStatusCompleted},
-			{ID: "n2", Type: NodeTypeModel, Goal: "y", Status: NodeStatusCompleted},
+			{ID: "n1", Type: NodeTypeModel, Goal: "x", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: true}},
+			{ID: "n2", Type: NodeTypeModel, Goal: "y", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: true}},
 		},
 	}
 	s := UpdateGraphStatus(g)
@@ -295,12 +309,25 @@ func TestUpdateGraphStatus_AllCompleted(t *testing.T) {
 	}
 }
 
+func TestUpdateGraphStatus_UnverifiedCompletedIsRunning(t *testing.T) {
+	g := &TaskGraph{
+		ID:     "g-unverified",
+		TaskID: "t-unverified",
+		Nodes: []TaskGraphNode{
+			{ID: "n1", Type: NodeTypeModel, Goal: "x", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: false}},
+		},
+	}
+	if s := UpdateGraphStatus(g); s != GraphStatusRunning {
+		t.Fatalf("unverified completed node should keep graph running, got %q", s)
+	}
+}
+
 func TestUpdateGraphStatus_MixedCompletedAndSkipped(t *testing.T) {
 	g := &TaskGraph{
 		ID:     "g2",
 		TaskID: "t2",
 		Nodes: []TaskGraphNode{
-			{ID: "n1", Type: NodeTypeModel, Goal: "x", Status: NodeStatusCompleted},
+			{ID: "n1", Type: NodeTypeModel, Goal: "x", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: true}},
 			{ID: "n2", Type: NodeTypeModel, Goal: "y", Status: NodeStatusSkipped},
 		},
 	}
@@ -478,7 +505,7 @@ func TestScheduler_ResumeDoesNoRerunCompleted(t *testing.T) {
 		ID:     "g-resume",
 		TaskID: "t-resume",
 		Nodes: []TaskGraphNode{
-			{ID: "a", Type: NodeTypeModel, Goal: "already done", Status: NodeStatusCompleted},
+			{ID: "a", Type: NodeTypeModel, Goal: "already done", Status: NodeStatusCompleted, Acceptance: Acceptance{Verified: true}},
 			{ID: "b", Type: NodeTypeModel, Goal: "was blocked", Status: NodeStatusPending, Depends: []string{"a"}},
 			{ID: "c", Type: NodeTypeModel, Goal: "also pending", Status: NodeStatusPending},
 		},
@@ -512,17 +539,17 @@ func TestScheduler_ComplexGraphTickByTick(t *testing.T) {
 	assertReady(t, g, 10, []string{"fetch"})
 
 	// Tick 1: fetch completed → parse and summary ready
-	g.NodeByID("fetch").Status = NodeStatusCompleted
+	g.NodeByID("fetch").SetCompleted(true, "done")
 	assertReady(t, g, 10, []string{"parse", "summary"})
 
 	// Tick 2: parse completed → analyze ready, summary still running
-	g.NodeByID("parse").Status = NodeStatusCompleted
+	g.NodeByID("parse").SetCompleted(true, "done")
 	g.NodeByID("summary").Status = NodeStatusRunning
 	assertReady(t, g, 10, []string{"analyze"})
 
 	// Tick 3: analyze completed, summary completed → all done
-	g.NodeByID("analyze").Status = NodeStatusCompleted
-	g.NodeByID("summary").Status = NodeStatusCompleted
+	g.NodeByID("analyze").SetCompleted(true, "done")
+	g.NodeByID("summary").SetCompleted(true, "done")
 	assertReady(t, g, 10, []string{})
 
 	// Graph status should be completed

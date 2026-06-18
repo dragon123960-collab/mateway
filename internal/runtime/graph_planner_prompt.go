@@ -87,6 +87,7 @@ Node types:
 - "subtask": a verifiable sub-task.
   * mode "direct": a single model reasoning step. No tools used. For simple Q&A, synthesis, text generation.
   * mode "react": the node executor reasons and uses tools iteratively INSIDE the node. "allowed_tools" lists which tools this node may call.
+- "skill": execute one registered skill as a sub-task. Use mode "skill" and set "skill" to the exact skill name.
 - "human_review": pause for human review of intermediate output.
 - "human_confirm": pause for human confirmation before continuing (use before mutations).
 
@@ -95,6 +96,7 @@ Rules:
 - Use "depends" to express ordering. A node depends on another if it needs that node's output.
 - SIMPLE QA → single "subtask" node, mode "direct", only one node.
 - TOOL TASKS → "subtask" nodes, mode "react", with "allowed_tools" listing exact tool names. Do NOT emit a separate tool node for each file read or command.
+- REGISTERED SKILL TASKS → one "skill" node with mode "skill" and the exact "skill" name. Do NOT create a separate "load_skill" subtask just to read SKILL.md.
 - HIGH RISK (file writes, deletes, deploys) → insert "human_confirm" node before the mutation node.
 - If the user explicitly asks for confirmation/approval/review/permission, include a human_confirm or human_review node before that action.
 - Skill names are NOT tool names. Put skill references in the node's "skill" field or in task.required_capabilities.skills.
@@ -123,6 +125,13 @@ Node fields (for subtask/react nodes):
 - outputs: conceptual output labels
 - acceptance: verifiable completion condition
 
+Node fields (for skill nodes):
+- type: "skill"
+- mode: "skill"
+- skill: exact registered skill name from Available skills
+- goal: what the skill should accomplish
+- depends/outputs/acceptance as usual
+
 Output exactly this JSON shape:
 {
   "task": {
@@ -150,6 +159,16 @@ Output exactly this JSON shape:
       "inputs": ["repo_path"],
       "outputs": ["analysis"],
       "acceptance": "includes entrypoints, modules, and risks"
+    },
+    {
+      "id": "evaluate-source",
+      "type": "skill",
+      "mode": "skill",
+      "skill": "source-evaluation",
+      "goal": "evaluate source quality using the registered skill",
+      "depends": ["analyze"],
+      "outputs": ["source_evaluation"],
+      "acceptance": "evaluation follows the skill criteria"
     },
     {
       "id": "answer",
@@ -223,13 +242,18 @@ func renderGraphPlannerPrompt(goal, userText string, tools *agentcore.ToolRegist
 	return b.String()
 }
 
-func renderUnifiedPlannerPrompt(goal, userText string, tools *agentcore.ToolRegistry, skills []discoveredSkill) string {
+func renderUnifiedPlannerPrompt(goal, userText, plannerContext string, tools *agentcore.ToolRegistry, skills []discoveredSkill) string {
 	var b strings.Builder
 	b.WriteString("User task:\n")
 	b.WriteString(strings.TrimSpace(goal))
 	if strings.TrimSpace(userText) != "" && strings.TrimSpace(userText) != strings.TrimSpace(goal) {
 		b.WriteString("\n\nCurrent user message:\n")
 		b.WriteString(strings.TrimSpace(userText))
+	}
+	if context := strings.TrimSpace(plannerContext); context != "" {
+		b.WriteString("\n\nPlanner context:\n")
+		b.WriteString("- Use this context only to plan the task correctly. Do not treat it as completed evidence.\n")
+		b.WriteString(context)
 	}
 
 	b.WriteString("\n\nGuidance:\n")
@@ -244,6 +268,9 @@ func renderUnifiedPlannerPrompt(goal, userText string, tools *agentcore.ToolRegi
 	if len(skills) > 0 {
 		b.WriteString("\nAvailable skills:\n")
 		b.WriteString("- Skill names are instructional references, NOT executable tools. Do NOT put skill names in allowed_tools.\n")
+		b.WriteString("- Use a skill node only when the skill metadata matches the node: stage must not be planning, granularity must be subtask, and allowed_tools must be a subset of the skill metadata allowed_tools.\n")
+		b.WriteString("- Skills with granularity=workflow must be decomposed into normal subtask/react nodes; do not emit them as a single skill node.\n")
+		b.WriteString("- Preserve skill metadata inputs and outputs as node inputs/outputs when they are relevant to dependency planning.\n")
 		for _, skill := range skills {
 			b.WriteString("- name: ")
 			b.WriteString(skill.Name)
@@ -251,6 +278,22 @@ func renderUnifiedPlannerPrompt(goal, userText string, tools *agentcore.ToolRegi
 			b.WriteString(strings.TrimSpace(skill.Description))
 			b.WriteString("\n  stage: ")
 			b.WriteString(defaultText(skill.Stage, "instruction"))
+			b.WriteString("\n  type: ")
+			b.WriteString(defaultText(skill.GraphType, "prompt"))
+			b.WriteString("\n  granularity: ")
+			b.WriteString(defaultText(skill.Granularity, "subtask"))
+			if len(skill.Inputs) > 0 {
+				b.WriteString("\n  inputs: ")
+				b.WriteString(strings.Join(skill.Inputs, ", "))
+			}
+			if len(skill.Outputs) > 0 {
+				b.WriteString("\n  outputs: ")
+				b.WriteString(strings.Join(skill.Outputs, ", "))
+			}
+			if len(skill.AllowedTools) > 0 {
+				b.WriteString("\n  allowed_tools: ")
+				b.WriteString(strings.Join(skill.AllowedTools, ", "))
+			}
 			b.WriteString("\n  path: ")
 			b.WriteString(skill.Path)
 			if hint := executionHint(skill); hint != "" {

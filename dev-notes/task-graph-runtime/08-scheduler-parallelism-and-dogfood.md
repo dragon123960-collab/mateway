@@ -68,10 +68,10 @@ Planner
 
 因为 node 是子任务，不是工具调用，所以这两个配置不是一个东西。
 
-默认建议：
+当前默认：
 
 ```text
-max_parallel_nodes = 1 或 2，保守默认
+max_parallel_nodes = 1，保守默认，保持单节点推进语义
 max_parallel_tools = 保持现有语义
 ```
 
@@ -128,6 +128,14 @@ Trace 应能看出：
 ```text
 dev-notes/task-graph-runtime/dogfood-YYYY-MM-DD.md
 ```
+
+完整端到端检查顺序见：
+
+```text
+dev-notes/task-graph-runtime/11-end-to-end-test-checklist.md
+```
+
+后续真实模型测试应优先按 11 文档逐阶段验收：先检查 Planner 是否生成正确 plan，再检查 Graph/Session、Scheduler、Executor、Verifier、Finalizer、Memory/Recovery，而不是只看最终回答。
 
 Dogfood 场景必须覆盖：
 
@@ -291,3 +299,41 @@ TODO checklist:
 必须包含 independent parallel nodes、dependency order、max limit、completed skip、high-risk/human gate behavior 的测试。
 不要做 distributed scheduling、worker queues 或 multi-agent orchestration。
 ```
+
+## 当前实现状态
+
+截至 2026-06-17：
+
+- 已增加 `execution.max_parallel_nodes`，默认值为 `1`。
+- 已保持 `max_parallel_tools` 原语义；它只代表 node-local AgentCore loop 内部工具并发能力，不代表 graph node 调度。
+- Runtime scheduler 已从固定 `ReadyNodes(g, 1)` 改为：
+  - 先获取完整 ready node 列表；
+  - 按 `max_parallel_nodes` 选择本 tick 的 selected batch；
+  - 对未选 node 写入 `scheduler_waiting` 和等待原因；
+  - 对 selected node 先统一标记 `running` 并持久化，避免恢复时重复启动。
+- 第一版采用本地 goroutine 并行，不引入 worker pool 或分布式调度。每个 selected node 在独立的 session/graph sandbox 中执行，完成后由主 goroutine 按 node 顺序合并 node result、messages、usage、pending action 和 task step 增量。
+- `traceRecorder` 已加锁，允许并行 node 写入同一个 trace 文件。
+- 已加入 high-risk/human/mutation 保守批次保护：
+  - `human_review` / `human_confirm` / `mode=human` 视为 parallel-sensitive；
+  - `Input.risk`、`Input.mutation`、`Input.human_gate`、`Input.requires_human_confirmation` 命中高风险值时视为 parallel-sensitive；
+  - sensitive node 在一个 tick 中独占批次。
+- 已新增 trace 事件：
+  - `scheduler_tick`
+  - `node_ready`
+  - `scheduler_waiting`
+  - `node_completed`
+- 自动化测试覆盖：
+  - 默认 `max_parallel_nodes=1`；
+  - 自定义 `max_parallel_nodes`；
+  - invalid 值回落；
+  - independent ready nodes 在配置为 2 时同 tick selected；
+  - independent ready nodes 会真实并发进入模型调用；
+  - max limit waiting reason；
+  - sensitive node 独占批次；
+  - required scheduler/node trace events。
+- `go test -race ./internal/runtime` 已覆盖 node 并行路径。
+
+仍需真实模型 dogfood：
+
+- 已创建 dogfood 记录模板：`dev-notes/task-graph-runtime/dogfood-2026-06-17.md`。
+- 真实模型运行需要可用模型配置和本地运行环境；若运行失败，必须在 dogfood 文档里记录具体 blocker。
