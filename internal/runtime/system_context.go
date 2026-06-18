@@ -258,42 +258,22 @@ func appendPreviousTaskContext(systemPrompt string, state session.State, current
 }
 
 func shouldInjectPreviousTaskContext(state session.State, currentTaskID string, userText string) bool {
-	if strings.TrimSpace(renderSessionSummaryContext(state.Summary)) != "" && likelyFollowupText(userText) {
+	if strings.TrimSpace(renderSessionSummaryContext(state.Summary)) != "" && isContextualShortMessage(userText) {
 		return true
 	}
 	tasks := recentPreviousTasks(state, currentTaskID, 3)
 	if len(tasks) == 0 {
 		return false
 	}
-	return likelyFollowupText(userText)
+	return isContextualShortMessage(userText)
 }
 
-func likelyFollowupText(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	if lower == "" {
+func isContextualShortMessage(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || isNewTaskSignal(text) {
 		return false
 	}
-	if len([]rune(lower)) <= 24 {
-		return true
-	}
-	return containsAnyFollowupPhrase(lower,
-		"continue", "resume", "continue that", "resume that", "try again", "do it again",
-		"ok now", "yes now", "done now", "fixed now", "approved now", "authorized now",
-		"继续", "接着", "刚才", "上次", "那个", "这个", "好了", "可以了", "修复了", "授权了", "同意",
-	)
-}
-
-func containsAnyFollowupPhrase(text string, phrases ...string) bool {
-	for _, phrase := range phrases {
-		phrase = strings.TrimSpace(phrase)
-		if phrase == "" {
-			continue
-		}
-		if strings.Contains(text, phrase) {
-			return true
-		}
-	}
-	return false
+	return len([]rune(text)) <= 24
 }
 
 func recentPreviousTasks(state session.State, currentTaskID string, limit int) []session.TaskNode {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -97,6 +98,94 @@ func TestShouldIgnoreFeishuGroupWithoutMentionWhenRequired(t *testing.T) {
 	if shouldIgnoreInbound(cfg, msg) {
 		t.Fatal("expected mentioned group message accepted")
 	}
+}
+
+func TestSessionRunnerSerializesSameSession(t *testing.T) {
+	runner := newSessionRunner()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	var orderMu sync.Mutex
+	var order []string
+
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		orderMu.Lock()
+		order = append(order, "first-start")
+		orderMu.Unlock()
+		close(firstStarted)
+		<-releaseFirst
+		orderMu.Lock()
+		order = append(order, "first-end")
+		orderMu.Unlock()
+	})
+	<-firstStarted
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		orderMu.Lock()
+		order = append(order, "second")
+		orderMu.Unlock()
+		close(secondDone)
+	})
+	select {
+	case <-secondDone:
+		t.Fatal("second same-session task ran before first completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second same-session task did not run after first completed")
+	}
+	orderMu.Lock()
+	got := strings.Join(order, ",")
+	orderMu.Unlock()
+	if got != "first-start,first-end,second" {
+		t.Fatalf("unexpected order: %s", got)
+	}
+}
+
+func TestSessionRunnerAllowsDifferentSessionsInParallel(t *testing.T) {
+	runner := newSessionRunner()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:a"}, func(context.Context) {
+		close(firstStarted)
+		<-releaseFirst
+	})
+	<-firstStarted
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:b"}, func(context.Context) {
+		close(secondDone)
+	})
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("different-session task should run without waiting")
+	}
+	close(releaseFirst)
+}
+
+func TestSessionRunnerStopsWaitingWhenContextCancelled(t *testing.T) {
+	runner := newSessionRunner()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondRan := make(chan struct{})
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		close(firstStarted)
+		<-releaseFirst
+	})
+	<-firstStarted
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner.Run(ctx, channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		close(secondRan)
+	})
+	select {
+	case <-secondRan:
+		t.Fatal("cancelled same-session task should not run while waiting")
+	default:
+	}
+	close(releaseFirst)
 }
 
 func TestReactionForReply(t *testing.T) {

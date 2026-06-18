@@ -45,7 +45,7 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			},
 		},
 	}
-	if len(reply.Progress) > 0 {
+	if progress := renderProgress(reply.Progress); progress != "" {
 		elements = append(elements, map[string]any{
 			"tag": "hr",
 		})
@@ -53,7 +53,7 @@ func buildCardElements(reply channel.OutboundMessage, text string) []map[string]
 			"tag": "div",
 			"text": map[string]any{
 				"tag":     "lark_md",
-				"content": "**Process**\n" + renderProgress(reply.Progress),
+				"content": "**Progress**\n" + progress,
 			},
 		})
 	}
@@ -88,33 +88,91 @@ func renderProgress(steps []channel.ProgressStep) string {
 
 func renderProgressLine(step channel.ProgressStep) string {
 	title := firstNonEmpty(strings.TrimSpace(step.Tool), strings.TrimSpace(step.Title))
+	status := strings.TrimSpace(step.Status)
+	summary := strings.TrimSpace(step.Summary)
 	if title == "" {
 		return ""
 	}
-	status := strings.TrimSpace(step.Status)
+	if strings.EqualFold(status, "thinking") && (summary == "" || strings.EqualFold(summary, "waiting for model output") || strings.EqualFold(summary, "thinking")) {
+		return ""
+	}
 	if status == "" {
 		status = "recorded"
 	}
+	marker := progressMarker(status)
 	var details []string
-	details = append(details, status)
+	details = append(details, progressStatusLabel(status))
 	if step.DurationMS > 0 {
 		details = append(details, formatDurationMS(step.DurationMS))
 	}
 	if step.TimedOut {
 		details = append(details, "timed out")
 	}
-	if summary := strings.TrimSpace(step.Summary); summary != "" {
+	if summary != "" {
 		details = append(details, truncateProgressText(summary, 72))
 	}
-	return "- `" + escapeInlineCode(title) + "`: " + strings.Join(details, " / ")
+	return "- " + marker + " `" + escapeInlineCode(progressTitle(title)) + "`: " + strings.Join(details, " / ")
+}
+
+func progressMarker(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "accepted", "completed", "success", "done":
+		return "✓"
+	case "failed", "blocked", "error":
+		return "✕"
+	default:
+		return "→"
+	}
+}
+
+func progressStatusLabel(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "accepted", "completed", "success", "done":
+		return "done"
+	case "failed", "blocked", "error":
+		return "blocked"
+	case "running":
+		return "running"
+	default:
+		return strings.TrimSpace(status)
+	}
+}
+
+func progressTitle(title string) string {
+	switch strings.TrimSpace(title) {
+	case "file.read":
+		return "Read"
+	case "file.write":
+		return "Write"
+	case "file.delete":
+		return "Delete"
+	case "terminal.run":
+		return "Run"
+	case "web.search":
+		return "Search"
+	case "web.fetch":
+		return "Fetch"
+	case "schedule.manage":
+		return "Schedule"
+	case "task.search":
+		return "Search tasks"
+	case "task.resume":
+		return "Resume task"
+	default:
+		return title
+	}
 }
 
 func truncateProgressText(text string, limit int) string {
 	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit <= 0 || len(text) <= limit {
+	if limit <= 0 {
 		return text
 	}
-	return text[:limit] + "..."
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "..."
 }
 
 func formatDurationMS(ms int64) string {

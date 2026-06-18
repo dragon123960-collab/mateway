@@ -839,7 +839,7 @@ func TestGraphAwareContinuation_ContinueGraph(t *testing.T) {
 	task := &session.TaskNode{ID: "t1", Goal: "answer", Status: "running", Graph: g}
 	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
 
-	d := graphAwareContinuation(state, "continue", task)
+	d := graphAwareContinuation(state, "answer status", task)
 	if d.Action != ActionContinueGraph {
 		t.Fatalf("expected continue_graph, got %q", d.Action)
 	}
@@ -915,7 +915,7 @@ func TestGraphAwareContinuation_BlockedGraphResumePreserved(t *testing.T) {
 	}}
 	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
 
-	d := graphAwareContinuation(state, "retry the read", task)
+	d := graphAwareContinuation(state, "/retry read", task)
 	if d.Action == ActionNewGraph {
 		t.Fatalf("blocked graph with retry signal should not be new_graph, got %q", d.Action)
 	}

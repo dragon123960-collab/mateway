@@ -31,7 +31,7 @@ type ContinuationDecision struct {
 // Priority order:
 //  1. Pending action active → answer_pending
 //  2. Active task awaiting user input → resume_node or new_graph
-//  3. Active task blocked/failed → resume_node (explicit signals only) or new_graph
+//  3. Active task blocked/failed → resume_node (explicit control command or same-task overlap) or new_graph
 //  4. Active task running → continue_graph or new_graph
 //  5. Completed task reference → reference_completed
 //  6. Recent completed task available → new_graph with context refs
@@ -195,28 +195,22 @@ func latestCompletedTask(state session.State) *session.TaskNode {
 }
 
 func isResumeSignal(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
-	for _, marker := range []string{
-		"continue", "继续", "接着", "retry", "重试", "again", "再试",
-		"授权", "authorized", "approved", "fixed", "修复", "done",
-		"可以", "go ahead", "go on",
-	} {
-		if lower == marker || strings.HasPrefix(lower, marker+" ") || strings.HasSuffix(lower, " "+marker) {
-			return true
-		}
-		if strings.Contains(lower, " "+marker+" ") {
-			return true
-		}
-	}
-	if lower == "ok" || lower == "yes" || lower == "go" {
-		return true
-	}
-	return false
+	return isResumeCommand(text)
 }
 
 func isNewTaskSignal(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return lower == "/new" || strings.HasPrefix(lower, "/new ")
+}
+
+func isResumeCommand(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, command := range []string{"/continue", "/resume", "/retry"} {
+		if lower == command || strings.HasPrefix(lower, command+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 func looksLikeCompletedReference(lower string, task session.TaskNode) bool {

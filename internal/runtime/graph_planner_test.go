@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dongping/mateway/internal/agentcore"
 	"github.com/dongping/mateway/internal/session"
@@ -18,6 +19,22 @@ type staticPlannerModel struct {
 
 func (m staticPlannerModel) Next(_ context.Context, _ agentcore.Context) (agentcore.Message, error) {
 	return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.json}, nil
+}
+
+type delayedPlannerModel struct {
+	delay time.Duration
+	json  string
+}
+
+func (m delayedPlannerModel) Next(ctx context.Context, _ agentcore.Context) (agentcore.Message, error) {
+	timer := time.NewTimer(m.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.json}, nil
+	case <-ctx.Done():
+		return agentcore.Message{}, ctx.Err()
+	}
 }
 
 func testUnifiedPlanJSON(goal, acceptance string, tools, skills []string, nodeJSONs ...string) string {
@@ -420,7 +437,7 @@ func TestConvertPlannerOutput_IncludesHumanNode(t *testing.T) {
 
 func TestPlanGraphWithModel_SimpleQA(t *testing.T) {
 	json := `{"goal":"answer question","risk":"low","nodes":[{"id":"answer","type":"model","goal":"answer the question","acceptance":"correct"}],"task_acceptance":"done"}`
-	g, err := planGraphWithModel(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", nil)
+	g, err := planGraphWithModel(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", time.Minute, nil)
 	if err != nil {
 		t.Fatalf("planGraphWithModel failed: %v", err)
 	}
@@ -430,7 +447,7 @@ func TestPlanGraphWithModel_SimpleQA(t *testing.T) {
 }
 
 func TestPlanGraphWithModel_InvalidJSON(t *testing.T) {
-	_, err := planGraphWithModel(t.Context(), staticPlannerModel{json: "not json"}, "test prompt", "task-1", nil)
+	_, err := planGraphWithModel(t.Context(), staticPlannerModel{json: "not json"}, "test prompt", "task-1", time.Minute, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid model output")
 	}
@@ -438,7 +455,7 @@ func TestPlanGraphWithModel_InvalidJSON(t *testing.T) {
 
 func TestPlanGraphWithModel_InvalidGraph(t *testing.T) {
 	json := `{"goal":"test","risk":"low","nodes":[{"id":"n1","type":"invalid","goal":"x"}],"task_acceptance":"done"}`
-	_, err := planGraphWithModel(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", nil)
+	_, err := planGraphWithModel(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", time.Minute, nil)
 	if err == nil || !strings.Contains(err.Error(), "graph validation failed") {
 		t.Fatalf("expected validation error, got: %v", err)
 	}
@@ -446,7 +463,7 @@ func TestPlanGraphWithModel_InvalidGraph(t *testing.T) {
 
 func TestPlanGraphWithModel_UnknownDependency(t *testing.T) {
 	json := `{"goal":"test","risk":"low","nodes":[{"id":"a","type":"model","goal":"a"},{"id":"b","type":"model","goal":"b","depends":["missing"]}],"task_acceptance":"done"}`
-	_, err := planGraphWithModel(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-unk", nil)
+	_, err := planGraphWithModel(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-unk", time.Minute, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown dependency")
 	}
@@ -1466,7 +1483,7 @@ func TestPlanWithUnifiedPlanner_SimpleQA(t *testing.T) {
 			{"id": "answer", "type": "subtask", "mode": "direct", "goal": "answer the question", "acceptance": "correct"}
 		]
 	}`
-	plan, raw, err := planWithUnifiedPlanner(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", nil)
+	plan, raw, err := planWithUnifiedPlanner(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", time.Minute, nil)
 	if err != nil {
 		t.Fatalf("planWithUnifiedPlanner failed: %v", err)
 	}
@@ -1482,7 +1499,7 @@ func TestPlanWithUnifiedPlanner_SimpleQA(t *testing.T) {
 }
 
 func TestPlanWithUnifiedPlanner_InvalidJSON(t *testing.T) {
-	_, _, err := planWithUnifiedPlanner(t.Context(), staticPlannerModel{json: "not json"}, "test prompt", "task-1", nil)
+	_, _, err := planWithUnifiedPlanner(t.Context(), staticPlannerModel{json: "not json"}, "test prompt", "task-1", time.Minute, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -1501,9 +1518,33 @@ func TestPlanWithUnifiedPlanner_MissingGoal(t *testing.T) {
 			{"id": "n1", "type": "subtask", "mode": "direct", "goal": "x", "acceptance": "x"}
 		]
 	}`
-	_, _, err := planWithUnifiedPlanner(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", nil)
+	_, _, err := planWithUnifiedPlanner(t.Context(), staticPlannerModel{json: json}, "test prompt", "task-1", time.Minute, nil)
 	if err == nil {
 		t.Fatal("expected error for missing task goal")
+	}
+}
+
+func TestPlanWithUnifiedPlanner_UsesConfiguredTimeout(t *testing.T) {
+	json := testUnifiedPlanJSON(
+		"answer question",
+		"done",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"answer the question","acceptance":"done"}`,
+	)
+	plan, _, err := planWithUnifiedPlanner(
+		t.Context(),
+		delayedPlannerModel{delay: 25 * time.Millisecond, json: json},
+		"test prompt",
+		"task-1",
+		200*time.Millisecond,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("planner should use configured timeout instead of a short fixed deadline: %v", err)
+	}
+	if len(plan.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(plan.Nodes))
 	}
 }
 

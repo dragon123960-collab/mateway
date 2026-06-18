@@ -207,18 +207,23 @@ func suffixSummary(summary string) string {
 
 func compactInline(text string, limit int) string {
 	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit <= 0 || len(text) <= limit {
-		return text
-	}
-	return text[:limit] + "..."
+	return compactRunes(text, limit)
 }
 
 func compactBlock(text string, limit int) string {
 	text = strings.TrimSpace(text)
-	if limit <= 0 || len(text) <= limit {
+	return compactRunes(text, limit)
+}
+
+func compactRunes(text string, limit int) string {
+	if limit <= 0 {
 		return text
 	}
-	return text[:limit] + "..."
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "..."
 }
 
 func firstNonEmpty(values ...string) string {

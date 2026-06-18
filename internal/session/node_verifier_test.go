@@ -153,6 +153,43 @@ func TestVerifyNode_ModelNode_Passed(t *testing.T) {
 	}
 }
 
+func TestVerifyNode_ModelNode_RequiresConcreteURLRejectsPlaceholder(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "publish",
+		Type:          NodeTypeSkill,
+		Mode:          NodeModeSkill,
+		Goal:          "publish document and return URL",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "[open document](feishu_doc_url)",
+		Output:        map[string]any{"url": ""},
+		Acceptance:    Acceptance{Criteria: "must return a link"},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationFailed {
+		t.Fatalf("expected failed for placeholder URL, got %#v", result)
+	}
+	if !strings.Contains(result.Reason, "concrete URL") {
+		t.Fatalf("unexpected reason: %q", result.Reason)
+	}
+}
+
+func TestVerifyNode_ModelNode_RequiresConcreteURLAcceptsHTTPURL(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "publish",
+		Type:          NodeTypeSkill,
+		Mode:          NodeModeSkill,
+		Goal:          "publish document and return URL",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "created https://sample.feishu.cn/docx/abc123",
+		Output:        map[string]any{"url": "https://sample.feishu.cn/docx/abc123"},
+		Acceptance:    Acceptance{Criteria: "must return a link"},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationPassed {
+		t.Fatalf("expected passed for concrete URL, got %#v", result)
+	}
+}
+
 func TestVerifyNode_ModelNode_UnfinishedToolCallTextFails(t *testing.T) {
 	node := &TaskGraphNode{
 		ID:            "answer",

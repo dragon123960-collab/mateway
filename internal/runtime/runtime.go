@@ -952,6 +952,13 @@ func maxIterations(cfg *config.Root) int {
 	return cfg.Execution.MaxIterationsValue()
 }
 
+func plannerTimeout(cfg *config.Root) time.Duration {
+	if cfg == nil {
+		return time.Minute
+	}
+	return cfg.Execution.PlannerTimeoutDuration()
+}
+
 func inactivityTimeout(cfg *config.Root) time.Duration {
 	if cfg == nil {
 		return 5 * time.Minute
@@ -1170,16 +1177,10 @@ func shouldStartNewTaskInsteadOfSteering(state session.State, userText string) b
 	if active.Status != "await_user_input" || !looksLikeContinuationOffer(active.Summary) {
 		return false
 	}
-	lower := strings.ToLower(userText)
-	for _, marker := range []string{"yes", "y", "ok", "okay", "sure", "continue", "go ahead", "1", "2", "3", "4", "继续", "好的", "可以", "行"} {
-		if lower == marker {
-			return false
-		}
+	if isShortConfirmation(userText) || isResumeCommand(userText) {
+		return false
 	}
-	if strings.HasPrefix(lower, "now ") || strings.HasPrefix(lower, "new ") || strings.HasPrefix(lower, "另外") || strings.HasPrefix(lower, "还有") {
-		return true
-	}
-	return needsAction(userText) && len(strings.Fields(userText)) >= 4
+	return needsAction(userText) && len(meaningfulTokens(userText)) >= 2
 }
 
 func shouldBreakFailedTaskSteering(goal, userText string) bool {
@@ -1187,11 +1188,8 @@ func shouldBreakFailedTaskSteering(goal, userText string) bool {
 	if userText == "" {
 		return false
 	}
-	lower := strings.ToLower(userText)
-	for _, marker := range []string{"continue", "继续", "接着", "重试", "retry", "again", "再试"} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
+	if isResumeCommand(userText) {
+		return false
 	}
 	if !needsAction(userText) {
 		return false

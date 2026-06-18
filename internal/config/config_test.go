@@ -131,6 +131,12 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	if root.Execution.MaxIterationsValue() != 50 {
 		t.Fatalf("default max iterations = %d", root.Execution.MaxIterationsValue())
 	}
+	if root.Execution.PlannerTimeout != "60s" {
+		t.Fatalf("default planner timeout = %q", root.Execution.PlannerTimeout)
+	}
+	if root.Execution.PlannerTimeoutDuration() != time.Minute {
+		t.Fatalf("default planner timeout duration = %s", root.Execution.PlannerTimeoutDuration())
+	}
 	if root.Execution.InactivityTimeout != "5m" {
 		t.Fatalf("default inactivity timeout = %q", root.Execution.InactivityTimeout)
 	}

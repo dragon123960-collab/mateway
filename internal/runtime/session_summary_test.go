@@ -40,7 +40,7 @@ func TestUpdateSessionSummaryStoresTaskEvidenceAndContext(t *testing.T) {
 
 func TestAppendPreviousTaskContextIncludesSessionSummaryWithoutTasks(t *testing.T) {
 	state := session.State{Summary: session.SessionSummary{Text: "User prefers concise answers."}}
-	context := appendPreviousTaskContext("Base prompt", state, "task-current", "ok")
+	context := appendPreviousTaskContext("Base prompt", state, "task-current", "1")
 	if !strings.Contains(context, "Base prompt") || !strings.Contains(context, "Session summary:") || !strings.Contains(context, "User prefers concise answers.") {
 		t.Fatalf("unexpected context %q", context)
 	}

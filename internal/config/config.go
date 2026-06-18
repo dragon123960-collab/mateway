@@ -41,6 +41,7 @@ func DefaultRoot() Root {
 			MaxParallelTools:     4,
 			MaxParallelNodes:     1,
 			MaxIterations:        intPtr(50),
+			PlannerTimeout:       "60s",
 			InactivityTimeout:    "5m",
 			MaxContractFollowups: 4,
 			ModelVerifier:        "fallback",
@@ -348,6 +349,7 @@ type ExecutionConfig struct {
 	MaxParallelTools     int                 `yaml:"max_parallel_tools"`
 	MaxParallelNodes     int                 `yaml:"max_parallel_nodes"`
 	MaxIterations        *int                `yaml:"max_iterations"`
+	PlannerTimeout       string              `yaml:"planner_timeout"`
 	InactivityTimeout    string              `yaml:"inactivity_timeout"`
 	MaxContractFollowups int                 `yaml:"max_contract_followups"`
 	ModelVerifier        string              `yaml:"model_verifier"`
@@ -459,6 +461,14 @@ func (c ExecutionConfig) MaxParallelNodesValue() int {
 		return 1
 	}
 	return c.MaxParallelNodes
+}
+
+func (c ExecutionConfig) PlannerTimeoutDuration() time.Duration {
+	timeout, err := time.ParseDuration(strings.TrimSpace(c.PlannerTimeout))
+	if err != nil || timeout <= 0 {
+		return time.Minute
+	}
+	return timeout
 }
 
 func (c ExecutionConfig) InactivityTimeoutDuration() time.Duration {
@@ -840,6 +850,9 @@ func (r *Root) applyDefaults() {
 		r.Execution.MaxIterations = defaults.Execution.MaxIterations
 	} else if *r.Execution.MaxIterations < 0 {
 		r.Execution.MaxIterations = defaults.Execution.MaxIterations
+	}
+	if strings.TrimSpace(r.Execution.PlannerTimeout) == "" {
+		r.Execution.PlannerTimeout = defaults.Execution.PlannerTimeout
 	}
 	if strings.TrimSpace(r.Execution.InactivityTimeout) == "" {
 		r.Execution.InactivityTimeout = defaults.Execution.InactivityTimeout

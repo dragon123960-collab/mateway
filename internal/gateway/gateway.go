@@ -43,9 +43,10 @@ func Serve(ctx context.Context, cfg Config) error {
 }
 
 type channelRuntime struct {
-	Runtime runtime.Runtime
-	Dedupe  *inboundDedupe
-	Home    string
+	Runtime  runtime.Runtime
+	Dedupe   *inboundDedupe
+	Sessions *sessionRunner
+	Home     string
 }
 
 type channelStarter func(context.Context, channelRuntime) error
@@ -57,7 +58,7 @@ type channelSpec struct {
 }
 
 func enabledChannelStarters(ctx context.Context, cfg Config, dedupe *inboundDedupe) []func() error {
-	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe, Home: cfg.Config.App.Home}
+	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe, Sessions: newSessionRunner(), Home: cfg.Config.App.Home}
 	specs := builtinChannelSpecs(cfg)
 	starters := make([]func() error, 0, len(specs))
 	for _, spec := range specs {
@@ -116,7 +117,9 @@ func feishuChannelSpec(name string, channelCfg config.FeishuConfig) channelSpec 
 					return nil
 				}
 				msg = downloaded
-				go runFeishuMessage(rt.Runtime, sender, msg)
+				go rt.Sessions.Run(ctx, msg, func(runCtx context.Context) {
+					runFeishuMessage(runCtx, rt.Runtime, sender, msg)
+				})
 				return nil
 			})
 		},
@@ -132,7 +135,13 @@ func weixinChannelSpec(channelCfg config.WeixinConfig) channelSpec {
 				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
 					return channel.OutboundBatch{}, nil
 				}
-				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
+				var (
+					resp runtime.Response
+					err  error
+				)
+				rt.Sessions.Run(eventCtx, msg, func(runCtx context.Context) {
+					resp, err = runRuntimeMessage(runCtx, rt.Runtime, msg)
+				})
 				return channel.OutboundBatch{Reply: resp.Reply, FollowUps: resp.FollowUps}, err
 			})
 		},
@@ -310,10 +319,16 @@ func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.Inbo
 	return resp, nil
 }
 
-func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.InboundMessage) {
+func runFeishuMessage(ctx context.Context, rt runtime.Runtime, sender *feishu.Sender, msg channel.InboundMessage) {
 	start := time.Now()
 	runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			cancel()
+		}()
+	}
 	cardAction := isCardAction(msg)
 	if !cardAction {
 		react(runCtx, sender, msg.ID, "SMILE")
@@ -564,6 +579,44 @@ type inboundDedupe struct {
 	mu   sync.Mutex
 	ttl  time.Duration
 	seen map[string]time.Time
+}
+
+type sessionRunner struct {
+	mu       sync.Mutex
+	sessions map[string]chan struct{}
+}
+
+func newSessionRunner() *sessionRunner {
+	return &sessionRunner{sessions: map[string]chan struct{}{}}
+}
+
+func (r *sessionRunner) Run(ctx context.Context, msg channel.InboundMessage, fn func(context.Context)) {
+	if fn == nil {
+		return
+	}
+	lock := r.lockFor(msg.SessionKey)
+	select {
+	case lock <- struct{}{}:
+		defer func() { <-lock }()
+	case <-ctx.Done():
+		return
+	}
+	fn(ctx)
+}
+
+func (r *sessionRunner) lockFor(sessionKey string) chan struct{} {
+	key := strings.TrimSpace(sessionKey)
+	if key == "" {
+		key = "default"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock := r.sessions[key]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		r.sessions[key] = lock
+	}
+	return lock
 }
 
 func newInboundDedupe(ttl time.Duration) *inboundDedupe {

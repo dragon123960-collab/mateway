@@ -25,6 +25,7 @@ import (
 )
 
 const maxTUIEventLines = 2500
+const tuiSidebarCacheTTL = 500 * time.Millisecond
 
 type TUIOptions struct {
 	Config     *config.Root
@@ -100,6 +101,10 @@ type tuiModel struct {
 	historyIndex int
 	autoFollow   bool
 	newEvents    int
+
+	sidebarCache        string
+	sidebarCacheKey     string
+	sidebarCacheExpires time.Time
 }
 
 type tuiPicker struct {
@@ -673,6 +678,7 @@ func (m *tuiModel) acceptPicker() tea.Cmd {
 	switch kind {
 	case "sessions":
 		m.sessionKey = item.Value
+		m.invalidateSidebarCache()
 		m.addEvent("session: " + item.Value)
 	case "models":
 		m.switchTUIModel(item.Value)
@@ -774,6 +780,11 @@ func (m *tuiModel) sidebarView(height int) string {
 	if width == 0 {
 		return ""
 	}
+	cacheKey := m.sidebarViewCacheKey(width, height)
+	now := time.Now()
+	if m.sidebarCache != "" && m.sidebarCacheKey == cacheKey && now.Before(m.sidebarCacheExpires) {
+		return m.sidebarCache
+	}
 	state, _ := session.NewStore(m.cfg.App.Home).Load(m.sessionKey)
 	summary := m.sidebarSummary(state)
 	lines := []string{colorize("Mateway", ansiGreen, true), ""}
@@ -796,7 +807,33 @@ func (m *tuiModel) sidebarView(height int) string {
 	lines = appendSidebarSection(lines, "Task", summary.TaskLines...)
 	lines = appendSidebarSection(lines, "Tools", summary.ToolLines...)
 	lines = m.fitSidebarLines(lines, maxInt(1, height-2), maxInt(8, width-5))
-	return sidebarStyle(width, height).Render(strings.Join(lines, "\n"))
+	rendered := sidebarStyle(width, height).Render(strings.Join(lines, "\n"))
+	m.sidebarCache = rendered
+	m.sidebarCacheKey = cacheKey
+	m.sidebarCacheExpires = now.Add(tuiSidebarCacheTTL)
+	return rendered
+}
+
+func (m *tuiModel) sidebarViewCacheKey(width, height int) string {
+	return strings.Join([]string{
+		m.sessionKey,
+		fmt.Sprint(width),
+		fmt.Sprint(height),
+		fmt.Sprint(m.sidebarScroll),
+		fmt.Sprint(m.running),
+		m.status,
+		fmt.Sprint(m.progress),
+		fmt.Sprint(m.toolEvents),
+		m.lastTool,
+		m.lastToolState,
+		m.currentTask,
+	}, "\x00")
+}
+
+func (m *tuiModel) invalidateSidebarCache() {
+	m.sidebarCache = ""
+	m.sidebarCacheKey = ""
+	m.sidebarCacheExpires = time.Time{}
 }
 
 type tuiSidebarSummary struct {
@@ -829,8 +866,8 @@ func (m *tuiModel) sidebarSummary(state session.State) tuiSidebarSummary {
 	}
 	out.UsageLines = usageLines(usage)
 	if m.running {
-		if task, ok := selectedTask(state); ok && task.Graph != nil && len(task.Graph.Nodes) > 0 {
-			out.TaskLines = taskSidebarLines(task)
+		if task, ok := m.selectedRunningTask(state); ok && task.Graph != nil && len(task.Graph.Nodes) > 0 {
+			out.TaskLines = graphTaskSidebarLinesWithRequest(task, firstNonEmpty(task.Status, task.Execution.Status, "running"), m.currentTask)
 		} else {
 			out.TaskLines = m.liveGraphLines()
 		}
@@ -841,11 +878,35 @@ func (m *tuiModel) sidebarSummary(state session.State) tuiSidebarSummary {
 	return out
 }
 
+func (m *tuiModel) selectedRunningTask(state session.State) (session.TaskNode, bool) {
+	if strings.TrimSpace(state.ActiveTask) != "" {
+		for _, task := range state.Tasks {
+			if task.ID == state.ActiveTask {
+				return task, true
+			}
+		}
+	}
+	current := strings.TrimSpace(m.currentTask)
+	if current == "" {
+		return selectedTask(state)
+	}
+	for i := len(state.Tasks) - 1; i >= 0; i-- {
+		task := state.Tasks[i]
+		if !session.IsOpenTaskStatus(task.Status) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(task.Goal), current) {
+			return task, true
+		}
+	}
+	return session.TaskNode{}, false
+}
+
 func (m *tuiModel) liveGraphLines() []string {
 	lines := []string{"▾ TaskGraph planning", "[•] " + compactInline(firstNonEmpty(m.currentTask, "waiting for graph plan"), 84)}
 	lines = append(lines, "Runtime: "+m.runtimeStatus())
 	if strings.TrimSpace(m.currentTask) != "" {
-		lines = append(lines, "Goal: "+compactInline(m.currentTask, 84))
+		lines = append(lines, "Request: "+compactInline(m.currentTask, 84))
 	}
 	lines = append(lines, "Waiting for graph nodes")
 	return lines
@@ -1004,9 +1065,19 @@ func taskSidebarLines(task session.TaskNode) []string {
 }
 
 func graphTaskSidebarLines(task session.TaskNode, fallbackStatus string) []string {
+	return graphTaskSidebarLinesWithRequest(task, fallbackStatus, "")
+}
+
+func graphTaskSidebarLinesWithRequest(task session.TaskNode, fallbackStatus, request string) []string {
 	g := task.Graph
 	status := firstNonEmpty(g.Status, fallbackStatus, "latest")
 	lines := []string{"▾ TaskGraph " + status}
+	if strings.TrimSpace(request) != "" {
+		lines = append(lines, "Request: "+compactInline(request, 72))
+	}
+	if strings.TrimSpace(task.ID) != "" {
+		lines = append(lines, "Task ID: "+compactInline(task.ID, 72))
+	}
 	goal := compactInline(firstNonEmpty(task.Summary, task.Goal, task.ID), 72)
 	if goal != "" {
 		lines = append(lines, "Task: "+goal)
@@ -1016,13 +1087,47 @@ func graphTaskSidebarLines(task session.TaskNode, fallbackStatus string) []strin
 	}
 	lines = append(lines, graphNodeStatsLine(g))
 	lines = append(lines, graphFocusLines(g)...)
-	for _, node := range g.Nodes {
+	nodes, omitted := sidebarGraphNodes(g.Nodes, 8)
+	for _, node := range nodes {
 		lines = append(lines, graphNodeLine(node))
+	}
+	if omitted > 0 {
+		lines = append(lines, colorize(fmt.Sprintf("... %d more nodes", omitted), ansiDim, true))
 	}
 	if task.Execution.Contract != nil {
 		lines = append(lines, "Task acceptance: legacy contract stored")
 	}
 	return lines
+}
+
+func sidebarGraphNodes(nodes []session.TaskGraphNode, limit int) ([]session.TaskGraphNode, int) {
+	if limit <= 0 || len(nodes) <= limit {
+		return nodes, 0
+	}
+	selected := make([]session.TaskGraphNode, 0, limit)
+	seen := map[int]bool{}
+	add := func(i int) {
+		if i < 0 || i >= len(nodes) || seen[i] || len(selected) >= limit {
+			return
+		}
+		seen[i] = true
+		selected = append(selected, nodes[i])
+	}
+	for i, node := range nodes {
+		switch strings.ToLower(strings.TrimSpace(node.Status)) {
+		case session.NodeStatusRunning, session.NodeStatusVerifying, session.NodeStatusRetrying,
+			session.NodeStatusAwaitingInput, session.NodeStatusBlocked, session.NodeStatusFailed,
+			session.NodeStatusReady, session.NodeStatusNeedsReplan:
+			add(i)
+		}
+	}
+	for i := 0; i < len(nodes) && len(selected) < limit/2; i++ {
+		add(i)
+	}
+	for i := len(nodes) - 1; i >= 0 && len(selected) < limit; i-- {
+		add(i)
+	}
+	return selected, len(nodes) - len(selected)
 }
 
 func graphFocusLines(g *session.TaskGraph) []string {
@@ -1231,7 +1336,9 @@ func (m *tuiModel) fitSidebarLines(lines []string, maxLines, width int) []string
 		return nil
 	}
 	var wrapped []string
+	lineLimit := maxInt(120, width*3)
 	for _, line := range lines {
+		line = compactInline(line, lineLimit)
 		wrapped = append(wrapped, wrapLines(line, width)...)
 	}
 	if len(wrapped) <= maxLines {
@@ -1630,10 +1737,12 @@ func (m *tuiModel) submit() tea.Cmd {
 	m.toolEvents = 0
 	m.currentTask = text
 	m.liveSteps = nil
+	m.sidebarScroll = 0
+	m.invalidateSidebarCache()
 	m.addEvent(colorize("User", ansiCyan, true))
 	m.addEvent("│ " + compactBlock(text, 600))
 	m.addEvent("")
-	m.addEvent(colorize("• Thinking", ansiDim, true))
+	m.addEvent(colorize("• Working on task...", ansiDim, true))
 	return m.runTaskCmd(text)
 }
 
@@ -1794,7 +1903,7 @@ func (m *tuiModel) handleSlash(cmd SlashCommand) bool {
 		m.addEvent(colorize("User", ansiCyan, true))
 		m.addEvent("│ /new")
 		m.addEvent("")
-		m.addEvent(colorize("• Thinking", ansiDim, true))
+		m.addEvent(colorize("• Working on task...", ansiDim, true))
 		go m.runTask("/new")
 	case "session":
 		if len(cmd.Args) == 0 {
@@ -1805,6 +1914,7 @@ func (m *tuiModel) handleSlash(cmd SlashCommand) bool {
 		}
 		next := ResolveSessionKey(cmd.Args[0])
 		m.sessionKey = next
+		m.invalidateSidebarCache()
 		m.addEvent("session: " + next)
 	case "sessions":
 		if len(cmd.Args) == 0 {
@@ -2139,6 +2249,7 @@ func (m *tuiModel) resume(args []string) error {
 	source := ResolveSessionKey(values[0])
 	if attach {
 		m.sessionKey = source
+		m.invalidateSidebarCache()
 		m.addEvent("attached: " + source)
 		return nil
 	}
@@ -2252,13 +2363,31 @@ func wrapLines(text string, width int) []string {
 			continue
 		}
 		for visibleLen(line) > width && width > 0 {
-			head := truncateANSI(line, width)
+			head, rest := splitVisibleWidth(line, width)
+			if head == "" {
+				break
+			}
 			out = append(out, head)
-			line = strings.TrimPrefix(line, head)
+			line = rest
 		}
 		out = append(out, line)
 	}
 	return out
+}
+
+func splitVisibleWidth(text string, width int) (string, string) {
+	if width <= 0 {
+		return "", text
+	}
+	visible := 0
+	for i, r := range text {
+		w := runewidth.RuneWidth(r)
+		if visible+w > width {
+			return text[:i], text[i:]
+		}
+		visible += w
+	}
+	return text, ""
 }
 
 func truncateANSI(text string, width int) string {

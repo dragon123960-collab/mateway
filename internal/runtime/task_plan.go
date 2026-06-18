@@ -70,7 +70,7 @@ func latestOpenTask(state session.State) *session.TaskNode {
 
 func isShortConfirmation(text string) bool {
 	switch strings.ToLower(strings.TrimSpace(text)) {
-	case "1", "yes", "y", "ok", "okay", "go", "go ahead", "continue", "继续", "好", "可以", "执行":
+	case "1", "2", "3", "4":
 		return true
 	default:
 		return false
@@ -106,12 +106,13 @@ func looksLikeSameTaskFollowup(text string, task session.TaskNode) bool {
 
 func meaningfulTokens(text string) []string {
 	words := strings.FieldsFunc(text, func(r rune) bool {
-		return r == ' ' || r == ',' || r == '.' || r == ':' || r == ';' || r == '\n' || r == '\t'
+		return r == ' ' || r == ',' || r == '.' || r == ':' || r == ';' || r == '\n' || r == '\t' || r == '/' || r == '-' || r == '_'
 	})
 	stop := map[string]bool{
 		"the": true, "a": true, "an": true, "and": true, "or": true, "to": true, "it": true, "this": true,
 		"that": true, "please": true,
 		"list": true, "read": true, "file": true, "files": true, "every": true, "under": true,
+		"continue": true, "resume": true, "retry": true,
 	}
 	var out []string
 	for _, word := range words {

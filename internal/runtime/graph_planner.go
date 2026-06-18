@@ -91,7 +91,7 @@ func (rt Runtime) planTaskGraph(
 	}
 
 	prompt := renderGraphPlannerPrompt(task.Goal, userText, rt.Tools, skills)
-	g, err := planGraphWithModel(ctx, model, prompt, task.ID, trace)
+	g, err := planGraphWithModel(ctx, model, prompt, task.ID, plannerTimeout(rt.Config), trace)
 	if err != nil {
 		if trace != nil {
 			_ = trace.write(map[string]any{
@@ -118,18 +118,41 @@ func (rt Runtime) planTaskGraph(
 	return g, nil
 }
 
-func planGraphWithModel(ctx context.Context, model agentcore.Model, prompt, taskID string, trace *traceRecorder) (session.TaskGraph, error) {
-	graphCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+func planGraphWithModel(ctx context.Context, model agentcore.Model, prompt, taskID string, timeout time.Duration, trace *traceRecorder) (session.TaskGraph, error) {
+	graphCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":                   "model_call_start",
+			"model_stage":            "planner_legacy",
+			"task_id":                taskID,
+			"timeout_ms":             timeout.Milliseconds(),
+			"prompt_chars":           len(prompt),
+			"estimated_input_tokens": estimateModelInputTokens(graphPlannerSystemPrompt, []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}}, nil),
+		})
+	}
 	reply, err := model.Next(graphCtx, agentcore.Context{
 		SystemPrompt: graphPlannerSystemPrompt,
 		Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
 	})
 	if err != nil {
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":        "model_call_failed",
+				"model_stage": "planner_legacy",
+				"task_id":     taskID,
+				"error":       err.Error(),
+			})
+		}
 		return session.TaskGraph{}, err
 	}
 
 	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":        "model_call_end",
+			"model_stage": "planner_legacy",
+			"task_id":     taskID,
+		})
 		_ = trace.write(map[string]any{
 			"type":          "graph_planner_output",
 			"task_id":       taskID,
@@ -357,7 +380,7 @@ func (rt Runtime) planTaskGraphUnified(
 	}
 
 	prompt := renderUnifiedPlannerPrompt(task.Goal, userText, plannerContext, tools, skills)
-	plan, rawJSON, err := planWithUnifiedPlanner(ctx, model, prompt, task.ID, trace)
+	plan, rawJSON, err := planWithUnifiedPlanner(ctx, model, prompt, task.ID, plannerTimeout(rt.Config), trace)
 	if err != nil {
 		if trace != nil {
 			_ = trace.write(map[string]any{
@@ -397,14 +420,17 @@ func (rt Runtime) planTaskGraphUnified(
 	return plan, contract, nil
 }
 
-func planWithUnifiedPlanner(ctx context.Context, model agentcore.Model, prompt, taskID string, trace *traceRecorder) (TaskGraphPlan, string, error) {
-	graphCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+func planWithUnifiedPlanner(ctx context.Context, model agentcore.Model, prompt, taskID string, timeout time.Duration, trace *traceRecorder) (TaskGraphPlan, string, error) {
+	graphCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if trace != nil {
 		_ = trace.write(map[string]any{
-			"type":        "model_call_start",
-			"model_stage": "planner",
-			"task_id":     taskID,
+			"type":                   "model_call_start",
+			"model_stage":            "planner",
+			"task_id":                taskID,
+			"timeout_ms":             timeout.Milliseconds(),
+			"prompt_chars":           len(prompt),
+			"estimated_input_tokens": estimateModelInputTokens(unifiedPlannerSystemPrompt, []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}}, nil),
 		})
 	}
 	reply, err := model.Next(graphCtx, agentcore.Context{
