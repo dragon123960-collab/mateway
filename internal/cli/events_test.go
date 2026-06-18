@@ -75,6 +75,39 @@ func TestNDJSONEventWriterSeparatesToolArgsAndResultSummary(t *testing.T) {
 	}
 }
 
+func TestNDJSONEventWriterKeepsRuntimeProgressSeparateFromTools(t *testing.T) {
+	var out bytes.Buffer
+	writer := &NDJSONEventWriter{Out: &out}
+	writer.Progress(channel.OutboundMessage{Progress: []channel.ProgressStep{{
+		Title:   "Plan",
+		Status:  "running",
+		Summary: "preparing task graph",
+	}}})
+	writer.Progress(channel.OutboundMessage{Progress: []channel.ProgressStep{{
+		Title:   "Plan",
+		Status:  "completed",
+		Summary: "task graph ready",
+	}}})
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two events, got %q", out.String())
+	}
+	var running ProcessEvent
+	if err := json.Unmarshal([]byte(lines[0]), &running); err != nil {
+		t.Fatal(err)
+	}
+	if running.Type != "runtime.progress" || running.Title != "Plan" || running.Tool != "" {
+		t.Fatalf("unexpected runtime progress event: %#v", running)
+	}
+	var completed ProcessEvent
+	if err := json.Unmarshal([]byte(lines[1]), &completed); err != nil {
+		t.Fatal(err)
+	}
+	if completed.Type != "runtime.completed" || completed.Title != "Plan" || completed.Tool != "" {
+		t.Fatalf("unexpected runtime completed event: %#v", completed)
+	}
+}
+
 func TestRunAskRejectsConflictingOutputModes(t *testing.T) {
 	err := RunAsk(t.Context(), AskOptions{Quiet: true, JSON: true, Message: "hello"})
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {

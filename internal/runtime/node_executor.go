@@ -288,6 +288,11 @@ func (rt Runtime) executeReactNode(
 				"tool":      btc.ToolCall.Name,
 				"tool_args": redactPayload(cloneStringAnyMap(btc.ToolCall.Args)),
 			})
+			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
+				Tool:    btc.ToolCall.Name,
+				Status:  "running",
+				Summary: summarizeToolCall(btc.ToolCall),
+			})
 			return rt.applyBeforeToolCall(ctx, btc.Message, btc.ToolCall, btc.Tool, state, g.TaskID, trace)
 		},
 		AfterToolCall: func(_ context.Context, atc agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
@@ -305,6 +310,16 @@ func (rt Runtime) executeReactNode(
 				"tool":     atc.ToolCall.Name,
 				"is_error": atc.ToolResult.IsError,
 				"summary":  summarizeToolEvidence(atc.ToolResult),
+			})
+			status := "completed"
+			if atc.ToolResult.IsError {
+				status = "failed"
+			}
+			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
+				Tool:     atc.ToolCall.Name,
+				Status:   status,
+				Summary:  summarizeToolEvidence(atc.ToolResult),
+				TimedOut: toolResultTimedOut(atc.ToolResult),
 			})
 			return rt.applyAfterToolCall(ctx, atc.Message, atc.ToolCall, atc.Tool, atc.ToolResult, state, g.TaskID, trace), nil
 		},
@@ -674,16 +689,60 @@ func (rt Runtime) executeSkillNode(
 	skillType := meta.Graph.Type
 	skillType = strings.TrimSpace(strings.ToLower(skillType))
 
+	skillInstruction := buildSkillInstruction(string(data), meta)
 	switch skillType {
 	case "react":
-		return rt.executeSkillAsReact(ctx, msg, state, g, node, trace, model, string(data))
+		return rt.executeSkillAsReact(ctx, msg, state, g, node, trace, model, skillInstruction)
 	case "script":
 		node.SetBlocked(fmt.Sprintf("skill %q has graph.type=script; deterministic script execution is not implemented in Phase 03", skillName))
 		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	default:
-		return rt.executeSkillAsPrompt(ctx, msg, state, g, node, trace, model, string(data))
+		return rt.executeSkillAsPrompt(ctx, msg, state, g, node, trace, model, skillInstruction)
 	}
+}
+
+func buildSkillInstruction(skillBody string, meta graphSkillMeta) string {
+	var b strings.Builder
+	if strings.TrimSpace(meta.Graph.Usage) != "" || len(meta.Graph.Entrypoints) > 0 || len(meta.Graph.SuccessCriteria) > 0 || len(meta.Graph.AllowedTools) > 0 {
+		b.WriteString("--- Skill Metadata Contract ---\n")
+		if usage := strings.TrimSpace(meta.Graph.Usage); usage != "" {
+			b.WriteString("Usage: ")
+			b.WriteString(usage)
+			b.WriteString("\n")
+		}
+		if len(meta.Graph.AllowedTools) > 0 {
+			b.WriteString("Allowed tools: ")
+			b.WriteString(strings.Join(meta.Graph.AllowedTools, ", "))
+			b.WriteString("\n")
+		}
+		if len(meta.Graph.Entrypoints) > 0 {
+			b.WriteString("Entrypoints:\n")
+			for _, entrypoint := range meta.Graph.Entrypoints {
+				if strings.TrimSpace(entrypoint) == "" {
+					continue
+				}
+				b.WriteString("- ")
+				b.WriteString(strings.TrimSpace(entrypoint))
+				b.WriteString("\n")
+			}
+		}
+		if len(meta.Graph.SuccessCriteria) > 0 {
+			b.WriteString("Success criteria:\n")
+			for _, criterion := range meta.Graph.SuccessCriteria {
+				if strings.TrimSpace(criterion) == "" {
+					continue
+				}
+				b.WriteString("- ")
+				b.WriteString(strings.TrimSpace(criterion))
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("--- SKILL.md ---\n")
+	b.WriteString(skillBody)
+	return b.String()
 }
 
 func (rt Runtime) executeSkillAsPrompt(
@@ -755,6 +814,11 @@ func (rt Runtime) executeSkillAsReact(
 				"tool":      btc.ToolCall.Name,
 				"tool_args": redactPayload(cloneStringAnyMap(btc.ToolCall.Args)),
 			})
+			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
+				Tool:    btc.ToolCall.Name,
+				Status:  "running",
+				Summary: summarizeToolCall(btc.ToolCall),
+			})
 			return rt.applyBeforeToolCall(ctx, btc.Message, btc.ToolCall, btc.Tool, state, g.TaskID, trace)
 		},
 		AfterToolCall: func(_ context.Context, atc agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
@@ -772,6 +836,16 @@ func (rt Runtime) executeSkillAsReact(
 				"tool":     atc.ToolCall.Name,
 				"is_error": atc.ToolResult.IsError,
 				"summary":  summarizeToolEvidence(atc.ToolResult),
+			})
+			status := "completed"
+			if atc.ToolResult.IsError {
+				status = "failed"
+			}
+			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
+				Tool:     atc.ToolCall.Name,
+				Status:   status,
+				Summary:  summarizeToolEvidence(atc.ToolResult),
+				TimedOut: toolResultTimedOut(atc.ToolResult),
 			})
 			return rt.applyAfterToolCall(ctx, atc.Message, atc.ToolCall, atc.Tool, atc.ToolResult, state, g.TaskID, trace), nil
 		},
@@ -848,9 +922,12 @@ func findRegisteredSkill(cfg *config.Root, name string) (*discoveredSkill, error
 
 type graphSkillMeta struct {
 	Graph struct {
-		Granularity  string   `yaml:"granularity"`
-		Type         string   `yaml:"type"`
-		AllowedTools []string `yaml:"allowed_tools"`
+		Granularity     string   `yaml:"granularity"`
+		Type            string   `yaml:"type"`
+		AllowedTools    []string `yaml:"allowed_tools"`
+		Usage           string   `yaml:"usage"`
+		Entrypoints     []string `yaml:"entrypoints"`
+		SuccessCriteria []string `yaml:"success_criteria"`
 	} `yaml:"graph"`
 }
 
@@ -911,7 +988,9 @@ func (rt Runtime) executeHumanNode(
 	if question == "" {
 		question = "Please review and confirm."
 	}
-	question = strings.TrimSpace(question + "\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.")
+	if kind == session.PendingKindHumanConfirm {
+		question = appendHumanConfirmGuidance(question)
+	}
 
 	state.Pending = &session.PendingAction{
 		Kind:     kind,
@@ -1068,6 +1147,10 @@ func renderReferencedTaskContext(task session.TaskNode) string {
 		b.WriteString(summarize(summary))
 	}
 	if task.Graph != nil {
+		if final := finalTaskContextText(task.Graph); final != "" {
+			b.WriteString("\nFinal output: ")
+			b.WriteString(trimAndTruncateRunesWithSuffix(final, 2400))
+		}
 		count := 0
 		for _, node := range task.Graph.Nodes {
 			if node.Status != session.NodeStatusCompleted {
@@ -1101,6 +1184,16 @@ func renderReferencedTaskContext(task session.TaskNode) string {
 		return ""
 	}
 	return text
+}
+
+func finalTaskContextText(g *session.TaskGraph) string {
+	if g == nil {
+		return ""
+	}
+	if text := directSingleNodeResult(g); text != "" {
+		return text
+	}
+	return finalCompletedNodeResult(g)
 }
 
 func referencedNodeText(node session.TaskGraphNode) string {
@@ -1197,6 +1290,14 @@ func toolResultBlocked(result agentcore.ToolResult) bool {
 	return decision == "blocked"
 }
 
+func toolResultTimedOut(result agentcore.ToolResult) bool {
+	if result.Evidence == nil {
+		return false
+	}
+	timedOut, _ := result.Evidence["timed_out"].(bool)
+	return timedOut
+}
+
 func cloneStringAnyMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
@@ -1238,7 +1339,7 @@ func (rt Runtime) verifyAndTraceNode(ctx context.Context, g *session.TaskGraph, 
 		})
 	}
 
-	if result.Status == session.VerificationNeedsInput && !isHumanNode(node) {
+	if result.Status == session.VerificationNeedsInput && !isHumanNode(node) && result.Confidence != "hard" {
 		result.Status = session.VerificationBlocked
 		result.Reason = "model verifier requested input, but only human nodes can await input; blocked instead"
 		result.Confidence = "low"

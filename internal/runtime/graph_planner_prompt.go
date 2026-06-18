@@ -294,6 +294,18 @@ func renderUnifiedPlannerPrompt(goal, userText, plannerContext string, tools *ag
 				b.WriteString("\n  allowed_tools: ")
 				b.WriteString(strings.Join(skill.AllowedTools, ", "))
 			}
+			if strings.TrimSpace(skill.Usage) != "" {
+				b.WriteString("\n  usage: ")
+				b.WriteString(strings.TrimSpace(skill.Usage))
+			}
+			if len(skill.Entrypoints) > 0 {
+				b.WriteString("\n  entrypoints: ")
+				b.WriteString(strings.Join(skill.Entrypoints, " | "))
+			}
+			if len(skill.Success) > 0 {
+				b.WriteString("\n  success_criteria: ")
+				b.WriteString(strings.Join(skill.Success, " | "))
+			}
 			b.WriteString("\n  path: ")
 			b.WriteString(skill.Path)
 			if hint := executionHint(skill); hint != "" {

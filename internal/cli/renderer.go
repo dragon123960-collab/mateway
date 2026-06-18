@@ -132,7 +132,11 @@ func processEventLabelAndDetail(event ProcessEvent) (string, string) {
 	case "tool.blocked":
 		return "✕", friendlyToolName(tool) + suffixSummary(summary)
 	case "runtime.completed":
-		return "", ""
+		return "✓", compactInline(firstNonEmpty(event.Title, "Runtime"), 72) + suffixSummary(summary)
+	case "runtime.progress":
+		return "→", compactInline(firstNonEmpty(event.Title, "Runtime"), 72) + suffixSummary(firstNonEmpty(args, summary))
+	case "runtime.blocked":
+		return "✕", compactInline(firstNonEmpty(event.Title, "Runtime"), 72) + suffixSummary(summary)
 	case "gateway.completed":
 		return "", ""
 	default:

@@ -134,6 +134,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "effective_text": userText})
 	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})
 
+	rt.emitProgressStep(msg, state, task.ID, channel.ProgressStep{
+		Title:   "Plan",
+		Status:  "running",
+		Summary: "preparing task graph",
+	})
 	if err := rt.ensureGraphForTask(ctx, msg, &state, task, userText, trace); err != nil {
 		if isTransientBootstrapError(err) {
 			state.AwaitUserInputActiveTaskWithSummary(friendlyRuntimeError(rt.Config, msg, err), trace.id, trace.path)
@@ -159,6 +164,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 		return resp, nil
 	}
+	rt.emitProgressStep(msg, state, task.ID, channel.ProgressStep{
+		Title:   "Plan",
+		Status:  "completed",
+		Summary: "task graph ready",
+	})
 
 	return rt.runGraphTask(ctx, msg, &state, task, userText, trace)
 }
@@ -282,6 +292,11 @@ func (rt Runtime) runGraphTask(
 			})
 
 			startNodeAttempt(trace, g, node)
+			rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
+				Title:   firstNonEmpty(node.Goal, node.ID),
+				Status:  "running",
+				Summary: "node " + node.ID,
+			})
 		}
 
 		if err := rt.saveState(state, trace); err != nil {
@@ -303,6 +318,11 @@ func (rt Runtime) runGraphTask(
 					"type":           "node_completed",
 					"status":         node.Status,
 					"result_summary": node.ResultSummary,
+				})
+				rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
+					Title:   firstNonEmpty(node.Goal, node.ID),
+					Status:  "completed",
+					Summary: "node " + node.ID,
 				})
 			}
 			if node.Status == session.NodeStatusRetrying {

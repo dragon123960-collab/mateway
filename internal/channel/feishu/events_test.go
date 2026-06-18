@@ -139,6 +139,24 @@ func TestRenderReplyMessageUsesEnglishRuntimeText(t *testing.T) {
 	}
 }
 
+func TestRenderReplyMessageUsesConfirmationFooter(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "input_required",
+		Text:     "Approve publish.\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "Mateway Needs Confirmation") || !strings.Contains(content, "Reply with 1 to confirm and continue, or 2 to cancel.") {
+		t.Fatalf("expected confirmation card, got %s", content)
+	}
+	if strings.Contains(content, "missing information") {
+		t.Fatalf("confirmation card should not ask for missing information, got %s", content)
+	}
+}
+
 func TestNormalizeCardActionMapsToConfirmMessage(t *testing.T) {
 	openMessageID := "om_card"
 	openChatID := "oc_card"

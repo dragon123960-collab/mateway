@@ -205,6 +205,9 @@ func feishuCardTitle(reply channel.OutboundMessage) string {
 	}
 	switch reply.Style {
 	case channel.StyleInputRequired:
+		if isConfirmationInputRequired(reply) {
+			return "Mateway Needs Confirmation"
+		}
 		return "Mateway Needs More Information"
 	case channel.StyleError:
 		return "Mateway Failed"
@@ -218,6 +221,9 @@ func cardFooterNote(reply channel.OutboundMessage) string {
 	case channel.StylePartial:
 		return "Status: partial"
 	case channel.StyleInputRequired:
+		if isConfirmationInputRequired(reply) {
+			return "Reply with 1 to confirm and continue, or 2 to cancel."
+		}
 		return "Please reply directly with the missing information."
 	case channel.StyleError:
 		return "The task stopped at a safe point. You can add more information and retry."
@@ -226,6 +232,11 @@ func cardFooterNote(reply channel.OutboundMessage) string {
 	default:
 		return "Status: " + firstNonEmpty(strings.TrimSpace(string(reply.Style)), string(channel.StyleCompleted))
 	}
+}
+
+func isConfirmationInputRequired(reply channel.OutboundMessage) bool {
+	text := strings.ToLower(strings.TrimSpace(reply.Text))
+	return strings.Contains(text, "reply 1 to confirm") && strings.Contains(text, "2 to cancel")
 }
 
 func sanitizeFeishuText(reply channel.OutboundMessage) string {

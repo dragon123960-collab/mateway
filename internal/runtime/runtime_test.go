@@ -134,6 +134,30 @@ func TestRuntimeSystemContextAddsTriggeredSectionsAndSelectedSkills(t *testing.T
 	}
 }
 
+func TestRuntimeSystemContextAddsLocalTonightFreshnessPolicy(t *testing.T) {
+	cfg := config.DefaultRoot()
+	cfg.Scheduler.Timezone = "Asia/Shanghai"
+	contract := session.TaskContract{
+		Summary:       "find tonight's games",
+		RequiresTools: true,
+		RequiredEvidence: []session.TaskEvidenceContract{{
+			Kind:        "current_external_fact",
+			Tool:        "web.search",
+			Description: "current schedule",
+		}},
+	}
+	text := buildRuntimeSystemContextForTask(&cfg, config.AgentProfileConfig{}, "what games are tonight", contract)
+	for _, want := range []string{
+		"Asia/Shanghai",
+		"local evening-to-late-night window",
+		"do not include events that already happened earlier this morning",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in runtime context, got:\n%s", want, text)
+		}
+	}
+}
+
 func TestRuntimeNewArchivesAndClearsSession(t *testing.T) {
 	rt := newTestRuntime(t)
 	state := session.State{Key: "cli:test"}
@@ -333,6 +357,9 @@ func TestRuntimeHandle_CompletedTaskReferenceInjectsGraphContext(t *testing.T) {
 	}
 	if !strings.Contains(model.secondNodeContext, "[referenced_task_context]") || !strings.Contains(model.secondNodeContext, "调度 TaskGraph") {
 		t.Fatalf("second node did not receive referenced task context:\n%s", model.secondNodeContext)
+	}
+	if !strings.Contains(model.secondNodeContext, "Final output:") {
+		t.Fatalf("second node should receive final output context:\n%s", model.secondNodeContext)
 	}
 	state := loadState(t, rt, "cli:completed-ref")
 	if len(state.Tasks) < 2 {
@@ -586,6 +613,59 @@ func TestRuntimeProgressSinkDoesNotEmitFinalTextAsModelProgress(t *testing.T) {
 		if strings.Contains(step.Summary, "final answer should not be progress") {
 			t.Fatalf("final text leaked into progress: %#v", updates)
 		}
+	}
+}
+
+func TestRuntimeProgressSinkEmitsGraphNodeAndToolProgress(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"collect facts",
+		"answer with facts",
+		[]string{"web.search"},
+		nil,
+		`{"id":"search","type":"subtask","mode":"react","goal":"Collect current facts","acceptance":"search completed","allowed_tools":["web.search"]}`,
+	), text: "final answer"}
+	registry := agentcore.NewToolRegistry()
+	registry.Register(runtimeNamedTool{name: "web.search", content: "result"})
+	rt.Tools = registry
+	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
+		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{
+			ID:   "call_1",
+			Name: "web.search",
+			Args: map[string]any{"query": "current facts"},
+		}}},
+		{Role: agentcore.RoleAssistant, Content: "facts collected"},
+	}}, rt.Tools)
+
+	var updates []channel.OutboundMessage
+	rt.ProgressSink = func(msg channel.OutboundMessage) {
+		updates = append(updates, msg)
+	}
+	if _, err := rt.Handle(context.Background(), inbound("cli:test", "collect facts")); err != nil {
+		t.Fatal(err)
+	}
+	var sawPlanRunning, sawPlanDone, sawNodeRunning, sawNodeDone, sawToolRunning, sawToolDone bool
+	for _, update := range updates {
+		for _, step := range update.Progress {
+			switch {
+			case step.Title == "Plan" && step.Status == "running":
+				sawPlanRunning = true
+			case step.Title == "Plan" && step.Status == "completed":
+				sawPlanDone = true
+			case step.Title == "Collect current facts" && step.Status == "running":
+				sawNodeRunning = true
+			case step.Title == "Collect current facts" && step.Status == "completed":
+				sawNodeDone = true
+			case step.Tool == "web.search" && step.Status == "running":
+				sawToolRunning = true
+			case step.Tool == "web.search" && step.Status == "completed":
+				sawToolDone = true
+			}
+		}
+	}
+	if !sawPlanRunning || !sawPlanDone || !sawNodeRunning || !sawNodeDone || !sawToolRunning || !sawToolDone {
+		t.Fatalf("missing progress updates planRunning=%v planDone=%v nodeRunning=%v nodeDone=%v toolRunning=%v toolDone=%v updates=%#v",
+			sawPlanRunning, sawPlanDone, sawNodeRunning, sawNodeDone, sawToolRunning, sawToolDone, updates)
 	}
 }
 

@@ -26,6 +26,10 @@ func (rt Runtime) emitProgress(msg channel.InboundMessage, state session.State, 
 	})
 }
 
+func (rt Runtime) emitProgressStep(msg channel.InboundMessage, state session.State, taskID string, step channel.ProgressStep) {
+	rt.emitProgress(msg, state, taskID, 0, step)
+}
+
 func summarizeToolCall(call agentcore.ToolCall) string {
 	switch call.Name {
 	case "terminal.run":

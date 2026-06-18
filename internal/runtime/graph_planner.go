@@ -536,6 +536,17 @@ func convertTaskGraphPlanWithSkills(plan TaskGraphPlan, taskID string, skills []
 					allowedTools = append([]string(nil), discovered.AllowedTools...)
 				}
 			}
+			if discovered, ok := skillByName[strings.ToLower(skill)]; ok {
+				if strings.TrimSpace(discovered.Usage) != "" {
+					nodeInput["skill_usage"] = discovered.Usage
+				}
+				if len(discovered.Entrypoints) > 0 {
+					nodeInput["skill_entrypoints"] = append([]string(nil), discovered.Entrypoints...)
+				}
+				if len(discovered.Success) > 0 {
+					nodeInput["skill_success_criteria"] = append([]string(nil), discovered.Success...)
+				}
+			}
 		}
 		if risk := strings.TrimSpace(pn.Risk); risk != "" {
 			if nodeInput == nil {

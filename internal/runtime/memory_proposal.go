@@ -176,6 +176,29 @@ func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.Inbo
 	}
 
 	userResponse := strings.TrimSpace(msg.Text)
+	if kind == session.PendingKindHumanReview {
+		_ = trace.write(map[string]any{
+			"type":          "graph_human_pending_resolved",
+			"graph_id":      task.Graph.ID,
+			"node_id":       nodeID,
+			"kind":          kind,
+			"command":       "answer",
+			"confirmed":     true,
+			"user_response": userResponse,
+		})
+		node.Status = session.NodeStatusCompleted
+		node.ResultSummary = userResponse
+		node.Output = map[string]any{"text": userResponse}
+		node.Acceptance.Verified = true
+		node.VerifiedAt = time.Now()
+		node.UpdatedAt = time.Now()
+		state.Pending = nil
+		if err := rt.saveState(state, trace); err != nil {
+			return Response{}, true, err
+		}
+		return Response{}, false, nil
+	}
+
 	action, ok := parseNumericHumanPendingAction(userResponse)
 	if !ok {
 		_ = trace.write(map[string]any{
@@ -186,7 +209,11 @@ func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.Inbo
 			"pending_kind":  kind,
 			"user_response": userResponse,
 		})
-		resp := rt.reply(msg, "Please reply with 1 to confirm and continue, or 2 to cancel and block this task.", channel.StyleInputRequired)
+		replyText := strings.TrimSpace(state.Pending.Question)
+		if replyText == "" {
+			replyText = "Please reply with 1 to confirm and continue, or 2 to cancel and block this task."
+		}
+		resp := rt.reply(msg, replyText, channel.StyleInputRequired)
 		resp.TraceID = traceID(trace)
 		resp.TracePath = tracePath(trace)
 		return resp, true, nil
@@ -204,10 +231,23 @@ func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.Inbo
 	})
 
 	if isConfirm {
-		node.Status = session.NodeStatusCompleted
-		node.ResultSummary = userResponse
-		node.Acceptance.Verified = true
-		node.VerifiedAt = time.Now()
+		if node.Type == session.NodeTypeHumanConfirm {
+			node.Status = session.NodeStatusCompleted
+			node.ResultSummary = userResponse
+			node.Acceptance.Verified = true
+			node.VerifiedAt = time.Now()
+		} else {
+			node.Status = session.NodeStatusPending
+			node.Acceptance.Verified = false
+			node.Acceptance.Reason = ""
+			node.FailureReason = ""
+			if node.Input == nil {
+				node.Input = map[string]any{}
+			}
+			node.Input["user_confirmed"] = true
+			node.Input["confirmation_response"] = userResponse
+			node.Input["confirmation_instruction"] = "User confirmed this mutation. Execute the real action now; do not dry-run or ask for confirmation again."
+		}
 	} else {
 		node.Status = session.NodeStatusBlocked
 		node.FailureReason = userResponse
@@ -223,7 +263,24 @@ func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.Inbo
 }
 
 func parseNumericHumanPendingAction(text string) (string, bool) {
-	switch strings.TrimSpace(text) {
+	trimmed := strings.TrimSpace(text)
+	switch trimmed {
+	case "1":
+		return "confirm", true
+	case "2":
+		return "cancel", true
+	}
+	digit := ""
+	for _, r := range trimmed {
+		if r != '1' && r != '2' {
+			continue
+		}
+		if digit != "" {
+			return "", false
+		}
+		digit = string(r)
+	}
+	switch digit {
 	case "1":
 		return "confirm", true
 	case "2":

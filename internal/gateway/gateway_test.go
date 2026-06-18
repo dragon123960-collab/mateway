@@ -229,7 +229,7 @@ func TestFeishuProgressTextIncludesSteps(t *testing.T) {
 			{Tool: "web.search", Status: "running", Summary: "北京天气"},
 		},
 	})
-	if !strings.Contains(text, "web.search: call") || !strings.Contains(text, "北京天气") {
+	if !strings.Contains(text, "→ Search: running") || !strings.Contains(text, "北京天气") {
 		t.Fatalf("unexpected progress text %q", text)
 	}
 }
@@ -242,7 +242,22 @@ func TestFeishuProgressTextShowsToolResultOutcome(t *testing.T) {
 			{Tool: "file.write", Status: "failed", Summary: "permission denied"},
 		},
 	})
-	for _, want := range []string{"terminal.run: success / tests passed", "file.write: failed / permission denied"} {
+	for _, want := range []string{"✓ Run: done / tests passed", "✕ Write: blocked / permission denied"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestFeishuProgressTextShowsRuntimeSteps(t *testing.T) {
+	text := feishuProgressText(channel.OutboundMessage{
+		Text: "Processing...",
+		Progress: []channel.ProgressStep{
+			{Title: "Plan", Status: "running", Summary: "preparing task graph"},
+			{Title: "Collect current facts", Status: "completed", Summary: "node search"},
+		},
+	})
+	for _, want := range []string{"→ Plan: running / preparing task graph", "✓ Collect current facts: done / node search"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in %q", want, text)
 		}
@@ -303,6 +318,36 @@ func TestShouldSendProcessingAckAllowsTaskPlanExecute(t *testing.T) {
 	}
 	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "2"}) {
 		t.Fatal("expected replan control to skip processing ack")
+	}
+}
+
+func TestShouldSendProcessingAckAllowsHumanPendingResume(t *testing.T) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := state.StartTask("review missing info")
+	state.Pending = &session.PendingAction{Kind: session.PendingKindHumanReview, TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "title and content"}) {
+		t.Fatal("expected human review answer to send processing ack")
+	}
+
+	state.Pending = &session.PendingAction{Kind: session.PendingKindHumanConfirm, TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认1"}) {
+		t.Fatal("expected human confirm approval to send processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认12"}) {
+		t.Fatal("expected ambiguous human confirm reply to skip processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "title and content"}) {
+		t.Fatal("expected non-numeric human confirm context update to skip processing ack")
 	}
 }
 

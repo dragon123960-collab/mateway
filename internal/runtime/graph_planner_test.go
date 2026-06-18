@@ -1470,6 +1470,37 @@ func TestRenderUnifiedPlannerPrompt_IncludesPlannerContext(t *testing.T) {
 	}
 }
 
+func TestRenderUnifiedPlannerPrompt_IncludesSkillExecutionMetadata(t *testing.T) {
+	rt := newTestRuntime(t)
+	skills := []discoveredSkill{{
+		Name:         "feishu-notify",
+		Description:  "Create Feishu documents.",
+		Stage:        "execution",
+		GraphType:    "react",
+		Granularity:  "subtask",
+		AllowedTools: []string{"terminal.run"},
+		Inputs:       []string{"title", "markdown_file"},
+		Outputs:      []string{"document_url"},
+		Usage:        "Use terminal.run with the helper wrapper and return the created URL.",
+		Entrypoints:  []string{"python3 /skill/scripts/feishu.docs.create --title <title>"},
+		Success:      []string{"Return the created document URL."},
+		Path:         "/tmp/skills/feishu-notify/SKILL.md",
+	}}
+	prompt := renderUnifiedPlannerPrompt("publish document", "", "", rt.Tools, skills)
+	for _, want := range []string{
+		"name: feishu-notify",
+		"type: react",
+		"allowed_tools: terminal.run",
+		"usage: Use terminal.run with the helper wrapper",
+		"entrypoints: python3 /skill/scripts/feishu.docs.create",
+		"success_criteria: Return the created document URL.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestPlanWithUnifiedPlanner_SimpleQA(t *testing.T) {
 	json := `{
 		"task": {

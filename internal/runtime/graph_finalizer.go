@@ -351,11 +351,9 @@ func ensurePendingForGraph(state *session.State, g *session.TaskGraph) {
 	kind := session.PendingKindHumanReview
 	if awaitingNode != nil {
 		question = strings.TrimSpace(firstNonEmpty(awaitingNode.Acceptance.Criteria, awaitingNode.Goal, question))
-		if awaitingNode.Type == session.NodeTypeHumanConfirm || awaitingNode.Type == session.NodeTypeHumanReview {
-			question = strings.TrimSpace(question + "\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.")
-		}
-		if awaitingNode.Type == session.NodeTypeHumanConfirm {
+		if awaitingNode.Type == session.NodeTypeHumanConfirm || awaitingNodeHasConfirmationGate(*awaitingNode) {
 			kind = session.PendingKindHumanConfirm
+			question = appendHumanConfirmGuidance(question)
 		}
 	}
 
@@ -366,6 +364,19 @@ func ensurePendingForGraph(state *session.State, g *session.TaskGraph) {
 		NodeID:   nodeID(awaitingNode),
 		Question: question,
 	}
+}
+
+func appendHumanConfirmGuidance(question string) string {
+	return strings.TrimSpace(strings.TrimSpace(question) + "\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.")
+}
+
+func awaitingNodeHasConfirmationGate(node session.TaskGraphNode) bool {
+	value, ok := node.Input["requires_human_confirmation"]
+	if !ok {
+		return false
+	}
+	confirmed, ok := value.(bool)
+	return ok && confirmed
 }
 
 func nodeID(node *session.TaskGraphNode) string {

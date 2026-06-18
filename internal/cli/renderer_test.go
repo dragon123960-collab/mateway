@@ -41,6 +41,17 @@ func TestRenderProcessEventShowsToolOutcome(t *testing.T) {
 	}
 }
 
+func TestRenderProcessEventShowsRuntimeProgress(t *testing.T) {
+	line := renderProcessEvent(ProcessEvent{Type: "runtime.progress", Title: "Plan", Summary: "preparing task graph"}, false)
+	if !strings.Contains(line, "→ Plan") || !strings.Contains(line, "preparing task graph") || strings.Contains(line, "Tool") {
+		t.Fatalf("unexpected line: %q", line)
+	}
+	done := renderProcessEvent(ProcessEvent{Type: "runtime.completed", Title: "Plan", Summary: "task graph ready"}, false)
+	if !strings.Contains(done, "✓ Plan") || !strings.Contains(done, "task graph ready") {
+		t.Fatalf("unexpected line: %q", done)
+	}
+}
+
 func TestRenderProcessEventHidesReadResultSummary(t *testing.T) {
 	line := renderProcessEvent(ProcessEvent{Type: "tool.completed", Tool: "file.read", Summary: "# README", DurationMS: 12}, false)
 	if line != "✓ Read (12ms)" {

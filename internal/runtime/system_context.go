@@ -57,6 +57,7 @@ func buildRuntimeSystemContextForTask(cfg *config.Root, profile config.AgentProf
 		b.WriteString("\nTask freshness policy:\n")
 		b.WriteString("- Use web.search or web.fetch for weather, news, prices, schedules, software versions, laws, APIs, or anything likely to have changed.\n")
 		b.WriteString("- When building search queries for today/current/latest tasks, use the current date above exactly; do not silently substitute an older year.\n")
+		b.WriteString("- Interpret relative time phrases in the user's configured timezone above. For tonight/evening, use the local evening-to-late-night window for the current date; do not include events that already happened earlier this morning unless the user asks for today's full schedule or completed results.\n")
 		b.WriteString("- Do not present stale dated search results as current. Prefer official and primary sources when available.\n")
 	}
 	if needsMatewaySelfKnowledgeContext(userText) {
