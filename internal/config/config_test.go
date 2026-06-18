@@ -125,6 +125,9 @@ func TestExecutionConfigDefaults(t *testing.T) {
 	if root.Execution.MaxParallelTools != 4 {
 		t.Fatalf("default max parallel tools = %d", root.Execution.MaxParallelTools)
 	}
+	if root.Execution.MaxParallelNodes != 1 || root.Execution.MaxParallelNodesValue() != 1 {
+		t.Fatalf("default max parallel nodes = %d", root.Execution.MaxParallelNodes)
+	}
 	if root.Execution.MaxIterationsValue() != 50 {
 		t.Fatalf("default max iterations = %d", root.Execution.MaxIterationsValue())
 	}
@@ -141,10 +144,18 @@ func TestExecutionConfigDefaults(t *testing.T) {
 		t.Fatalf("unexpected context budget defaults: %#v", root.Execution.ContextBudget)
 	}
 	zero := 0
-	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1}}
+	root = Root{Execution: ExecutionConfig{MaxParallelTools: 1, MaxParallelNodes: 3}}
 	root.NormalizeForUse()
 	if root.Execution.MaxParallelTools != 1 {
 		t.Fatalf("configured max parallel tools = %d", root.Execution.MaxParallelTools)
+	}
+	if root.Execution.MaxParallelNodes != 3 || root.Execution.MaxParallelNodesValue() != 3 {
+		t.Fatalf("configured max parallel nodes = %d", root.Execution.MaxParallelNodes)
+	}
+	root = Root{Execution: ExecutionConfig{MaxParallelNodes: -2}}
+	root.NormalizeForUse()
+	if root.Execution.MaxParallelNodes != 1 || root.Execution.MaxParallelNodesValue() != 1 {
+		t.Fatalf("invalid max parallel nodes should default to 1, got %d", root.Execution.MaxParallelNodes)
 	}
 	root = Root{Execution: ExecutionConfig{MaxIterations: &zero}}
 	root.NormalizeForUse()
@@ -288,6 +299,17 @@ func TestEnsureDefaultConfigFilesSeedsEditableDefaultSkills(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected default skill %s to exist: %v", path, err)
 		}
+		metadataPath := filepath.Join(home, "workspace", "skills", name, ".mateway", "metadata.yaml")
+		data, err := os.ReadFile(metadataPath)
+		if err != nil {
+			t.Fatalf("expected default skill metadata %s to exist: %v", metadataPath, err)
+		}
+		if !strings.Contains(string(data), `adapter_version: "2"`) || !strings.Contains(string(data), `granularity: "subtask"`) {
+			t.Fatalf("unexpected default skill metadata for %s:\n%s", name, data)
+		}
+		if name == "fresh-search" && (!strings.Contains(string(data), `type: "react"`) || !strings.Contains(string(data), `web.search`) || !strings.Contains(string(data), `web.fetch`)) {
+			t.Fatalf("fresh-search metadata should allow web react execution:\n%s", data)
+		}
 	}
 	defaultAgentSkill := filepath.Join(home, "workspace", "agents", "main", "skills", "fresh-search", "SKILL.md")
 	if _, err := os.Stat(defaultAgentSkill); err == nil {
@@ -374,6 +396,36 @@ func TestEnsureDefaultConfigFilesUsesCustomAssetsDir(t *testing.T) {
 	}
 	if string(data) != "# Custom Init Assets\n" {
 		t.Fatalf("expected custom asset content, got %q", string(data))
+	}
+}
+
+func TestEnsureDefaultConfigFilesFallsBackToEmbeddedAssets(t *testing.T) {
+	home := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
+
+	if err := EnsureDefaultConfigFiles(home); err != nil {
+		t.Fatalf("ensure default config files from embedded assets: %v", err)
+	}
+	for _, rel := range []string{
+		filepath.Join("config", "config.yaml"),
+		filepath.Join("workspace", "skills", "fresh-search", "SKILL.md"),
+		filepath.Join("workspace", "skills", "fresh-search", ".mateway", "metadata.yaml"),
+		filepath.Join("workspace", "memory", "README.md"),
+	} {
+		if _, err := os.Stat(filepath.Join(home, rel)); err != nil {
+			t.Fatalf("expected embedded init file %s: %v", rel, err)
+		}
 	}
 }
 

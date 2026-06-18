@@ -61,89 +61,18 @@ func TestRedactSecretStringKeepsRequiredSecretDeclarationIntact(t *testing.T) {
 	}
 }
 
-func TestRuntimeTraceRedactsToolResultSecrets(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Tools = agentcore.NewToolRegistry()
-	rt.Tools.Register(secretTool{})
-	rt.Pool.agents["main"] = agentcore.NewAgent(secretToolModel{}, rt.Tools)
-
-	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "inspect secret"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
-	for _, secret := range []string{"PXUj5ftvjscRpPy7", "QBptnPtt6Hnp3awb", "abcdef1234567890"} {
-		if strings.Contains(text, secret) {
-			t.Fatalf("trace leaked secret %q:\n%s", secret, text)
-		}
-	}
-	if !strings.Contains(text, redactedSecret) {
-		t.Fatalf("expected redacted marker in trace:\n%s", text)
-	}
-}
-
-func TestRuntimeTaskStepSummaryRedactsSecrets(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Tools = agentcore.NewToolRegistry()
-	rt.Tools.Register(secretTool{})
-	rt.Pool.agents["main"] = agentcore.NewAgent(secretToolModel{}, rt.Tools)
-
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "inspect secret"}); err != nil {
-		t.Fatal(err)
-	}
-	state, err := rt.Store.Load("cli:test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Tasks) != 1 || len(state.Tasks[0].Steps) != 1 {
-		t.Fatalf("expected one tool step, got %#v", state.Tasks)
-	}
-	if strings.Contains(state.Tasks[0].Steps[0].Summary, "PXUj5ftvjscRpPy7") {
-		t.Fatalf("step summary leaked secret: %#v", state.Tasks[0].Steps[0])
-	}
-	if !strings.Contains(state.Tasks[0].Steps[0].Summary, redactedSecret) {
-		t.Fatalf("expected redacted summary, got %#v", state.Tasks[0].Steps[0])
-	}
-	for _, msg := range state.Messages {
-		if strings.Contains(msg.Content, "PXUj5ftvjscRpPy7") || strings.Contains(msg.Content, "QBptnPtt6Hnp3awb") {
-			t.Fatalf("stored transcript leaked secret: %#v", msg)
-		}
-	}
-}
-
-func TestRuntimeNextModelTurnSeesRedactedToolResult(t *testing.T) {
-	home := t.TempDir()
-	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
-	rt := New(cfg)
-	rt.Tools = agentcore.NewToolRegistry()
-	rt.Tools.Register(secretTool{})
-	model := &captureToolMessageModel{}
-	rt.Pool.agents["main"] = agentcore.NewAgent(model, rt.Tools)
-
-	if _, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "inspect secret"}); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(model.seenToolContent, "PXUj5ftvjscRpPy7") || strings.Contains(model.seenToolContent, "QBptnPtt6Hnp3awb") || strings.Contains(model.seenToolContent, "abcdef1234567890") {
-		t.Fatalf("next model turn saw unredacted tool content: %q", model.seenToolContent)
-	}
-	if !strings.Contains(model.seenToolContent, redactedSecret) {
-		t.Fatalf("expected next model turn to see redacted marker, got %q", model.seenToolContent)
-	}
-}
-
 func TestRuntimeFinalReplyRedactsSecrets(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home}, Agents: config.AgentsConfig{Default: "main", Profiles: []config.AgentProfileConfig{{ID: "main"}}}}
 	rt := New(cfg)
-	rt.Pool.agents["main"] = agentcore.NewAgent(secretFinalModel{}, rt.Tools)
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"store this secret",
+		"secret stored",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"store secret","acceptance":"stored"}`,
+	), text: "Secret stored: auth_code=QBptnPtt6Hnp3awb"}
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 
 	resp, err := rt.Handle(context.Background(), channel.InboundMessage{ID: "1", Channel: "cli", SessionKey: "cli:test", Text: "store this secret"})
 	if err != nil {

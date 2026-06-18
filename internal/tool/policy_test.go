@@ -14,16 +14,36 @@ import (
 	"github.com/dongping/mateway/internal/secret"
 )
 
-func TestResolveAllowedPathDefaultsRelativeToHome(t *testing.T) {
+func TestResolveAllowedPathDefaultsRelativeToProjectRoot(t *testing.T) {
 	home := t.TempDir()
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
-	path, err := ResolveAllowedPath("notes/a.txt", cfg)
+	path, err := ResolveAllowedPath("internal/runtime/runtime.go", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(home, "notes", "a.txt")
+	root, ok := currentMatewayProjectRoot()
+	if !ok {
+		t.Fatal("expected current project root")
+	}
+	want := filepath.Join(root, "internal", "runtime", "runtime.go")
 	if path != want {
 		t.Fatalf("path = %q want %q", path, want)
+	}
+}
+
+func TestResolveAllowedPathAllowsCurrentProjectAbsolutePath(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	root, ok := currentMatewayProjectRoot()
+	if !ok {
+		t.Fatal("expected current project root")
+	}
+	path, err := ResolveAllowedPath(filepath.Join(root, "internal", "runtime", "runtime.go"), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(path, filepath.Join("internal", "runtime", "runtime.go")) {
+		t.Fatalf("path = %q", path)
 	}
 }
 
@@ -155,6 +175,25 @@ func TestTerminalPolicyAllowsMutationCommandsWithoutApproval(t *testing.T) {
 		decision := CheckTerminalCommand(command, cfg)
 		if !decision.Allow {
 			t.Fatalf("expected mutation command allowed without approval for %q, got %#v", command, decision)
+		}
+	}
+}
+
+func TestTerminalPolicyBlocksMutationPathsOutsideAllowedRoots(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: filepath.Join(home, "workspace")},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	for _, command := range []string{
+		"mkdir -p /tmp/mateway-smoke",
+		"chmod +x /tmp/mateway-smoke/hello.sh",
+		"cat > /tmp/mateway-smoke/hello.sh <<'EOF'\necho hi\nEOF",
+		"tee /tmp/mateway-smoke/hello.sh",
+	} {
+		decision := CheckTerminalCommand(command, cfg)
+		if decision.Allow || decision.Class != "path_policy" || !strings.Contains(decision.Reason, "outside allowed roots") {
+			t.Fatalf("expected path policy block for %q, got %#v", command, decision)
 		}
 	}
 }
@@ -456,6 +495,33 @@ func TestFileWriteAllowsRedactedContent(t *testing.T) {
 	}
 	if string(data) != content {
 		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestFileWriteEvidenceIncludesHashAndPreview(t *testing.T) {
+	home := t.TempDir()
+	cfg := &config.Root{App: config.AppConfig{Home: home}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
+	target := filepath.Join(home, "note.txt")
+	content := "hello task graph\n"
+	result := FileWriteTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "file.write",
+		Args: map[string]any{"path": target, "content": content},
+	})
+	if result.IsError {
+		t.Fatalf("expected file write success, got %#v", result)
+	}
+	if result.Evidence["path"] != target {
+		t.Fatalf("expected path evidence %q, got %#v", target, result.Evidence["path"])
+	}
+	if result.Evidence["bytes"] != len(content) {
+		t.Fatalf("expected bytes evidence %d, got %#v", len(content), result.Evidence["bytes"])
+	}
+	if result.Evidence["sha256"] == "" {
+		t.Fatalf("expected sha256 evidence, got %#v", result.Evidence)
+	}
+	if result.Evidence["content_preview"] != strings.TrimSpace(content) {
+		t.Fatalf("expected content preview, got %#v", result.Evidence["content_preview"])
 	}
 }
 

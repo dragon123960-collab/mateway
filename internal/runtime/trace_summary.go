@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -40,7 +41,31 @@ type TraceSummary struct {
 	CacheWriteTokens     int
 	CacheInputTokens     int
 	CacheOutputTokens    int
+	ModelCallStarts      int
+	ModelCallEnds        int
+	ModelCallFailures    int
+	ModelCallSkips       int
+	ModelStages          map[string]TraceModelStageSummary
 	ToolCalls            []string
+}
+
+type TraceModelStageSummary struct {
+	Starts   int
+	Ends     int
+	Failures int
+	Skips    int
+}
+
+func (s TraceSummary) ModelStageNames() []string {
+	names := make([]string, 0, len(s.ModelStages))
+	for name := range s.ModelStages {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func SummarizeTrace(path string) (TraceSummary, error) {
@@ -49,7 +74,7 @@ func SummarizeTrace(path string) (TraceSummary, error) {
 		return TraceSummary{}, err
 	}
 	defer file.Close()
-	out := TraceSummary{Path: path}
+	out := TraceSummary{Path: path, ModelStages: map[string]TraceModelStageSummary{}}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -62,6 +87,18 @@ func SummarizeTrace(path string) (TraceSummary, error) {
 		eventType := fmt.Sprint(event["type"])
 		duration := int64(number(event["duration_ms"]))
 		switch eventType {
+		case "model_call_start":
+			out.ModelCallStarts++
+			addModelStageEvent(&out, event, "start")
+		case "model_call_end":
+			out.ModelCallEnds++
+			addModelStageEvent(&out, event, "end")
+		case "model_call_failed":
+			out.ModelCallFailures++
+			addModelStageEvent(&out, event, "failed")
+		case "model_call_skipped":
+			out.ModelCallSkips++
+			addModelStageEvent(&out, event, "skipped")
 		case "message_start":
 			out.ModelDurationMS += duration
 			input := int(number(event["input_tokens"]))
@@ -133,6 +170,31 @@ func SummarizeTrace(path string) (TraceSummary, error) {
 		return TraceSummary{}, err
 	}
 	return out, nil
+}
+
+func addModelStageEvent(out *TraceSummary, event map[string]any, kind string) {
+	if out == nil {
+		return
+	}
+	if out.ModelStages == nil {
+		out.ModelStages = map[string]TraceModelStageSummary{}
+	}
+	stage := traceString(event["model_stage"])
+	if stage == "" {
+		stage = "unknown"
+	}
+	summary := out.ModelStages[stage]
+	switch kind {
+	case "start":
+		summary.Starts++
+	case "end":
+		summary.Ends++
+	case "failed":
+		summary.Failures++
+	case "skipped":
+		summary.Skips++
+	}
+	out.ModelStages[stage] = summary
 }
 
 func captureTraceIdentity(out *TraceSummary, event map[string]any) {

@@ -36,6 +36,7 @@ type TaskNode struct {
 	Summary   string         `json:"summary,omitempty"`
 	Status    string         `json:"status"`
 	Execution ExecutionFrame `json:"execution,omitempty"`
+	Graph     *TaskGraph     `json:"graph,omitempty"`
 	Steps     []TaskStep     `json:"steps,omitempty"`
 	TraceID   string         `json:"trace_id,omitempty"`
 	TracePath string         `json:"trace_path,omitempty"`
@@ -62,6 +63,7 @@ type ExecutionFrame struct {
 	Status        string           `json:"status,omitempty"`
 	OriginalTask  string           `json:"original_task,omitempty"`
 	Contract      *TaskContract    `json:"contract,omitempty"`
+	ContextRefs   []string         `json:"context_refs,omitempty"`
 	TraceRefs     []TraceRef       `json:"trace_refs,omitempty"`
 	CurrentStepID string           `json:"current_step_id,omitempty"`
 	CurrentNodeID string           `json:"current_node_id,omitempty"`
@@ -115,6 +117,8 @@ type TraceRef struct {
 const (
 	PendingKindMemoryProposalReview = "memory_proposal_review"
 	PendingKindTaskPlanConfirm      = "task_plan_confirm"
+	PendingKindHumanReview          = "human_review"
+	PendingKindHumanConfirm         = "human_confirm"
 )
 
 type ExecutionEvent struct {
@@ -131,6 +135,8 @@ type ExecutionEvent struct {
 type PendingAction struct {
 	Kind        string `json:"kind"`
 	TaskID      string `json:"task_id"`
+	GraphID     string `json:"graph_id,omitempty"`
+	NodeID      string `json:"node_id,omitempty"`
 	ProposalID  string `json:"proposal_id,omitempty"`
 	Question    string `json:"question,omitempty"`
 	Feedback    string `json:"feedback,omitempty"`
@@ -465,6 +471,34 @@ func (s *State) AddExecutionEvent(taskID string, event ExecutionEvent) {
 			return
 		}
 	}
+}
+
+func (s *State) SetTaskContextRefs(taskID string, refs []string) {
+	now := time.Now()
+	refs = uniqueNonEmptyStrings(refs)
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == taskID {
+			ensureExecutionFrame(&s.Tasks[i], now)
+			s.Tasks[i].Execution.ContextRefs = refs
+			s.Tasks[i].Execution.UpdatedAt = now
+			s.Tasks[i].UpdatedAt = now
+			return
+		}
+	}
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *State) AddTraceRef(taskID string, ref TraceRef) {

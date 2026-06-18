@@ -220,7 +220,15 @@ func TestRecordTaskCompletionWritesSkillUsageLedger(t *testing.T) {
 			}},
 		},
 		TraceID: "trace-skill",
-		Skills:  []SkillEvidence{{Name: "fresh-search", Path: filepath.Join(home, "workspace", "skills", "fresh-search", "SKILL.md"), Scope: "shared"}},
+		GraphSummary: &session.GraphMemorySummary{
+			GraphID:      "g1",
+			TaskID:       "task-skill",
+			Status:       "completed",
+			RetriedNodes: []string{"search"},
+			Nodes: []session.NodeMemorySummary{
+				{ID: "search", Type: "skill", Goal: "search web", Status: "completed", ResultSummary: "found 5 results", Attempts: 2, SelectedSkill: "fresh-search"},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +238,50 @@ func TestRecordTaskCompletionWritesSkillUsageLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	if !strings.Contains(text, `"type":"skill_usage"`) || !strings.Contains(text, `"name":"fresh-search"`) || !strings.Contains(text, `"tool_sequence":["file.read"]`) {
+	if !strings.Contains(text, `"type":"skill_usage"`) || !strings.Contains(text, `"name":"fresh-search"`) {
 		t.Fatalf("unexpected skill usage ledger:\n%s", text)
+	}
+	if !strings.Contains(text, `"skill_node_id":"search"`) || !strings.Contains(text, `"graph_id":"g1"`) {
+		t.Fatalf("missing graph/node refs in skill usage:\n%s", text)
+	}
+}
+
+func TestRecordTaskCompletionWritesGraphNodeClassifications(t *testing.T) {
+	home := t.TempDir()
+	_, err := RecordTaskCompletion(LearningEvent{
+		Home:       home,
+		SessionKey: "cli:test",
+		Task: session.TaskNode{
+			ID:     "task-graph",
+			Goal:   "run graph",
+			Status: "failed",
+		},
+		TraceID: "trace-graph",
+		GraphSummary: &session.GraphMemorySummary{
+			GraphID:      "g1",
+			TaskID:       "task-graph",
+			Status:       "failed",
+			FailedNodes:  []string{"fail"},
+			RetriedNodes: []string{"retry"},
+			BlockedNodes: []string{"block"},
+			Nodes: []session.NodeMemorySummary{
+				{ID: "retry", Type: "model", Mode: "react", Goal: "retry work", Status: "completed", Attempts: 2, ResultSummary: "eventually ok", VerifierStatus: "passed"},
+				{ID: "fail", Type: "tool", Goal: "run", Status: "failed", Attempts: 1, FailureReason: "boom", VerifierStatus: "failed"},
+				{ID: "block", Type: "human_review", Goal: "confirm", Status: "awaiting_input", Attempts: 1, VerifierStatus: "needs_input"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "observe", "learning", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{`"graph_id":"g1"`, `"failed_nodes":["fail"]`, `"retried_nodes":["retry"]`, `"blocked_nodes":["block"]`, `"verifier_status":"failed"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("learning event missing %s:\n%s", want, text)
+		}
 	}
 }

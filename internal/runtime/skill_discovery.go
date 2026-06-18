@@ -10,15 +10,21 @@ import (
 
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/session"
+	skillpkg "github.com/dongping/mateway/internal/skill"
 )
 
 type discoveredSkill struct {
-	Name        string
-	Description string
-	Stage       string
-	Priority    string
-	Path        string
-	Scope       string
+	Name         string
+	Description  string
+	Stage        string
+	GraphType    string
+	Granularity  string
+	AllowedTools []string
+	Inputs       []string
+	Outputs      []string
+	Priority     string
+	Path         string
+	Scope        string
 }
 
 type skillRelevance struct {
@@ -52,8 +58,12 @@ func discoverSkillsForAgent(cfg *config.Root, agentID string, limit int) []disco
 	roots := skillRoots(workspace, agentID)
 	var out []discoveredSkill
 	seen := map[string]bool{}
-	for _, root := range roots {
-		for _, skill := range discoverSkillsInRoot(root) {
+	for i, root := range roots {
+		scope := "shared"
+		if i == 0 {
+			scope = "agent"
+		}
+		for _, skill := range discoverSkillsInRoot(root, scope) {
 			key := strings.ToLower(skill.Name)
 			if seen[key] {
 				continue
@@ -80,7 +90,7 @@ func skillRoots(workspace, agentID string) []string {
 	}
 }
 
-func discoverSkillsInRoot(root string) []discoveredSkill {
+func discoverSkillsInRoot(root, scope string) []discoveredSkill {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil
@@ -91,16 +101,36 @@ func discoverSkillsInRoot(root string) []discoveredSkill {
 			continue
 		}
 		path := filepath.Join(root, entry.Name(), "SKILL.md")
-		text := readSkillHeader(path)
-		if text == "" {
+		if _, err := os.Stat(path); err != nil {
 			continue
 		}
-		skill := parseSkillHeader(text)
+		metadata, ok, err := skillpkg.ReadMetadata(filepath.Dir(path))
+		if err != nil || !ok {
+			continue
+		}
+		skill := discoveredSkill{
+			Stage:        metadata.Graph.Stage,
+			GraphType:    metadata.Graph.Type,
+			Granularity:  metadata.Graph.Granularity,
+			AllowedTools: append([]string(nil), metadata.Graph.AllowedTools...),
+			Inputs:       append([]string(nil), metadata.Graph.Inputs...),
+			Outputs:      append([]string(nil), metadata.Graph.Outputs...),
+		}
+		text := readSkillHeader(path)
+		if text != "" {
+			header := parseSkillHeader(text)
+			skill.Name = header.Name
+			skill.Description = header.Description
+			if skill.Stage == "" {
+				skill.Stage = header.Stage
+			}
+			skill.Priority = header.Priority
+		}
 		if skill.Name == "" {
 			skill.Name = entry.Name()
 		}
 		skill.Path = path
-		skill.Scope = skillScope(path)
+		skill.Scope = scope
 		out = append(out, skill)
 	}
 	return out
@@ -156,6 +186,8 @@ func parseSkillHeader(text string) discoveredSkill {
 			skill.Description = value
 		case "stage":
 			skill.Stage = value
+		case "granularity":
+			skill.Granularity = value
 		case "priority":
 			skill.Priority = value
 		}

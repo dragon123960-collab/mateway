@@ -48,6 +48,14 @@ func printTraceSummary(out io.Writer, path string) error {
 	fmt.Fprintln(out, "model_ms:", summary.ModelDurationMS)
 	fmt.Fprintln(out, "tool_ms:", summary.ToolDurationMS)
 	fmt.Fprintln(out, "runtime_ms:", summary.RuntimeDurationMS)
+	fmt.Fprintln(out, "model_requests:", summary.ModelRequests)
+	fmt.Fprintf(out, "model_calls: start=%d end=%d failed=%d skipped=%d\n", summary.ModelCallStarts, summary.ModelCallEnds, summary.ModelCallFailures, summary.ModelCallSkips)
+	if stages := summary.ModelStageNames(); len(stages) > 0 {
+		for _, stage := range stages {
+			stats := summary.ModelStages[stage]
+			fmt.Fprintf(out, "model_stage.%s: start=%d end=%d failed=%d skipped=%d\n", stage, stats.Starts, stats.Ends, stats.Failures, stats.Skips)
+		}
+	}
 	if len(summary.ToolCalls) > 0 {
 		fmt.Fprintln(out, "tools:", strings.Join(summary.ToolCalls, ", "))
 	}
@@ -117,6 +125,14 @@ func PrintTraceReport(out io.Writer, path string) error {
 				fmt.Fprintf(out, " duration=%dms", model.DurationMS)
 			}
 			fmt.Fprintln(out)
+		}
+	}
+	if len(report.ModelStages) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Model Call Budget")
+		for _, stage := range sortedTraceReportStageNames(report.ModelStages) {
+			stats := report.ModelStages[stage]
+			fmt.Fprintf(out, "- %s start=%d end=%d failed=%d skipped=%d\n", stage, stats.Starts, stats.Ends, stats.Failures, stats.Skips)
 		}
 	}
 	if len(report.VisibleTools) > 0 {
@@ -311,6 +327,7 @@ type traceReport struct {
 	Request           string
 	Contract          traceReportContract
 	Models            []traceReportModel
+	ModelStages       map[string]runtime.TraceModelStageSummary
 	VisibleTools      []string
 	HiddenTools       int
 	TrimmedTools      []string
@@ -390,6 +407,14 @@ func buildTraceReport(path string) (traceReport, error) {
 			report.AgentID = traceString(event["agent_id"])
 		}
 		switch traceString(event["type"]) {
+		case "model_call_start":
+			addTraceReportModelStage(&report, event, "start")
+		case "model_call_end":
+			addTraceReportModelStage(&report, event, "end")
+		case "model_call_failed":
+			addTraceReportModelStage(&report, event, "failed")
+		case "model_call_skipped":
+			addTraceReportModelStage(&report, event, "skipped")
 		case "request":
 			report.Request = traceString(event["text"])
 		case "task_contract_created":
@@ -462,6 +487,42 @@ func buildTraceReport(path string) (traceReport, error) {
 		}
 	}
 	return report, scanner.Err()
+}
+
+func addTraceReportModelStage(report *traceReport, event map[string]any, kind string) {
+	if report == nil {
+		return
+	}
+	if report.ModelStages == nil {
+		report.ModelStages = make(map[string]runtime.TraceModelStageSummary)
+	}
+	stage := traceString(event["model_stage"])
+	if stage == "" {
+		stage = "unknown"
+	}
+	stats := report.ModelStages[stage]
+	switch kind {
+	case "start":
+		stats.Starts++
+	case "end":
+		stats.Ends++
+	case "failed":
+		stats.Failures++
+	case "skipped":
+		stats.Skips++
+	}
+	report.ModelStages[stage] = stats
+}
+
+func sortedTraceReportStageNames(stages map[string]runtime.TraceModelStageSummary) []string {
+	names := make([]string, 0, len(stages))
+	for name := range stages {
+		if strings.TrimSpace(name) != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func traceContractFromEvent(event map[string]any) traceReportContract {

@@ -33,9 +33,46 @@ Mateway 默认在 `~/.mateway` 下存储本地运行时数据。`mateway init` �
 - `channels`: 飞书和微信配置。
 - `security`: 工作区路径强制、可访问路径和终端沙箱设置。
 - `search`: 网页搜索供应商和预算。
-- `scheduler`: 本地调度循环设置。
+- `execution`: TaskGraph / AgentCore 执行预算和上下文预算。
+- `memory`: 任务完成后的 memory observe 和 proposal nudge 设置。
+- `learning`: learning distill 和 skill crystallization 设置。
+- `skills`: 公共 skill catalog 搜索入口。
+- `remote`: 终端远程 profile 白名单。
+- `scheduler`: heartbeat 本地调度循环设置。
 
 模型定义位于 `config/models/*.yaml`。渠道定义位于 `config/channels/*.yaml`。
+
+## Execution
+
+`execution` 当前稳定字段：
+
+- `max_parallel_nodes`: TaskGraph Scheduler 每个 tick 最多同时执行多少个 ready nodes。默认 `1`，需要真实 node 并行时可调大。
+- `max_parallel_tools`: 单个 node-local AgentCore loop 内部可用的工具并发预算。它不是 graph node 并发。
+- `max_iterations`: node-local AgentCore loop 的最大迭代次数。
+- `inactivity_timeout`: runtime 活动看门狗超时。
+- `max_contract_followups`: observe/completion follow-up 的上限，保留用于旧 contract hook 兼容。
+- `model_verifier`: node 验收时模型 verifier 的调用策略。默认 `fallback`，deterministic verifier 已通过时不再调用模型；可设为 `always` 强制每个带 acceptance 的已通过 node 再做模型语义验收；`off`/`never` 表示关闭模型 verifier。
+- `context_budget`: 输入上下文裁剪和工具结果压缩预算。
+
+`max_parallel_nodes` 和 `max_parallel_tools` 不要混用。Node 是可验收子任务；tool call 只是 node 内 action/evidence。
+
+## Memory And Learning
+
+`memory` 当前稳定字段：
+
+- `enabled`: 是否在任务完成后运行 memory observe。
+- `root`: memory root，空值表示默认 workspace memory。
+- `recent_days`: memory context 默认近期待检索窗口。
+- `proposal_nudge`: proposal 提醒节奏、渠道和数量。
+
+`learning` 当前稳定字段：
+
+- `enabled`: learning observe 总开关。
+- `skill_crystallization.enabled`: 是否允许 heartbeat 从重复经验中提出 skill proposal。
+- `skill_crystallization.success_threshold`: 触发 skill proposal 的重复成功次数阈值。
+- `skill_crystallization.min_confidence`: proposal 最低置信度。
+
+旧字段 `memory.auto_propose`、`memory.auto_commit_low_risk` 和 `scheduler.state_dir` 不再写入新默认配置。结构体仍能读取旧配置，以便旧用户配置文件继续加载。
 
 ## Agents
 
@@ -57,15 +94,19 @@ Agent profiles 可以设置：
 
 ```text
 workspace/skills/<skill_name>/SKILL.md
+workspace/skills/<skill_name>/.mateway/metadata.yaml
+workspace/agents/<agent_id>/skills/<skill_name>/SKILL.md
+workspace/agents/<agent_id>/skills/<skill_name>/.mateway/metadata.yaml
 ```
 
 它们应保持为技能，而非嵌入到 runtime 代码中。Runtime 代码拥有硬边界；技能拥有用户可编辑的工作流指导。
 
-执行提示上下文是有门的：
+技能发现和执行以本地注册为准：
 
-- 规划阶段可以发现 skill header
-- contract 可以选择所需技能
-- 执行阶段只接收已选技能或显式的 skill/workflow 上下文
+- 只有带 `.mateway/metadata.yaml` 的 skill 才参与发现和执行。
+- Planner 读取 metadata 摘要，用于判断 skill 是否适合作为 subtask node。
+- Node Executor 只有在 skill node 被选中后才读取对应 `SKILL.md`。
+- Skill 名称不是 tool 名称；真实工具调用仍受 node allowed tools、tool policy 和 trace 约束。
 
 ## Secrets
 

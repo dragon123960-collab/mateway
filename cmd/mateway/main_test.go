@@ -734,7 +734,16 @@ func TestDoctorAllowsExternalSkillWithMatewayMetadata(t *testing.T) {
 	}
 	path := filepath.Join(home, "workspace", "skills", "external", "SKILL.md")
 	writeMainTestFile(t, path, "---\nname: external\nallowed-tools: Bash(external:*)\n---\n# External\n")
-	writeMainTestFile(t, filepath.Join(home, "workspace", "skills", "external", ".mateway", "metadata.yaml"), "adapter_version: \"1\"\ntool_runtime: mateway\nsource: external\n")
+	writeMainTestFile(t, filepath.Join(home, "workspace", "skills", "external", ".mateway", "metadata.yaml"), `adapter_version: "2"
+source: "external"
+installed_at: "2026-06-17T00:00:00Z"
+tool_runtime: "mateway"
+graph:
+  mode: "adapted"
+  type: "prompt"
+  stage: "execution"
+  granularity: "subtask"
+`)
 	out := captureStdout(t, func() error { return run([]string{"doctor"}) })
 	if strings.Contains(out, "WARN\tskill.external_metadata_missing") {
 		t.Fatalf("doctor should accept external metadata:\n%s", out)

@@ -14,6 +14,7 @@ import (
 
 var destructiveCommandPattern = regexp.MustCompile(`(?i)(^|\s|&&|\|\||;|` + "`" + `)(rm(\s|$)|rmdir(\s|$)|shred(\s|$)|git\s+(reset|clean)(\s|$))`)
 var shellControlPattern = regexp.MustCompile(`[;&|` + "`" + `$<>]`)
+var shellRedirectPathPattern = regexp.MustCompile(`(?:^|\s)(?:>>?|<<?)\s*([^'"\s]+|'[^']+'|"[^"]+")`)
 
 func IsDangerousCommand(cmd string) bool {
 	cmd = strings.TrimSpace(cmd)
@@ -38,6 +39,9 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 	}
 	if IsDangerousCommand(command) {
 		return TerminalDecision{Class: "destructive", Reason: "destructive terminal command is blocked"}
+	}
+	if reason := blockedTerminalMutationPathReason(command, fields, cfg); reason != "" {
+		return TerminalDecision{Class: "path_policy", Reason: reason}
 	}
 	if looksLikeNetworkCommand(fields[0]) {
 		if profile, ok := matchRemoteProfile(fields, cfg); ok {
@@ -67,6 +71,69 @@ func CheckTerminalCommand(command string, cfg *config.Root) TerminalDecision {
 		return TerminalDecision{Allow: true, Class: "guarded_mutation"}
 	}
 	return TerminalDecision{Allow: true, Class: "unknown"}
+}
+
+func blockedTerminalMutationPathReason(command string, fields []string, cfg *config.Root) string {
+	if cfg == nil || !cfg.Security.EnforceWorkspacePaths {
+		return ""
+	}
+	for _, raw := range shellMutationPaths(command, fields) {
+		if _, err := ResolveAllowedPath(raw, cfg); err != nil {
+			return err.Error()
+		}
+	}
+	return ""
+}
+
+func shellMutationPaths(command string, fields []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(raw string) {
+		raw = strings.Trim(strings.TrimSpace(raw), `"'`)
+		if raw == "" || strings.HasPrefix(raw, "&") || strings.Contains(raw, "$") {
+			return
+		}
+		if !looksLikePathArg(raw) {
+			return
+		}
+		if !seen[raw] {
+			seen[raw] = true
+			out = append(out, raw)
+		}
+	}
+	for _, match := range shellRedirectPathPattern.FindAllStringSubmatch(command, -1) {
+		if len(match) >= 2 {
+			add(match[1])
+		}
+	}
+	for i := 0; i < len(fields); i++ {
+		cmd := filepath.Base(fields[i])
+		switch cmd {
+		case "mkdir", "touch", "chmod", "chown", "ln", "tee":
+			for j := i + 1; j < len(fields); j++ {
+				arg := fields[j]
+				if arg == "&&" || arg == ";" || arg == "|" || arg == "||" {
+					break
+				}
+				if strings.HasPrefix(arg, "-") {
+					continue
+				}
+				add(arg)
+			}
+		case "cp", "mv":
+			for j := i + 1; j < len(fields); j++ {
+				arg := fields[j]
+				if arg == "&&" || arg == ";" || arg == "|" || arg == "||" {
+					break
+				}
+				if strings.HasPrefix(arg, "-") {
+					continue
+				}
+				add(arg)
+			}
+		}
+	}
+	return out
 }
 
 func isSafeReadOnlyChain(command string, cfg *config.Root) bool {
@@ -519,6 +586,12 @@ func ResolveAllowedPath(raw string, cfg *config.Root) (string, error) {
 }
 
 func defaultPathBase(cfg *config.Root) string {
+	if root, ok := currentMatewayProjectRoot(); ok {
+		return root
+	}
+	if cfg != nil && strings.TrimSpace(cfg.App.Workspace) != "" {
+		return cfg.App.Workspace
+	}
 	if cfg != nil && strings.TrimSpace(cfg.App.Home) != "" {
 		return cfg.App.Home
 	}
@@ -538,6 +611,9 @@ func allowedRoots(cfg *config.Root) []string {
 	}
 	if strings.TrimSpace(cfg.App.Workspace) != "" {
 		roots = append(roots, cfg.App.Workspace)
+	}
+	if root, ok := currentMatewayProjectRoot(); ok {
+		roots = append(roots, root)
 	}
 	roots = append(roots, cfg.Security.AccessiblePaths...)
 	return roots

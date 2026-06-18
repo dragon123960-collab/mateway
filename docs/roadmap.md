@@ -1,40 +1,46 @@
 # 路线图
 
-Mateway 当前的方向是为小型 local-first agent runtime 做 loop engineering。
+Mateway 的主线是成为 local-first agent runtime kernel：一次 Planner 生成 TaskGraph，node 表示可验收子任务，复杂 node 内部使用局部 ReAct，工具调用作为 node 内 action/evidence 记录。
 
 ## 当前主线
 
 ```text
-planning contract
-  -> selected skill preflight
-  -> executable checklist
-  -> transcript-driven ReAct execution
-  -> evidence evaluator
-  -> final answer or blocker
+Planner
+  -> TaskGraph
+  -> Scheduler
+  -> Node-local execution
+  -> Node verifier
+  -> Graph / task verifier
+  -> Finalizer
+  -> Memory observe
 ```
 
 ## 近期工作
 
-- 提示精简：保持常驻 runtime 上下文小巧，只在触发时注入 freshness、connector 和 self-knowledge 部分。
-- Skill 上下文门控：保持默认技能作为可编辑资产，但执行时只注入已选技能。
-- Contract 检查清单上下文：给执行阶段提供紧凑的检查清单，而非完整的 JSON contract 加重复规则。
-- 文档重构：保持 README 简短，将稳定的架构、配置、执行流程和路线图说明移至 `docs/`。
+- Planner + TaskContract 合并：一次 planning call 输出 task acceptance、required capabilities 和 subtask graph。
+- Subtask node 模型：node 不默认表示工具调用，tool node 只保留为确定性特例。
+- Node-local ReAct：复杂 node 内部使用 AgentCore loop 和 allowed tools。
+- Verifier / retry / local replan：node 验收失败先重试，attempts 耗尽后替换 failed node 和 downstream pending nodes。
+- Trace / session recovery：用 graph state 从未完成节点继续，不从头执行。
+- Skill metadata v2：已注册 skill 才参与发现，metadata 提供 planner-facing inputs/outputs/type。
+- Stable docs 与 dev-notes 重建。
 
 ## 后续工作
 
+- `max_parallel_nodes` 本地并发调度。
+- 更好的 model/deterministic verifier 分层，降低 LLM 验收成本。
+- Domain app embedding API：structured input/output、status、trace、progress stream。
 - Docker 后端的终端沙箱，用于 `terminal.run`。
-- 当规划遗漏相关 skill 时，更精确的 contract 修复。
-- 更完善的临时重试和抓取失败预算，关联到 plan items 和 required evidence。
-- 长期会话、大型工具输出和保留 task contracts 时更安全的上下文经济。
-- 基于重复成功工作流的技能和记忆结晶。
+- Heartbeat/offline memory distill 持续改进，包括主体-关系-客体整理。
 
 ## 非目标
 
-- 无 PlanExecute 框架。
-- 无 DAG runtime。
-- 无 multi-agent supervisor 或子 agent 派生。
-- 无 gateway 业务路由层。
+- 不做 heavy workflow platform。
+- 不做 distributed workflow engine。
+- 不做 multi-tenant company scheduler。
+- 不做 distributed multi-agent supervisor 或 subagent spawning。
+- 不做 gateway 业务路由层。
 - 无飞书/Lark 专用 runtime 分支。
 - 除 `terminal.run` 外无其他命令执行工具。
 
-这些边界是有意设置的。Mateway 应通过使循环更可观察、更 evidence 感知和更本地有用来成长，而非变成一个沉重的 workflow 平台。
+Mateway 可以支持本地 agent node 作为执行角色，但调度系统、分布式 worker 和公司级 orchestration 应作为外部系统单独实现，并调用 Mateway 作为 runtime kernel。

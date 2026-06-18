@@ -82,10 +82,8 @@ func looksLikeSameTaskFollowup(text string, task session.TaskNode) bool {
 	if lower == "" {
 		return false
 	}
-	for _, marker := range []string{"/new", "new task", "新任务", "另一个", "另外", "unrelated"} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
+	if isNewTaskSignal(lower) {
+		return false
 	}
 	target := strings.ToLower(task.Goal + " " + task.Summary)
 	if task.Execution.Contract != nil {
@@ -103,11 +101,6 @@ func looksLikeSameTaskFollowup(text string, task session.TaskNode) bool {
 	if overlap > 0 {
 		return true
 	}
-	for _, marker := range []string{"继续", "接着", "再", "also", "same", "that", "它", "这个"} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
 	return false
 }
 
@@ -117,7 +110,7 @@ func meaningfulTokens(text string) []string {
 	})
 	stop := map[string]bool{
 		"the": true, "a": true, "an": true, "and": true, "or": true, "to": true, "it": true, "this": true,
-		"that": true, "please": true, "继续": true, "再": true, "一下": true,
+		"that": true, "please": true,
 		"list": true, "read": true, "file": true, "files": true, "every": true, "under": true,
 	}
 	var out []string
@@ -181,13 +174,14 @@ func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.Stat
 	case "execute":
 		state.Pending = nil
 		state.ActiveTask = task.ID
+		task.Graph = nil
 		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhaseExecute, MessageID: msg.ID})
-		if err := rt.saveState(state, trace); err != nil {
+		if err := rt.ensureGraphForTask(ctx, msg, state, task, task.Goal, trace); err != nil {
 			return Response{}, true, err
 		}
 		_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "control_text": msg.Text, "effective_task_goal": task.Goal})
 		_ = trace.write(map[string]any{"type": "task_plan_confirmed", "task_id": task.ID, "control_text": msg.Text, "effective_task_goal": task.Goal})
-		resp, err := rt.runTask(ctx, msg, state, task, task.Goal, tracePhaseExecute, trace)
+		resp, err := rt.runGraphTask(ctx, msg, state, task, task.Goal, trace)
 		return resp, true, err
 	case "replan":
 		if pending.ReplanCount >= 5 {

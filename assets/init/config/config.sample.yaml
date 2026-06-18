@@ -6,9 +6,9 @@ app:
   workspace: ""
 
 model:
-  default: glm-4.7-flash
+  default: minimax
   fallbacks:
-    - minimax
+    - agnes-2-flash
   roles:
     vision:
       - glm-4.6v-flash
@@ -17,8 +17,10 @@ model:
 
 execution:
   max_parallel_tools: 4
+  max_parallel_nodes: 1
   max_iterations: 50
   inactivity_timeout: 5m
+  model_verifier: fallback
   context_budget:
     enabled: true
     soft_ratio: 0.65
@@ -32,8 +34,6 @@ memory:
   enabled: true
   root: ""
   recent_days: 3
-  auto_propose: true
-  auto_commit_low_risk: false
   proposal_nudge:
     enabled: true
     interval: 24h
@@ -75,7 +75,6 @@ remote:
 scheduler:
   enabled: false
   timezone: Asia/Shanghai
-  state_dir: ""
   interval: 30s
 
 agents:

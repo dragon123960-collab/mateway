@@ -2,6 +2,8 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -63,7 +65,31 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true}
 	}
-	return agentcore.ToolResult{ToolCallID: call.ID, Content: "wrote " + path, Evidence: map[string]any{"path": path, "bytes": len(content)}}
+	contentBytes := []byte(content)
+	sum := sha256.Sum256(contentBytes)
+	return agentcore.ToolResult{
+		ToolCallID: call.ID,
+		Content:    fmt.Sprintf("wrote %s (%d bytes)", path, len(contentBytes)),
+		Evidence: map[string]any{
+			"path":            path,
+			"bytes":           len(contentBytes),
+			"sha256":          hex.EncodeToString(sum[:]),
+			"content_preview": fileWritePreview(content),
+		},
+	}
+}
+
+func fileWritePreview(content string) string {
+	const limit = 200
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	runes := []rune(content)
+	if len(runes) <= limit {
+		return content
+	}
+	return string(runes[:limit]) + "..."
 }
 
 func (FileEditTool) Name() string        { return "file.edit" }

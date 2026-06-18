@@ -829,10 +829,10 @@ func (m *tuiModel) sidebarSummary(state session.State) tuiSidebarSummary {
 	}
 	out.UsageLines = usageLines(usage)
 	if m.running {
-		if task, ok := selectedTask(state); ok && task.Execution.Contract != nil {
+		if task, ok := selectedTask(state); ok && task.Graph != nil && len(task.Graph.Nodes) > 0 {
 			out.TaskLines = taskSidebarLines(task)
 		} else {
-			out.TaskLines = []string{"▾ Contract pending", "[•] " + compactInline(firstNonEmpty(m.currentTask, "waiting for runtime contract"), 84)}
+			out.TaskLines = m.liveGraphLines()
 		}
 	} else {
 		out.TaskLines = taskLines(state)
@@ -841,17 +841,22 @@ func (m *tuiModel) sidebarSummary(state session.State) tuiSidebarSummary {
 	return out
 }
 
-func (m *tuiModel) liveTaskLines() []string {
-	lines := []string{"Status: " + firstNonEmpty(m.status, "running")}
+func (m *tuiModel) liveGraphLines() []string {
+	lines := []string{"▾ TaskGraph planning", "[•] " + compactInline(firstNonEmpty(m.currentTask, "waiting for graph plan"), 84)}
+	lines = append(lines, "Runtime: "+m.runtimeStatus())
 	if strings.TrimSpace(m.currentTask) != "" {
 		lines = append(lines, "Goal: "+compactInline(m.currentTask, 84))
 	}
-	if len(m.liveSteps) > 0 {
-		lines = append(lines, recentStepLines(m.liveSteps, 4)...)
-	} else {
-		lines = append(lines, "Waiting for first tool/event")
-	}
+	lines = append(lines, "Waiting for graph nodes")
 	return lines
+}
+
+func (m *tuiModel) runtimeStatus() string {
+	status := strings.TrimSpace(m.status)
+	if m.running && (status == "" || strings.EqualFold(status, "Idle")) {
+		return "running"
+	}
+	return firstNonEmpty(status, "running")
 }
 
 func (m *tuiModel) sessionDisplayName(state session.State) string {
@@ -934,6 +939,17 @@ func traceSummaryLines(summary runtime.TraceSummary) []string {
 		lines = append(lines, fmt.Sprintf("tools %s", durationText(summary.ToolDurationMS)))
 		lines = append(lines, fmt.Sprintf("runtime %s", durationText(summary.RuntimeDurationMS)))
 	}
+	for _, stage := range summary.ModelStageNames() {
+		stageSummary := summary.ModelStages[stage]
+		label := fmt.Sprintf("%s %d/%d", stage, stageSummary.Ends, stageSummary.Starts)
+		if stageSummary.Skips > 0 {
+			label += fmt.Sprintf(" skip %d", stageSummary.Skips)
+		}
+		if stageSummary.Failures > 0 {
+			label += fmt.Sprintf(" fail %d", stageSummary.Failures)
+		}
+		lines = append(lines, compactInline(label, 72))
+	}
 	return lines
 }
 
@@ -965,6 +981,9 @@ func selectedTask(state session.State) (session.TaskNode, bool) {
 
 func taskSidebarLines(task session.TaskNode) []string {
 	status := firstNonEmpty(task.Status, task.Execution.Status, "latest")
+	if task.Graph != nil && len(task.Graph.Nodes) > 0 {
+		return graphTaskSidebarLines(task, status)
+	}
 	lines := []string{contractListTitle(status)}
 	contract := task.Execution.Contract
 	if contract == nil {
@@ -982,6 +1001,200 @@ func taskSidebarLines(task session.TaskNode) []string {
 	}
 	lines = append(lines, requirementLines(contract, task.Steps)...)
 	return lines
+}
+
+func graphTaskSidebarLines(task session.TaskNode, fallbackStatus string) []string {
+	g := task.Graph
+	status := firstNonEmpty(g.Status, fallbackStatus, "latest")
+	lines := []string{"▾ TaskGraph " + status}
+	goal := compactInline(firstNonEmpty(task.Summary, task.Goal, task.ID), 72)
+	if goal != "" {
+		lines = append(lines, "Task: "+goal)
+	}
+	if strings.TrimSpace(g.ID) != "" {
+		lines = append(lines, "Graph: "+compactInline(g.ID, 72))
+	}
+	lines = append(lines, graphNodeStatsLine(g))
+	lines = append(lines, graphFocusLines(g)...)
+	for _, node := range g.Nodes {
+		lines = append(lines, graphNodeLine(node))
+	}
+	if task.Execution.Contract != nil {
+		lines = append(lines, "Task acceptance: legacy contract stored")
+	}
+	return lines
+}
+
+func graphFocusLines(g *session.TaskGraph) []string {
+	if g == nil {
+		return nil
+	}
+	var out []string
+	if node := focusedGraphNode(g); node != nil {
+		out = append(out, "Current: "+compactInline(firstNonEmpty(node.Goal, node.ID), 72))
+		if detail := graphNodeDetailLine(*node); detail != "" {
+			out = append(out, "Detail: "+compactInline(detail, 72))
+		}
+		if accept := graphAcceptanceLine(*node); accept != "" {
+			out = append(out, "Accept: "+compactInline(accept, 72))
+		}
+		if evidence := latestEvidenceLine(*node); evidence != "" {
+			out = append(out, "Evidence: "+compactInline(evidence, 72))
+		}
+	}
+	if result := latestCompletedResultLine(g); result != "" {
+		out = append(out, "Latest: "+compactInline(result, 72))
+	}
+	return out
+}
+
+func focusedGraphNode(g *session.TaskGraph) *session.TaskGraphNode {
+	if g == nil {
+		return nil
+	}
+	preferred := []string{
+		session.NodeStatusRunning,
+		session.NodeStatusVerifying,
+		session.NodeStatusRetrying,
+		session.NodeStatusAwaitingInput,
+		session.NodeStatusBlocked,
+		session.NodeStatusFailed,
+		session.NodeStatusReady,
+		session.NodeStatusPending,
+		session.NodeStatusNeedsReplan,
+	}
+	for _, status := range preferred {
+		for i := range g.Nodes {
+			if strings.EqualFold(g.Nodes[i].Status, status) {
+				return &g.Nodes[i]
+			}
+		}
+	}
+	for i := len(g.Nodes) - 1; i >= 0; i-- {
+		if strings.TrimSpace(g.Nodes[i].ResultSummary) != "" || strings.TrimSpace(g.Nodes[i].FailureReason) != "" {
+			return &g.Nodes[i]
+		}
+	}
+	return nil
+}
+
+func graphNodeLine(node session.TaskGraphNode) string {
+	label := compactInline(firstNonEmpty(node.Goal, node.ID), 64)
+	return contractChecklistLine(node.Status, label, graphNodeDetailLine(node))
+}
+
+func graphNodeDetailLine(node session.TaskGraphNode) string {
+	var parts []string
+	parts = append(parts, firstNonEmpty(node.Status, session.NodeStatusPending))
+	if strings.TrimSpace(node.Mode) != "" {
+		parts = append(parts, node.Mode)
+	} else if strings.TrimSpace(node.Type) != "" {
+		parts = append(parts, node.Type)
+	}
+	if node.Attempts > 0 {
+		parts = append(parts, fmt.Sprintf("attempts=%d", node.Attempts))
+	}
+	if len(node.Depends) > 0 {
+		parts = append(parts, "after "+strings.Join(node.Depends, ","))
+	}
+	if len(node.AllowedTools) > 0 {
+		parts = append(parts, "tools "+strings.Join(node.AllowedTools, ","))
+	}
+	if strings.TrimSpace(node.FailureReason) != "" {
+		parts = append(parts, compactInline(node.FailureReason, 48))
+	} else if strings.TrimSpace(node.ResultSummary) != "" && (node.Status == session.NodeStatusCompleted || node.Status == session.NodeStatusSkipped) {
+		parts = append(parts, compactInline(node.ResultSummary, 48))
+	}
+	return strings.Join(nonEmptyStrings(parts), " / ")
+}
+
+func graphAcceptanceLine(node session.TaskGraphNode) string {
+	if strings.TrimSpace(node.Acceptance.Criteria) == "" && strings.TrimSpace(node.Acceptance.Reason) == "" {
+		return ""
+	}
+	state := "pending"
+	if node.Acceptance.Verified {
+		state = "verified"
+	}
+	parts := []string{state}
+	if strings.TrimSpace(node.Acceptance.Criteria) != "" {
+		parts = append(parts, node.Acceptance.Criteria)
+	}
+	if strings.TrimSpace(node.Acceptance.Reason) != "" {
+		parts = append(parts, node.Acceptance.Reason)
+	}
+	return strings.Join(parts, " / ")
+}
+
+func latestEvidenceLine(node session.TaskGraphNode) string {
+	for i := len(node.EvidenceRefs) - 1; i >= 0; i-- {
+		evidence := node.EvidenceRefs[i]
+		label := firstNonEmpty(evidence.Summary, evidence.ToolName, evidence.Kind)
+		if strings.TrimSpace(label) == "" {
+			continue
+		}
+		if evidence.Blocked {
+			label = "blocked " + label
+		} else if evidence.IsError {
+			label = "error " + label
+		}
+		return label
+	}
+	return ""
+}
+
+func latestCompletedResultLine(g *session.TaskGraph) string {
+	if g == nil {
+		return ""
+	}
+	for i := len(g.Nodes) - 1; i >= 0; i-- {
+		node := g.Nodes[i]
+		if node.Status != session.NodeStatusCompleted || strings.TrimSpace(node.ResultSummary) == "" {
+			continue
+		}
+		return node.ResultSummary
+	}
+	return ""
+}
+
+func graphNodeStatsLine(g *session.TaskGraph) string {
+	if g == nil || len(g.Nodes) == 0 {
+		return "Nodes: 0"
+	}
+	counts := map[string]int{}
+	for _, node := range g.Nodes {
+		counts[firstNonEmpty(node.Status, session.NodeStatusPending)]++
+	}
+	order := []string{
+		session.NodeStatusCompleted,
+		session.NodeStatusRunning,
+		session.NodeStatusReady,
+		session.NodeStatusPending,
+		session.NodeStatusAwaitingInput,
+		session.NodeStatusBlocked,
+		session.NodeStatusFailed,
+		session.NodeStatusRetrying,
+		session.NodeStatusNeedsReplan,
+		session.NodeStatusSkipped,
+	}
+	parts := []string{fmt.Sprintf("%d nodes", len(g.Nodes))}
+	for _, status := range order {
+		if counts[status] > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", status, counts[status]))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func contractListTitle(status string) string {

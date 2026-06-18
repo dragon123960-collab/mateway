@@ -164,6 +164,111 @@ func TestTUIProgressStatusUsesActionLabels(t *testing.T) {
 	}
 }
 
+func TestTaskSidebarLinesPreferGraphNodes(t *testing.T) {
+	task := session.TaskNode{
+		ID:     "task-1",
+		Goal:   "build report",
+		Status: "running",
+		Execution: session.ExecutionFrame{Contract: &session.TaskContract{
+			Summary: "legacy contract",
+		}},
+		Graph: &session.TaskGraph{
+			ID:     "graph-task-1",
+			TaskID: "task-1",
+			Status: session.GraphStatusRunning,
+			Nodes: []session.TaskGraphNode{
+				{
+					ID:            "collect",
+					Type:          session.NodeTypeSubtask,
+					Mode:          session.NodeModeReact,
+					Goal:          "collect files",
+					Status:        session.NodeStatusCompleted,
+					Attempts:      1,
+					ResultSummary: "collected README and package files",
+					Acceptance:    session.Acceptance{Criteria: "files collected", Verified: true},
+				},
+				{
+					ID:           "write",
+					Type:         session.NodeTypeSubtask,
+					Mode:         session.NodeModeDirect,
+					Goal:         "write report",
+					Status:       session.NodeStatusRunning,
+					Depends:      []string{"collect"},
+					AllowedTools: []string{"file.read"},
+					Attempts:     2,
+					Acceptance:   session.Acceptance{Criteria: "report drafted"},
+					EvidenceRefs: []session.EvidenceRef{{ToolName: "file.read", Summary: "read source notes"}},
+				},
+			},
+		},
+	}
+	lines := taskSidebarLines(task)
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"▾ TaskGraph running",
+		"2 nodes",
+		"completed=1",
+		"running=1",
+		"Current: write report",
+		"Detail: running / direct / attempts=2 / after collect / tools file.read",
+		"Accept: pending / report drafted",
+		"Evidence: read source notes",
+		"Latest: collected README",
+		"collect files",
+		"write report",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("sidebar missing %q:\n%s", want, joined)
+		}
+	}
+	if !strings.Contains(joined, "2 nodes") || !strings.Contains(joined, "collect files") || !strings.Contains(joined, "write report") {
+		t.Fatalf("sidebar should render graph nodes, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "▾ Contract") {
+		t.Fatalf("graph task should not use contract title, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "Task acceptance: legacy contract stored") {
+		t.Fatalf("contract should be shown only as task acceptance note, got:\n%s", joined)
+	}
+}
+
+func TestTaskSidebarLinesShowBlockedNodeDetails(t *testing.T) {
+	task := session.TaskNode{
+		ID:     "task-1",
+		Goal:   "write outside workspace",
+		Status: "blocked",
+		Graph: &session.TaskGraph{
+			ID:     "graph-task-1",
+			TaskID: "task-1",
+			Status: session.GraphStatusBlocked,
+			Nodes: []session.TaskGraphNode{{
+				ID:            "create",
+				Type:          session.NodeTypeSubtask,
+				Mode:          session.NodeModeReact,
+				Goal:          "create file",
+				Status:        session.NodeStatusBlocked,
+				Attempts:      1,
+				FailureReason: "node contains blocked tool evidence",
+				Acceptance:    session.Acceptance{Criteria: "file created", Reason: "acceptance criteria not verified"},
+				EvidenceRefs:  []session.EvidenceRef{{ToolName: "terminal.run", Summary: "path outside allowed roots", Blocked: true}},
+			}},
+		},
+	}
+	joined := strings.Join(taskSidebarLines(task), "\n")
+	for _, want := range []string{
+		"▾ TaskGraph blocked",
+		"blocked=1",
+		"Current: create file",
+		"Detail: blocked / react / attempts=1 / node contains blocked tool evidence",
+		"Accept: pending / file created / acceptance criteria not verified",
+		"Evidence: blocked path outside allowed roots",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("blocked sidebar missing %q:\n%s", want, joined)
+		}
+	}
+}
+
 func TestTUIFooterShowsInputFrame(t *testing.T) {
 	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
 	app.width = 100
@@ -257,6 +362,9 @@ func TestTUIViewShowsSidebarOnWideTerminals(t *testing.T) {
 	home := t.TempDir()
 	tracePath := filepath.Join(home, "trace.jsonl")
 	trace := `{"type":"message_start","duration_ms":12,"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}` + "\n" +
+		`{"type":"model_call_start","model_stage":"planner"}` + "\n" +
+		`{"type":"model_call_end","model_stage":"planner"}` + "\n" +
+		`{"type":"model_call_skipped","model_stage":"node_verifier","reason":"deterministic_verifier_sufficient"}` + "\n" +
 		`{"type":"tool_execution_end","tool_call":{"Name":"terminal.run"},"tool_result":{"Content":"ok"},"duration_ms":34}` + "\n" +
 		`{"type":"runtime_done","duration_ms":99}` + "\n"
 	if err := os.WriteFile(tracePath, []byte(trace), 0o600); err != nil {
@@ -285,7 +393,7 @@ func TestTUIViewShowsSidebarOnWideTerminals(t *testing.T) {
 	app.height = 40
 	app.resize()
 	view := app.View()
-	for _, want := range []string{"Mateway", "STATE", "AGENT", "SESSION", "USAGE", "TRACE", "TASK", "28 tokens", "checked trace display"} {
+	for _, want := range []string{"Mateway", "STATE", "AGENT", "SESSION", "USAGE", "TRACE", "TASK", "28 tokens", "planner 1/1", "node_verifier 0/0 skip 1", "checked trace display"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("wide TUI view missing %q:\n%s", want, view)
 		}
@@ -427,7 +535,7 @@ func TestTUISidebarShowsLiveTaskWhileRunning(t *testing.T) {
 	if strings.Contains(lines, "old completed task") {
 		t.Fatalf("live sidebar should not show old task:\n%s", lines)
 	}
-	for _, want := range []string{"▾ Contract pending", "[•] 我们来具体看看"} {
+	for _, want := range []string{"▾ TaskGraph planning", "[•] 我们来具体看看", "Runtime: Thinking"} {
 		if !strings.Contains(lines, want) {
 			t.Fatalf("live sidebar missing %q:\n%s", want, lines)
 		}
@@ -463,13 +571,13 @@ func TestTUISidebarShowsStoredContractWhileRunning(t *testing.T) {
 	app.running = true
 	app.currentTask = "fallback text should not be primary"
 	lines := strings.Join(app.sidebarSummary(state).TaskLines, "\n")
-	for _, want := range []string{"▾ Contract running", "[✓] search current facts", "[✓] Search"} {
+	for _, want := range []string{"▾ TaskGraph planning", "[•] fallback text should not be primary", "Runtime: running"} {
 		if !strings.Contains(lines, want) {
 			t.Fatalf("running contract missing %q:\n%s", want, lines)
 		}
 	}
-	if strings.Contains(lines, "Recent steps") || strings.Contains(lines, "fallback text should not be primary") {
-		t.Fatalf("running sidebar should prefer contract checklist:\n%s", lines)
+	if strings.Contains(lines, "▾ Contract running") || strings.Contains(lines, "[✓] Search") {
+		t.Fatalf("running sidebar should not prefer legacy contract checklist:\n%s", lines)
 	}
 }
 

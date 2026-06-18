@@ -39,9 +39,11 @@ func DefaultRoot() Root {
 		},
 		Execution: ExecutionConfig{
 			MaxParallelTools:     4,
+			MaxParallelNodes:     1,
 			MaxIterations:        intPtr(50),
 			InactivityTimeout:    "5m",
 			MaxContractFollowups: 4,
+			ModelVerifier:        "fallback",
 			ContextBudget: ContextBudgetConfig{
 				Enabled:                boolPtr(true),
 				SoftRatio:              0.65,
@@ -344,9 +346,11 @@ type ModelConfig struct {
 
 type ExecutionConfig struct {
 	MaxParallelTools     int                 `yaml:"max_parallel_tools"`
+	MaxParallelNodes     int                 `yaml:"max_parallel_nodes"`
 	MaxIterations        *int                `yaml:"max_iterations"`
 	InactivityTimeout    string              `yaml:"inactivity_timeout"`
 	MaxContractFollowups int                 `yaml:"max_contract_followups"`
+	ModelVerifier        string              `yaml:"model_verifier"`
 	ContextBudget        ContextBudgetConfig `yaml:"context_budget"`
 }
 
@@ -448,6 +452,13 @@ func (c ExecutionConfig) MaxIterationsValue() int {
 		return 50
 	}
 	return *c.MaxIterations
+}
+
+func (c ExecutionConfig) MaxParallelNodesValue() int {
+	if c.MaxParallelNodes <= 0 {
+		return 1
+	}
+	return c.MaxParallelNodes
 }
 
 func (c ExecutionConfig) InactivityTimeoutDuration() time.Duration {
@@ -821,6 +832,9 @@ func (r *Root) applyDefaults() {
 	}
 	if r.Execution.MaxParallelTools <= 0 {
 		r.Execution.MaxParallelTools = defaults.Execution.MaxParallelTools
+	}
+	if r.Execution.MaxParallelNodes <= 0 {
+		r.Execution.MaxParallelNodes = defaults.Execution.MaxParallelNodes
 	}
 	if r.Execution.MaxIterations == nil {
 		r.Execution.MaxIterations = defaults.Execution.MaxIterations

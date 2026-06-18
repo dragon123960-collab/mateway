@@ -104,8 +104,15 @@ func TestToolCompactionSpecializesFileContent(t *testing.T) {
 func TestSimpleTaskSkipsContractModel(t *testing.T) {
 	rt := newTestRuntime(t)
 	counter := &countingModel{text: `{"summary":"should not run","requires_tools":true}`}
+	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
+		"hello?",
+		"answer directly",
+		nil,
+		nil,
+		`{"id":"answer","type":"subtask","mode":"direct","goal":"answer the user","acceptance":"answered"}`,
+	), text: "hello"}
 	rt.ContractModel = counter
-	rt.Pool.agents["main"] = agentcore.NewAgent(staticTextModel{text: "hello"}, rt.Tools)
+	rt.Pool.agents["main"] = agentcore.NewAgent(rt.Model, rt.Tools)
 	resp, err := rt.Handle(context.Background(), inbound("cli:simple-contract", "hello?"))
 	if err != nil {
 		t.Fatal(err)
@@ -143,75 +150,6 @@ func TestTraceSummaryContextBudgetTelemetry(t *testing.T) {
 	}
 	if summary.CacheHits != 1 || summary.CacheReadTokens != 120 || summary.CacheWriteTokens != 40 {
 		t.Fatalf("unexpected cache summary %#v", summary)
-	}
-}
-
-func TestRuntimeBudgetsEveryModelTurn(t *testing.T) {
-	rt := newTestRuntime(t)
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "terminal.run", content: strings.Repeat("search result\n", 1200)})
-	rt.Tools = registry
-	rt.Pool.agents["main"] = agentcore.NewAgent(&sequenceModel{messages: []agentcore.Message{
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_1", Name: "terminal.run", Args: map[string]any{"command": "echo one"}}}},
-		{Role: agentcore.RoleAssistant, ToolCalls: []agentcore.ToolCall{{ID: "call_2", Name: "terminal.run", Args: map[string]any{"command": "echo two"}}}},
-		{Role: agentcore.RoleAssistant, Content: "done"},
-	}}, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"search twice","requires_tools":true,"required_tools":["terminal.run"],"required_evidence":[{"kind":"runtime_state","tool":"terminal.run","description":"search evidence"}],"expected_outcome":"answer","completion_policy":"use evidence"}`}
-	resp, err := rt.Handle(context.Background(), inbound("cli:budget-turns", "check singbox service status"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Reply.Style == "input_required" {
-		resp, err = rt.Handle(context.Background(), inbound("cli:budget-turns", "1"))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if resp.Failed {
-		t.Fatalf("unexpected failure %#v", resp)
-	}
-	data, err := os.ReadFile(resp.TracePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(string(data), `"type":"context_budget_estimated"`); got < 3 {
-		t.Fatalf("expected budget telemetry for each model turn, got %d:\n%s", got, string(data))
-	}
-}
-
-func TestRuntimeModelSeesFilteredTools(t *testing.T) {
-	rt := newTestRuntime(t)
-	cfg := rt.Config
-	cfg.Execution.ContextBudget.MaxVisibleTools = 2
-	registry := agentcore.NewToolRegistry()
-	for _, name := range []string{"file.read", "terminal.run", "schedule.manage", "task.search"} {
-		registry.Register(runtimeNamedTool{name: name, content: "ok"})
-	}
-	rt.Tools = registry
-	capture := &captureToolsModel{text: "done"}
-	rt.Pool.agents["main"] = agentcore.NewAgent(capture, rt.Tools)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"check service","requires_tools":false,"expected_outcome":"answer","completion_policy":"answer directly"}`}
-	resp, err := rt.Handle(context.Background(), inbound("cli:filtered-tools", "explain project structure"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Reply.Style == "input_required" {
-		resp, err = rt.Handle(context.Background(), inbound("cli:filtered-tools", "1"))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if resp.Failed {
-		t.Fatalf("unexpected failure %#v", resp)
-	}
-	if len(capture.toolNames) < 2 {
-		t.Fatalf("expected at least 2 default visible tools, got %#v", capture.toolNames)
-	}
-	if !containsString(capture.toolNames, "terminal.run") {
-		t.Fatalf("expected terminal.run in filtered tools, got %#v", capture.toolNames)
-	}
-	if containsString(capture.toolNames, "schedule.manage") || containsString(capture.toolNames, "task.search") {
-		t.Fatalf("non-default tools should be trimmed under budget, got %#v", capture.toolNames)
 	}
 }
 

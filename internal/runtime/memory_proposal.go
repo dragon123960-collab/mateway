@@ -96,8 +96,18 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 	if state.Pending == nil {
 		return Response{}, false, nil
 	}
+	_ = trace.write(map[string]any{
+		"type":         "continuation_decision",
+		"action":       ActionAnswerPending,
+		"task_id":      state.Pending.TaskID,
+		"reason":       "pending action intercepted before state machine",
+		"pending_kind": state.Pending.Kind,
+	})
 	if state.Pending.Kind == session.PendingKindTaskPlanConfirm {
 		return rt.handleTaskPlanConfirm(ctx, state, msg, trace)
+	}
+	if state.Pending.Kind == session.PendingKindHumanConfirm || state.Pending.Kind == session.PendingKindHumanReview {
+		return rt.handleGraphHumanPending(state, msg, trace)
 	}
 	if state.Pending.Kind != session.PendingKindMemoryProposalReview {
 		_ = trace.write(map[string]any{"type": "pending_discarded", "pending_kind": state.Pending.Kind, "task_id": state.Pending.TaskID})
@@ -146,6 +156,81 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		return Response{}, true, err
 	}
 	return rt.reply(msg, runtimeText(rt.Config, msg, "memory.reject.done", nil), channel.StyleCompleted), true, nil
+}
+
+func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
+	taskID := state.Pending.TaskID
+	nodeID := state.Pending.NodeID
+	kind := state.Pending.Kind
+
+	task := state.TaskByID(taskID)
+	if task == nil || task.Graph == nil {
+		state.Pending = nil
+		return Response{}, false, nil
+	}
+
+	node := task.Graph.NodeByID(nodeID)
+	if node == nil {
+		state.Pending = nil
+		return Response{}, false, nil
+	}
+
+	userResponse := strings.TrimSpace(msg.Text)
+	action, ok := parseNumericHumanPendingAction(userResponse)
+	if !ok {
+		_ = trace.write(map[string]any{
+			"type":          "pending_control_invalid_reply",
+			"task_id":       taskID,
+			"graph_id":      task.Graph.ID,
+			"node_id":       nodeID,
+			"pending_kind":  kind,
+			"user_response": userResponse,
+		})
+		resp := rt.reply(msg, "Please reply with 1 to confirm and continue, or 2 to cancel and block this task.", channel.StyleInputRequired)
+		resp.TraceID = traceID(trace)
+		resp.TracePath = tracePath(trace)
+		return resp, true, nil
+	}
+	isConfirm := action == "confirm"
+
+	_ = trace.write(map[string]any{
+		"type":          "graph_human_pending_resolved",
+		"graph_id":      task.Graph.ID,
+		"node_id":       nodeID,
+		"kind":          kind,
+		"command":       action,
+		"confirmed":     isConfirm,
+		"user_response": userResponse,
+	})
+
+	if isConfirm {
+		node.Status = session.NodeStatusCompleted
+		node.ResultSummary = userResponse
+		node.Acceptance.Verified = true
+		node.VerifiedAt = time.Now()
+	} else {
+		node.Status = session.NodeStatusBlocked
+		node.FailureReason = userResponse
+	}
+	node.UpdatedAt = time.Now()
+
+	state.Pending = nil
+	if err := rt.saveState(state, trace); err != nil {
+		return Response{}, true, err
+	}
+
+	return Response{}, false, nil
+}
+
+func parseNumericHumanPendingAction(text string) (string, bool) {
+	switch strings.TrimSpace(text) {
+	case "1":
+		return "confirm", true
+	case "2":
+		return "cancel", true
+	default:
+		return "", false
+	}
 }
 
 func parseNumericMemoryProposalReviewAction(text string) (string, bool) {

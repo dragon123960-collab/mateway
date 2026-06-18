@@ -1,66 +1,77 @@
 # 执行流程
 
-Mateway 的主要流程如下：
+Mateway 的稳定主线是 TaskGraph Runtime：
 
 ```text
 入站消息
-  -> 活跃任务导向或新任务
-  -> task contract
-  -> 可选计划审核
-  -> 已选 skill 预检
-  -> AgentCore ReAct 循环
-  -> 工具 evidence 和 plan item 更新
-  -> completion evaluator
-  -> 最终答案或 blocker
+  -> Planner
+  -> TaskGraph
+  -> Scheduler
+  -> Node Executor
+  -> Node Verifier
+  -> Graph / Task Verifier
+  -> Finalizer
+  -> Memory Observe
 ```
 
-## 1. 消息和任务
+## 1. 入站消息
 
-Gateway 和渠道适配器归一化入站消息。Runtime 要么将消息路由到现有活跃任务，要么创建新的 `TaskNode`。
+Gateway 和 channel adapter 只负责 I/O、归一化和投递。Runtime 根据 session state 决定消息是新任务、续接任务、pending human control，还是已有 graph 的 steering input。
 
-简短追问可复用先前任务上下文。独立的新任务不应接收弱化的前置任务提示上下文。
+## 2. Planner
 
-## 2. Contract 规划
+Planner 是唯一的任务规划入口。它一次输出 `TaskGraphPlan`：任务级 goal、risk、acceptance、required capabilities、final output shape，以及子任务 nodes。
 
-Runtime 创建轻量级 `TaskContract`：
+Planner 不生成工具调用序列。它生成可验收子任务、依赖关系、执行 mode、allowed tools、skill 选择、human gates 和每个 node 的 acceptance。
 
-- 直接任务获得最小计划形态
-- 低风险工具任务可自动执行
-- 复杂或高风险任务可暂停等待计划审核
+历史 `TaskContract` 的完成语义会合并到 Planner 输出中，不再作为独立规划阶段暴露。
 
-Contract 包含一个工具执行检查清单和一个验收检查清单。必需工具必须是真实工具名称。已选技能单独记录。
+## 3. TaskGraph And Scheduler
 
-## 3. Skill 预检
+Runtime 校验 Planner 输出后持久化 TaskGraph。Scheduler 根据 `depends + status` 计算 ready nodes，并按 `execution.max_parallel_nodes` 做本地并发调度。
 
-规划阶段可以发现本地 `SKILL.md` header 并选择相关执行技能。已选技能可在执行前读取并转换为真实工具 plan items。
+并发调度保持 local-first：selected nodes 在独立 session/graph sandbox 中执行，完成后由主 runtime 合并 node result、messages、usage、pending action 和 task step 增量。High-risk、human、mutation node 默认保守独占批次。
 
-执行阶段默认不会收到完整技能目录。只接收已选任务技能或显式的 skill/workflow 上下文。
+Completed and verified nodes are never rerun. Pending nodes only run when all dependencies completed or skipped.
 
-## 4. ReAct 执行
+## 4. Node Executor
 
-模型在正常的 AgentCore 循环中运行。它可以调用可见工具、接收观察结果，并根据 transcript 上下文决定下一步。
+Node 是可验收子任务，不是工具调用。Node execution mode 决定执行方式：
 
-Mateway 不会机械地重放计划。Hooks 和 evaluator 在保持循环简洁的同时强制执行 task contract。
+- `direct`: 一次模型调用。
+- `react`: node-local AgentCore loop，可调用 allowed tools。
+- `skill`: 加载已注册 skill metadata 和 `SKILL.md`。
+- `script` / `tool`: 确定性执行特例。
+- `human`: 等待确认或审阅。
 
-## 5. 工具 Evidence
+Node 内部 tool calls 只写入 trace/evidence refs。工具成功不是 node 成功；node final output 必须通过 verifier。
 
-工具结果会更新任务步骤、执行事件、evidence 摘要和 plan item 状态。大型工具输出可被压缩，后续通过 `toolresult.read` 检索。
+## 5. Verification, Retry, Replan
 
-类 secret 数据在持久化存储和后续模型轮次之前会被脱敏。
+Node 完成后进入 verifier。Verifier 先做确定性检查，必要时调用 model verifier。
 
-## 6. 完成评估
+若 node 验收不合格，runtime 使用 verifier feedback 重试同一 node。若 attempts 耗尽，runtime 可触发 local replan：保留 completed upstream nodes，替换 failed node 和 downstream pending nodes。
 
-在最终回答之前，completion evaluator 检查：
+Graph / task verifier 在所有关键节点完成后检查 task acceptance。如果最终验收不满足，runtime 应追加 repair/synthesis node 或局部 replan，而不是从头执行。
 
-- 必需工具已被接受
-- 必需 evidence 存在或有有效替代
-- 必需 plan items 已完成或已阻塞
-- 不可用的工具产生具体 blocker
+## 6. Human Control
 
-如果任务未完成，模型会收到简短追问：
+高风险操作、用户明确要求确认或人工审阅时，Planner 插入 `human_confirm` 或 `human_review` node。执行到该 node 时 Runtime 创建 pending action，等待用户继续或取消。
 
-```text
-Missing: <requirement>. Next required action: call <tool> or state blocker.
-```
+Human confirmation is a node-level gate. It does not bypass tool policy, path validation, secret redaction or verifier.
 
-最终输出应报告结果、交付物路径/URL（如适用）或具体的 blocker。
+## 7. Trace, Session, Recovery
+
+Trace 记录事实链：planner、scheduler、node execution、tool calls、verifier、finalizer 和 memory observe。关键事件必须包含 `task_id`、`graph_id`、`node_id` 和 `attempt`。
+
+Session graph state 是恢复状态。崩溃恢复时 completed verified nodes 跳过，running nodes 恢复为 pending/retryable，awaiting input nodes 继续等待用户输入。
+
+TaskGraph 是单个任务内部的 DAG 状态，不是 Git-like tree store。Session 保存可恢复快照，Trace 保存 append-only 事件账本，Memory 保存任务完成后的蒸馏知识。
+
+历史任务的继续和分支由 Task Lineage Tree 表达，而不是由 Session 表达。未完成任务从原 graph state 恢复；已完成任务如果继续，应 fork 新 task，并记录父任务、可选的旧 node/evidence 引用。
+
+长期 Memory Tree/Graph 可以作为 heartbeat/offline distill 的可重建索引演进，用于主体-关系-客体、项目事实和经验沉淀，但不进入 runtime 主状态。
+
+## 8. Finalizer And Memory
+
+Finalizer 只使用 verified node results 生成最终回答或 blocker。任务结束后 runtime 将 GraphMemorySummary 交给 memory observe。Heartbeat 可在离线阶段继续做长期学习和主体-关系-客体整理。
