@@ -62,20 +62,6 @@ func run(args []string) error {
 			return cli.RunTUI(context.Background(), cli.TUIOptions{Config: cfg, SessionKey: key, In: os.Stdin, Out: os.Stdout})
 		}
 		return cli.RunChat(context.Background(), cli.ChatOptions{Config: cfg, SessionKey: key, In: os.Stdin, Out: os.Stdout})
-	case "tui":
-		fs := flag.NewFlagSet("mateway tui", flag.ContinueOnError)
-		sessionKey := fs.String("session", "", "session key to use")
-		if err := fs.Parse(args[1:]); err != nil {
-			if err == flag.ErrHelp {
-				return nil
-			}
-			return err
-		}
-		cfg, err := loadConfig()
-		if err != nil {
-			return err
-		}
-		return cli.RunTUI(context.Background(), cli.TUIOptions{Config: cfg, SessionKey: *sessionKey, In: os.Stdin, Out: os.Stdout})
 	case "init":
 		fs := flag.NewFlagSet("mateway init", flag.ContinueOnError)
 		homeFlag := fs.String("home", "", "override MATEWAY_HOME for initialization")
@@ -429,7 +415,6 @@ func printHelp() {
 Usage:
   mateway init
   mateway chat [--session <session_key>] [--cwd-session] [--classic]
-  mateway tui [--session <session_key>]
   mateway ask [--session <session_key>] [--quiet|--json|--events] <message>
   mateway send --to <channel:target> <message>
   mateway fetch-history --from <channel:target> [--session <session_key>] [--limit <n>] [--since <duration>]

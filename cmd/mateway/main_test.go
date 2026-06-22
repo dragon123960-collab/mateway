@@ -89,6 +89,9 @@ func TestInitSupportsHomeFlag(t *testing.T) {
 			t.Fatalf("expected %s under init home: %v", rel, err)
 		}
 	}
+	if _, err := os.Stat(filepath.Join(home, "workspace", "skills", "meihua-yishu")); !os.IsNotExist(err) {
+		t.Fatalf("meihua-yishu should not be installed by default, err=%v", err)
+	}
 }
 
 func TestInitSupportsAssetsDirFlag(t *testing.T) {
@@ -174,6 +177,15 @@ func TestHelpIncludesSend(t *testing.T) {
 	_, _ = out.ReadFrom(r)
 	if !strings.Contains(out.String(), "mateway send --to <channel:target> <message>") {
 		t.Fatalf("help missing send:\n%s", out.String())
+	}
+	for _, removed := range []string{
+		"mateway api ",
+		"mateway serve [--host",
+		"mateway tui ",
+	} {
+		if strings.Contains(out.String(), removed) {
+			t.Fatalf("help still exposes %q:\n%s", removed, out.String())
+		}
 	}
 }
 

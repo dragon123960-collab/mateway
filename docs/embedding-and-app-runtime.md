@@ -59,14 +59,14 @@ Domain applications should package deterministic rules, prompts and references a
 Example layout:
 
 ```text
-workspace/skills/meihua-yishu/
+workspace/skills/domain-example/
   SKILL.md
   .mateway/metadata.yaml
-  scripts/calculate_hexagram.ts
+  scripts/normalize_input.ts
   references/rules.md
 ```
 
-A deterministic script can calculate domain facts, while a prompt/react skill can explain or adapt the result. For example, an Electron "Book of Fate" app can use a script skill to compute hexagrams from two numbers and a prompt skill to produce the interpretation.
+A deterministic script can calculate domain facts, while a prompt/react skill can explain or adapt the result. For example, a desktop domain app can use a script skill to normalize selected data and a prompt skill to produce the final interpretation or report.
 
 ## External Scheduling
 

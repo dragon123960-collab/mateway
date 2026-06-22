@@ -27,7 +27,7 @@ message -> Planner -> TaskGraph -> Scheduler
 
 ## Current Capabilities
 
-- CLI entrypoints: `mateway ask`, `mateway chat`, and `mateway tui`
+- CLI entrypoints: `mateway ask` and `mateway chat`
 - Feishu WebSocket gateway and native Weixin iLink Bot channel
 - Built-in tools: `file.read`, `file.write`, `file.edit`, `file.delete`, `terminal.run`, `web.search`, `web.fetch`, `secret.set`, `schedule.manage`, `task.search`, `task.resume`, and `toolresult.read`
 - Tool policy with destructive terminal command blocking, path validation, and secret redaction
@@ -66,7 +66,7 @@ Try the CLI:
 ./build/mateway chat
 ```
 
-`mateway chat` opens the interactive terminal UI when the current terminal supports it, and falls back to the classic line-based REPL with `--classic`. Use `mateway tui` to start the TUI directly.
+`mateway chat` opens the interactive terminal UI when the current terminal supports it, and falls back to the classic line-based REPL with `--classic`.
 
 `mateway init` creates the local home under `~/.mateway/`:
 

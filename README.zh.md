@@ -27,7 +27,7 @@ message -> Planner -> TaskGraph -> Scheduler
 
 ## 当前能力
 
-- CLI 入口：`mateway ask`、`mateway chat`、`mateway tui`
+- CLI 入口：`mateway ask`、`mateway chat`
 - 飞书 WebSocket gateway 和原生微信 iLink Bot channel
 - 内置工具：`file.read`、`file.write`、`file.edit`、`file.delete`、`terminal.run`、`web.search`、`web.fetch`、`secret.set`、`schedule.manage`、`task.search`、`task.resume`、`toolresult.read`
 - Tool policy：阻断 destructive terminal command、路径校验、secret 脱敏
@@ -66,7 +66,7 @@ vim ~/.mateway/config/config.yaml
 ./build/mateway chat
 ```
 
-`mateway chat` 会在支持交互终端时打开 TUI，也可以通过 `--classic` 使用传统行式 REPL。`mateway tui` 可以直接启动 TUI。
+`mateway chat` 会在支持交互终端时打开 TUI，也可以通过 `--classic` 使用传统行式 REPL。
 
 `mateway init` 会在 `~/.mateway/` 下创建本地 home：
 
