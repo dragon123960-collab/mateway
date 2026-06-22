@@ -241,6 +241,7 @@ var enumFields = map[string]map[string]bool{
 	"type": {
 		"preference": true, "decision": true, "experience": true, "skill": true,
 		"pattern": true, "wiki": true, "diary": true, "reflection": true, "proposal": true,
+		"fact": true,
 	},
 	"scope": {
 		"global": true, "user": true, "org": true, "agent": true, "project": true,
@@ -250,6 +251,7 @@ var enumFields = map[string]map[string]bool{
 	},
 	"status": {
 		"proposed": true, "active": true, "rejected": true, "deprecated": true, "archived": true,
+		"superseded": true, "expired": true,
 	},
 	"confidence": {
 		"high": true, "medium": true, "low": true,

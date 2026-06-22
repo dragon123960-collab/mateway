@@ -227,14 +227,14 @@ func workspace(cfg *config.Root) string {
 
 func defaultHeartbeat(cfg *config.Root) config.HeartbeatConfig {
 	if cfg == nil {
-		return config.HeartbeatConfig{Enabled: false, Interval: "30m", Jobs: []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning"}}
+		return config.HeartbeatConfig{Enabled: false, Interval: "30m", Jobs: []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning", "memory_lifecycle"}}
 	}
 	for _, profile := range cfg.Agents.Profiles {
 		if profile.Default || strings.EqualFold(profile.ID, cfg.Agents.Default) {
 			return profile.Heartbeat
 		}
 	}
-	return config.HeartbeatConfig{Enabled: false, Interval: "30m", Jobs: []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning"}}
+	return config.HeartbeatConfig{Enabled: false, Interval: "30m", Jobs: []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning", "memory_lifecycle"}}
 }
 
 func ensureAgentFiles(workspace string, profile config.AgentProfileConfig) error {

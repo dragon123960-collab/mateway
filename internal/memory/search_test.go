@@ -94,6 +94,79 @@ Concise answers should keep evidence.
 	}
 }
 
+func TestSearchRootFiltersLifecycleByDefault(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "projects", "mateway", "environment", "old-host.md"), `---
+type: fact
+scope: project
+visibility: private
+status: superseded
+topic_path: projects/mateway/environment
+subject: staging_server
+predicate: ssh_host
+object: 10.0.0.8
+sources:
+  - trace:old
+confidence: high
+created_at: 2026-05-01
+updated_at: 2026-05-01
+schema_version: 1
+---
+Old staging host 10.0.0.8.
+`)
+	writeFile(t, filepath.Join(root, "projects", "mateway", "environment", "new-host.md"), `---
+type: fact
+scope: project
+visibility: private
+status: active
+topic_path: projects/mateway/environment
+subject: staging_server
+predicate: ssh_host
+object: 10.0.0.9
+sources:
+  - trace:new
+confidence: high
+created_at: 2026-06-01
+updated_at: 2026-06-01
+schema_version: 1
+---
+Current staging host 10.0.0.9.
+`)
+	writeFile(t, filepath.Join(root, "projects", "mateway", "environment", "expired-host.md"), `---
+type: fact
+scope: project
+visibility: private
+status: active
+topic_path: projects/mateway/environment
+subject: staging_server
+predicate: ssh_host
+object: 10.0.0.7
+sources:
+  - trace:expired
+confidence: medium
+valid_until: 2026-01-01
+created_at: 2025-12-01
+updated_at: 2025-12-01
+schema_version: 1
+---
+Expired staging host 10.0.0.7.
+`)
+	results, _, err := SearchRoot(root, SearchOptions{Query: "staging host", TopicPath: "projects/mateway/environment", Subject: "staging_server", Predicate: "ssh_host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "projects/mateway/environment/new-host.md" {
+		t.Fatalf("expected only active current memory, got %#v", results)
+	}
+	history, _, err := SearchRoot(root, SearchOptions{Query: "staging host", IncludeHistory: true, TopicPath: "projects/mateway/environment", Subject: "staging_server", Predicate: "ssh_host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 3 {
+		t.Fatalf("expected history results, got %#v", history)
+	}
+}
+
 func TestSearchRootRequiresQuery(t *testing.T) {
 	_, _, err := SearchRoot(t.TempDir(), SearchOptions{})
 	if err == nil {

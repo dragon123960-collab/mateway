@@ -114,3 +114,63 @@ func TestProposalStoreCommitWritesActiveMemory(t *testing.T) {
 		t.Fatalf("unexpected audit:\n%s", audit)
 	}
 }
+
+func TestProposalStoreCommitSupersedesMatchingActiveMemory(t *testing.T) {
+	home := t.TempDir()
+	memoryRoot := filepath.Join(home, "workspace", "memory")
+	oldPath := filepath.Join(memoryRoot, "projects", "mateway", "environment", "old-host.md")
+	writeFile(t, oldPath, `---
+type: fact
+scope: project
+visibility: private
+status: active
+topic_path: projects/mateway/environment
+subject: staging_server
+predicate: ssh_host
+object: 10.0.0.8
+sources:
+  - trace:old
+confidence: high
+created_at: 2026-05-01
+updated_at: 2026-05-01
+schema_version: 1
+---
+# Old host
+
+Staging host was 10.0.0.8.
+`)
+	store := ProposalStore{Home: home, MemoryRoot: memoryRoot}
+	created, err := store.Create(CreateProposalInput{
+		Type:       "fact",
+		Scope:      "project",
+		Title:      "Staging host",
+		Body:       "Staging host is now 10.0.0.9.",
+		Sources:    []string{"trace:new"},
+		Confidence: "high",
+		TopicPath:  "projects/mateway/environment",
+		Subject:    "staging_server",
+		Predicate:  "ssh_host",
+		Object:     "10.0.0.9",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, target, err := store.Commit(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldData, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(oldData), "status: superseded") || !strings.Contains(string(oldData), "superseded_by:") {
+		t.Fatalf("old memory not superseded:\n%s", oldData)
+	}
+	newData, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(newData), "supersedes:") || !strings.Contains(string(newData), "old-host.md") {
+		t.Fatalf("new memory missing supersedes:\n%s", newData)
+	}
+}

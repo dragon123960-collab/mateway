@@ -129,7 +129,7 @@ func DefaultRoot() Root {
 				Enabled:  false,
 				Interval: "30m",
 				Schedule: HeartbeatSchedule{DailyAt: "03:30"},
-				Jobs:     []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning"},
+				Jobs:     []string{"memory_lint", "memory_index_rebuild", "memory_distill", "learning_distill", "skill_learning", "memory_lifecycle"},
 				QuietHours: HeartbeatQuietHours{
 					Start: "23:00",
 					End:   "08:00",

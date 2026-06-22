@@ -25,6 +25,7 @@ type HeartbeatResult struct {
 	Distill   DistillHeartbeatResult
 	Learning  DistillHeartbeatResult
 	Skill     SkillLearningHeartbeatResult
+	Lifecycle LifecycleHeartbeatResult
 }
 
 type HeartbeatServeInput struct {
@@ -124,6 +125,14 @@ func ServeHeartbeat(ctx context.Context, input HeartbeatServeInput) error {
 				if err != nil {
 					return err
 				}
+			case "lifecycle":
+				lifecycle, err := RunLifecycleHeartbeat(LifecycleHeartbeatInput{Home: input.Home, MemoryRoot: input.MemoryRoot, Now: input.Now})
+				if input.OnResult != nil {
+					input.OnResult(HeartbeatResult{Root: input.MemoryRoot, IndexPath: input.IndexPath, Lifecycle: lifecycle})
+				}
+				if err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("unsupported heartbeat job %q", job)
 			}
@@ -168,6 +177,11 @@ func NormalizeHeartbeatJobs(jobs []string) []string {
 			if !seen["skill_learning"] {
 				out = append(out, "skill_learning")
 				seen["skill_learning"] = true
+			}
+		case "lifecycle", "memory_lifecycle":
+			if !seen["lifecycle"] {
+				out = append(out, "lifecycle")
+				seen["lifecycle"] = true
 			}
 		}
 	}

@@ -25,14 +25,22 @@ type IndexEntry struct {
 	ProjectID     string   `json:"project_id,omitempty"`
 	Visibility    string   `json:"visibility,omitempty"`
 	Status        string   `json:"status,omitempty"`
+	TopicPath     string   `json:"topic_path,omitempty"`
+	Subject       string   `json:"subject,omitempty"`
+	Predicate     string   `json:"predicate,omitempty"`
+	Object        string   `json:"object,omitempty"`
 	Tags          []string `json:"tags,omitempty"`
 	Aliases       []string `json:"aliases,omitempty"`
 	OpFingerprint string   `json:"op_fingerprint,omitempty"`
 	Sources       []string `json:"sources,omitempty"`
 	Confidence    string   `json:"confidence,omitempty"`
+	ValidFrom     string   `json:"valid_from,omitempty"`
+	ValidUntil    string   `json:"valid_until,omitempty"`
 	CreatedAt     string   `json:"created_at,omitempty"`
 	UpdatedAt     string   `json:"updated_at,omitempty"`
 	ReviewAfter   string   `json:"review_after,omitempty"`
+	Supersedes    []string `json:"supersedes,omitempty"`
+	SupersededBy  []string `json:"superseded_by,omitempty"`
 	Snippet       string   `json:"snippet,omitempty"`
 }
 
@@ -90,20 +98,42 @@ func entryFromDocument(doc Document) IndexEntry {
 		ProjectID:     stringValue(doc.FrontMatter["project_id"]),
 		Visibility:    stringValue(doc.FrontMatter["visibility"]),
 		Status:        stringValue(doc.FrontMatter["status"]),
+		TopicPath:     stringValue(doc.FrontMatter["topic_path"]),
+		Subject:       stringValue(doc.FrontMatter["subject"]),
+		Predicate:     stringValue(doc.FrontMatter["predicate"]),
+		Object:        stringValue(doc.FrontMatter["object"]),
 		Tags:          stringSlice(doc.FrontMatter["tags"]),
 		Aliases:       stringSlice(doc.FrontMatter["aliases"]),
 		OpFingerprint: stringValue(doc.FrontMatter["op_fingerprint"]),
 		Sources:       stringSlice(doc.FrontMatter["sources"]),
 		Confidence:    stringValue(doc.FrontMatter["confidence"]),
+		ValidFrom:     stringValue(doc.FrontMatter["valid_from"]),
+		ValidUntil:    stringValue(doc.FrontMatter["valid_until"]),
 		CreatedAt:     stringValue(doc.FrontMatter["created_at"]),
 		UpdatedAt:     stringValue(doc.FrontMatter["updated_at"]),
 		ReviewAfter:   stringValue(doc.FrontMatter["review_after"]),
+		Supersedes:    stringSlice(doc.FrontMatter["supersedes"]),
+		SupersededBy:  stringSlice(doc.FrontMatter["superseded_by"]),
 		Snippet:       snippet(doc.Body, 240),
 	}
 }
 
 func stringValue(value any) string {
-	return strings.TrimSpace(fmt.Sprint(value))
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case time.Time:
+		if typed.Hour() == 0 && typed.Minute() == 0 && typed.Second() == 0 && typed.Nanosecond() == 0 {
+			return typed.Format("2006-01-02")
+		}
+		return typed.Format(time.RFC3339)
+	default:
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text == "<nil>" {
+			return ""
+		}
+		return text
+	}
 }
 
 func stringSlice(value any) []string {

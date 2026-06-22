@@ -15,14 +15,25 @@ scope: agent
 owner_agent: main
 visibility: private
 status: active
+topic_path: agents/main/workflows
+subject: readme
+predicate: inspect
+object: file.read
 tags: [tool, file]
 aliases: [readme-check]
 op_fingerprint: file.read:README
 sources:
   - trace:abc
 confidence: high
+valid_from: 2026-05-01
+valid_until: 2026-07-01
 created_at: 2026-05-29
 updated_at: 2026-05-29
+review_after: 2026-06-29
+supersedes:
+  - agents/main/experience/old.md
+superseded_by:
+  - agents/main/experience/new.md
 schema_version: 1
 ---
 # README check
@@ -45,6 +56,15 @@ Use file.read for local README inspection.
 	}
 	if len(entry.Tags) != 2 || entry.Tags[0] != "tool" || entry.Sources[0] != "trace:abc" {
 		t.Fatalf("unexpected metadata: %#v", entry)
+	}
+	if entry.TopicPath != "agents/main/workflows" || entry.Subject != "readme" || entry.Predicate != "inspect" || entry.Object != "file.read" {
+		t.Fatalf("tree fields not indexed: %#v", entry)
+	}
+	if entry.ValidFrom != "2026-05-01" || entry.ValidUntil != "2026-07-01" || entry.ReviewAfter != "2026-06-29" {
+		t.Fatalf("lifecycle fields not indexed: %#v", entry)
+	}
+	if len(entry.Supersedes) != 1 || len(entry.SupersededBy) != 1 {
+		t.Fatalf("supersession fields not indexed: %#v", entry)
 	}
 	if entry.Snippet == "" {
 		t.Fatalf("expected snippet: %#v", entry)

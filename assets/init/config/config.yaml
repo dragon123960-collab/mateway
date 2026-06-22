@@ -94,6 +94,7 @@ agents:
           - memory_distill
           - learning_distill
           - skill_learning
+          - memory_lifecycle
         auto_send_summary: false
         quiet_hours:
           start: "23:00"

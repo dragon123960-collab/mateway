@@ -91,6 +91,10 @@ func runMemory(args []string) error {
 		rootFlag := fs.String("root", "", "memory root to search")
 		scopeFlag := fs.String("scope", "", "optional scope filter")
 		typeFlag := fs.String("type", "", "optional type filter")
+		topicFlag := fs.String("topic", "", "optional topic_path filter")
+		subjectFlag := fs.String("subject", "", "optional subject filter")
+		predicateFlag := fs.String("predicate", "", "optional predicate filter")
+		includeHistoryFlag := fs.Bool("include-history", false, "include expired and superseded memories")
 		limitFlag := fs.Int("limit", 5, "maximum results")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -105,10 +109,14 @@ func runMemory(args []string) error {
 			root = memoryRoot(cfg)
 		}
 		results, issues, err := memory.SearchRoot(root, memory.SearchOptions{
-			Query: query,
-			Limit: *limitFlag,
-			Scope: strings.TrimSpace(*scopeFlag),
-			Type:  strings.TrimSpace(*typeFlag),
+			Query:          query,
+			Limit:          *limitFlag,
+			Scope:          strings.TrimSpace(*scopeFlag),
+			Type:           strings.TrimSpace(*typeFlag),
+			TopicPath:      strings.TrimSpace(*topicFlag),
+			Subject:        strings.TrimSpace(*subjectFlag),
+			Predicate:      strings.TrimSpace(*predicateFlag),
+			IncludeHistory: *includeHistoryFlag,
 		})
 		if err != nil {
 			return err
@@ -122,7 +130,10 @@ func runMemory(args []string) error {
 		fmt.Println("memory_root:", root)
 		fmt.Println("results:", len(results))
 		for i, result := range results {
-			fmt.Printf("%d. %s type=%s scope=%s score=%d\n", i+1, result.Path, result.Type, result.Scope, result.Score)
+			fmt.Printf("%d. %s type=%s scope=%s status=%s score=%d\n", i+1, result.Path, result.Type, result.Scope, result.Status, result.Score)
+			if result.TopicPath != "" || result.Subject != "" || result.Predicate != "" {
+				fmt.Printf("   tree: topic=%s subject=%s predicate=%s\n", result.TopicPath, result.Subject, result.Predicate)
+			}
 			if result.Snippet != "" {
 				fmt.Println("   snippet:", result.Snippet)
 			}
@@ -199,7 +210,7 @@ func runMemoryReport(args []string) error {
 
 func runMemoryHeartbeat(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|learning|skill|serve>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|learning|skill|lifecycle|serve>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -251,6 +262,13 @@ func runMemoryHeartbeat(args []string) error {
 		})
 		printSkillLearningResult(result)
 		printSkillProposalSummaries(skill.NewProposalStore(cfg), result.ProposalIDs)
+		return err
+	case "lifecycle":
+		result, err := memory.RunLifecycleHeartbeat(memory.LifecycleHeartbeatInput{
+			Home:       cfg.App.Home,
+			MemoryRoot: memoryRoot(cfg),
+		})
+		printLifecycleResult(result)
 		return err
 	case "serve":
 		fs := flag.NewFlagSet("mateway memory heartbeat serve", flag.ContinueOnError)
@@ -320,6 +338,15 @@ func runMemoryHeartbeat(args []string) error {
 					if err != nil {
 						return err
 					}
+				case "lifecycle":
+					lifecycle, err := memory.RunLifecycleHeartbeat(memory.LifecycleHeartbeatInput{
+						Home:       cfg.App.Home,
+						MemoryRoot: memoryRoot(cfg),
+					})
+					printLifecycleResult(lifecycle)
+					if err != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -343,7 +370,7 @@ func runMemoryHeartbeat(args []string) error {
 			},
 		})
 	default:
-		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|learning|skill|serve>")
+		return fmt.Errorf("usage: mateway memory heartbeat <lint-index|distill|learning|skill|lifecycle|serve>")
 	}
 }
 
@@ -392,6 +419,22 @@ func printSkillLearningResult(result memory.SkillLearningHeartbeatResult) {
 	}
 	for _, errText := range result.Errors {
 		fmt.Println("skill_learning_error:", errText)
+	}
+}
+
+func printLifecycleResult(result memory.LifecycleHeartbeatResult) {
+	fmt.Println("memory_root:", result.Root)
+	fmt.Println("lifecycle_scanned:", result.Scanned)
+	fmt.Println("lifecycle_issues:", result.Issues)
+	fmt.Println("lifecycle_expired:", result.Expired)
+	fmt.Println("lifecycle_review_due:", result.ReviewDue)
+	fmt.Println("lifecycle_conflicts:", result.Conflicts)
+	for _, item := range result.Items {
+		if len(item.Paths) > 0 {
+			fmt.Printf("- %s topic=%s subject=%s predicate=%s paths=%s\n", item.Kind, item.TopicPath, item.Subject, item.Predicate, strings.Join(item.Paths, ", "))
+			continue
+		}
+		fmt.Printf("- %s topic=%s subject=%s predicate=%s path=%s due=%s\n", item.Kind, item.TopicPath, item.Subject, item.Predicate, item.Path, item.Due)
 	}
 }
 
@@ -561,16 +604,30 @@ func runMemoryProposal(args []string) error {
 		scope := fs.String("scope", "agent", "proposal scope")
 		source := fs.String("source", "", "comma-separated source refs")
 		confidence := fs.String("confidence", "low", "confidence: high, medium, or low")
+		topic := fs.String("topic", "", "memory topic_path")
+		subject := fs.String("subject", "", "memory subject")
+		predicate := fs.String("predicate", "", "memory predicate")
+		object := fs.String("object", "", "memory object")
+		validFrom := fs.String("valid-from", "", "memory valid_from date")
+		validUntil := fs.String("valid-until", "", "memory valid_until date")
+		reviewAfter := fs.String("review-after", "", "memory review_after date")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		proposal, err := store.Create(memory.CreateProposalInput{
-			Type:       *proposalType,
-			Scope:      *scope,
-			Title:      *title,
-			Body:       *body,
-			Sources:    splitComma(*source),
-			Confidence: *confidence,
+			Type:        *proposalType,
+			Scope:       *scope,
+			Title:       *title,
+			Body:        *body,
+			Sources:     splitComma(*source),
+			Confidence:  *confidence,
+			TopicPath:   *topic,
+			Subject:     *subject,
+			Predicate:   *predicate,
+			Object:      *object,
+			ValidFrom:   *validFrom,
+			ValidUntil:  *validUntil,
+			ReviewAfter: *reviewAfter,
 		})
 		if err != nil {
 			return err
