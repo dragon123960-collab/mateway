@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -32,6 +33,25 @@ func TestWrapLinesSplitsLongLines(t *testing.T) {
 	lines := wrapLines("abcdef", 3)
 	if strings.Join(lines, ",") != "abc,def" {
 		t.Fatalf("unexpected wrap: %#v", lines)
+	}
+}
+
+func TestWrapLinesHandlesWideCharacters(t *testing.T) {
+	lines := wrapLines("查看一下今晚世界杯对阵的赛程，看点是什么", 10)
+	if len(lines) < 2 {
+		t.Fatalf("expected wrapped wide-character lines, got %#v", lines)
+	}
+	for _, line := range lines {
+		if visibleLen(line) > 10 {
+			t.Fatalf("line exceeds width: %q width=%d", line, visibleLen(line))
+		}
+	}
+}
+
+func TestCompactInlineDoesNotSplitUTF8(t *testing.T) {
+	got := compactInline("查看一下今晚世界杯对阵的赛程", 5)
+	if got != "查看一下今..." {
+		t.Fatalf("compactInline = %q", got)
 	}
 }
 
@@ -342,6 +362,149 @@ func TestTUIViewDoesNotGrowWhenSidebarIsLong(t *testing.T) {
 	}
 }
 
+func TestTUISidebarHandlesLargeGraphWithoutHugeOutput(t *testing.T) {
+	home := t.TempDir()
+	nodes := make([]session.TaskGraphNode, 0, 80)
+	for i := 0; i < 80; i++ {
+		status := session.NodeStatusCompleted
+		if i == 52 {
+			status = session.NodeStatusRunning
+		}
+		nodes = append(nodes, session.TaskGraphNode{
+			ID:            fmt.Sprintf("node-%02d", i),
+			Goal:          fmt.Sprintf("process oversized node %02d %s", i, strings.Repeat("goal ", 100)),
+			Status:        status,
+			Mode:          session.NodeModeReact,
+			Attempts:      1,
+			ResultSummary: strings.Repeat("large result ", 20000),
+			Acceptance:    session.Acceptance{Criteria: strings.Repeat("acceptance ", 20000), Verified: status == session.NodeStatusCompleted},
+			EvidenceRefs:  []session.EvidenceRef{{ToolName: "web.fetch", Summary: strings.Repeat("evidence ", 20000)}},
+		})
+	}
+	state := session.State{
+		Key:        "cli:default",
+		ActiveTask: "task-1",
+		Tasks: []session.TaskNode{{
+			ID:      "task-1",
+			Status:  "running",
+			Summary: strings.Repeat("large task ", 1000),
+			Graph: &session.TaskGraph{
+				ID:     "graph-task-1",
+				TaskID: "task-1",
+				Status: session.GraphStatusRunning,
+				Nodes:  nodes,
+			},
+		}},
+	}
+	rawLines := strings.Join(taskSidebarLines(state.Tasks[0]), "\n")
+	if !strings.Contains(rawLines, "more nodes") {
+		t.Fatalf("large graph should summarize omitted nodes:\n%s", rawLines)
+	}
+	if err := session.NewStore(home).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: home}}, "cli:default")
+	app.width = 160
+	app.height = 36
+	app.resize()
+	view := app.View()
+	if got := lipgloss.Height(view); got != app.height {
+		t.Fatalf("view height = %d, want %d", got, app.height)
+	}
+	if len(view) > 30000 {
+		t.Fatalf("sidebar rendered too much text: %d bytes", len(view))
+	}
+}
+
+func TestTUISidebarHandlesLargeChineseGraphWithoutRunawayWrap(t *testing.T) {
+	home := t.TempDir()
+	nodes := make([]session.TaskGraphNode, 0, 40)
+	for i := 0; i < 40; i++ {
+		status := session.NodeStatusCompleted
+		if i == 8 {
+			status = session.NodeStatusRunning
+		}
+		nodes = append(nodes, session.TaskGraphNode{
+			ID:            fmt.Sprintf("node-%02d", i),
+			Goal:          strings.Repeat("查看今晚世界杯赛程和看点", 80),
+			Status:        status,
+			Mode:          session.NodeModeDirect,
+			ResultSummary: strings.Repeat("赛程看点总结", 20000),
+			Acceptance:    session.Acceptance{Criteria: strings.Repeat("覆盖所有比赛和看点", 20000), Verified: status == session.NodeStatusCompleted},
+			EvidenceRefs:  []session.EvidenceRef{{ToolName: "web.search", Summary: strings.Repeat("搜索结果摘要", 20000)}},
+		})
+	}
+	state := session.State{
+		Key:        "cli:default",
+		ActiveTask: "task-1",
+		Tasks: []session.TaskNode{{
+			ID:      "task-1",
+			Status:  "running",
+			Summary: strings.Repeat("查看一下今晚世界杯对阵的赛程，看点是什么", 500),
+			Graph: &session.TaskGraph{
+				ID:     "graph-task-1",
+				TaskID: "task-1",
+				Status: session.GraphStatusRunning,
+				Nodes:  nodes,
+			},
+		}},
+	}
+	if err := session.NewStore(home).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: home}}, "cli:default")
+	app.width = 160
+	app.height = 36
+	app.resize()
+	view := app.View()
+	if got := lipgloss.Height(view); got != app.height {
+		t.Fatalf("view height = %d, want %d", got, app.height)
+	}
+	if len(view) > 30000 {
+		t.Fatalf("sidebar rendered too much Chinese text: %d bytes", len(view))
+	}
+}
+
+func TestTUISidebarUsesShortLivedCache(t *testing.T) {
+	home := t.TempDir()
+	tracePath := filepath.Join(home, "trace.jsonl")
+	if err := os.WriteFile(tracePath, []byte(`{"type":"model_call_start","model_stage":"planner"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := session.State{
+		Key: "cli:default",
+		Tasks: []session.TaskNode{{
+			ID:        "task-1",
+			Status:    "running",
+			Summary:   "cache trace summary",
+			TracePath: tracePath,
+		}},
+	}
+	if err := session.NewStore(home).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: home}}, "cli:default")
+	app.width = 140
+	app.height = 30
+	app.resize()
+	first := app.sidebarView(app.height)
+	if err := os.WriteFile(tracePath, []byte(`{"type":"model_call_start","model_stage":"node_direct"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second := app.sidebarView(app.height)
+	if first != second {
+		t.Fatal("sidebar should reuse cache within the cache TTL")
+	}
+	app.sidebarCacheExpires = time.Now().Add(-time.Second)
+	third := app.sidebarView(app.height)
+	if third == first {
+		t.Fatal("sidebar should refresh after cache expiry")
+	}
+	if !strings.Contains(third, "node_direct") {
+		t.Fatalf("refreshed sidebar did not read updated trace:\n%s", third)
+	}
+}
+
 func TestTUISidebarCanScrollLongContent(t *testing.T) {
 	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
 	var lines []string
@@ -545,6 +708,63 @@ func TestTUISidebarShowsLiveTaskWhileRunning(t *testing.T) {
 	}
 }
 
+func TestTUISidebarDoesNotShowOldTaskForNewRunningRequest(t *testing.T) {
+	state := session.State{Tasks: []session.TaskNode{{
+		ID:      "old",
+		Status:  "completed",
+		Goal:    "old football search",
+		Summary: "old completed football summary",
+		Graph: &session.TaskGraph{
+			ID:     "graph-old",
+			TaskID: "old",
+			Status: session.GraphStatusCompleted,
+			Nodes:  []session.TaskGraphNode{{ID: "old-node", Goal: "old node", Status: session.NodeStatusCompleted}},
+		},
+	}}}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
+	app.running = true
+	app.status = "Thinking"
+	app.currentTask = "create a new Feishu document"
+	lines := strings.Join(app.sidebarSummary(state).TaskLines, "\n")
+	for _, want := range []string{"▾ TaskGraph planning", "Request: create a new Feishu document", "Waiting for graph nodes"} {
+		if !strings.Contains(lines, want) {
+			t.Fatalf("live new request sidebar missing %q:\n%s", want, lines)
+		}
+	}
+	if strings.Contains(lines, "old football") || strings.Contains(lines, "old completed") {
+		t.Fatalf("running sidebar should not show previous completed task:\n%s", lines)
+	}
+}
+
+func TestTUISidebarShowsRunningRequestAndTaskID(t *testing.T) {
+	state := session.State{Tasks: []session.TaskNode{{
+		ID:     "task-new",
+		Status: "running",
+		Goal:   "create a new Feishu document",
+		Graph: &session.TaskGraph{
+			ID:     "graph-new",
+			TaskID: "task-new",
+			Status: session.GraphStatusRunning,
+			Nodes: []session.TaskGraphNode{{
+				ID:     "draft",
+				Goal:   "draft document",
+				Status: session.NodeStatusRunning,
+				Mode:   session.NodeModeReact,
+			}},
+		},
+	}}}
+	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
+	app.running = true
+	app.status = "Thinking"
+	app.currentTask = "create a new Feishu document"
+	lines := strings.Join(app.sidebarSummary(state).TaskLines, "\n")
+	for _, want := range []string{"Request: create a new Feishu document", "Task ID: task-new", "Task: create a new Feishu document"} {
+		if !strings.Contains(lines, want) {
+			t.Fatalf("running graph sidebar missing %q:\n%s", want, lines)
+		}
+	}
+}
+
 func TestTUISidebarShowsStoredContractWhileRunning(t *testing.T) {
 	state := session.State{
 		Key:        "cli:default",
@@ -623,7 +843,7 @@ func TestTUISlashModelAndTools(t *testing.T) {
 	}
 }
 
-func TestTUISubmitShowsThinkingImmediately(t *testing.T) {
+func TestTUISubmitShowsWorkingPlaceholder(t *testing.T) {
 	app := newTUIModel(context.Background(), &config.Root{App: config.AppConfig{Home: t.TempDir()}}, "cli:default")
 	app.input.SetValue("hello")
 	cmd := app.submit()
@@ -631,8 +851,11 @@ func TestTUISubmitShowsThinkingImmediately(t *testing.T) {
 		t.Fatal("submit should return task command")
 	}
 	joined := strings.Join(app.events, "\n")
-	if !strings.Contains(joined, "User") || !strings.Contains(joined, "• Thinking") {
-		t.Fatalf("submit should append user and thinking events:\n%s", joined)
+	if !strings.Contains(joined, "User") || !strings.Contains(joined, "• Working on task...") {
+		t.Fatalf("submit should append user and working placeholder:\n%s", joined)
+	}
+	if strings.Contains(joined, "• Thinking") {
+		t.Fatalf("submit should not append empty thinking event:\n%s", joined)
 	}
 }
 

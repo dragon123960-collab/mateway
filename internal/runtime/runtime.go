@@ -134,6 +134,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 	_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "effective_text": userText})
 	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: phase, MessageID: msg.ID})
 
+	rt.emitProgressStep(msg, state, task.ID, channel.ProgressStep{
+		Title:   "Plan",
+		Status:  "running",
+		Summary: "preparing task graph",
+	})
 	if err := rt.ensureGraphForTask(ctx, msg, &state, task, userText, trace); err != nil {
 		if isTransientBootstrapError(err) {
 			state.AwaitUserInputActiveTaskWithSummary(friendlyRuntimeError(rt.Config, msg, err), trace.id, trace.path)
@@ -159,6 +164,11 @@ func (rt Runtime) Handle(ctx context.Context, msg channel.InboundMessage) (Respo
 		_ = trace.write(map[string]any{"type": "reply", "text": resp.Reply.Text, "style": resp.Reply.Style})
 		return resp, nil
 	}
+	rt.emitProgressStep(msg, state, task.ID, channel.ProgressStep{
+		Title:   "Plan",
+		Status:  "completed",
+		Summary: "task graph ready",
+	})
 
 	return rt.runGraphTask(ctx, msg, &state, task, userText, trace)
 }
@@ -282,6 +292,11 @@ func (rt Runtime) runGraphTask(
 			})
 
 			startNodeAttempt(trace, g, node)
+			rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
+				Title:   firstNonEmpty(node.Goal, node.ID),
+				Status:  "running",
+				Summary: "node " + node.ID,
+			})
 		}
 
 		if err := rt.saveState(state, trace); err != nil {
@@ -303,6 +318,11 @@ func (rt Runtime) runGraphTask(
 					"type":           "node_completed",
 					"status":         node.Status,
 					"result_summary": node.ResultSummary,
+				})
+				rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
+					Title:   firstNonEmpty(node.Goal, node.ID),
+					Status:  "completed",
+					Summary: "node " + node.ID,
 				})
 			}
 			if node.Status == session.NodeStatusRetrying {
@@ -952,6 +972,13 @@ func maxIterations(cfg *config.Root) int {
 	return cfg.Execution.MaxIterationsValue()
 }
 
+func plannerTimeout(cfg *config.Root) time.Duration {
+	if cfg == nil {
+		return time.Minute
+	}
+	return cfg.Execution.PlannerTimeoutDuration()
+}
+
 func inactivityTimeout(cfg *config.Root) time.Duration {
 	if cfg == nil {
 		return 5 * time.Minute
@@ -1170,16 +1197,10 @@ func shouldStartNewTaskInsteadOfSteering(state session.State, userText string) b
 	if active.Status != "await_user_input" || !looksLikeContinuationOffer(active.Summary) {
 		return false
 	}
-	lower := strings.ToLower(userText)
-	for _, marker := range []string{"yes", "y", "ok", "okay", "sure", "continue", "go ahead", "1", "2", "3", "4", "继续", "好的", "可以", "行"} {
-		if lower == marker {
-			return false
-		}
+	if isShortConfirmation(userText) || isResumeCommand(userText) {
+		return false
 	}
-	if strings.HasPrefix(lower, "now ") || strings.HasPrefix(lower, "new ") || strings.HasPrefix(lower, "另外") || strings.HasPrefix(lower, "还有") {
-		return true
-	}
-	return needsAction(userText) && len(strings.Fields(userText)) >= 4
+	return needsAction(userText) && len(meaningfulTokens(userText)) >= 2
 }
 
 func shouldBreakFailedTaskSteering(goal, userText string) bool {
@@ -1187,11 +1208,8 @@ func shouldBreakFailedTaskSteering(goal, userText string) bool {
 	if userText == "" {
 		return false
 	}
-	lower := strings.ToLower(userText)
-	for _, marker := range []string{"continue", "继续", "接着", "重试", "retry", "again", "再试"} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
+	if isResumeCommand(userText) {
+		return false
 	}
 	if !needsAction(userText) {
 		return false

@@ -24,6 +24,9 @@ type Skill struct {
 	AllowedTools []string
 	Inputs       []string
 	Outputs      []string
+	Usage        string
+	Entrypoints  []string
+	Success      []string
 	Priority     string
 	Path         string
 	Scope        string
@@ -72,14 +75,17 @@ type Metadata struct {
 }
 
 type GraphMetadata struct {
-	Mode         string   `yaml:"mode"`
-	Type         string   `yaml:"type"`
-	Stage        string   `yaml:"stage"`
-	Granularity  string   `yaml:"granularity"`
-	Inputs       []string `yaml:"inputs,omitempty"`
-	Outputs      []string `yaml:"outputs,omitempty"`
-	AllowedTools []string `yaml:"allowed_tools,omitempty"`
-	SafetyNotes  []string `yaml:"safety_notes,omitempty"`
+	Mode            string   `yaml:"mode"`
+	Type            string   `yaml:"type"`
+	Stage           string   `yaml:"stage"`
+	Granularity     string   `yaml:"granularity"`
+	Inputs          []string `yaml:"inputs,omitempty"`
+	Outputs         []string `yaml:"outputs,omitempty"`
+	AllowedTools    []string `yaml:"allowed_tools,omitempty"`
+	Usage           string   `yaml:"usage,omitempty"`
+	Entrypoints     []string `yaml:"entrypoints,omitempty"`
+	SuccessCriteria []string `yaml:"success_criteria,omitempty"`
+	SafetyNotes     []string `yaml:"safety_notes,omitempty"`
 }
 
 type RegisterInput struct {
@@ -219,6 +225,7 @@ func Install(input InstallInput) (InstallResult, error) {
 	metadataPath, err := WriteMetadata(filepath.Dir(target), DefaultMetadata(DefaultMetadataInput{
 		Source: source,
 		Header: header,
+		Body:   string(data),
 		Notes: []string{
 			"Original SKILL.md is preserved. Mateway-specific adaptation lives in this metadata directory.",
 			"Use terminal.run for command execution; use file.read/write/delete for local files; use secret.set and terminal.run.env_secrets for credentials.",
@@ -268,6 +275,7 @@ func WriteMetadata(skillDir string, metadata Metadata) (string, error) {
 type DefaultMetadataInput struct {
 	Source string
 	Header Skill
+	Body   string
 	Notes  []string
 }
 
@@ -278,10 +286,19 @@ func DefaultMetadata(input DefaultMetadataInput) Metadata {
 	}
 	graphType := "prompt"
 	allowedTools := []string(nil)
-	switch strings.ToLower(strings.TrimSpace(input.Header.Name)) {
+	usage := defaultSkillUsage(input.Header, input.Body)
+	entrypoints := inferSkillEntrypoints(input.Body)
+	successCriteria := defaultSuccessCriteria(input.Header, input.Body)
+	nameLower := strings.ToLower(strings.TrimSpace(input.Header.Name))
+	bodyLower := strings.ToLower(input.Body)
+	switch nameLower {
 	case "fresh-search":
 		graphType = "react"
 		allowedTools = []string{"web.search", "web.fetch"}
+	}
+	if graphType == "prompt" && (strings.Contains(bodyLower, "terminal.run") || len(entrypoints) > 0) {
+		graphType = "react"
+		allowedTools = appendUniqueStrings(allowedTools, "terminal.run")
 	}
 	return Metadata{
 		AdapterVersion: "2",
@@ -290,13 +307,85 @@ func DefaultMetadata(input DefaultMetadataInput) Metadata {
 		ToolRuntime:    "mateway",
 		Notes:          input.Notes,
 		Graph: GraphMetadata{
-			Mode:         "adapted",
-			Type:         graphType,
-			Stage:        stage,
-			Granularity:  "subtask",
-			AllowedTools: allowedTools,
+			Mode:            "adapted",
+			Type:            graphType,
+			Stage:           stage,
+			Granularity:     "subtask",
+			AllowedTools:    allowedTools,
+			Usage:           usage,
+			Entrypoints:     entrypoints,
+			SuccessCriteria: successCriteria,
 		},
 	}
+}
+
+func defaultSkillUsage(header Skill, body string) string {
+	var parts []string
+	if desc := strings.TrimSpace(header.Description); desc != "" {
+		parts = append(parts, desc)
+	}
+	bodyLower := strings.ToLower(body)
+	switch {
+	case strings.Contains(bodyLower, "terminal.run"):
+		parts = append(parts, "Execute this skill through a node-local ReAct loop. Follow SKILL.md exactly, use terminal.run for command examples, and do not claim completion until command evidence satisfies success_criteria.")
+	case strings.Contains(bodyLower, "lark-cli"):
+		parts = append(parts, "Use lark-cli commands described in SKILL.md and return the created resource URL, token, or command output as node output.")
+	default:
+		parts = append(parts, "Use SKILL.md as node-local instruction. Produce output that satisfies this metadata's outputs and success_criteria.")
+	}
+	return strings.Join(parts, " ")
+}
+
+func inferSkillEntrypoints(body string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "python ") || strings.HasPrefix(lower, "python3 "):
+			out = appendUniqueStrings(out, trimmed)
+		case strings.HasPrefix(lower, "lark-cli "):
+			out = appendUniqueStrings(out, trimmed)
+		case strings.Contains(lower, "/scripts/") && !strings.HasPrefix(trimmed, "#"):
+			out = appendUniqueStrings(out, trimmed)
+		}
+		if len(out) >= 5 {
+			break
+		}
+	}
+	return out
+}
+
+func defaultSuccessCriteria(header Skill, body string) []string {
+	bodyLower := strings.ToLower(body)
+	var out []string
+	if strings.Contains(bodyLower, "do not claim") {
+		out = append(out, "Do not claim success unless the required command or API call returns successful evidence.")
+	}
+	if strings.Contains(bodyLower, "url") || strings.Contains(bodyLower, "token") {
+		out = append(out, "Return the created resource URL, token, or verifiable command output.")
+	}
+	if len(out) == 0 {
+		out = append(out, "Return a concise result that satisfies the node goal and SKILL.md instructions.")
+	}
+	return out
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	seen := make(map[string]bool, len(values)+len(additions))
+	var out []string
+	for _, value := range append(values, additions...) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func Register(input RegisterInput) (RegisterResult, error) {
@@ -331,6 +420,7 @@ func Register(input RegisterInput) (RegisterResult, error) {
 	written, err := WriteMetadata(skillDir, DefaultMetadata(DefaultMetadataInput{
 		Source: source,
 		Header: header,
+		Body:   string(data),
 		Notes: []string{
 			"Registered from an existing local SKILL.md.",
 		},
@@ -514,6 +604,9 @@ func listRoot(root, scope string) ([]Skill, error) {
 		item.AllowedTools = append([]string(nil), metadata.Graph.AllowedTools...)
 		item.Inputs = append([]string(nil), metadata.Graph.Inputs...)
 		item.Outputs = append([]string(nil), metadata.Graph.Outputs...)
+		item.Usage = metadata.Graph.Usage
+		item.Entrypoints = append([]string(nil), metadata.Graph.Entrypoints...)
+		item.Success = append([]string(nil), metadata.Graph.SuccessCriteria...)
 		out = append(out, item)
 	}
 	return out, nil

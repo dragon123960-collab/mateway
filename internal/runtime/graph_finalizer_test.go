@@ -252,8 +252,8 @@ func TestFinalizeAndRespond_AwaitingInput_CreatesPendingAction(t *testing.T) {
 	if state.Pending.Kind != session.PendingKindHumanReview {
 		t.Fatalf("pending Kind=%q, want human review", state.Pending.Kind)
 	}
-	if !strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
-		t.Fatalf("reply should include numeric confirmation guidance, got %q", resp.Reply.Text)
+	if strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
+		t.Fatalf("human review reply should not include numeric confirmation guidance, got %q", resp.Reply.Text)
 	}
 	if state.ActiveTask != "t1" {
 		t.Fatal("awaiting_input should keep ActiveTask")
@@ -273,6 +273,111 @@ func TestFinalizeAndRespond_AwaitingHumanConfirmCreatesConfirmPending(t *testing
 		TaskID: "t1",
 		Nodes: []session.TaskGraphNode{
 			{ID: "confirm", Type: session.NodeTypeHumanConfirm, Goal: "approve write", Status: session.NodeStatusAwaitingInput},
+		},
+	}
+
+	vr := session.VerifyTaskGraph(g)
+	resp, err := rt.FinalizeAndRespond(t.Context(), msg, state, g, vr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != session.PendingKindHumanConfirm {
+		t.Fatalf("expected human confirm pending, got %#v", state.Pending)
+	}
+	if !strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
+		t.Fatalf("reply should include numeric confirmation guidance, got %q", resp.Reply.Text)
+	}
+}
+
+func TestFinalizeAndRespond_AwaitingMutationNodeCreatesConfirmPending(t *testing.T) {
+	rt := newTestRuntime(t)
+	msg := inbound("cli:test", "hi")
+	state := &session.State{Key: "cli:test", ActiveTask: "t1"}
+
+	g := &session.TaskGraph{
+		ID:     "g-await-mutation",
+		TaskID: "t1",
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:            "publish",
+				Type:          session.NodeTypeSkill,
+				Mode:          session.NodeModeSkill,
+				Goal:          "create document and return URL",
+				Status:        session.NodeStatusAwaitingInput,
+				Input:         map[string]any{"requires_human_confirmation": true},
+				ResultSummary: "Dry-run passed. Need human_confirm approval before create mutation.",
+				Output:        map[string]any{"url": true},
+				Acceptance: session.Acceptance{
+					Reason: "node requests explicit user confirmation before performing the mutation",
+				},
+			},
+		},
+	}
+
+	vr := session.VerifyTaskGraph(g)
+	resp, err := rt.FinalizeAndRespond(t.Context(), msg, state, g, vr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != session.PendingKindHumanConfirm {
+		t.Fatalf("expected human confirm pending, got %#v", state.Pending)
+	}
+	if state.Pending.NodeID != "publish" {
+		t.Fatalf("pending node = %q, want publish", state.Pending.NodeID)
+	}
+	if !strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
+		t.Fatalf("reply should include numeric confirmation guidance, got %q", resp.Reply.Text)
+	}
+}
+
+func TestFinalizeAndRespond_AwaitingNonHumanConfirmTextStaysReviewPending(t *testing.T) {
+	rt := newTestRuntime(t)
+	msg := inbound("cli:test", "hi")
+	state := &session.State{Key: "cli:test", ActiveTask: "t1"}
+
+	g := &session.TaskGraph{
+		ID:     "g-await-info",
+		TaskID: "t1",
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:     "collect-info",
+				Type:   session.NodeTypeHumanReview,
+				Goal:   "confirm title and content before publishing",
+				Status: session.NodeStatusAwaitingInput,
+			},
+		},
+	}
+
+	vr := session.VerifyTaskGraph(g)
+	resp, err := rt.FinalizeAndRespond(t.Context(), msg, state, g, vr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Pending == nil || state.Pending.Kind != session.PendingKindHumanReview {
+		t.Fatalf("expected human review pending, got %#v", state.Pending)
+	}
+	if strings.Contains(resp.Reply.Text, "Reply 1 to confirm") {
+		t.Fatalf("missing-info prompt should not include numeric confirmation guidance, got %q", resp.Reply.Text)
+	}
+}
+
+func TestFinalizeAndRespond_AwaitingStructuredConfirmationGateCreatesConfirmPending(t *testing.T) {
+	rt := newTestRuntime(t)
+	msg := inbound("cli:test", "hi")
+	state := &session.State{Key: "cli:test", ActiveTask: "t1"}
+
+	g := &session.TaskGraph{
+		ID:     "g-await-mutation",
+		TaskID: "t1",
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:     "publish",
+				Type:   session.NodeTypeSkill,
+				Mode:   session.NodeModeSkill,
+				Goal:   "create document and return URL",
+				Status: session.NodeStatusAwaitingInput,
+				Input:  map[string]any{"requires_human_confirmation": true},
+			},
 		},
 	}
 
@@ -839,7 +944,7 @@ func TestGraphAwareContinuation_ContinueGraph(t *testing.T) {
 	task := &session.TaskNode{ID: "t1", Goal: "answer", Status: "running", Graph: g}
 	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
 
-	d := graphAwareContinuation(state, "continue", task)
+	d := graphAwareContinuation(state, "answer status", task)
 	if d.Action != ActionContinueGraph {
 		t.Fatalf("expected continue_graph, got %q", d.Action)
 	}
@@ -915,7 +1020,7 @@ func TestGraphAwareContinuation_BlockedGraphResumePreserved(t *testing.T) {
 	}}
 	state := session.State{Key: "cli:test", ActiveTask: "t1", Tasks: []session.TaskNode{*task}}
 
-	d := graphAwareContinuation(state, "retry the read", task)
+	d := graphAwareContinuation(state, "/retry read", task)
 	if d.Action == ActionNewGraph {
 		t.Fatalf("blocked graph with retry signal should not be new_graph, got %q", d.Action)
 	}

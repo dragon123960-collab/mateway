@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -99,6 +100,94 @@ func TestShouldIgnoreFeishuGroupWithoutMentionWhenRequired(t *testing.T) {
 	}
 }
 
+func TestSessionRunnerSerializesSameSession(t *testing.T) {
+	runner := newSessionRunner()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	var orderMu sync.Mutex
+	var order []string
+
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		orderMu.Lock()
+		order = append(order, "first-start")
+		orderMu.Unlock()
+		close(firstStarted)
+		<-releaseFirst
+		orderMu.Lock()
+		order = append(order, "first-end")
+		orderMu.Unlock()
+	})
+	<-firstStarted
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		orderMu.Lock()
+		order = append(order, "second")
+		orderMu.Unlock()
+		close(secondDone)
+	})
+	select {
+	case <-secondDone:
+		t.Fatal("second same-session task ran before first completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second same-session task did not run after first completed")
+	}
+	orderMu.Lock()
+	got := strings.Join(order, ",")
+	orderMu.Unlock()
+	if got != "first-start,first-end,second" {
+		t.Fatalf("unexpected order: %s", got)
+	}
+}
+
+func TestSessionRunnerAllowsDifferentSessionsInParallel(t *testing.T) {
+	runner := newSessionRunner()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondDone := make(chan struct{})
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:a"}, func(context.Context) {
+		close(firstStarted)
+		<-releaseFirst
+	})
+	<-firstStarted
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:b"}, func(context.Context) {
+		close(secondDone)
+	})
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("different-session task should run without waiting")
+	}
+	close(releaseFirst)
+}
+
+func TestSessionRunnerStopsWaitingWhenContextCancelled(t *testing.T) {
+	runner := newSessionRunner()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondRan := make(chan struct{})
+	go runner.Run(context.Background(), channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		close(firstStarted)
+		<-releaseFirst
+	})
+	<-firstStarted
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner.Run(ctx, channel.InboundMessage{SessionKey: "cli:test"}, func(context.Context) {
+		close(secondRan)
+	})
+	select {
+	case <-secondRan:
+		t.Fatal("cancelled same-session task should not run while waiting")
+	default:
+	}
+	close(releaseFirst)
+}
+
 func TestReactionForReply(t *testing.T) {
 	cases := map[string]string{
 		"input_required": "EYES",
@@ -140,7 +229,7 @@ func TestFeishuProgressTextIncludesSteps(t *testing.T) {
 			{Tool: "web.search", Status: "running", Summary: "北京天气"},
 		},
 	})
-	if !strings.Contains(text, "web.search: call") || !strings.Contains(text, "北京天气") {
+	if !strings.Contains(text, "→ Search: running") || !strings.Contains(text, "北京天气") {
 		t.Fatalf("unexpected progress text %q", text)
 	}
 }
@@ -153,7 +242,22 @@ func TestFeishuProgressTextShowsToolResultOutcome(t *testing.T) {
 			{Tool: "file.write", Status: "failed", Summary: "permission denied"},
 		},
 	})
-	for _, want := range []string{"terminal.run: success / tests passed", "file.write: failed / permission denied"} {
+	for _, want := range []string{"✓ Run: done / tests passed", "✕ Write: blocked / permission denied"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestFeishuProgressTextShowsRuntimeSteps(t *testing.T) {
+	text := feishuProgressText(channel.OutboundMessage{
+		Text: "Processing...",
+		Progress: []channel.ProgressStep{
+			{Title: "Plan", Status: "running", Summary: "preparing task graph"},
+			{Title: "Collect current facts", Status: "completed", Summary: "node search"},
+		},
+	})
+	for _, want := range []string{"→ Plan: running / preparing task graph", "✓ Collect current facts: done / node search"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in %q", want, text)
 		}
@@ -214,6 +318,36 @@ func TestShouldSendProcessingAckAllowsTaskPlanExecute(t *testing.T) {
 	}
 	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "2"}) {
 		t.Fatal("expected replan control to skip processing ack")
+	}
+}
+
+func TestShouldSendProcessingAckAllowsHumanPendingResume(t *testing.T) {
+	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
+	state, err := rt.Store.Load("cli:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := state.StartTask("review missing info")
+	state.Pending = &session.PendingAction{Kind: session.PendingKindHumanReview, TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "title and content"}) {
+		t.Fatal("expected human review answer to send processing ack")
+	}
+
+	state.Pending = &session.PendingAction{Kind: session.PendingKindHumanConfirm, TaskID: task.ID}
+	if err := rt.Store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认1"}) {
+		t.Fatal("expected human confirm approval to send processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "确认12"}) {
+		t.Fatal("expected ambiguous human confirm reply to skip processing ack")
+	}
+	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "title and content"}) {
+		t.Fatal("expected non-numeric human confirm context update to skip processing ack")
 	}
 }
 

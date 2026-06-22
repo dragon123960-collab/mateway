@@ -75,7 +75,7 @@ func TestDetermineContinuation_AwaitUserInput_ShortConfirmation(t *testing.T) {
 			makeTask("task-1", "build feature", "await_user_input"),
 		},
 	}
-	for _, text := range []string{"yes", "ok", "1", "continue", "继续"} {
+	for _, text := range []string{"1", "2", "3", "4"} {
 		dec := determineContinuation(state, text)
 		if dec.Action != ActionResumeNode {
 			t.Fatalf("text=%q: expected resume_node, got %s", text, dec.Action)
@@ -145,7 +145,7 @@ func TestDetermineContinuation_BlockedTask_ResumeSignal(t *testing.T) {
 			makeTask("task-2", "deploy service", "failed"),
 		},
 	}
-	for _, text := range []string{"continue", "重试", "retry", "fixed it", "authorized", "done, try again"} {
+	for _, text := range []string{"/continue", "/resume", "/retry", "/retry deployment"} {
 		dec := determineContinuation(state, text)
 		if dec.Action != ActionResumeNode {
 			t.Fatalf("text=%q: expected resume_node, got %s", text, dec.Action)
@@ -178,7 +178,7 @@ func TestDetermineContinuation_RunningTask_ShortConfirmation(t *testing.T) {
 			makeTask("task-3", "analyze code", "running"),
 		},
 	}
-	for _, text := range []string{"ok", "go ahead", "go", "1"} {
+	for _, text := range []string{"1", "2", "3", "4"} {
 		dec := determineContinuation(state, text)
 		if dec.Action != ActionContinueGraph {
 			t.Fatalf("text=%q: expected continue_graph, got %s", text, dec.Action)
@@ -274,7 +274,6 @@ func TestDetermineContinuation_CompletedTask_DefaultCarriesContext(t *testing.T)
 	}
 	for _, text := range []string{
 		"基于刚才的结果总结一句话",
-		"继续上次的项目设置",
 		"tell me a story about dragons",
 	} {
 		dec := determineContinuation(state, text)
@@ -391,7 +390,7 @@ func TestDetermineContinuation_ResumeNode_IncludesCurrentNodeID(t *testing.T) {
 			},
 		},
 	}
-	dec := determineContinuation(state, "approved")
+	dec := determineContinuation(state, "1")
 	if dec.Action != ActionResumeNode {
 		t.Fatalf("expected resume_node, got %s", dec.Action)
 	}
@@ -419,7 +418,7 @@ func TestDetermineContinuation_BlockedWithNodeID(t *testing.T) {
 			},
 		},
 	}
-	dec := determineContinuation(state, "retry deployment")
+	dec := determineContinuation(state, "/retry deployment")
 	if dec.Action != ActionResumeNode {
 		t.Fatalf("expected resume_node, got %s", dec.Action)
 	}

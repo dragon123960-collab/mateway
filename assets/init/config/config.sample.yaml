@@ -19,6 +19,7 @@ execution:
   max_parallel_tools: 4
   max_parallel_nodes: 1
   max_iterations: 50
+  planner_timeout: 60s
   inactivity_timeout: 5m
   model_verifier: fallback
   context_budget:

@@ -316,6 +316,54 @@ func TestExecuteNode_SkillNode_Success(t *testing.T) {
 	}
 }
 
+func TestExecuteNode_SkillNodeInjectsMetadataContract(t *testing.T) {
+	rt, workspace := newTestRuntimeWithWorkspace(t)
+	var capturedSystemPrompt string
+	rt.Model = captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		capturedSystemPrompt = c.SystemPrompt
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: "created https://example.test/doc"}, nil
+	}}
+	createRegisteredSkillWithMetadata(t, workspace, "publish-skill", `graph:
+  mode: "adapted"
+  type: "prompt"
+  stage: "execution"
+  granularity: "subtask"
+  allowed_tools:
+    - terminal.run
+  usage: "Use terminal.run with the documented helper and return the created URL."
+  entrypoints:
+    - "python3 /tmp/skill/scripts/create-doc --title X"
+  success_criteria:
+    - "Return the created URL."
+`, "# Publish Skill\nUse the helper.")
+
+	g := newTestGraph(session.TaskGraphNode{
+		ID:       "skill-node",
+		Type:     session.NodeTypeSkill,
+		Mode:     session.NodeModeSkill,
+		Goal:     "publish document",
+		Status:   session.NodeStatusPending,
+		Executor: "publish-skill",
+	})
+	node := g.NodeByID("skill-node")
+
+	err := rt.executeNode(t.Context(), inbound("cli:test", "publish"), &session.State{}, g, node, "publish", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"--- Skill Metadata Contract ---",
+		"Use terminal.run with the documented helper",
+		"python3 /tmp/skill/scripts/create-doc --title X",
+		"Return the created URL.",
+		"--- SKILL.md ---",
+	} {
+		if !strings.Contains(capturedSystemPrompt, want) {
+			t.Fatalf("expected skill prompt to contain %q, got:\n%s", want, capturedSystemPrompt)
+		}
+	}
+}
+
 func TestExecuteNode_SkillNode_Unregistered(t *testing.T) {
 	rt, _ := newTestRuntimeWithWorkspace(t)
 	rt.Model = staticTextModel{text: "unused"}
@@ -521,8 +569,8 @@ func TestExecuteNode_HumanReview_CreatesPending(t *testing.T) {
 	if !strings.Contains(state.Pending.Question, "please review the deployment plan") {
 		t.Fatalf("expected question text, got %q", state.Pending.Question)
 	}
-	if !strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
-		t.Fatalf("expected numeric confirmation guidance, got %q", state.Pending.Question)
+	if strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
+		t.Fatalf("human_review should ask for information without numeric confirmation guidance, got %q", state.Pending.Question)
 	}
 }
 
@@ -550,6 +598,9 @@ func TestExecuteNode_HumanConfirm_CreatesPending(t *testing.T) {
 	if state.Pending.Kind != session.PendingKindHumanConfirm {
 		t.Fatalf("expected human_confirm pending kind, got %q", state.Pending.Kind)
 	}
+	if !strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
+		t.Fatalf("expected numeric confirmation guidance, got %q", state.Pending.Question)
+	}
 }
 
 func TestExecuteNode_HumanReview_UsesAcceptanceCriteria(t *testing.T) {
@@ -572,8 +623,8 @@ func TestExecuteNode_HumanReview_UsesAcceptanceCriteria(t *testing.T) {
 	if !strings.Contains(state.Pending.Question, "verify output matches requirements") {
 		t.Fatalf("expected acceptance criteria as question, got %q", state.Pending.Question)
 	}
-	if !strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
-		t.Fatalf("expected numeric confirmation guidance, got %q", state.Pending.Question)
+	if strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
+		t.Fatalf("human_review should ask for information without numeric confirmation guidance, got %q", state.Pending.Question)
 	}
 }
 
@@ -2143,6 +2194,28 @@ graph:
   stage: "execution"
   granularity: "%s"
 `, granularity)
+	if err := os.WriteFile(filepath.Join(dir, ".mateway", "metadata.yaml"), []byte(metaContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content := fmt.Sprintf("---\nname: %s\n---\n%s", name, body)
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func createRegisteredSkillWithMetadata(t *testing.T, workspace, name, graphYAML, body string) string {
+	t.Helper()
+	dir := filepath.Join(workspace, "skills", name)
+	if err := os.MkdirAll(filepath.Join(dir, ".mateway"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaContent := fmt.Sprintf(`adapter_version: "2"
+source: "test"
+installed_at: "2026-06-17T00:00:00Z"
+tool_runtime: "mateway"
+%s
+`, graphYAML)
 	if err := os.WriteFile(filepath.Join(dir, ".mateway", "metadata.yaml"), []byte(metaContent), 0o644); err != nil {
 		t.Fatal(err)
 	}

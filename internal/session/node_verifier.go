@@ -2,18 +2,22 @@ package session
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
 
+var httpURLPattern = regexp.MustCompile(`https?://[^\s<>"')\]]+`)
+
 type NodeVerificationResult struct {
-	Status                 string        // passed | retry | failed | blocked | needs_input | replan | pending
-	Reason                 string        // human-readable explanation
-	Missing                []string      // missing evidence or criteria
-	EvidenceRefs           []EvidenceRef // supporting evidence
-	Confidence             string        // low | medium | high (from model verifier)
-	Retryable              bool          // whether the same node can be retried
-	FeedbackForNextAttempt string        // compact feedback injected into the next attempt
+	Status                    string        // passed | retry | failed | blocked | needs_input | replan | pending
+	Reason                    string        // human-readable explanation
+	Missing                   []string      // missing evidence or criteria
+	EvidenceRefs              []EvidenceRef // supporting evidence
+	Confidence                string        // low | medium | high (from model verifier)
+	Retryable                 bool          // whether the same node can be retried
+	FeedbackForNextAttempt    string        // compact feedback injected into the next attempt
+	RequiresHumanConfirmation bool          // needs explicit approval before retrying a guarded mutation
 }
 
 const (
@@ -158,6 +162,25 @@ func verifyModelNode(node *TaskGraphNode) NodeVerificationResult {
 			FeedbackForNextAttempt: "Retry the node using an allowed safe approach, or report a concrete blocker instead of treating the failed tool result as completed work.",
 		}
 	}
+	if requiresConcreteURL(node) && !hasConcreteURLArtifact(node) {
+		if requestsUserConfirmationBeforeMutation(node) {
+			return NodeVerificationResult{
+				Status:                    VerificationNeedsInput,
+				Reason:                    "node requests explicit user confirmation before performing the mutation",
+				Missing:                   []string{"user confirmation"},
+				Confidence:                "hard",
+				RequiresHumanConfirmation: true,
+			}
+		}
+		return NodeVerificationResult{
+			Status:                 VerificationFailed,
+			Reason:                 "node requires a concrete URL/link result but none was produced",
+			Missing:                []string{"concrete http(s) URL"},
+			Confidence:             "hard",
+			Retryable:              true,
+			FeedbackForNextAttempt: "Produce a real http(s) URL in the node result or report the concrete blocker. Do not use placeholder links such as feishu_doc_url.",
+		}
+	}
 
 	return NodeVerificationResult{
 		Status:       VerificationPassed,
@@ -197,6 +220,93 @@ func unresolvedFailedToolEvidence(node *TaskGraphNode, summary string) bool {
 		return false
 	}
 	return true
+}
+
+func requiresConcreteURL(node *TaskGraphNode) bool {
+	if node == nil {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		node.Goal,
+		node.Acceptance.Criteria,
+		fmt.Sprint(node.Output["url"]),
+		fmt.Sprint(node.Output["link"]),
+	}, " "))
+	for _, marker := range []string{"url", "link"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func requestsUserConfirmationBeforeMutation(node *TaskGraphNode) bool {
+	if node == nil {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		node.Goal,
+		node.Acceptance.Criteria,
+		node.ResultSummary,
+		fmt.Sprint(node.Output["text"]),
+	}, "\n"))
+	if text == "" {
+		return false
+	}
+	hasConfirm := strings.Contains(text, "confirm") ||
+		strings.Contains(text, "approval") ||
+		strings.Contains(text, "permission") ||
+		strings.Contains(text, "human_confirm")
+	hasMutation := strings.Contains(text, "create") ||
+		strings.Contains(text, "send") ||
+		strings.Contains(text, "publish") ||
+		strings.Contains(text, "write") ||
+		strings.Contains(text, "mutation")
+	if !hasConfirm || !hasMutation {
+		return false
+	}
+	if hasConcreteURLArtifact(node) {
+		return false
+	}
+	return true
+}
+
+func hasConcreteURLArtifact(node *TaskGraphNode) bool {
+	if node == nil {
+		return false
+	}
+	values := []string{
+		node.ResultSummary,
+		fmt.Sprint(node.Output["url"]),
+		fmt.Sprint(node.Output["link"]),
+		fmt.Sprint(node.Output["text"]),
+	}
+	for _, ref := range node.EvidenceRefs {
+		values = append(values, ref.Summary)
+	}
+	for _, value := range values {
+		if hasConcreteURL(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasConcreteURL(text string) bool {
+	for _, match := range httpURLPattern.FindAllString(text, -1) {
+		lower := strings.ToLower(strings.TrimSpace(match))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "example.") ||
+			strings.Contains(lower, "placeholder") ||
+			strings.Contains(lower, "feishu_doc_url") ||
+			strings.Contains(lower, "lark_doc_url") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func looksLikeUnfinishedNodeOutput(text string) bool {
@@ -292,6 +402,12 @@ func ApplyNodeVerification(node *TaskGraphNode, result NodeVerificationResult) {
 	case VerificationNeedsInput:
 		if node.Status != NodeStatusAwaitingInput {
 			node.Status = NodeStatusAwaitingInput
+		}
+		if result.RequiresHumanConfirmation {
+			if node.Input == nil {
+				node.Input = map[string]any{}
+			}
+			node.Input["requires_human_confirmation"] = true
 		}
 	}
 	node.UpdatedAt = now

@@ -139,6 +139,24 @@ func TestRenderReplyMessageUsesEnglishRuntimeText(t *testing.T) {
 	}
 }
 
+func TestRenderReplyMessageUsesConfirmationFooter(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Channel:  "feishu",
+		ThreadID: "thread_123",
+		Style:    "input_required",
+		Text:     "Approve publish.\n\nReply 1 to confirm and continue, or 2 to cancel and block this task.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "Mateway Needs Confirmation") || !strings.Contains(content, "Reply with 1 to confirm and continue, or 2 to cancel.") {
+		t.Fatalf("expected confirmation card, got %s", content)
+	}
+	if strings.Contains(content, "missing information") {
+		t.Fatalf("confirmation card should not ask for missing information, got %s", content)
+	}
+}
+
 func TestNormalizeCardActionMapsToConfirmMessage(t *testing.T) {
 	openMessageID := "om_card"
 	openChatID := "oc_card"
@@ -223,12 +241,44 @@ func TestRenderReplyMessageIncludesProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Process", "file.read", "terminal.run", "timed out"} {
+	for _, want := range []string{"Progress", "Read", "Run", "timed out"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected %q in progress card, got %s", want, content)
 		}
 	}
 	if strings.Contains(content, strings.Repeat("long ", 20)) {
 		t.Fatalf("expected long progress summary to be truncated, got %s", content)
+	}
+}
+
+func TestRenderReplyMessageHidesEmptyThinkingProgress(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Text:  "Processing...",
+		Style: "processing",
+		Progress: []channel.ProgressStep{
+			{Title: "model", Status: "thinking", Summary: "waiting for model output"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, "Progress") || strings.Contains(content, "thinking") {
+		t.Fatalf("empty thinking progress should be hidden, got %s", content)
+	}
+}
+
+func TestRenderReplyMessageProgressTruncatesUTF8Safely(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Text:  "Processing...",
+		Style: "processing",
+		Progress: []channel.ProgressStep{
+			{Tool: "web.search", Status: "running", Summary: strings.Repeat("今晚世界杯赛程", 30)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "Search") || !strings.Contains(content, "今晚世界杯") {
+		t.Fatalf("expected UTF-8 progress summary, got %s", content)
 	}
 }

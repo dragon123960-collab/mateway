@@ -49,6 +49,7 @@ Mateway 默认在 `~/.mateway` 下存储本地运行时数据。`mateway init` �
 - `max_parallel_nodes`: TaskGraph Scheduler 每个 tick 最多同时执行多少个 ready nodes。默认 `1`，需要真实 node 并行时可调大。
 - `max_parallel_tools`: 单个 node-local AgentCore loop 内部可用的工具并发预算。它不是 graph node 并发。
 - `max_iterations`: node-local AgentCore loop 的最大迭代次数。
+- `planner_timeout`: Planner 首次生成 `TaskGraphPlan` 的模型调用超时。默认 `60s`。复杂任务、长 skill 列表或慢 provider 可以调到 `90s`/`120s`。
 - `inactivity_timeout`: runtime 活动看门狗超时。
 - `max_contract_followups`: observe/completion follow-up 的上限，保留用于旧 contract hook 兼容。
 - `model_verifier`: node 验收时模型 verifier 的调用策略。默认 `fallback`，deterministic verifier 已通过时不再调用模型；可设为 `always` 强制每个带 acceptance 的已通过 node 再做模型语义验收；`off`/`never` 表示关闭模型 verifier。

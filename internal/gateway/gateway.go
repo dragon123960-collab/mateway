@@ -43,9 +43,10 @@ func Serve(ctx context.Context, cfg Config) error {
 }
 
 type channelRuntime struct {
-	Runtime runtime.Runtime
-	Dedupe  *inboundDedupe
-	Home    string
+	Runtime  runtime.Runtime
+	Dedupe   *inboundDedupe
+	Sessions *sessionRunner
+	Home     string
 }
 
 type channelStarter func(context.Context, channelRuntime) error
@@ -57,7 +58,7 @@ type channelSpec struct {
 }
 
 func enabledChannelStarters(ctx context.Context, cfg Config, dedupe *inboundDedupe) []func() error {
-	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe, Home: cfg.Config.App.Home}
+	rt := channelRuntime{Runtime: cfg.Runtime, Dedupe: dedupe, Sessions: newSessionRunner(), Home: cfg.Config.App.Home}
 	specs := builtinChannelSpecs(cfg)
 	starters := make([]func() error, 0, len(specs))
 	for _, spec := range specs {
@@ -116,7 +117,9 @@ func feishuChannelSpec(name string, channelCfg config.FeishuConfig) channelSpec 
 					return nil
 				}
 				msg = downloaded
-				go runFeishuMessage(rt.Runtime, sender, msg)
+				go rt.Sessions.Run(ctx, msg, func(runCtx context.Context) {
+					runFeishuMessage(runCtx, rt.Runtime, sender, msg)
+				})
 				return nil
 			})
 		},
@@ -132,7 +135,13 @@ func weixinChannelSpec(channelCfg config.WeixinConfig) channelSpec {
 				if shouldIgnoreGeneric(msg) || prepareInbound(&msg, rt.Dedupe) {
 					return channel.OutboundBatch{}, nil
 				}
-				resp, err := runRuntimeMessage(eventCtx, rt.Runtime, msg)
+				var (
+					resp runtime.Response
+					err  error
+				)
+				rt.Sessions.Run(eventCtx, msg, func(runCtx context.Context) {
+					resp, err = runRuntimeMessage(runCtx, rt.Runtime, msg)
+				})
 				return channel.OutboundBatch{Reply: resp.Reply, FollowUps: resp.FollowUps}, err
 			})
 		},
@@ -310,10 +319,16 @@ func runRuntimeMessage(ctx context.Context, rt runtime.Runtime, msg channel.Inbo
 	return resp, nil
 }
 
-func runFeishuMessage(rt runtime.Runtime, sender *feishu.Sender, msg channel.InboundMessage) {
+func runFeishuMessage(ctx context.Context, rt runtime.Runtime, sender *feishu.Sender, msg channel.InboundMessage) {
 	start := time.Now()
 	runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			cancel()
+		}()
+	}
 	cardAction := isCardAction(msg)
 	if !cardAction {
 		react(runCtx, sender, msg.ID, "SMILE")
@@ -422,10 +437,7 @@ func feishuProgressText(update channel.OutboundMessage) string {
 	}
 	b.WriteString(text)
 	for _, step := range update.Progress {
-		title := strings.TrimSpace(step.Tool)
-		if title == "" {
-			title = strings.TrimSpace(step.Title)
-		}
+		title := progressDisplayTitle(step)
 		if title == "" {
 			continue
 		}
@@ -434,9 +446,11 @@ func feishuProgressText(update channel.OutboundMessage) string {
 			status = "recorded"
 		}
 		b.WriteString("\n- ")
+		b.WriteString(progressDisplayMarker(status))
+		b.WriteString(" ")
 		b.WriteString(title)
 		b.WriteString(": ")
-		b.WriteString(feishuProgressStatus(status))
+		b.WriteString(progressDisplayStatus(status))
 		if step.TimedOut {
 			b.WriteString(" / timed out")
 		}
@@ -448,20 +462,69 @@ func feishuProgressText(update channel.OutboundMessage) string {
 	return b.String()
 }
 
-func feishuProgressStatus(status string) string {
-	switch strings.TrimSpace(status) {
-	case "running":
-		return "call"
-	case "accepted", "completed":
-		return "success"
-	case "failed", "blocked", "suspect":
-		return "failed"
-	default:
-		if strings.TrimSpace(status) != "" {
-			return strings.TrimSpace(status)
-		}
-		return "recorded"
+func progressDisplayTitle(step channel.ProgressStep) string {
+	if tool := strings.TrimSpace(step.Tool); tool != "" {
+		return gatewayProgressTitle(tool)
 	}
+	return compactProgressLineText(strings.TrimSpace(step.Title), 72)
+}
+
+func gatewayProgressTitle(title string) string {
+	switch strings.TrimSpace(title) {
+	case "file.read":
+		return "Read"
+	case "file.write":
+		return "Write"
+	case "file.delete":
+		return "Delete"
+	case "terminal.run":
+		return "Run"
+	case "web.search":
+		return "Search"
+	case "web.fetch":
+		return "Fetch"
+	case "schedule.manage":
+		return "Schedule"
+	case "task.search":
+		return "Search tasks"
+	case "task.resume":
+		return "Resume task"
+	default:
+		return gatewayFirstNonEmpty(strings.TrimSpace(title), "Task")
+	}
+}
+
+func progressDisplayMarker(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "accepted", "completed", "success", "done":
+		return "✓"
+	case "failed", "blocked", "error", "suspect":
+		return "✕"
+	default:
+		return "→"
+	}
+}
+
+func progressDisplayStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "running":
+		return "running"
+	case "accepted", "completed", "success", "done":
+		return "done"
+	case "failed", "blocked", "error", "suspect":
+		return "blocked"
+	default:
+		return gatewayFirstNonEmpty(strings.TrimSpace(status), "recorded")
+	}
+}
+
+func gatewayFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func compactProgressLineText(text string, limit int) string {
@@ -484,9 +547,40 @@ func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) boo
 	}
 	state, err := rt.Store.Load(msg.SessionKey)
 	if err == nil && state.Pending != nil {
-		return state.Pending.Kind == session.PendingKindTaskPlanConfirm && strings.TrimSpace(msg.Text) == "1"
+		return shouldSendProcessingAckForPending(state.Pending.Kind, msg.Text)
 	}
 	return !isSlashCommand(msg.Text)
+}
+
+func shouldSendProcessingAckForPending(kind, text string) bool {
+	trimmed := strings.TrimSpace(text)
+	switch kind {
+	case session.PendingKindTaskPlanConfirm:
+		return trimmed == "1"
+	case session.PendingKindHumanReview:
+		return trimmed != ""
+	case session.PendingKindHumanConfirm:
+		return isSingleNumericPendingConfirm(trimmed)
+	default:
+		return false
+	}
+}
+
+func isSingleNumericPendingConfirm(text string) bool {
+	if strings.TrimSpace(text) == "1" {
+		return true
+	}
+	digit := ""
+	for _, r := range text {
+		if r != '1' && r != '2' {
+			continue
+		}
+		if digit != "" {
+			return false
+		}
+		digit = string(r)
+	}
+	return digit == "1"
 }
 
 func isSlashCommand(text string) bool {
@@ -564,6 +658,44 @@ type inboundDedupe struct {
 	mu   sync.Mutex
 	ttl  time.Duration
 	seen map[string]time.Time
+}
+
+type sessionRunner struct {
+	mu       sync.Mutex
+	sessions map[string]chan struct{}
+}
+
+func newSessionRunner() *sessionRunner {
+	return &sessionRunner{sessions: map[string]chan struct{}{}}
+}
+
+func (r *sessionRunner) Run(ctx context.Context, msg channel.InboundMessage, fn func(context.Context)) {
+	if fn == nil {
+		return
+	}
+	lock := r.lockFor(msg.SessionKey)
+	select {
+	case lock <- struct{}{}:
+		defer func() { <-lock }()
+	case <-ctx.Done():
+		return
+	}
+	fn(ctx)
+}
+
+func (r *sessionRunner) lockFor(sessionKey string) chan struct{} {
+	key := strings.TrimSpace(sessionKey)
+	if key == "" {
+		key = "default"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock := r.sessions[key]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		r.sessions[key] = lock
+	}
+	return lock
 }
 
 func newInboundDedupe(ttl time.Duration) *inboundDedupe {

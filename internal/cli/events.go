@@ -87,7 +87,7 @@ type ProcessEvent struct {
 func eventFromProgressStep(step channel.ProgressStep) ProcessEvent {
 	title := firstNonEmpty(strings.TrimSpace(step.Tool), strings.TrimSpace(step.Title))
 	status := strings.TrimSpace(step.Status)
-	eventType := processEventType(title, status)
+	eventType := processEventType(title, status, strings.TrimSpace(step.Tool) != "")
 	event := ProcessEvent{
 		Type:       eventType,
 		Title:      title,
@@ -107,10 +107,19 @@ func eventFromProgressStep(step channel.ProgressStep) ProcessEvent {
 	return event
 }
 
-func processEventType(title, status string) string {
+func processEventType(title, status string, isTool bool) string {
 	switch {
 	case title == "model":
 		return "model.thinking"
+	case !isTool:
+		switch status {
+		case "accepted", "completed", "success", "done":
+			return "runtime.completed"
+		case "blocked", "failed", "error":
+			return "runtime.blocked"
+		default:
+			return "runtime.progress"
+		}
 	case status == "running":
 		return "tool.started"
 	case status == "accepted" || status == "completed":

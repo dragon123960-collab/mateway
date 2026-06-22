@@ -22,6 +22,9 @@ type discoveredSkill struct {
 	AllowedTools []string
 	Inputs       []string
 	Outputs      []string
+	Usage        string
+	Entrypoints  []string
+	Success      []string
 	Priority     string
 	Path         string
 	Scope        string
@@ -115,6 +118,9 @@ func discoverSkillsInRoot(root, scope string) []discoveredSkill {
 			AllowedTools: append([]string(nil), metadata.Graph.AllowedTools...),
 			Inputs:       append([]string(nil), metadata.Graph.Inputs...),
 			Outputs:      append([]string(nil), metadata.Graph.Outputs...),
+			Usage:        metadata.Graph.Usage,
+			Entrypoints:  append([]string(nil), metadata.Graph.Entrypoints...),
+			Success:      append([]string(nil), metadata.Graph.SuccessCriteria...),
 		}
 		text := readSkillHeader(path)
 		if text != "" {

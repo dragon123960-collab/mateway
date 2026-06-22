@@ -79,8 +79,40 @@ func TestInstallFromLocalSkillFile(t *testing.T) {
 	if metadata.AdapterVersion != "2" || metadata.Graph.Type != "prompt" || metadata.Graph.Granularity != "subtask" {
 		t.Fatalf("metadata graph fields = %#v", metadata)
 	}
+	if metadata.Graph.Usage == "" || len(metadata.Graph.SuccessCriteria) == 0 {
+		t.Fatalf("expected generated usage contract, got %#v", metadata.Graph)
+	}
 	if _, err := Install(InstallInput{Workspace: workspace, Source: source}); err == nil {
 		t.Fatal("expected duplicate install error")
+	}
+}
+
+func TestInstallCommandSkillWritesExecutionMetadata(t *testing.T) {
+	workspace := t.TempDir()
+	source := filepath.Join(t.TempDir(), "SKILL.md")
+	content := "---\nname: Feishu Notify\ndescription: Create Feishu docs.\n---\n# Feishu\nUse terminal.run.\n```bash\npython3 /tmp/skill/scripts/feishu.docs.create --title X\n```\nReturn the created document URL.\n"
+	if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Install(InstallInput{Workspace: workspace, Source: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok, err := ReadMetadata(filepath.Dir(result.Path))
+	if err != nil || !ok {
+		t.Fatalf("expected metadata, ok=%v err=%v", ok, err)
+	}
+	if metadata.Graph.Type != "react" {
+		t.Fatalf("command skill should default to react, got %q", metadata.Graph.Type)
+	}
+	if strings.Join(metadata.Graph.AllowedTools, ",") != "terminal.run" {
+		t.Fatalf("allowed tools = %v", metadata.Graph.AllowedTools)
+	}
+	if len(metadata.Graph.Entrypoints) == 0 || !strings.Contains(metadata.Graph.Entrypoints[0], "feishu.docs.create") {
+		t.Fatalf("entrypoints = %v", metadata.Graph.Entrypoints)
+	}
+	if len(metadata.Graph.SuccessCriteria) == 0 || !strings.Contains(strings.Join(metadata.Graph.SuccessCriteria, " "), "URL") {
+		t.Fatalf("success criteria = %v", metadata.Graph.SuccessCriteria)
 	}
 }
 
@@ -115,6 +147,9 @@ func TestRegisterLocalSkillWritesMetadata(t *testing.T) {
 	}
 	if metadata.Graph.Type != "prompt" || metadata.Graph.Stage != "execution" {
 		t.Fatalf("metadata = %#v", metadata)
+	}
+	if metadata.Graph.Usage == "" || len(metadata.Graph.SuccessCriteria) == 0 {
+		t.Fatalf("expected generated usage metadata, got %#v", metadata.Graph)
 	}
 }
 
