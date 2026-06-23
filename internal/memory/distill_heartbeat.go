@@ -306,6 +306,9 @@ func isDuplicateDistillProposal(home, memoryRoot string, proposal distilledPropo
 		if existing.Status == "proposed" && duplicateKey(existing.Title) == key {
 			return true
 		}
+		if existing.Status == "rejected" && (duplicateKey(existing.Title) == key || sharesSource(existing.Sources, proposal.Sources)) {
+			return true
+		}
 		if sharesSource(existing.Sources, proposal.Sources) {
 			return true
 		}

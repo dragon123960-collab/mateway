@@ -95,6 +95,27 @@ func TestRunDistillHeartbeatSkipsDuplicateProposal(t *testing.T) {
 	}
 }
 
+func TestRunDistillHeartbeatSkipsRejectedProposal(t *testing.T) {
+	home := t.TempDir()
+	store := ProposalStore{Home: home, MemoryRoot: filepath.Join(home, "workspace", "memory")}
+	created, err := store.Create(CreateProposalInput{Title: "README 检查流程", Type: "experience", Scope: "agent", Body: "Existing.", Sources: []string{"observe/diary/one.md"}, Confidence: "medium"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Reject(created.ID, "not useful"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(home, "observe", "diary", "one.md"), "# Task diary\n\n- Goal: 记住 README 检查流程\n")
+	model := distillStaticModel{text: `{"title":"README 检查流程","type":"experience","scope":"agent","body":"Use file.read when checking README workflows.","sources":["observe/diary/one.md"],"confidence":"medium"}`}
+	result, err := RunDistillHeartbeat(context.Background(), DistillHeartbeatInput{Home: home, MemoryRoot: filepath.Join(home, "workspace", "memory"), Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 0 || result.Duplicates != 1 {
+		t.Fatalf("expected rejected duplicate skip, got %#v", result)
+	}
+}
+
 func TestRunDistillHeartbeatNoModelSkipsCandidates(t *testing.T) {
 	home := t.TempDir()
 	writeFile(t, filepath.Join(home, "observe", "diary", "one.md"), "# Task diary\n\n- Goal: 记住 README 检查流程\n")

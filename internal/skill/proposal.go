@@ -179,12 +179,43 @@ func (s ProposalStore) Promote(id string) (Proposal, string, error) {
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return Proposal{}, "", err
 	}
+	var metadata *Metadata
+	if _, ok, err := ReadMetadata(filepath.Dir(target)); err != nil {
+		return Proposal{}, "", err
+	} else if !ok {
+		header := ParseHeader(proposal.NewContent)
+		value := DefaultMetadata(DefaultMetadataInput{
+			Source: "skill_proposal:" + proposal.ID,
+			Header: header,
+			Body:   proposal.NewContent,
+			Notes: []string{
+				"Created from a promoted Mateway skill proposal.",
+			},
+		})
+		if err := ValidateMetadata(value); err != nil {
+			return Proposal{}, "", err
+		}
+		metadata = &value
+	}
 	if err := os.WriteFile(tmp, []byte(proposal.NewContent), 0o644); err != nil {
 		return Proposal{}, "", err
 	}
 	if err := os.Rename(tmp, target); err != nil {
 		_ = os.Remove(tmp)
 		return Proposal{}, "", err
+	}
+	if metadata != nil {
+		if _, err := WriteMetadata(filepath.Dir(target), *metadata); err != nil {
+			if backupDir != "" {
+				backupPath := filepath.Join(backupDir, filepath.Base(filepath.Dir(target))+"-SKILL.md")
+				if data, readErr := os.ReadFile(backupPath); readErr == nil {
+					_ = os.WriteFile(target, data, 0o644)
+				}
+			} else {
+				_ = os.Remove(target)
+			}
+			return Proposal{}, "", err
+		}
 	}
 	proposal.Status = "promoted"
 	proposal.UpdatedAt = time.Now().Format(time.RFC3339Nano)

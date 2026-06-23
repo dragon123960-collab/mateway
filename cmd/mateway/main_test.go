@@ -413,6 +413,23 @@ func TestMemoryProposalShowCommandPrintsDetail(t *testing.T) {
 	}
 }
 
+func TestMemoryLearningInboxCommandPrintsTopItems(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MATEWAY_HOME", home)
+	if err := run([]string{"init", "--home", home}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"memory", "proposal", "create", "--title", "README workflow", "--body", "Use file.read before README edits.", "--source", "trace:abc"}); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return run([]string{"memory", "learning", "inbox"}) })
+	for _, want := range []string{"learning_inbox: 1", "memory_proposals: 1", "memory_proposal", "mateway memory proposal show"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in inbox:\n%s", want, out)
+		}
+	}
+}
+
 func TestAgentProfileProposalCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("MATEWAY_HOME", home)

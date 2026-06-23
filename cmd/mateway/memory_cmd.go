@@ -158,19 +158,39 @@ func runMemory(args []string) error {
 }
 
 func runMemoryLearning(args []string) error {
-	if len(args) != 1 || args[0] != "report" {
-		return fmt.Errorf("usage: mateway memory learning report")
-	}
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	report, err := memory.BuildLearningReport(memory.LearningReportInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace})
-	if err != nil {
-		return err
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mateway memory learning <report|inbox>")
 	}
-	printLearningReport(report)
-	return nil
+	switch args[0] {
+	case "report":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: mateway memory learning report")
+		}
+		report, err := memory.BuildLearningReport(memory.LearningReportInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace})
+		if err != nil {
+			return err
+		}
+		printLearningReport(report)
+		return nil
+	case "inbox":
+		fs := flag.NewFlagSet("mateway memory learning inbox", flag.ContinueOnError)
+		limit := fs.Int("limit", 5, "maximum inbox items")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		inbox, err := memory.BuildLearningInbox(memory.LearningInboxInput{Home: cfg.App.Home, Workspace: cfg.App.Workspace, Limit: *limit})
+		if err != nil {
+			return err
+		}
+		printLearningInbox(inbox)
+		return nil
+	default:
+		return fmt.Errorf("usage: mateway memory learning <report|inbox>")
+	}
 }
 
 func runMemoryReport(args []string) error {
@@ -478,6 +498,34 @@ func printLearningReport(report memory.LearningReport) {
 	fmt.Println("skill_proposals_pending:", report.SkillProposalsPending)
 	if report.LastLearningAudit != "" {
 		fmt.Println("last_learning_audit:", report.LastLearningAudit)
+	}
+}
+
+func printLearningInbox(inbox memory.LearningInbox) {
+	fmt.Println("learning_inbox:", len(inbox.Items))
+	fmt.Println("memory_proposals:", inbox.MemoryProposals)
+	fmt.Println("skill_proposals:", inbox.SkillProposals)
+	fmt.Println("reflections:", inbox.Reflections)
+	fmt.Println("failed_tasks:", inbox.FailedTasks)
+	fmt.Println("repeated_tool_sequences:", inbox.RepeatedToolSequences)
+	for i, item := range inbox.Items {
+		fmt.Printf("%d. %s id=%s priority=%d", i+1, item.Kind, item.ID, item.Priority)
+		if item.Status != "" {
+			fmt.Printf(" status=%s", item.Status)
+		}
+		if item.Count > 0 {
+			fmt.Printf(" count=%d", item.Count)
+		}
+		if item.Title != "" {
+			fmt.Printf(" title=%s", item.Title)
+		}
+		fmt.Println()
+		if item.Summary != "" {
+			fmt.Println("   summary:", item.Summary)
+		}
+		if item.Action != "" {
+			fmt.Println("   action:", item.Action)
+		}
 	}
 }
 

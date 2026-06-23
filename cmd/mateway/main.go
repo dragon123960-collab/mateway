@@ -455,6 +455,7 @@ Usage:
   mateway memory heartbeat skill
   mateway memory heartbeat serve [--once] [--interval <duration>]
   mateway memory learning report
+  mateway memory learning inbox [--limit <n>]
   mateway memory report [--root <path>]
   mateway schedule list
   mateway schedule run-due

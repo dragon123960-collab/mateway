@@ -34,7 +34,8 @@ message -> Planner -> TaskGraph -> Scheduler
 - TaskGraph runtime 基础：planner、graph state、node execution、verifier、finalizer 和 recovery-oriented trace
 - Context budget、压缩 tool output、通过 `raw_ref` 回读原始输出
 - 多 agent profile 基础：channel bindings、agent-specific skills、agent-scoped memory，以及未来本地 agent node 角色
-- Memory proposal、lint、search、index rebuild 和 learning heartbeat 命令
+- Memory proposal、lint、search、index rebuild、learning inbox 和 heartbeat distill 命令
+- Skill learning loop：重复任务和 skill evidence 可以生成可审查的 `skill proposal` patch，promote 后注册给 planner discovery
 
 `terminal.run` 是唯一命令执行工具。它可以通过 `env_secrets` 注入 secret；trace 只记录 secret id 和环境变量名，不记录明文 secret。
 
@@ -67,6 +68,14 @@ vim ~/.mateway/config/config.yaml
 ```
 
 `mateway chat` 会在支持交互终端时打开 TUI，也可以通过 `--classic` 使用传统行式 REPL。
+
+查看本地 learning candidates：
+
+```bash
+./build/mateway memory learning inbox
+./build/mateway memory proposal list
+./build/mateway skill proposal list
+```
 
 `mateway init` 会在 `~/.mateway/` 下创建本地 home：
 

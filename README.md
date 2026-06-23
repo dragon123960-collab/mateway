@@ -34,7 +34,8 @@ message -> Planner -> TaskGraph -> Scheduler
 - TaskGraph runtime foundations: planner, graph state, node execution, verifier, finalizer, and recovery-oriented trace
 - Context budgeting, compacted tool output, and raw output retrieval by `raw_ref`
 - Multi-agent profile foundations with channel bindings, agent-specific skills, agent-scoped memory, and future local agent node roles
-- Memory proposal, lint, search, index rebuild, and learning heartbeat commands
+- Memory proposal, lint, search, index rebuild, learning inbox, and heartbeat distill commands
+- Skill learning loop: repeated task/skill evidence can produce reviewable `skill proposal` patches, and promoted skills are registered for planner discovery
 
 `terminal.run` is the only command execution tool. It can inject secrets through `env_secrets`; traces record only secret ids and environment variable names, never secret values.
 
@@ -67,6 +68,14 @@ Try the CLI:
 ```
 
 `mateway chat` opens the interactive terminal UI when the current terminal supports it, and falls back to the classic line-based REPL with `--classic`.
+
+Review local learning candidates:
+
+```bash
+./build/mateway memory learning inbox
+./build/mateway memory proposal list
+./build/mateway skill proposal list
+```
 
 `mateway init` creates the local home under `~/.mateway/`:
 

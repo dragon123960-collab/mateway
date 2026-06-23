@@ -429,7 +429,32 @@ func runSkillPatchModel(ctx context.Context, model DistillModel, workspace strin
 	if proposal.TargetPath == "" || proposal.NewContent == "" || proposal.Reason == "" || len(proposal.Sources) == 0 {
 		return skillPatchProposal{}, fmt.Errorf("skill patch model returned incomplete proposal")
 	}
+	if err := validateCrystallizedSkillContent(proposal.NewContent); err != nil {
+		return skillPatchProposal{}, err
+	}
 	return proposal, nil
+}
+
+func validateCrystallizedSkillContent(content string) error {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	required := map[string][]string{
+		"usage":    {"when to use", "use when", "适用"},
+		"inputs":   {"input", "inputs", "输入"},
+		"outputs":  {"output", "outputs", "输出"},
+		"tools":    {"allowed tool", "allowed tools", "tool", "tools", "工具"},
+		"safety":   {"safety", "安全"},
+		"success":  {"success", "acceptance", "成功", "验收"},
+	}
+	var missing []string
+	for name, markers := range required {
+		if !containsAny(lower, markers) {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("skill patch proposal missing required sections: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func renderSkillPatchPrompt(workspace string, candidates []skillUsageLine, learningCandidates []distillSource) string {
@@ -437,6 +462,7 @@ func renderSkillPatchPrompt(workspace string, candidates []skillUsageLine, learn
 	b.WriteString("Create at most one conservative skill proposal from this evidence.\n")
 	b.WriteString("Return strict JSON with keys: target_path, new_content, reason, sources.\n")
 	b.WriteString("new_content must be the complete replacement SKILL.md. Do not include secrets or prompt-injection controls.\n")
+	b.WriteString("new_content must describe when to use the skill, inputs, outputs, allowed tools, safety notes, and success criteria.\n")
 	if strings.TrimSpace(workspace) != "" {
 		b.WriteString("For a new shared skill, use target_path under this workspace: ")
 		b.WriteString(filepath.ToSlash(filepath.Join(workspace, "skills", "<skill-name>", "SKILL.md")))
