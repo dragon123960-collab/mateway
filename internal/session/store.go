@@ -79,8 +79,15 @@ type TaskContract struct {
 	RequiredEvidence []TaskEvidenceContract `json:"required_evidence,omitempty"`
 	PlanItems        []TaskPlanItem         `json:"plan_items,omitempty"`
 	ExpectedOutcome  string                 `json:"expected_outcome,omitempty"`
-	CompletionPolicy string                 `json:"completion_policy,omitempty"`
-	CreatedAt        time.Time              `json:"created_at,omitempty"`
+	// TaskAcceptance mirrors the unified planner's task.acceptance; kept in sync
+	// with ExpectedOutcome for compatibility. Used by the task-level verifier.
+	TaskAcceptance string `json:"task_acceptance,omitempty"`
+	// FinalOutput lists the structured output keys declared by the unified
+	// planner (plan.Task.FinalOutput.Structured). The task-level deterministic
+	// verifier checks that each key is present in some verified node's Output.
+	FinalOutput      []string  `json:"final_output,omitempty"`
+	CompletionPolicy string    `json:"completion_policy,omitempty"`
+	CreatedAt        time.Time `json:"created_at,omitempty"`
 }
 
 type TaskPlanItem struct {

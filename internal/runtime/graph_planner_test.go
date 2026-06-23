@@ -78,6 +78,9 @@ func (m plannerVerifierModel) Next(_ context.Context, ctx agentcore.Context) (ag
 	if strings.Contains(ctx.SystemPrompt, "verification judge") {
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"criteria satisfied","missing":[],"confidence":"high"}`}, nil
 	}
+	if strings.Contains(ctx.SystemPrompt, "task-graph acceptance judge") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"passed","reason":"task acceptance satisfied","missing":[],"confidence":"high","verifier_feedback":""}`}, nil
+	}
 	if strings.Contains(ctx.SystemPrompt, "TaskGraphPlan") || strings.Contains(ctx.SystemPrompt, "sub-task") {
 		return agentcore.Message{Role: agentcore.RoleAssistant, Content: m.planJSON}, nil
 	}

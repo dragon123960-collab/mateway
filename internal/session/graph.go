@@ -13,6 +13,15 @@ const (
 	GraphStatusBlocked       = "blocked"
 	GraphStatusFailed        = "failed"
 	GraphStatusCompleted     = "completed"
+	// GraphStatusNeedsRepair is a GraphVerificationResult.Status only; it is never
+	// assigned to TaskGraph.Status (kept out of validGraphStatuses on purpose).
+	GraphStatusNeedsRepair = "needs_repair"
+)
+
+const (
+	RepairStatusPassed  = "passed"
+	RepairStatusFailed  = "failed"
+	RepairStatusBlocked = "blocked"
 )
 
 var validGraphStatuses = map[string]bool{
@@ -242,12 +251,24 @@ func (n *TaskGraphNode) IsActive() bool {
 }
 
 type TaskGraph struct {
-	ID        string          `json:"id"`
-	TaskID    string          `json:"task_id"`
-	Status    string          `json:"status"`
-	Nodes     []TaskGraphNode `json:"nodes"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	ID             string          `json:"id"`
+	TaskID         string          `json:"task_id"`
+	Status         string          `json:"status"`
+	Nodes          []TaskGraphNode `json:"nodes"`
+	RepairAttempts []RepairAttempt `json:"repair_attempts,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+}
+
+// RepairAttempt records one task-level repair/synthesis round appended after
+// the task verifier returned needs_repair. It is the accumulated task-level
+// feedback history; node-level attempt feedback still lives on node.Input.
+type RepairAttempt struct {
+	Round            int       `json:"round"`
+	RepairNodeID     string    `json:"repair_node_id,omitempty"`
+	VerifierFeedback string    `json:"verifier_feedback,omitempty"`
+	Status           string    `json:"status"` // passed | failed | blocked
+	AttemptedAt      time.Time `json:"attempted_at"`
 }
 
 type TaskGraphNode struct {

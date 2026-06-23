@@ -663,6 +663,8 @@ func taskContractFromPlan(plan TaskGraphPlan) session.TaskContract {
 		RequiredTools:    requiredTools,
 		RequiredEvidence: evidenceItems,
 		ExpectedOutcome:  strings.TrimSpace(plan.Task.Acceptance),
+		TaskAcceptance:   strings.TrimSpace(plan.Task.Acceptance),
+		FinalOutput:      cleanStringSlice(plan.Task.FinalOutput.Structured),
 		PlanItems:        planItems,
 		CreatedAt:        time.Now(),
 	}
@@ -832,4 +834,208 @@ func cleanStringSlice(ss []string) []string {
 		return nil
 	}
 	return out
+}
+
+type siblingNodeOutput struct {
+	ID      string
+	Summary string
+}
+
+// generateReplacementNode asks the unified planner model to produce a single
+// replacement node for a failed node, after retry exhaustion. Returns an error
+// when no model is configured, the model output is invalid, or the produced
+// node fails tool/skill validation.
+func (rt Runtime) generateReplacementNode(
+	ctx context.Context,
+	g *session.TaskGraph,
+	failedNode *session.TaskGraphNode,
+	trace *traceRecorder,
+) (session.TaskGraphNode, error) {
+	if rt.Model == nil {
+		return session.TaskGraphNode{}, fmt.Errorf("no model configured for replan")
+	}
+	feedback := strings.TrimSpace(failedNode.FailureReason)
+	if failedNode.Acceptance.Reason != "" && feedback == "" {
+		feedback = failedNode.Acceptance.Reason
+	}
+
+	siblings := siblingVerifiedOutputs(g, failedNode.ID)
+	prompt := renderReplanPrompt(failedNode, feedback, siblings, rt.Tools)
+	replanCtx, cancel := context.WithTimeout(ctx, plannerTimeout(rt.Config))
+	defer cancel()
+
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":         "model_call_start",
+			"model_stage":  "replan",
+			"graph_id":     g.ID,
+			"task_id":      g.TaskID,
+			"failed_node":  failedNode.ID,
+			"depth":        localReplanDepth(failedNode) + 1,
+			"prompt_chars": len(prompt),
+		})
+	}
+	reply, err := rt.Model.Next(replanCtx, agentcore.Context{
+		SystemPrompt: replanSystemPrompt,
+		Messages:     []agentcore.Message{{Role: agentcore.RoleUser, Content: prompt}},
+	})
+	if err != nil {
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":        "model_call_failed",
+				"model_stage": "replan",
+				"graph_id":    g.ID,
+				"task_id":     g.TaskID,
+				"failed_node": failedNode.ID,
+				"error":       err.Error(),
+			})
+		}
+		return session.TaskGraphNode{}, err
+	}
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":          "replan_raw_output",
+			"graph_id":      g.ID,
+			"task_id":       g.TaskID,
+			"failed_node":   failedNode.ID,
+			"output_length": len(reply.Content),
+			"raw":           summarize(reply.Content),
+		})
+	}
+
+	plan, err := parseReplanPlan(reply.Content, failedNode)
+	if err != nil {
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":        "replan_parse_failed",
+				"graph_id":    g.ID,
+				"task_id":     g.TaskID,
+				"failed_node": failedNode.ID,
+				"error":       err.Error(),
+			})
+		}
+		return session.TaskGraphNode{}, err
+	}
+	if errs := validatePlanTools(plan, rt.Tools, nil); !errs.IsValid() {
+		return session.TaskGraphNode{}, fmt.Errorf("replan tool validation failed: %s", errs.Error())
+	}
+	node, err := replanNodeToTaskGraphNode(plan, failedNode)
+	if err != nil {
+		return session.TaskGraphNode{}, err
+	}
+	if trace != nil {
+		_ = trace.write(map[string]any{
+			"type":          "replan_node_generated",
+			"graph_id":      g.ID,
+			"task_id":       g.TaskID,
+			"failed_node":   failedNode.ID,
+			"replacement":   node.ID,
+			"mode":          node.Mode,
+			"allowed_tools": node.AllowedTools,
+		})
+	}
+	return node, nil
+}
+
+func siblingVerifiedOutputs(g *session.TaskGraph, excludeID string) []siblingNodeOutput {
+	var out []siblingNodeOutput
+	for i := range g.Nodes {
+		n := &g.Nodes[i]
+		if n.ID == excludeID {
+			continue
+		}
+		if n.Status != session.NodeStatusCompleted && n.Status != session.NodeStatusSkipped {
+			continue
+		}
+		if n.Acceptance.Criteria != "" && !n.Acceptance.Verified {
+			continue
+		}
+		summary := strings.TrimSpace(n.ResultSummary)
+		if summary == "" {
+			if text, ok := n.Output["text"].(string); ok {
+				summary = strings.TrimSpace(text)
+			}
+		}
+		if summary == "" {
+			continue
+		}
+		out = append(out, siblingNodeOutput{ID: n.ID, Summary: summary})
+	}
+	return out
+}
+
+func parseReplanPlan(raw string, failedNode *session.TaskGraphNode) (TaskGraphPlan, error) {
+	plan, err := parseTaskGraphPlan(raw)
+	if err != nil {
+		return TaskGraphPlan{}, err
+	}
+	if len(plan.Nodes) == 0 {
+		return TaskGraphPlan{}, fmt.Errorf("replan produced no nodes")
+	}
+	// Keep only the first replacement node; the replan contract is one node.
+	plan.Nodes = plan.Nodes[:1]
+	// Ensure the replacement carries the failed node's prerequisite deps and id.
+	if strings.TrimSpace(plan.Nodes[0].ID) == "" {
+		plan.Nodes[0].ID = "repair-" + failedNode.ID
+	}
+	if len(plan.Nodes[0].Depends) == 0 {
+		plan.Nodes[0].Depends = append([]string(nil), failedNode.Depends...)
+	}
+	return plan, nil
+}
+
+func replanNodeToTaskGraphNode(plan TaskGraphPlan, failedNode *session.TaskGraphNode) (session.TaskGraphNode, error) {
+	pn := plan.Nodes[0]
+	id := normalizeGraphNodeID(pn.ID, 0)
+	if !strings.HasPrefix(id, "repair-") {
+		id = "repair-" + failedNode.ID
+	}
+	nodeType := normalizePlanNodeType(pn)
+	if nodeType != session.NodeTypeSubtask && nodeType != session.NodeTypeModel {
+		nodeType = session.NodeTypeSubtask
+	}
+	mode := determineNodeModeForType(pn, nodeType)
+	if len(pn.AllowedTools) == 0 && len(failedNode.AllowedTools) > 0 {
+		mode = session.NodeModeReact
+	}
+	now := time.Now()
+	var deps []string
+	if len(pn.Depends) > 0 {
+		deps = normalizeDepends(pn.Depends)
+	} else {
+		deps = append([]string(nil), failedNode.Depends...)
+	}
+	allowedTools := cleanStringSlice(pn.AllowedTools)
+	if len(allowedTools) == 0 {
+		allowedTools = append([]string(nil), failedNode.AllowedTools...)
+	}
+
+	node := session.TaskGraphNode{
+		ID:           id,
+		Type:         nodeType,
+		Mode:         mode,
+		Goal:         strings.TrimSpace(pn.Goal),
+		Status:       session.NodeStatusPending,
+		Depends:      deps,
+		Input:        planNodeInput(pn),
+		Output:       stringSliceToMap(pn.Outputs),
+		AllowedTools: allowedTools,
+		Acceptance: session.Acceptance{
+			Criteria: strings.TrimSpace(pn.Acceptance),
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if node.Input == nil {
+		node.Input = map[string]any{}
+	}
+	node.Input["replan_reason"] = strings.TrimSpace(failedNode.FailureReason)
+	node.Input["local_replan_depth"] = localReplanDepth(failedNode) + 1
+	if node.Goal == "" {
+		node.Goal = "Repair and complete: " + strings.TrimSpace(failedNode.Goal)
+	}
+	if node.Acceptance.Criteria == "" {
+		node.Acceptance.Criteria = "Produces a result that addresses the verifier feedback and the original node goal."
+	}
+	return node, nil
 }

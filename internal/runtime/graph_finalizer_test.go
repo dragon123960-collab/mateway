@@ -1385,36 +1385,6 @@ func TestRunGraphTask_DirectFailureAppliesLocalReplan(t *testing.T) {
 	}
 }
 
-func TestLocalReplanReplacementNodePreservesReactTools(t *testing.T) {
-	node := &session.TaskGraphNode{
-		ID:            "summarize-runtime-file",
-		Type:          session.NodeTypeSubtask,
-		Mode:          session.NodeModeReact,
-		Goal:          "summarize runtime file",
-		Status:        session.NodeStatusFailed,
-		Depends:       []string{"read-files"},
-		AllowedTools:  []string{"file.read", "terminal.run"},
-		FailureReason: "verifier rejected missing file evidence",
-		Input: map[string]any{
-			"local_replan_depth": 1,
-		},
-	}
-
-	repair := localReplanReplacementNode(node)
-	if repair.Mode != session.NodeModeReact {
-		t.Fatalf("repair mode = %q, want %q", repair.Mode, session.NodeModeReact)
-	}
-	if strings.Join(repair.AllowedTools, ",") != "file.read,terminal.run" {
-		t.Fatalf("repair allowed tools = %v", repair.AllowedTools)
-	}
-	if strings.Join(repair.Depends, ",") != "read-files" {
-		t.Fatalf("repair depends = %v", repair.Depends)
-	}
-	if depth := localReplanDepth(&repair); depth != 2 {
-		t.Fatalf("repair depth = %d, want 2", depth)
-	}
-}
-
 func TestRunGraphTask_NodeTraceEventsIncludeRequiredIDs(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Model = staticTextModel{text: "done"}
@@ -1537,6 +1507,9 @@ type barrierModel struct {
 type retryThenPassRepairModel struct{}
 
 func (m retryThenPassRepairModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "node-level replan generator") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"task":{"goal":"repair","acceptance":"repair accepted"},"nodes":[{"id":"repair-analyze","type":"subtask","mode":"direct","goal":"Repair and complete analyze","depends":[],"outputs":["repair_result"],"acceptance":"repair accepted"}]}`}, nil
+	}
 	if strings.Contains(ctx.SystemPrompt, "verification judge") {
 		user := ""
 		if len(ctx.Messages) > 0 {
@@ -1553,6 +1526,9 @@ func (m retryThenPassRepairModel) Next(_ context.Context, ctx agentcore.Context)
 type failThenPassRepairModel struct{}
 
 func (m failThenPassRepairModel) Next(_ context.Context, ctx agentcore.Context) (agentcore.Message, error) {
+	if strings.Contains(ctx.SystemPrompt, "node-level replan generator") {
+		return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"task":{"goal":"repair","acceptance":"repair accepted"},"nodes":[{"id":"repair-analyze","type":"subtask","mode":"direct","goal":"Repair and complete analyze","depends":[],"outputs":["repair_result"],"acceptance":"repair accepted"}]}`}, nil
+	}
 	if strings.Contains(ctx.SystemPrompt, "verification judge") {
 		user := ""
 		if len(ctx.Messages) > 0 {

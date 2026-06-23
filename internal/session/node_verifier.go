@@ -425,7 +425,10 @@ func VerifyTaskGraph(g *TaskGraph) GraphVerificationResult {
 }
 
 func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVerificationResult {
-	_ = contract // Compatibility parameter: graph-native verification is driven by node acceptance.
+	// Deterministic layer (always runs, free). The model layer is orchestrated
+	// by the runtime (config.Runtime.TaskVerifier) so this function stays pure
+	// and side-effect free.
+	_ = contract
 
 	result := GraphVerificationResult{
 		Status:      GraphStatusCompleted,
@@ -490,10 +493,51 @@ func VerifyTaskGraphWithContract(g *TaskGraph, contract *TaskContract) GraphVeri
 			result.Status = GraphStatusBlocked
 			result.Reason = fmt.Sprintf("nodes with unverified acceptance criteria: %s", strings.Join(unverified, ", "))
 			result.MissingNodes = unverified
+			return result
+		}
+		// Required final-output keys declared by the contract must be present in
+		// some verified node's Output. A missing key is a salvageable synthesis
+		// gap (needs_repair), not a hard blocker — the runtime may append a
+		// repair/synthesis node to close it.
+		if missing := missingFinalOutputs(g, contract); len(missing) > 0 {
+			result.Status = GraphStatusNeedsRepair
+			result.Reason = fmt.Sprintf("missing final outputs: %s", strings.Join(missing, ", "))
+			result.MissingNodes = missing
 		}
 	}
 
 	return result
+}
+
+// missingFinalOutputs returns the contract.FinalOutput keys that are not
+// present in any verified node's Output map. Returns nil when contract is nil
+// or declares no final outputs.
+func missingFinalOutputs(g *TaskGraph, contract *TaskContract) []string {
+	if contract == nil || len(contract.FinalOutput) == 0 {
+		return nil
+	}
+	available := make(map[string]bool, len(contract.FinalOutput))
+	for i := range g.Nodes {
+		n := &g.Nodes[i]
+		if n.Status != NodeStatusCompleted && n.Status != NodeStatusSkipped {
+			continue
+		}
+		if n.Acceptance.Criteria != "" && !n.Acceptance.Verified {
+			continue
+		}
+		for key := range n.Output {
+			available[key] = true
+		}
+	}
+	var missing []string
+	for _, key := range contract.FinalOutput {
+		key = strings.TrimSpace(key)
+		if key == "" || available[key] {
+			continue
+		}
+		missing = append(missing, key)
+	}
+	return missing
 }
 
 func findUnverifiedCriteriaNodes(g *TaskGraph) []string {

@@ -38,6 +38,11 @@ func FinalizeGraph(g *TaskGraph, vr GraphVerificationResult) GraphFinalizeResult
 		return finalizeBlocked(g, vr)
 	case GraphStatusFailed:
 		return finalizeFailed(g, vr)
+	case GraphStatusNeedsRepair:
+		// The runtime repair loop escalates needs_repair to blocked once the
+		// repair cap is reached; reaching the finalizer in this state is a
+		// safety net — treat as a concrete blocker.
+		return finalizeBlocked(g, vr)
 	default:
 		return finalizePartial(g, vr)
 	}

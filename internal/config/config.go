@@ -45,6 +45,9 @@ func DefaultRoot() Root {
 			InactivityTimeout:    "5m",
 			MaxContractFollowups: 4,
 			ModelVerifier:        "fallback",
+			TaskVerifier:         "on_failure",
+			MaxRepairRounds:      intPtr(2),
+			MaxNodeReplanDepth:   intPtr(2),
 			ContextBudget: ContextBudgetConfig{
 				Enabled:                boolPtr(true),
 				SoftRatio:              0.65,
@@ -353,6 +356,9 @@ type ExecutionConfig struct {
 	InactivityTimeout    string              `yaml:"inactivity_timeout"`
 	MaxContractFollowups int                 `yaml:"max_contract_followups"`
 	ModelVerifier        string              `yaml:"model_verifier"`
+	TaskVerifier         string              `yaml:"task_verifier"`
+	MaxRepairRounds      *int                `yaml:"max_repair_rounds"`
+	MaxNodeReplanDepth   *int                `yaml:"max_node_replan_depth"`
 	ContextBudget        ContextBudgetConfig `yaml:"context_budget"`
 }
 
@@ -484,6 +490,49 @@ func (c ExecutionConfig) MaxContractFollowupsValue() int {
 		return 4
 	}
 	return c.MaxContractFollowups
+}
+
+// TaskVerifierValue returns the task-level model verifier policy:
+// "always", "on_failure" (default), or "off".
+func (c ExecutionConfig) TaskVerifierValue() string {
+	v := strings.ToLower(strings.TrimSpace(c.TaskVerifier))
+	switch v {
+	case "always", "on_failure", "off":
+		return v
+	}
+	return "on_failure"
+}
+
+// MaxRepairRoundsValue returns the task-level repair round cap (0-3, default 2).
+// 0 disables repair-append entirely.
+func (c ExecutionConfig) MaxRepairRoundsValue() int {
+	if c.MaxRepairRounds == nil {
+		return 2
+	}
+	n := *c.MaxRepairRounds
+	if n < 0 {
+		return 0
+	}
+	if n > 3 {
+		return 3
+	}
+	return n
+}
+
+// MaxNodeReplanDepthValue returns the node-level model replan depth cap
+// (1-3, default 2).
+func (c ExecutionConfig) MaxNodeReplanDepthValue() int {
+	if c.MaxNodeReplanDepth == nil {
+		return 2
+	}
+	n := *c.MaxNodeReplanDepth
+	if n < 1 {
+		return 1
+	}
+	if n > 3 {
+		return 3
+	}
+	return n
 }
 
 type MemoryConfig struct {
@@ -850,6 +899,15 @@ func (r *Root) applyDefaults() {
 		r.Execution.MaxIterations = defaults.Execution.MaxIterations
 	} else if *r.Execution.MaxIterations < 0 {
 		r.Execution.MaxIterations = defaults.Execution.MaxIterations
+	}
+	if strings.TrimSpace(r.Execution.TaskVerifier) == "" {
+		r.Execution.TaskVerifier = defaults.Execution.TaskVerifier
+	}
+	if r.Execution.MaxRepairRounds == nil {
+		r.Execution.MaxRepairRounds = defaults.Execution.MaxRepairRounds
+	}
+	if r.Execution.MaxNodeReplanDepth == nil {
+		r.Execution.MaxNodeReplanDepth = defaults.Execution.MaxNodeReplanDepth
 	}
 	if strings.TrimSpace(r.Execution.PlannerTimeout) == "" {
 		r.Execution.PlannerTimeout = defaults.Execution.PlannerTimeout

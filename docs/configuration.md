@@ -53,6 +53,9 @@ Mateway 默认在 `~/.mateway` 下存储本地运行时数据。`mateway init` �
 - `inactivity_timeout`: runtime 活动看门狗超时。
 - `max_contract_followups`: observe/completion follow-up 的上限，保留用于旧 contract hook 兼容。
 - `model_verifier`: node 验收时模型 verifier 的调用策略。默认 `fallback`，deterministic verifier 已通过时不再调用模型；可设为 `always` 强制每个带 acceptance 的已通过 node 再做模型语义验收；`off`/`never` 表示关闭模型 verifier。
+- `task_verifier`: task-level 模型 verifier 的调用策略。默认 `on_failure`，只在确定性任务验收发现可修复缺口时调用；`always` 表示每次任务级验收都调用；`off` 表示只跑确定性任务验收。
+- `max_repair_rounds`: task-level repair/synthesis node 的最大追加轮数。默认 `2`，范围 `0` 到 `3`；设为 `0` 时不自动追加 repair node。
+- `max_node_replan_depth`: node-level model replan 的最大深度。默认 `2`，范围 `1` 到 `3`；超过后节点失败并触发 `local_replan_limit_reached`。
 - `context_budget`: 输入上下文裁剪和工具结果压缩预算。
 
 `max_parallel_nodes` 和 `max_parallel_tools` 不要混用。Node 是可验收子任务；tool call 只是 node 内 action/evidence。

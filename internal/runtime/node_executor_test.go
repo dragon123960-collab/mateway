@@ -1432,7 +1432,11 @@ func TestRunGraphTask_NodeVerifierRetryThenPasses(t *testing.T) {
 func TestRunGraphTask_NodeVerifierRetryExhausted(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Config.Execution.ModelVerifier = "always"
+	rt.Config.Execution.MaxNodeReplanDepth = intPtrTest(1)
 	rt.Model = captureModel{next: func(_ context.Context, c agentcore.Context) (agentcore.Message, error) {
+		if strings.Contains(c.SystemPrompt, "node-level replan generator") {
+			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"task":{"goal":"repair","acceptance":"fixed"},"nodes":[{"id":"repair-answer","type":"subtask","mode":"direct","goal":"repair answer","depends":[],"outputs":["repair_result"],"acceptance":"fixed"}]}`}, nil
+		}
 		if c.SystemPrompt == modelVerifierSystemPrompt {
 			return agentcore.Message{Role: agentcore.RoleAssistant, Content: `{"status":"retry","reason":"still missing","retryable":true,"confidence":"medium"}`}, nil
 		}

@@ -22,7 +22,7 @@ Runtime 拥有 TaskGraph 状态和执行策略，但不成为 heavy workflow eng
 
 - Planner 一次输出 task acceptance 和 subtask graph。
 - Scheduler 只做本地 ready-node 调度。
-- Node Executor 执行 direct、react、skill、script/tool 或 human node。
+- Node Executor 执行 direct、react、skill、tool 或 human node；skill `script` 执行仍在规划中，runtime 尚未实现。
 - AgentCore 在 node 内部提供局部 ReAct loop。
 - 工具实现真实动作并返回 evidence。
 - Tool policy、path validation 和 secret redaction 是硬安全边界。

@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/session"
 )
 
 const graphPlannerSystemPrompt = `You are a task graph planner. Your job is to break a user task into an ordered list of atomic execution nodes with dependencies.
@@ -181,6 +183,97 @@ Output exactly this JSON shape:
     }
   ]
 }`
+
+const replanSystemPrompt = `You are a node-level replan generator for a task graph runtime. A single node has failed verification and exhausted its retries. Produce ONE replacement node that achieves the failed node's goal while addressing the verifier feedback.
+
+Output exactly one JSON object. No narrative, no tool execution, no text outside the JSON.
+
+Rules:
+- Emit exactly one replacement node in "nodes"; "depends" must list the failed node's original prerequisites (provided).
+- The replacement must be a SUB-TASK, never a single tool call. Use type "subtask".
+- mode is "react" when the failed node had allowed_tools, otherwise "direct".
+- "allowed_tools" must exactly match tool names from Available tools and be a subset of the failed node's allowed-tools whitelist.
+- "goal" must describe what the replacement produces; "acceptance" must be a verifiable condition that closes the verifier feedback.
+- Do NOT invent dependencies or skill names.
+- Keep "id" as "repair-<failedNodeID>" (provided in the input).
+
+Output schema:
+{
+  "task": {
+    "goal": "<failed node goal>",
+    "risk": "low|medium|high",
+    "acceptance": "<rewritten acceptance>",
+    "required_capabilities": {"tools": [], "skills": [], "human_gates": []},
+    "final_output": {"text": true, "structured": []}
+  },
+  "nodes": [
+    {
+      "id": "repair-<failedNodeID>",
+      "type": "subtask",
+      "mode": "react|direct",
+      "goal": "...",
+      "depends": ["..."],
+      "allowed_tools": ["..."],
+      "outputs": ["repair_result"],
+      "acceptance": "..."
+    }
+  ]
+}`
+
+func renderReplanPrompt(
+	failedNode *session.TaskGraphNode,
+	verifierFeedback string,
+	siblingOutputs []siblingNodeOutput,
+	tools *agentcore.ToolRegistry,
+) string {
+	var b strings.Builder
+	b.WriteString("Failed node:\n")
+	b.WriteString(fmt.Sprintf("- id: %s\n", failedNode.ID))
+	b.WriteString(fmt.Sprintf("- type: %s\n", failedNode.Type))
+	b.WriteString(fmt.Sprintf("- mode: %s\n", failedNode.Mode))
+	b.WriteString(fmt.Sprintf("- goal: %s\n", strings.TrimSpace(failedNode.Goal)))
+	if strings.TrimSpace(failedNode.FailureReason) != "" {
+		b.WriteString(fmt.Sprintf("- failure_reason: %s\n", failedNode.FailureReason))
+	}
+	if len(failedNode.AllowedTools) > 0 {
+		b.WriteString(fmt.Sprintf("- allowed_tools: %s\n", strings.Join(failedNode.AllowedTools, ", ")))
+	}
+	if strings.TrimSpace(failedNode.Acceptance.Criteria) != "" {
+		b.WriteString(fmt.Sprintf("- acceptance_criteria: %s\n", failedNode.Acceptance.Criteria))
+	}
+	if summary := strings.TrimSpace(failedNode.ResultSummary); summary != "" {
+		b.WriteString(fmt.Sprintf("- result_summary: %s\n", summary))
+	}
+	if feedback := strings.TrimSpace(verifierFeedback); feedback != "" {
+		b.WriteString("\nVerifier feedback (the gap the replacement must close):\n")
+		b.WriteString(feedback)
+		b.WriteString("\n")
+	}
+	if len(siblingOutputs) > 0 {
+		b.WriteString("\nSibling verified node outputs (context, not constraints):\n")
+		for _, s := range siblingOutputs {
+			b.WriteString(fmt.Sprintf("- %s: %s\n", s.ID, s.Summary))
+		}
+	}
+	b.WriteString("\nReplacement depends (original prerequisites):\n")
+	if len(failedNode.Depends) > 0 {
+		b.WriteString(strings.Join(failedNode.Depends, ", "))
+	} else {
+		b.WriteString("(none)")
+	}
+	b.WriteString("\n\nAvailable tools:\n")
+	if tools != nil {
+		for _, tool := range toolsForContract(tools) {
+			b.WriteString("- ")
+			b.WriteString(tool.Name())
+			b.WriteString(": ")
+			b.WriteString(tool.Description())
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\nEmit exactly one replacement node as JSON.\n")
+	return b.String()
+}
 
 func renderGraphPlannerPrompt(goal, userText string, tools *agentcore.ToolRegistry, skills []discoveredSkill) string {
 	var b strings.Builder

@@ -214,212 +214,273 @@ func (rt Runtime) runGraphTask(
 		"nodes":    len(g.Nodes),
 	})
 
+	var pendingRepairNodeID string
+	var pendingRepairFeedback string
+	maxRepair := 0
+	if rt.Config != nil {
+		maxRepair = rt.Config.Execution.MaxRepairRoundsValue()
+	}
+schedulerLoop:
 	for {
-		ready := session.ReadyNodes(g, len(g.Nodes))
-		selected, waiting := selectReadyNodeBatch(g, ready, maxParallelNodes(rt.Config))
-
-		_ = trace.write(map[string]any{
-			"type":        "graph_schedule_tick",
-			"graph_id":    g.ID,
-			"task_id":     task.ID,
-			"ready_nodes": ready,
-			"selected":    selected,
-			"waiting":     waiting,
-			"total_nodes": len(g.Nodes),
-		})
-		_ = trace.write(map[string]any{
-			"type":               "scheduler_tick",
-			"graph_id":           g.ID,
-			"task_id":            task.ID,
-			"ready_nodes":        ready,
-			"selected_nodes":     selected,
-			"waiting_nodes":      waiting,
-			"max_parallel_nodes": maxParallelNodes(rt.Config),
-		})
-		for _, nodeID := range ready {
-			node := g.NodeByID(nodeID)
-			if node == nil {
-				continue
-			}
-			_ = trace.write(map[string]any{
-				"type":      "node_ready",
-				"graph_id":  g.ID,
-				"task_id":   task.ID,
-				"node_id":   node.ID,
-				"node_type": node.Type,
-				"node_mode": node.Mode,
-				"attempt":   node.Attempts + 1,
-			})
-		}
-		for _, nodeID := range waiting {
-			node := g.NodeByID(nodeID)
-			if node == nil {
-				continue
-			}
-			_ = trace.write(map[string]any{
-				"type":      "scheduler_waiting",
-				"graph_id":  g.ID,
-				"task_id":   task.ID,
-				"node_id":   node.ID,
-				"node_type": node.Type,
-				"node_mode": node.Mode,
-				"attempt":   node.Attempts + 1,
-				"reason":    schedulerWaitingReason(g, node, selected, maxParallelNodes(rt.Config)),
-			})
-		}
-
-		if len(selected) == 0 {
-			break
-		}
-
-		for _, nodeID := range selected {
-			node := g.NodeByID(nodeID)
-			if node == nil {
-				continue
-			}
-			if node.Status != session.NodeStatusPending {
-				continue
-			}
+		for {
+			ready := session.ReadyNodes(g, len(g.Nodes))
+			selected, waiting := selectReadyNodeBatch(g, ready, maxParallelNodes(rt.Config))
 
 			_ = trace.write(map[string]any{
-				"type":      "node_scheduled",
-				"graph_id":  g.ID,
-				"task_id":   task.ID,
-				"node_id":   node.ID,
-				"node_type": node.Type,
-				"node_mode": node.Mode,
-				"attempt":   node.Attempts + 1,
+				"type":        "graph_schedule_tick",
+				"graph_id":    g.ID,
+				"task_id":     task.ID,
+				"ready_nodes": ready,
+				"selected":    selected,
+				"waiting":     waiting,
+				"total_nodes": len(g.Nodes),
 			})
-
-			startNodeAttempt(trace, g, node)
-			rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
-				Title:   firstNonEmpty(node.Goal, node.ID),
-				Status:  "running",
-				Summary: "node " + node.ID,
+			_ = trace.write(map[string]any{
+				"type":               "scheduler_tick",
+				"graph_id":           g.ID,
+				"task_id":            task.ID,
+				"ready_nodes":        ready,
+				"selected_nodes":     selected,
+				"waiting_nodes":      waiting,
+				"max_parallel_nodes": maxParallelNodes(rt.Config),
 			})
-		}
-
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, err
-		}
-
-		results, err := rt.runSelectedNodes(ctx, msg, state, g, selected, userText, trace)
-		if err != nil {
-			return Response{}, err
-		}
-		for _, result := range results {
-			mergeNodeRunResult(state, g, result)
-			node := g.NodeByID(result.NodeID)
-			if node == nil {
-				continue
-			}
-			if node.Status == session.NodeStatusCompleted {
-				writeNodeEvent(trace, g, node, map[string]any{
-					"type":           "node_completed",
-					"status":         node.Status,
-					"result_summary": node.ResultSummary,
+			for _, nodeID := range ready {
+				node := g.NodeByID(nodeID)
+				if node == nil {
+					continue
+				}
+				_ = trace.write(map[string]any{
+					"type":      "node_ready",
+					"graph_id":  g.ID,
+					"task_id":   task.ID,
+					"node_id":   node.ID,
+					"node_type": node.Type,
+					"node_mode": node.Mode,
+					"attempt":   node.Attempts + 1,
 				})
+			}
+			for _, nodeID := range waiting {
+				node := g.NodeByID(nodeID)
+				if node == nil {
+					continue
+				}
+				_ = trace.write(map[string]any{
+					"type":      "scheduler_waiting",
+					"graph_id":  g.ID,
+					"task_id":   task.ID,
+					"node_id":   node.ID,
+					"node_type": node.Type,
+					"node_mode": node.Mode,
+					"attempt":   node.Attempts + 1,
+					"reason":    schedulerWaitingReason(g, node, selected, maxParallelNodes(rt.Config)),
+				})
+			}
+
+			if len(selected) == 0 {
+				break
+			}
+
+			for _, nodeID := range selected {
+				node := g.NodeByID(nodeID)
+				if node == nil {
+					continue
+				}
+				if node.Status != session.NodeStatusPending {
+					continue
+				}
+
+				_ = trace.write(map[string]any{
+					"type":      "node_scheduled",
+					"graph_id":  g.ID,
+					"task_id":   task.ID,
+					"node_id":   node.ID,
+					"node_type": node.Type,
+					"node_mode": node.Mode,
+					"attempt":   node.Attempts + 1,
+				})
+
+				startNodeAttempt(trace, g, node)
 				rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
 					Title:   firstNonEmpty(node.Goal, node.ID),
-					Status:  "completed",
+					Status:  "running",
 					Summary: "node " + node.ID,
 				})
 			}
-			if node.Status == session.NodeStatusRetrying {
-				node.Status = session.NodeStatusPending
-				_ = trace.write(map[string]any{
-					"type":     "node_retry_scheduled",
-					"graph_id": g.ID,
-					"task_id":  task.ID,
-					"node_id":  node.ID,
-					"attempt":  node.Attempts,
-				})
+
+			if err := rt.saveState(state, trace); err != nil {
+				return Response{}, err
 			}
-			if shouldApplyLocalReplan(node) {
-				if localReplanDepth(node) >= 1 {
-					node.Status = session.NodeStatusFailed
-					_ = trace.write(map[string]any{
-						"type":     "local_replan_limit_reached",
-						"graph_id": g.ID,
-						"task_id":  task.ID,
-						"node_id":  node.ID,
-						"reason":   node.FailureReason,
-					})
-					session.UpdateGraphStatus(g)
-					if err := rt.saveState(state, trace); err != nil {
-						return Response{}, err
-					}
+
+			results, err := rt.runSelectedNodes(ctx, msg, state, g, selected, userText, trace)
+			if err != nil {
+				return Response{}, err
+			}
+			for _, result := range results {
+				mergeNodeRunResult(state, g, result)
+				node := g.NodeByID(result.NodeID)
+				if node == nil {
 					continue
 				}
-				replacement := localReplanReplacementNode(node)
-				if errs := applyLocalReplanWithTrace(g, session.LocalReplanRequest{
-					FailedNodeID:     node.ID,
-					ReplacementNodes: []session.TaskGraphNode{replacement},
-				}, trace); !errs.IsValid() {
-					node.Status = session.NodeStatusFailed
-					node.FailureReason = errs.Error()
+				if node.Status == session.NodeStatusCompleted {
+					writeNodeEvent(trace, g, node, map[string]any{
+						"type":           "node_completed",
+						"status":         node.Status,
+						"result_summary": node.ResultSummary,
+					})
+					rt.emitProgressStep(msg, *state, task.ID, channel.ProgressStep{
+						Title:   firstNonEmpty(node.Goal, node.ID),
+						Status:  "completed",
+						Summary: "node " + node.ID,
+					})
+				}
+				if node.Status == session.NodeStatusRetrying {
+					node.Status = session.NodeStatusPending
 					_ = trace.write(map[string]any{
-						"type":     "local_replan_blocker",
+						"type":     "node_retry_scheduled",
 						"graph_id": g.ID,
 						"task_id":  task.ID,
 						"node_id":  node.ID,
-						"error":    errs.Error(),
+						"attempt":  node.Attempts,
 					})
+				}
+				if shouldApplyLocalReplan(node) {
+					if localReplanDepth(node) >= maxNodeReplanDepth(rt.Config) {
+						node.Status = session.NodeStatusFailed
+						_ = trace.write(map[string]any{
+							"type":     "local_replan_limit_reached",
+							"graph_id": g.ID,
+							"task_id":  task.ID,
+							"node_id":  node.ID,
+							"reason":   node.FailureReason,
+						})
+						session.UpdateGraphStatus(g)
+						if err := rt.saveState(state, trace); err != nil {
+							return Response{}, err
+						}
+						continue
+					}
+					replacement, replanErr := rt.generateReplacementNode(ctx, g, node, trace)
+					if replanErr != nil {
+						node.Status = session.NodeStatusFailed
+						node.FailureReason = "model replan failed: " + replanErr.Error()
+						_ = trace.write(map[string]any{
+							"type":     "local_replan_blocker",
+							"graph_id": g.ID,
+							"task_id":  task.ID,
+							"node_id":  node.ID,
+							"error":    node.FailureReason,
+						})
+						session.UpdateGraphStatus(g)
+						if err := rt.saveState(state, trace); err != nil {
+							return Response{}, err
+						}
+						continue
+					}
+					if errs := applyLocalReplanWithTrace(g, session.LocalReplanRequest{
+						FailedNodeID:     node.ID,
+						ReplacementNodes: []session.TaskGraphNode{replacement},
+					}, trace); !errs.IsValid() {
+						node.Status = session.NodeStatusFailed
+						node.FailureReason = errs.Error()
+						_ = trace.write(map[string]any{
+							"type":     "local_replan_blocker",
+							"graph_id": g.ID,
+							"task_id":  task.ID,
+							"node_id":  node.ID,
+							"error":    errs.Error(),
+						})
+					}
+				}
+
+				session.UpdateGraphStatus(g)
+
+				if err := rt.saveState(state, trace); err != nil {
+					return Response{}, err
 				}
 			}
 
-			session.UpdateGraphStatus(g)
+		}
 
+		vr := rt.verifyTaskGraph(ctx, g, task.Execution.Contract, trace)
+
+		if pendingRepairNodeID == "" {
+			if recoveredID, recoveredFeedback := unrecordedTaskRepairNode(g); recoveredID != "" {
+				pendingRepairNodeID = recoveredID
+				pendingRepairFeedback = recoveredFeedback
+			}
+		}
+		if pendingRepairNodeID != "" {
+			attemptStatus := repairAttemptStatus(vr.Status)
+			g.RepairAttempts = append(g.RepairAttempts, session.RepairAttempt{
+				Round:            len(g.RepairAttempts) + 1,
+				RepairNodeID:     pendingRepairNodeID,
+				VerifierFeedback: pendingRepairFeedback,
+				Status:           attemptStatus,
+				AttemptedAt:      time.Now(),
+			})
+			if trace != nil {
+				_ = trace.write(map[string]any{
+					"type":              "task_repair_round",
+					"graph_id":          g.ID,
+					"task_id":           task.ID,
+					"repair_node_id":    pendingRepairNodeID,
+					"round":             len(g.RepairAttempts),
+					"verify_status":     vr.Status,
+					"verify_reason":     vr.Reason,
+					"attempt_status":    attemptStatus,
+					"max_repair_rounds": maxRepair,
+				})
+			}
+			pendingRepairNodeID = ""
+			pendingRepairFeedback = ""
+			session.UpdateGraphStatus(g)
 			if err := rt.saveState(state, trace); err != nil {
 				return Response{}, err
 			}
 		}
 
-	}
+		if vr.Status == session.GraphStatusNeedsRepair {
+			if len(g.RepairAttempts) >= maxRepair {
+				vr.Status = session.GraphStatusBlocked
+				if strings.TrimSpace(vr.Reason) == "" {
+					vr.Reason = "repair cap reached"
+				} else {
+					vr.Reason = "repair cap reached: " + vr.Reason
+				}
+				if trace != nil {
+					_ = trace.write(map[string]any{
+						"type":     "task_repair_escalated_blocked",
+						"graph_id": g.ID,
+						"task_id":  task.ID,
+						"reason":   vr.Reason,
+						"attempts": len(g.RepairAttempts),
+					})
+				}
+				return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
+			}
+			feedback := strings.TrimSpace(vr.Reason)
+			repairNode := buildRepairNode(g, task, feedback, len(g.RepairAttempts)+1)
+			g.Nodes = append(g.Nodes, repairNode)
+			pendingRepairNodeID = repairNode.ID
+			pendingRepairFeedback = feedback
+			session.UpdateGraphStatus(g)
+			if err := rt.saveState(state, trace); err != nil {
+				return Response{}, err
+			}
+			if trace != nil {
+				_ = trace.write(map[string]any{
+					"type":           "task_repair_node_appended",
+					"graph_id":       g.ID,
+					"task_id":        task.ID,
+					"repair_node_id": repairNode.ID,
+					"round":          len(g.RepairAttempts) + 1,
+					"depends":        repairNode.Depends,
+				})
+			}
+			continue schedulerLoop
+		}
 
-	vr := session.VerifyTaskGraphWithContract(g, task.Execution.Contract)
-
-	return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
-}
-
-func localReplanReplacementNode(node *session.TaskGraphNode) session.TaskGraphNode {
-	now := time.Now()
-	id := "repair-" + strings.TrimSpace(node.ID)
-	if id == "repair-" {
-		id = fmt.Sprintf("repair-%d", now.UnixNano())
-	}
-	goal := strings.TrimSpace(node.Goal)
-	if goal == "" {
-		goal = "complete the failed node with a smaller, verifiable output"
-	}
-	reason := strings.TrimSpace(node.FailureReason)
-	if reason == "" {
-		reason = "previous node attempt was not accepted by verifier"
-	}
-	mode := session.NodeModeDirect
-	if len(node.AllowedTools) > 0 || strings.TrimSpace(node.Mode) == session.NodeModeReact {
-		mode = session.NodeModeReact
-	}
-	return session.TaskGraphNode{
-		ID:      id,
-		Type:    session.NodeTypeSubtask,
-		Mode:    mode,
-		Goal:    "Repair and complete: " + goal,
-		Status:  session.NodeStatusPending,
-		Depends: append([]string(nil), node.Depends...),
-		Input: map[string]any{
-			"replan_reason":      reason,
-			"local_replan_depth": localReplanDepth(node) + 1,
-		},
-		Output: map[string]any{
-			"repair_result": true,
-		},
-		Acceptance: session.Acceptance{
-			Criteria: "Produces a concise result that directly addresses the original node goal and verifier feedback.",
-		},
-		AllowedTools: append([]string(nil), node.AllowedTools...),
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
 	}
 }
 

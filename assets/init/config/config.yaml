@@ -20,6 +20,9 @@ execution:
   planner_timeout: 60s
   inactivity_timeout: 5m
   model_verifier: fallback
+  task_verifier: on_failure
+  max_repair_rounds: 2
+  max_node_replan_depth: 2
   context_budget:
     enabled: true
     soft_ratio: 0.65
