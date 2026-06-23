@@ -126,39 +126,6 @@ func TestContractStrategyReviewRequiredForMultiStepDelivery(t *testing.T) {
 	}
 }
 
-// --- Unit tests for shouldPauseForTaskPlan with strategy ---
-
-func TestShouldPauseForTaskPlanDirectNeverPauses(t *testing.T) {
-	contract := session.TaskContract{
-		RequiresTools: true,
-		RequiredTools: []string{"web.search"},
-	}
-	if shouldPauseForTaskPlan(contract, contractStrategyDirect) {
-		t.Fatal("direct strategy should never pause")
-	}
-}
-
-func TestShouldPauseForTaskPlanAutoContractNeverPauses(t *testing.T) {
-	contract := session.TaskContract{
-		RequiresTools:    true,
-		RequiredTools:    []string{"web.search"},
-		RequiredEvidence: []session.TaskEvidenceContract{{Tool: "web.search", Description: "test"}},
-	}
-	if shouldPauseForTaskPlan(contract, contractStrategyAutoContract) {
-		t.Fatal("auto_contract strategy should never pause")
-	}
-}
-
-func TestShouldPauseForTaskPlanReviewRequiredPauses(t *testing.T) {
-	contract := session.TaskContract{
-		RequiresTools: true,
-		RequiredTools: []string{"file.write"},
-	}
-	if !shouldPauseForTaskPlan(contract, contractStrategyReviewRequired) {
-		t.Fatal("review_required with tools should pause")
-	}
-}
-
 // --- Slice 6A: Universal Plan Shape integration tests ---
 
 // TestUniversalPlanShapeDirectHasMinimalContract verifies the Slice 6A

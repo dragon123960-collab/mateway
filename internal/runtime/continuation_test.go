@@ -39,7 +39,7 @@ func TestDetermineContinuation_PendingAction_Priority(t *testing.T) {
 			makeTask("task-1", "build feature", "running"),
 		},
 		Pending: &session.PendingAction{
-			Kind:   session.PendingKindTaskPlanConfirm,
+			Kind:   session.PendingKindHumanReview,
 			TaskID: "task-1",
 		},
 	}

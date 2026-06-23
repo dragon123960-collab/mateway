@@ -116,7 +116,6 @@ type TraceRef struct {
 
 const (
 	PendingKindMemoryProposalReview = "memory_proposal_review"
-	PendingKindTaskPlanConfirm      = "task_plan_confirm"
 	PendingKindHumanReview          = "human_review"
 	PendingKindHumanConfirm         = "human_confirm"
 )

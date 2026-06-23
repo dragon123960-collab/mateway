@@ -302,25 +302,6 @@ func TestShouldSendProcessingAckSkipsPendingSession(t *testing.T) {
 	}
 }
 
-func TestShouldSendProcessingAckAllowsTaskPlanExecute(t *testing.T) {
-	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
-	state, err := rt.Store.Load("cli:test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	task := state.StartTask("execute plan")
-	state.Pending = &session.PendingAction{Kind: session.PendingKindTaskPlanConfirm, TaskID: task.ID}
-	if err := rt.Store.Save(state); err != nil {
-		t.Fatal(err)
-	}
-	if !shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "1"}) {
-		t.Fatal("expected task plan execution to send processing ack")
-	}
-	if shouldSendProcessingAck(rt, channel.InboundMessage{SessionKey: "cli:test", Text: "2"}) {
-		t.Fatal("expected replan control to skip processing ack")
-	}
-}
-
 func TestShouldSendProcessingAckAllowsHumanPendingResume(t *testing.T) {
 	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	state, err := rt.Store.Load("cli:test")

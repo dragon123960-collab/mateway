@@ -103,9 +103,6 @@ func (rt Runtime) handlePending(ctx context.Context, state *session.State, msg c
 		"reason":       "pending action intercepted before state machine",
 		"pending_kind": state.Pending.Kind,
 	})
-	if state.Pending.Kind == session.PendingKindTaskPlanConfirm {
-		return rt.handleTaskPlanConfirm(ctx, state, msg, trace)
-	}
 	if state.Pending.Kind == session.PendingKindHumanConfirm || state.Pending.Kind == session.PendingKindHumanReview {
 		return rt.handleGraphHumanPending(state, msg, trace)
 	}

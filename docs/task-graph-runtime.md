@@ -37,7 +37,7 @@ Node execution mode 描述子任务内部如何执行：
 - `direct`: 一次模型调用完成简单生成、摘要、解释或最终 synthesis。
 - `react`: 使用 AgentCore 作为 node-local ReAct loop。模型可调用受限工具，直到产出 node final output。
 - `skill`: 读取已注册 skill metadata 和 `SKILL.md`，按 skill execution type 执行。
-- `script` / `tool`: 确定性脚本、API 或单工具特例。
+- `script` / `tool`: 确定性脚本、API 或单工具特例。`tool` 节点已实现；`script` 节点执行已实现，但 skill `type: script` 的执行包封装仍在规划中（见 roadmap），尚未在 runtime 中实现。
 - `human`: 等待用户确认或审阅。
 
 ReAct 不再是全局任务控制流，而是复杂 node 的局部执行策略。Node 执行完成后必须由 verifier 判断是否满足 acceptance。

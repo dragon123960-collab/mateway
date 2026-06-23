@@ -1,21 +1,15 @@
 package runtime
 
 import (
-	"context"
-	"fmt"
 	"strings"
 	"time"
 
-	"github.com/dongping/mateway/internal/agentcore"
-	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/session"
 )
 
 const (
-	tracePhasePlanReview      = "plan_review"
 	tracePhaseExecute         = "execute"
 	tracePhaseFollowupExecute = "followup_execute"
-	tracePhasePendingControl  = "pending_control"
 )
 
 type taskContinuity struct {
@@ -123,118 +117,6 @@ func meaningfulTokens(text string) []string {
 		out = append(out, word)
 	}
 	return out
-}
-
-func shouldPauseForTaskPlan(contract session.TaskContract, strategy contractStrategy) bool {
-	if strategy == contractStrategyDirect {
-		return false
-	}
-	if strategy == contractStrategyAutoContract {
-		return false
-	}
-	if contract.RequiresTools || len(contract.RequiredTools) > 0 || len(contract.RequiredEvidence) > 0 {
-		return true
-	}
-	actionItems := 0
-	for _, item := range contract.PlanItems {
-		if strings.TrimSpace(item.Tool) != "" {
-			actionItems++
-		}
-	}
-	return actionItems > 0 || len(contract.PlanItems) > 1
-}
-
-func parseTaskPlanConfirmAction(text string) (string, string) {
-	switch strings.TrimSpace(text) {
-	case "1":
-		return "execute", ""
-	case "2":
-		return "replan", ""
-	default:
-		return "replan", strings.TrimSpace(text)
-	}
-}
-
-func (rt Runtime) handleTaskPlanConfirm(ctx context.Context, state *session.State, msg channel.InboundMessage, trace *traceRecorder) (Response, bool, error) {
-	pending := state.Pending
-	if pending == nil || pending.Kind != session.PendingKindTaskPlanConfirm {
-		return Response{}, false, nil
-	}
-	task := state.TaskByID(pending.TaskID)
-	if task == nil {
-		state.Pending = nil
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		return Response{}, true, fmt.Errorf("task %s not found", pending.TaskID)
-	}
-	trace.setIdentity(map[string]any{"task_id": task.ID, "control_text": msg.Text, "effective_task_goal": task.Goal})
-	state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhasePendingControl, MessageID: msg.ID})
-	action, feedback := parseTaskPlanConfirmAction(msg.Text)
-	switch action {
-	case "execute":
-		state.Pending = nil
-		state.ActiveTask = task.ID
-		task.Graph = nil
-		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhaseExecute, MessageID: msg.ID})
-		if err := rt.ensureGraphForTask(ctx, msg, state, task, task.Goal, trace); err != nil {
-			return Response{}, true, err
-		}
-		_ = trace.write(map[string]any{"type": "request", "text": msg.Text, "control_text": msg.Text, "effective_task_goal": task.Goal})
-		_ = trace.write(map[string]any{"type": "task_plan_confirmed", "task_id": task.ID, "control_text": msg.Text, "effective_task_goal": task.Goal})
-		resp, err := rt.runGraphTask(ctx, msg, state, task, task.Goal, trace)
-		return resp, true, err
-	case "replan":
-		if pending.ReplanCount >= 5 {
-			resp := rt.reply(msg, "Replan limit reached. Reply 1 to execute the current plan or /new to start over.", channel.StyleInputRequired)
-			resp.TraceID = trace.id
-			resp.TracePath = trace.path
-			return resp, true, nil
-		}
-		pending.ReplanCount++
-		pending.Feedback = feedback
-		if task.Execution.Contract != nil {
-			task.Execution.Contract = nil
-		}
-		agent := rt.Pool.AgentForMessage(msg)
-		if agent == nil {
-			agent = agentcore.NewAgent(rt.Model, rt.Tools)
-		}
-		userText := task.Goal
-		if feedback != "" {
-			userText = strings.TrimSpace(task.Goal + "\nPlan feedback: " + feedback)
-		}
-		contract := rt.ensureTaskContract(ctx, msg, state, task, userText, agent.Model, trace)
-		if invalid := validateContractTools(contract, rt.Tools, skillsForRuntimeContext(rt.Config, rt.Pool.ProfileForMessage(msg).ID)); !invalid.IsValid() {
-			blocker := invalidContractBlockerText(contract, invalid, msg)
-			_ = trace.write(map[string]any{"type": "task_contract_blocked", "task_id": task.ID, "invalid_tools": invalid.InvalidTools, "invalid_skills": invalid.InvalidSkills})
-			state.BlockActiveTask("failed")
-			addInvalidContractExecutionEvent(state, task.ID, invalid)
-			if saveErr := rt.saveState(state, trace); saveErr != nil {
-				return Response{}, true, saveErr
-			}
-			return Response{Reply: channel.OutboundMessage{
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Text:     blocker,
-				Style:    channel.StyleError,
-			}, TraceID: trace.id, TracePath: trace.path, Failed: true}, true, nil
-		}
-		state.Pending = pending
-		state.AddTraceRef(task.ID, session.TraceRef{TraceID: trace.id, TracePath: trace.path, Phase: tracePhasePlanReview, MessageID: msg.ID})
-		if err := rt.saveState(state, trace); err != nil {
-			return Response{}, true, err
-		}
-		_ = trace.write(map[string]any{"type": "task_plan_replanned", "task_id": task.ID, "feedback": feedback, "replan_count": pending.ReplanCount})
-		return Response{Reply: channel.OutboundMessage{
-			Channel:  msg.Channel,
-			ThreadID: msg.ThreadID,
-			Text:     renderTaskPlanForReview(contract, firstNonEmpty(feedback, task.Goal, msg.Text)),
-			Style:    channel.StyleInputRequired,
-		}, TraceID: trace.id, TracePath: trace.path}, true, nil
-	default:
-		return Response{}, true, nil
-	}
 }
 
 func updatePlanItemsForToolResult(state *session.State, taskID string, toolName string, status string, evidence string) {

@@ -33,7 +33,7 @@ func (FileWriteTool) ToolContract() agentcore.ToolContract {
 		SoftFailureSignals:   []string{"permission denied", "outside allowed roots", "no such file or directory"},
 		ParallelMode:         "forbid",
 		ReusePolicy:          "never",
-		ConfirmationBoundary: "guarded mutation; path policy and secret scanning are enforced before writing.",
+		ConfirmationBoundary: "guarded mutation; path policy enforced before writing. Writes targeting skill or agent-core profile files are redirected to a proposal and pass a secret-like check; arbitrary-path writes rely on path policy alone.",
 	}
 }
 func (FileWriteTool) Risk() agentcore.Risk { return agentcore.RiskGuardedMutation }

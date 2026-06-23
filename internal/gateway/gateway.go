@@ -555,8 +555,6 @@ func shouldSendProcessingAck(rt runtime.Runtime, msg channel.InboundMessage) boo
 func shouldSendProcessingAckForPending(kind, text string) bool {
 	trimmed := strings.TrimSpace(text)
 	switch kind {
-	case session.PendingKindTaskPlanConfirm:
-		return trimmed == "1"
 	case session.PendingKindHumanReview:
 		return trimmed != ""
 	case session.PendingKindHumanConfirm:

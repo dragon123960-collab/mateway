@@ -72,52 +72,6 @@ type TaskPlanNode struct {
 	Executor     string         `json:"executor,omitempty"`
 }
 
-func (rt Runtime) planTaskGraph(
-	ctx context.Context,
-	task *session.TaskNode,
-	userText string,
-	model agentcore.Model,
-	skills []discoveredSkill,
-	trace *traceRecorder,
-) (session.TaskGraph, error) {
-	if model == nil {
-		return session.TaskGraph{}, fmt.Errorf("planner requires a model")
-	}
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":    "graph_planner_start",
-			"task_id": task.ID,
-		})
-	}
-
-	prompt := renderGraphPlannerPrompt(task.Goal, userText, rt.Tools, skills)
-	g, err := planGraphWithModel(ctx, model, prompt, task.ID, plannerTimeout(rt.Config), trace)
-	if err != nil {
-		if trace != nil {
-			_ = trace.write(map[string]any{
-				"type":    "graph_planner_failed",
-				"task_id": task.ID,
-				"error":   err.Error(),
-			})
-		}
-		return session.TaskGraph{}, err
-	}
-
-	if errs := validatePlannerToolExecutors(g, rt.Tools); !errs.IsValid() {
-		return session.TaskGraph{}, fmt.Errorf("graph tool validation failed: %s", errs.Error())
-	}
-
-	if trace != nil {
-		_ = trace.write(map[string]any{
-			"type":     "graph_planned",
-			"task_id":  task.ID,
-			"graph_id": g.ID,
-			"nodes":    len(g.Nodes),
-		})
-	}
-	return g, nil
-}
-
 func planGraphWithModel(ctx context.Context, model agentcore.Model, prompt, taskID string, timeout time.Duration, trace *traceRecorder) (session.TaskGraph, error) {
 	graphCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

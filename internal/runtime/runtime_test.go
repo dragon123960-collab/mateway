@@ -415,29 +415,6 @@ func TestRuntimeHandle_NewGraphCarriesRecentCompletedContext(t *testing.T) {
 	}
 }
 
-func TestTaskContractPromptIncludesDiscoveredSkills(t *testing.T) {
-	skills := []discoveredSkill{{
-		Name:        "feishu-notify",
-		Description: "Use when creating a Feishu/Lark cloud document.",
-		Stage:       "execution",
-		Priority:    "80",
-		Path:        "/tmp/workspace/skills/feishu-notify/SKILL.md",
-	}}
-	prompt := renderTaskContractPrompt("整理成文档，发到我的飞书云文档", "", agentcore.NewToolRegistry(), skills)
-	for _, want := range []string{"feishu-notify", "Skill names are instructional", "execution_hint"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("expected contract prompt to mention %q, got:\n%s", want, prompt)
-		}
-	}
-}
-
-func TestTaskContractPromptDoesNotHardCodeFeishuSkill(t *testing.T) {
-	prompt := renderTaskContractPrompt("整理成文档，发到我的飞书云文档", "", agentcore.NewToolRegistry(), nil)
-	if strings.Contains(prompt, "feishu-notify") {
-		t.Fatalf("contract prompt should only mention discovered skills, got:\n%s", prompt)
-	}
-}
-
 func TestFallbackContractForActionTaskRequiresTools(t *testing.T) {
 	contract := fallbackTaskContract("查看纳斯达克指数情况，近三天的走势，将其整理成文档，发到我的飞书云文档", "")
 	if !contract.RequiresTools {
@@ -457,9 +434,6 @@ func TestFallbackContractForActionTaskRequiresTools(t *testing.T) {
 	}
 	if len(contract.PlanItems) < 3 {
 		t.Fatalf("expected fallback contract plan items for search/write/publish, got %#v", contract.PlanItems)
-	}
-	if !shouldPauseForTaskPlan(contract, contractStrategyReviewRequired) {
-		t.Fatalf("expected fallback action contract to pause for plan review, got %#v", contract)
 	}
 }
 
@@ -1657,36 +1631,6 @@ func TestContractPromptSortsSkillsByPriorityAndName(t *testing.T) {
 	}
 }
 
-func TestContractPromptIncludesStructuredAvailableSkills(t *testing.T) {
-	skills := []discoveredSkill{{
-		Name:        "feishu-notify",
-		Description: "Send Feishu/Lark messages.",
-		Stage:       "cli",
-		Priority:    "80",
-		Path:        "/tmp/skills/feishu-notify/SKILL.md",
-		Scope:       "shared",
-	}}
-	prompt := renderTaskContractPrompt("发飞书消息", "", agentcore.NewToolRegistry(), skills)
-	for _, want := range []string{
-		"Available skills:",
-		"Skill names are instructional references",
-		"name: feishu-notify",
-		"description: Send Feishu/Lark messages.",
-		"stage: cli",
-		"priority: 80",
-		"path: /tmp/skills/feishu-notify/SKILL.md",
-		"scope: shared",
-		"execution_hint: read SKILL.md with file.read, then execute via terminal.run",
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("expected structured skills prompt to contain %q, got:\n%s", want, prompt)
-		}
-	}
-	if !strings.Contains(prompt, "Do NOT put skill names in required_tools") {
-		t.Fatalf("expected warning about skill names not being tools, got:\n%s", prompt)
-	}
-}
-
 func TestContractValidationRejectsSkillNameAsTool(t *testing.T) {
 	registry := agentcore.NewToolRegistry()
 	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
@@ -1753,50 +1697,6 @@ func TestRepairContractSkillUsageRemovesSkillToolsAndAddsReadItems(t *testing.T)
 	}
 }
 
-func TestContractReplanMapsSkillToRealTools(t *testing.T) {
-	rt := newTestRuntime(t)
-	cfg := rt.Config
-	cfg.App.Workspace = t.TempDir()
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "web.search", content: "ok"})
-	rt.Tools = registry
-
-	callCount := 0
-	rt.ContractModel = &dynamicContractModel{
-		gen: func() string {
-			callCount++
-			if callCount == 1 {
-				return `{"summary":"browse stock data","requires_tools":true,"required_tools":["agent-browser"],"plan_items":[{"id":"plan-1","title":"browse","status":"pending","tool":"agent-browser"}],"expected_outcome":"stock data","completion_policy":"use tool evidence"}`
-			}
-			return `{"summary":"browse stock data","requires_tools":true,"required_tools":["web.search","file.read","terminal.run"],"required_skills":[{"name":"agent-browser","path":"/tmp/skills/agent-browser/SKILL.md","reason":"needed for browsing"}],"plan_items":[{"id":"plan-1","title":"search","status":"pending","tool":"web.search"}],"expected_outcome":"stock data","completion_policy":"use tool evidence"}`
-		},
-	}
-
-	state := session.State{Key: "cli:test"}
-	task := state.StartTask("browse stock data")
-	if err := rt.Store.Save(state); err != nil {
-		t.Fatal(err)
-	}
-	contract := rt.ensureTaskContract(context.Background(), inbound("cli:test", "browse stock data"), &state, task, "browse stock data", nil, mustTrace(t))
-	if callCount < 2 {
-		t.Fatal("expected replan to be triggered when skill name is used as tool, got single call")
-	}
-	if contract.RequiresTools && len(contract.RequiredTools) > 0 {
-		for _, name := range contract.RequiredTools {
-			if name == "agent-browser" {
-				t.Fatalf("expected replan to remove agent-browser from required_tools, got %v", contract.RequiredTools)
-			}
-		}
-	}
-	for _, item := range contract.PlanItems {
-		if item.Tool == "agent-browser" {
-			t.Fatalf("expected replan to remove agent-browser from plan_items[].tool, got item %q with tool %q", item.ID, item.Tool)
-		}
-	}
-}
-
 func TestMissingToolBlockerIsStructuredAndDeduped(t *testing.T) {
 	rt := newTestRuntime(t)
 	registry := agentcore.NewToolRegistry()
@@ -1825,204 +1725,6 @@ func TestMissingToolBlockerIsStructuredAndDeduped(t *testing.T) {
 	}
 	if strings.Contains(blocker, "查看") || strings.Contains(blocker, "近三天") {
 		t.Fatalf("blocker should not echo the user-language request, got: %s", blocker)
-	}
-}
-
-func TestTraceRecordsSelectedContractSkills(t *testing.T) {
-	rt := newTestRuntime(t)
-	ws := t.TempDir()
-	cfg := rt.Config
-	cfg.App.Workspace = ws
-	skillDir := filepath.Join(ws, "skills", "test-skill")
-	if err := os.MkdirAll(skillDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: test-skill\ndescription: Test skill for trace verification.\npriority: 50\n---\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	writeRuntimeSkillMetadata(t, skillDir, "execution", "prompt", "subtask")
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	rt.Tools = registry
-	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":false,"expected_outcome":"done"}`}
-
-	state := session.State{Key: "cli:test"}
-	task := state.StartTask("test task with skill")
-	if err := rt.Store.Save(state); err != nil {
-		t.Fatal(err)
-	}
-	trace := mustTrace(t)
-	_ = rt.ensureTaskContract(context.Background(), inbound("cli:test", "test task with skill"), &state, task, "test task with skill", nil, trace)
-
-	data, err := os.ReadFile(trace.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	traceStr := string(data)
-	if !strings.Contains(traceStr, "task_contract_skills_selected") {
-		t.Fatalf("expected task_contract_skills_selected trace, got:\n%s", traceStr)
-	}
-	if !strings.Contains(traceStr, "test-skill") {
-		t.Fatalf("expected test-skill in trace, got:\n%s", traceStr)
-	}
-}
-
-func TestPlanReviewDisplaysRequiredSkills(t *testing.T) {
-	// The runtime no longer maintains a Chinese plan review branch; the
-	// structured English template is the only path.
-	contract := session.TaskContract{
-		Summary: "check market and write report",
-		RequiredSkills: []session.RequiredSkill{
-			{Name: "feishu-notify", Reason: "create Feishu cloud doc"},
-			{Name: "fresh-search", Reason: "search market data"},
-		},
-	}
-	text := renderTaskPlanForReview(contract, "")
-	if !strings.Contains(text, "Required skills:") {
-		t.Fatalf("expected Required skills in plan review, got:\n%s", text)
-	}
-	if !strings.Contains(text, "feishu-notify") || !strings.Contains(text, "create Feishu cloud doc") {
-		t.Fatalf("expected feishu-notify with reason, got:\n%s", text)
-	}
-	if !strings.Contains(text, "fresh-search") || !strings.Contains(text, "search market data") {
-		t.Fatalf("expected fresh-search with reason, got:\n%s", text)
-	}
-}
-
-func TestPlanReviewDisplaysRequiredSkillsEnglish(t *testing.T) {
-	contract := session.TaskContract{
-		Summary: "check Nasdaq and create doc",
-		RequiredSkills: []session.RequiredSkill{
-			{Name: "feishu-notify", Reason: "create Feishu cloud doc"},
-		},
-	}
-	text := renderTaskPlanForReviewEN(contract, false)
-	if !strings.Contains(text, "Required skills:") {
-		t.Fatalf("expected Required skills in plan review, got:\n%s", text)
-	}
-	if !strings.Contains(text, "feishu-notify") || !strings.Contains(text, "create Feishu cloud doc") {
-		t.Fatalf("expected feishu-notify with reason, got:\n%s", text)
-	}
-}
-
-func TestTaskContractCreatedTraceIncludesRequiredSkills(t *testing.T) {
-	rt := newTestRuntime(t)
-	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":true,"required_tools":["file.read"],"required_skills":[{"name":"feishu-notify","path":"/tmp/skills/feishu-notify/SKILL.md","reason":"create Feishu cloud doc"}],"expected_outcome":"done"}`}
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	rt.Tools = registry
-
-	state := session.State{Key: "cli:test"}
-	task := state.StartTask("test task")
-	if err := rt.Store.Save(state); err != nil {
-		t.Fatal(err)
-	}
-	trace := mustTrace(t)
-	rt.ensureTaskContract(context.Background(), inbound("cli:test", "test task"), &state, task, "test task", nil, trace)
-
-	data, err := os.ReadFile(trace.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	traceStr := string(data)
-	if !strings.Contains(traceStr, "task_contract_created") {
-		t.Fatal("expected task_contract_created trace")
-	}
-	if !strings.Contains(traceStr, "required_skills") || !strings.Contains(traceStr, "feishu-notify") {
-		t.Fatalf("expected required_skills in trace, got:\n%s", traceStr)
-	}
-}
-
-func TestSkillSelectionTraceIncludesOmittedCount(t *testing.T) {
-	rt := newTestRuntime(t)
-	ws := t.TempDir()
-	cfg := rt.Config
-	cfg.App.Workspace = ws
-	for i := 0; i < 30; i++ {
-		dir := filepath.Join(ws, "skills", fmt.Sprintf("skill-%d", i))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		content := fmt.Sprintf("---\nname: skill-%d\ndescription: Test skill %d.\npriority: %d\n---\n", i, i, i)
-		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		writeRuntimeSkillMetadata(t, dir, "execution", "prompt", "subtask")
-	}
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	rt.Tools = registry
-	rt.ContractModel = contractJSONModel{json: `{"summary":"test","requires_tools":false,"expected_outcome":"done"}`}
-
-	state := session.State{Key: "cli:test"}
-	task := state.StartTask("test task")
-	if err := rt.Store.Save(state); err != nil {
-		t.Fatal(err)
-	}
-	trace := mustTrace(t)
-	rt.ensureTaskContract(context.Background(), inbound("cli:test", "test task"), &state, task, "test task", nil, trace)
-
-	data, err := os.ReadFile(trace.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	traceStr := string(data)
-	if !strings.Contains(traceStr, "task_contract_skills_selected") {
-		t.Fatal("expected task_contract_skills_selected trace")
-	}
-	if !strings.Contains(traceStr, "discovered_count") || !strings.Contains(traceStr, "omitted_count") || !strings.Contains(traceStr, "selected_count") {
-		t.Fatalf("expected count fields in trace, got:\n%s", traceStr)
-	}
-	if !strings.Contains(traceStr, `"omitted_count":6`) {
-		t.Fatalf("expected 6 omitted skills (30 total - 24 limit), got:\n%s", traceStr)
-	}
-}
-
-func TestFeishuCloudDocContractRequiresFeishuNotifyAndTerminalRun(t *testing.T) {
-	rt := newTestRuntime(t)
-	ws := t.TempDir()
-	cfg := rt.Config
-	cfg.App.Workspace = ws
-	skillDir := filepath.Join(ws, "skills", "feishu-notify")
-	if err := os.MkdirAll(skillDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: feishu-notify\ndescription: Send Feishu messages and create cloud documents.\npriority: 80\n---\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "file.write", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "web.search", content: "ok"})
-	rt.Tools = registry
-	rt.ContractModel = contractJSONModel{json: `{"summary":"create Feishu cloud doc for Nasdaq report","requires_tools":true,"required_tools":["file.read","file.write","terminal.run","web.search"],"required_skills":[{"name":"feishu-notify","path":"/workspace/skills/feishu-notify/SKILL.md","reason":"create Feishu cloud document"}],"required_evidence":[{"kind":"local_file","tool":"file.read","description":"read /workspace/skills/feishu-notify/SKILL.md"},{"kind":"local_file","tool":"file.write","description":"write markdown document"}],"expected_outcome":"report on Nasdaq trend published to Feishu cloud doc"}`}
-
-	contract := rt.ensureTaskContract(context.Background(), inbound("cli:test", "查看纳指走势，发到飞书云文档"), &session.State{Key: "cli:test"}, &session.TaskNode{ID: "task-1", Goal: "查看纳指走势，发到飞书云文档", Status: "running"}, "查看纳指走势，发到飞书云文档", nil, mustTrace(t))
-
-	if len(contract.RequiredSkills) == 0 {
-		t.Fatal("expected feishu-notify in required_skills")
-	}
-	found := false
-	for _, s := range contract.RequiredSkills {
-		if s.Name == "feishu-notify" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected feishu-notify in required_skills, got %v", contract.RequiredSkills)
-	}
-	hasTerminal := false
-	for _, t := range contract.RequiredTools {
-		if t == "terminal.run" {
-			hasTerminal = true
-			break
-		}
-	}
-	if !hasTerminal {
-		t.Fatalf("expected terminal.run in required_tools, got %v", contract.RequiredTools)
 	}
 }
 
@@ -2056,66 +1758,6 @@ func TestFeishuBotReadyDoesNotRequireUserLogin(t *testing.T) {
 		if tool == "lark-cli" || tool == "feishu" {
 			t.Fatal("contract should not require a Feishu-specific runtime tool")
 		}
-	}
-}
-
-func TestContractReplanFeedbackRequiresSkillReadPlanItem(t *testing.T) {
-	contract := session.TaskContract{
-		Summary:       "create Feishu cloud document",
-		RequiresTools: true,
-		RequiredTools: []string{"file.read", "terminal.run"},
-		RequiredSkills: []session.RequiredSkill{
-			{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md", Reason: "create Feishu cloud doc"},
-		},
-		RequiredEvidence: []session.TaskEvidenceContract{
-			{Kind: "local_file", Tool: "file.read", Description: "read /tmp/skills/feishu-notify/SKILL.md"},
-		},
-		PlanItems: []session.TaskPlanItem{
-			{ID: "plan-1", Title: "create document via helper", Status: "pending", Tool: "terminal.run", Criteria: "run helper script from skill"},
-		},
-	}
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
-
-	validation := validateContractTools(contract, registry, []discoveredSkill{
-		{Name: "feishu-notify", Path: "/tmp/skills/feishu-notify/SKILL.md"},
-	})
-	if validation.IsValid() {
-		t.Fatal("expected contract to be invalid without a file.read plan item for the required skill")
-	}
-	feedback := contractReplanFeedback(validation, contract)
-	for _, want := range []string{"plan_items", "tool=file.read", "SKILL.md", "file.read plan item"} {
-		if !strings.Contains(feedback, want) {
-			t.Fatalf("expected replan feedback to mention %q, got: %s", want, feedback)
-		}
-	}
-}
-
-func TestFeishuNotifyWrapperCommandSelected(t *testing.T) {
-	skill := discoveredSkill{
-		Name:        "feishu-notify",
-		Description: "Send Feishu messages and create cloud documents via lark-cli.",
-		Stage:       "cli",
-		Priority:    "80",
-		Path:        "/tmp/skills/feishu-notify/SKILL.md",
-		Scope:       "shared",
-	}
-	hint := executionHint(skill)
-	if !strings.Contains(hint, "terminal.run") {
-		t.Fatalf("CLI skill execution hint should mention terminal.run, got: %s", hint)
-	}
-
-	registry := agentcore.NewToolRegistry()
-	registry.Register(runtimeNamedTool{name: "file.read", content: "ok"})
-	registry.Register(runtimeNamedTool{name: "terminal.run", content: "ok"})
-
-	prompt := renderTaskContractPrompt("创建飞书云文档", "", registry, []discoveredSkill{skill})
-	if !strings.Contains(prompt, "execution_hint") {
-		t.Fatal("contract prompt should include execution_hint")
-	}
-	if !strings.Contains(prompt, "terminal.run") {
-		t.Fatal("contract prompt should mention terminal.run for CLI skill")
 	}
 }
 
