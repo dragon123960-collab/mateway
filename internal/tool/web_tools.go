@@ -39,7 +39,23 @@ func (WebFetchTool) ToolContract() agentcore.ToolContract {
 }
 func (WebFetchTool) Risk() agentcore.Risk { return agentcore.RiskSafeRead }
 func (WebFetchTool) Run(ctx context.Context, call agentcore.ToolCall) agentcore.ToolResult {
-	rawURL := fmt.Sprint(call.Args["url"])
+	rawURL := strings.TrimSpace(fmt.Sprint(call.Args["url"]))
+	if strings.HasPrefix(rawURL, "file://") {
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    "web.fetch cannot read local file:// URLs; use file.read with the absolute local path instead.",
+			IsError:    true,
+			Evidence:   map[string]any{"url": rawURL, "failure_kind": "local_file_url", "recommended_tool": "file.read"},
+		}
+	}
+	if strings.HasPrefix(rawURL, "raw_ref:") || strings.HasPrefix(rawURL, "tool-result:") || strings.Contains(rawURL, "raw_ref=tool-result:") {
+		return agentcore.ToolResult{
+			ToolCallID: call.ID,
+			Content:    "web.fetch cannot read raw_ref/tool-result references; use toolresult.read with raw_ref instead.",
+			IsError:    true,
+			Evidence:   map[string]any{"url": rawURL, "failure_kind": "tool_result_ref", "recommended_tool": "toolresult.read"},
+		}
+	}
 	if blocked, ok := IsBlockedFetchURL(rawURL); ok {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: "web.fetch blocked private or local address: " + blocked, IsError: true, Evidence: map[string]any{"url": rawURL, "blocked": true, "reason": "ssrf_blocked"}}
 	}

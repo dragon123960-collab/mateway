@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/dongping/mateway/internal/agentcore"
+	"github.com/dongping/mateway/internal/channel"
 	"github.com/dongping/mateway/internal/config"
 	"github.com/dongping/mateway/internal/session"
 )
@@ -214,6 +215,15 @@ func TestExecuteNode_ToolNode_UnknownTool(t *testing.T) {
 	}
 	if !strings.Contains(node.FailureReason, "nonexistent.tool") {
 		t.Fatalf("failure reason should mention the tool, got %q", node.FailureReason)
+	}
+	if len(node.EvidenceRefs) != 1 {
+		t.Fatalf("expected one error evidence ref, got %d", len(node.EvidenceRefs))
+	}
+	if !node.EvidenceRefs[0].IsError || !node.EvidenceRefs[0].Blocked {
+		t.Fatalf("expected blocked error evidence, got %#v", node.EvidenceRefs[0])
+	}
+	if got := strings.Join(stringSliceFromOutput(node.Output["tool_errors"]), "\n"); !strings.Contains(got, "nonexistent.tool") {
+		t.Fatalf("expected structured tool error output, got %#v", node.Output)
 	}
 }
 
@@ -607,6 +617,7 @@ func TestExecuteNode_HumanReview_UsesAcceptanceCriteria(t *testing.T) {
 	rt := newTestRuntime(t)
 	state := &session.State{}
 	g := newTestGraph(session.TaskGraphNode{
+		Goal: "generic review goal",
 		ID:   "review",
 		Type: session.NodeTypeHumanReview,
 		Acceptance: session.Acceptance{
@@ -622,6 +633,9 @@ func TestExecuteNode_HumanReview_UsesAcceptanceCriteria(t *testing.T) {
 	}
 	if !strings.Contains(state.Pending.Question, "verify output matches requirements") {
 		t.Fatalf("expected acceptance criteria as question, got %q", state.Pending.Question)
+	}
+	if strings.Contains(state.Pending.Question, "generic review goal") {
+		t.Fatalf("acceptance criteria should be preferred over generic goal, got %q", state.Pending.Question)
 	}
 	if strings.Contains(state.Pending.Question, "Reply 1 to confirm") {
 		t.Fatalf("human_review should ask for information without numeric confirmation guidance, got %q", state.Pending.Question)
@@ -847,6 +861,26 @@ func TestBuildNodeSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestBuildNodeSystemPromptForMessageIncludesArtifactOutputPolicy(t *testing.T) {
+	rt, workspace := newTestRuntimeWithWorkspace(t)
+	node := &session.TaskGraphNode{
+		ID:   "write-artifacts",
+		Type: session.NodeTypeModel,
+		Goal: "write artifacts",
+	}
+	prompt := rt.buildNodeSystemPromptForMessage(channel.InboundMessage{}, node, &session.TaskGraph{ID: "g1", TaskID: "t1"})
+	for _, want := range []string{
+		filepath.Join(workspace, "outputs"),
+		filepath.Join(workspace, "skills"),
+		filepath.Join(workspace, "agents", "<agent>", "skills"),
+		"installed skill sources only",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected node prompt to contain %q, got:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildToolCallFromNode(t *testing.T) {
 	node := &session.TaskGraphNode{
 		ID:       "readme",
@@ -913,6 +947,45 @@ func TestRenderModelNodeInputIncludesGoalAndDependencies(t *testing.T) {
 		if !strings.Contains(input, want) {
 			t.Fatalf("expected model node input to contain %q, got %q", want, input)
 		}
+	}
+}
+
+func TestRenderModelNodeInputIncludesDependencyArtifactPaths(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "script-xiaohongshu.md")
+	relativePath := "tasks/cursor-vibe-coding/ignored.md"
+	g := newTestGraph(
+		session.TaskGraphNode{
+			ID:            "draft-script",
+			Type:          session.NodeTypeSubtask,
+			Status:        session.NodeStatusCompleted,
+			ResultSummary: "wrote script",
+			Output: map[string]any{
+				"artifact_paths":  []string{artifactPath, relativePath},
+				"file_write_path": artifactPath,
+			},
+		},
+		session.TaskGraphNode{
+			ID:      "outline",
+			Type:    session.NodeTypeModel,
+			Goal:    "Use the script to draft a slide outline",
+			Depends: []string{"draft-script"},
+		},
+	)
+	node := g.NodeByID("outline")
+
+	input := renderModelNodeInput(g, node, "make slides")
+	for _, want := range []string{
+		"Structured dependency outputs",
+		"use these absolute paths exactly",
+		"artifact_paths: " + artifactPath,
+		"file_write_path: " + artifactPath,
+	} {
+		if !strings.Contains(input, want) {
+			t.Fatalf("expected model node input to contain %q, got %q", want, input)
+		}
+	}
+	if strings.Contains(input, relativePath) {
+		t.Fatalf("relative path should not be promoted into dependency artifacts, got %q", input)
 	}
 }
 
@@ -1136,6 +1209,22 @@ func TestExecuteNode_ToolNode_EvidenceHasElapsed(t *testing.T) {
 	}
 	if node.ResultSummary == "" {
 		t.Fatal("expected result summary")
+	}
+	if got, ok := node.Output["artifact_paths"].([]string); !ok || len(got) != 1 || got[0] != filepath.Join(tmpDir, "README.md") {
+		t.Fatalf("expected absolute artifact path in node output, got %#v", node.Output["artifact_paths"])
+	}
+	if got, ok := node.Output["file_read_path"].(string); !ok || got != filepath.Join(tmpDir, "README.md") {
+		t.Fatalf("expected file_read_path in node output, got %#v", node.Output["file_read_path"])
+	}
+}
+
+func TestRecordToolArtifactOutputsIgnoresRelativePaths(t *testing.T) {
+	node := &session.TaskGraphNode{}
+	recordToolArtifactOutputs(node, "file.write", agentcore.ToolResult{
+		Evidence: map[string]any{"path": "output/report.md"},
+	})
+	if len(node.Output) != 0 {
+		t.Fatalf("relative paths should not be recorded as artifact outputs, got %#v", node.Output)
 	}
 }
 
@@ -1485,6 +1574,51 @@ func TestRunGraphTask_NodeVerifierRetryExhausted(t *testing.T) {
 	}
 	if session.ReadyNodes(state.Tasks[0].Graph, 1) != nil {
 		t.Fatalf("failed repair node should not be ready again")
+	}
+}
+
+func TestRunGraphTask_RevalidatesCompletedPathOutputsAndInvalidatesDependents(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Model = staticTextModel{text: "regenerated"}
+	g := newTestGraph(
+		session.TaskGraphNode{
+			ID:            "deck",
+			Type:          session.NodeTypeSubtask,
+			Mode:          session.NodeModeDirect,
+			Goal:          "generate deck",
+			Status:        session.NodeStatusCompleted,
+			ResultSummary: "deck generated",
+			Output:        map[string]any{"deck_horizontal_path": true},
+			Acceptance:    session.Acceptance{Verified: true},
+		},
+		session.TaskGraphNode{
+			ID:            "metadata",
+			Type:          session.NodeTypeSubtask,
+			Mode:          session.NodeModeDirect,
+			Goal:          "write metadata",
+			Depends:       []string{"deck"},
+			Status:        session.NodeStatusCompleted,
+			ResultSummary: "metadata generated",
+			Output:        map[string]any{"text": "metadata generated"},
+			Acceptance:    session.Acceptance{Verified: true},
+		},
+	)
+	task := &session.TaskNode{ID: g.TaskID, Goal: "repair deck", Graph: g}
+	state := &session.State{Tasks: []session.TaskNode{*task}, ActiveTask: task.ID}
+	trace := newTestTraceRecorder(t)
+
+	_, _ = rt.runGraphTask(t.Context(), inbound("cli:test", "repair"), state, &state.Tasks[0], "repair", trace)
+
+	events := readTraceFile(t, trace.path)
+	if !traceHasEvent(events, "completed_node_revalidated") {
+		t.Fatal("expected completed_node_revalidated trace event")
+	}
+	if !traceHasEvent(events, "completed_node_invalidated_by_dependency") {
+		t.Fatal("expected completed_node_invalidated_by_dependency trace event")
+	}
+	deck := state.Tasks[0].Graph.NodeByID("deck")
+	if deck == nil || deck.Attempts == 0 {
+		t.Fatalf("expected invalid deck node to be retried, got %#v", deck)
 	}
 }
 

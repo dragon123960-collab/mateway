@@ -2,6 +2,8 @@ package session
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -162,6 +164,16 @@ func verifyModelNode(node *TaskGraphNode) NodeVerificationResult {
 			FeedbackForNextAttempt: "Retry the node using an allowed safe approach, or report a concrete blocker instead of treating the failed tool result as completed work.",
 		}
 	}
+	if missing := missingConcretePathOutputs(node); len(missing) > 0 {
+		return NodeVerificationResult{
+			Status:                 VerificationFailed,
+			Reason:                 "node declares local path output without a concrete existing file path",
+			Missing:                missing,
+			Confidence:             "hard",
+			Retryable:              true,
+			FeedbackForNextAttempt: "Write the artifact to disk with file.write or file.edit and return the exact absolute path. Do not use boolean placeholders for *_path outputs.",
+		}
+	}
 	if requiresConcreteURL(node) && !hasConcreteURLArtifact(node) {
 		if requestsUserConfirmationBeforeMutation(node) {
 			return NodeVerificationResult{
@@ -220,6 +232,59 @@ func unresolvedFailedToolEvidence(node *TaskGraphNode, summary string) bool {
 		return false
 	}
 	return true
+}
+
+func missingConcretePathOutputs(node *TaskGraphNode) []string {
+	if node == nil || len(node.Output) == 0 {
+		return nil
+	}
+	var missing []string
+	for key, value := range node.Output {
+		key = strings.TrimSpace(key)
+		if !strings.HasSuffix(key, "_path") {
+			continue
+		}
+		if concreteArtifactPathSatisfiesOutput(key, node.Output) {
+			continue
+		}
+		paths := outputStringSlice(value)
+		if len(paths) == 0 {
+			missing = append(missing, key)
+			continue
+		}
+		found := false
+		for _, path := range paths {
+			path = strings.TrimSpace(path)
+			if path == "" || !filepath.IsAbs(path) {
+				continue
+			}
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func concreteArtifactPathSatisfiesOutput(key string, output map[string]any) bool {
+	if output == nil || !strings.HasSuffix(key, "_path") {
+		return false
+	}
+	stem := strings.TrimSuffix(strings.TrimSpace(key), "_path")
+	for _, path := range outputStringSlice(output["artifact_paths"]) {
+		path = strings.TrimSpace(path)
+		if path == "" || !filepath.IsAbs(path) || !artifactPathMatchesFinalOutput(stem, path) {
+			continue
+		}
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func requiresConcreteURL(node *TaskGraphNode) bool {
@@ -528,6 +593,15 @@ func missingFinalOutputs(g *TaskGraph, contract *TaskContract) []string {
 		for key := range n.Output {
 			available[key] = true
 		}
+		for _, key := range contract.FinalOutput {
+			key = strings.TrimSpace(key)
+			if key == "" || available[key] {
+				continue
+			}
+			if finalOutputSatisfiedByArtifactPath(key, n.Output) {
+				available[key] = true
+			}
+		}
 	}
 	var missing []string
 	for _, key := range contract.FinalOutput {
@@ -538,6 +612,77 @@ func missingFinalOutputs(g *TaskGraph, contract *TaskContract) []string {
 		missing = append(missing, key)
 	}
 	return missing
+}
+
+func finalOutputSatisfiedByArtifactPath(key string, output map[string]any) bool {
+	if output == nil || !strings.HasSuffix(key, "_path") {
+		return false
+	}
+	stem := strings.TrimSuffix(strings.TrimSpace(key), "_path")
+	if stem == "" {
+		return false
+	}
+	for _, path := range outputStringSlice(output["artifact_paths"]) {
+		if artifactPathMatchesFinalOutput(stem, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactPathMatchesFinalOutput(stem, path string) bool {
+	path = strings.ToLower(strings.TrimSpace(path))
+	stem = strings.ToLower(strings.TrimSpace(stem))
+	if path == "" || stem == "" {
+		return false
+	}
+	compactStem := strings.ReplaceAll(stem, "_", "-")
+	if strings.Contains(path, compactStem) {
+		return true
+	}
+	parts := strings.Split(compactStem, "-")
+	matched := 0
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if strings.Contains(path, part) {
+			matched++
+		}
+	}
+	return matched > 0 && matched == len(nonEmptyStrings(parts))
+}
+
+func outputStringSlice(value any) []string {
+	switch v := value.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		return []string{strings.TrimSpace(v)}
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := values[:0]
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func findUnverifiedCriteriaNodes(g *TaskGraph) []string {

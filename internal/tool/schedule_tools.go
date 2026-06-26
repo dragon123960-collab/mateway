@@ -25,14 +25,14 @@ func (ScheduleManageTool) Schema() agentcore.Schema {
 			"run_at":       map[string]any{"type": "string", "description": "RFC3339 time. Required for create, optional for update."},
 			"interval":     map[string]any{"type": "string", "description": "Go duration: 30m, 24h. Optional for create/update."},
 			"session_key":  map[string]any{"type": "string", "description": "Optional session key for the scheduled task."},
-			"require_test": map[string]any{"type": "boolean", "description": "If true, create as paused pending test. Default false."},
+			"require_test": map[string]any{"type": "boolean", "description": "If true, create as paused pending test. Default true."},
 			"status":       map[string]any{"type": "string", "description": "For update: active, paused, done."},
 		},
 	}
 }
 func (ScheduleManageTool) ToolContract() agentcore.ToolContract {
 	return agentcore.ToolContract{
-		WhenToUse:            "Manage local scheduled tasks. action=list is a safe read. action=delete permanently removes a task. action=create/update/pause/resume/run_now are guarded mutations that change schedule state. Use action=create when the user asks to run a task later. Scheduled tasks are channel-neutral: the scheduler does not automatically send results back to channels.",
+		WhenToUse:            "Manage local scheduled tasks. action=list is a safe read. action=delete permanently removes a task. action=create/update/pause/resume/run_now are guarded mutations that change schedule state. Use action=create when the user asks to run a task later. New schedules default to require_test=true so they remain pending until a successful test run. Scheduled tasks are channel-neutral: the scheduler does not automatically send results back to channels.",
 		WhenNotToUse:         "Do not use for immediate tasks; execute those directly. Do not use action=delete when the user only wants to temporarily stop a task; use action=pause instead.",
 		OutputContract:       "Return schedule id, status, run time, and interval. action=delete returns deleted=true/false. action=list returns one line per task.",
 		Evidence:             "Return id, status, run_at, interval, session_key. action=delete returns id and deleted boolean. action=list returns count.",
@@ -78,7 +78,7 @@ func scheduleActionCreate(cfg *config.Root, call agentcore.ToolCall) agentcore.T
 			return agentcore.ToolResult{ToolCallID: call.ID, Content: "interval must be a Go duration such as 30m or 24h", IsError: true}
 		}
 	}
-	requireTest := false
+	requireTest := true
 	if raw := strings.ToLower(toolArgString(call.Args, "require_test")); raw == "false" || raw == "no" {
 		requireTest = false
 	} else if raw == "true" || raw == "yes" {
@@ -99,11 +99,12 @@ func scheduleActionCreate(cfg *config.Root, call agentcore.ToolCall) agentcore.T
 		ToolCallID: call.ID,
 		Content:    fmt.Sprintf("scheduled %s status=%s at %s", task.ID, task.Status, task.RunAt),
 		Evidence: map[string]any{
-			"id":          task.ID,
-			"status":      task.Status,
-			"run_at":      task.RunAt,
-			"interval":    task.Interval,
-			"session_key": task.SessionKey,
+			"id":           task.ID,
+			"status":       task.Status,
+			"run_at":       task.RunAt,
+			"interval":     task.Interval,
+			"session_key":  task.SessionKey,
+			"require_test": task.RequireTest,
 		},
 	}
 }
@@ -202,11 +203,13 @@ func scheduleToolResult(callID, action string, task schedule.Task) agentcore.Too
 		ToolCallID: callID,
 		Content:    fmt.Sprintf("%s schedule %s status=%s run_at=%s", action, task.ID, task.Status, task.RunAt),
 		Evidence: map[string]any{
-			"id":          task.ID,
-			"status":      task.Status,
-			"run_at":      task.RunAt,
-			"interval":    task.Interval,
-			"session_key": task.SessionKey,
+			"id":           task.ID,
+			"status":       task.Status,
+			"run_at":       task.RunAt,
+			"interval":     task.Interval,
+			"session_key":  task.SessionKey,
+			"require_test": task.RequireTest,
+			"runbook_id":   task.RunbookID,
 		},
 	}
 }

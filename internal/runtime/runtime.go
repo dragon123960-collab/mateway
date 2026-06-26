@@ -196,6 +196,7 @@ func (rt Runtime) runGraphTask(
 	g := task.Graph
 
 	session.RecoverRunningNodes(g)
+	revalidateCompletedNodes(g, trace)
 	session.UpdateGraphStatus(g)
 	if trace != nil {
 		_ = trace.write(map[string]any{
@@ -440,6 +441,23 @@ schedulerLoop:
 		}
 
 		if vr.Status == session.GraphStatusNeedsRepair {
+			if isWorkflowLaneGraph(g) {
+				vr.Status = session.GraphStatusBlocked
+				if strings.TrimSpace(vr.Reason) == "" {
+					vr.Reason = "workflow lane task acceptance still has gaps"
+				} else {
+					vr.Reason = "workflow lane repair disabled: " + vr.Reason
+				}
+				if trace != nil {
+					_ = trace.write(map[string]any{
+						"type":     "workflow_lane_task_repair_disabled",
+						"graph_id": g.ID,
+						"task_id":  task.ID,
+						"reason":   vr.Reason,
+					})
+				}
+				return rt.FinalizeAndRespond(ctx, msg, state, g, vr, trace)
+			}
 			if len(g.RepairAttempts) >= maxRepair {
 				vr.Status = session.GraphStatusBlocked
 				if strings.TrimSpace(vr.Reason) == "" {
@@ -1224,6 +1242,95 @@ func looksLikeInputRequest(text string) bool {
 	return containsAny(lower, runtimeCueList(nil, "router.input_request.contains")) ||
 		containsAny(lower, runtimeCueList(nil, "router.input_request.question")) ||
 		looksLikeContinuationOffer(trimmed)
+}
+
+func revalidateCompletedNodes(g *session.TaskGraph, trace *traceRecorder) {
+	if g == nil {
+		return
+	}
+	invalidated := map[string]bool{}
+	for i := range g.Nodes {
+		node := &g.Nodes[i]
+		if node.Status != session.NodeStatusCompleted || !node.Acceptance.Verified {
+			continue
+		}
+		result := session.VerifyNode(node)
+		if result.Status == session.VerificationPassed {
+			continue
+		}
+		if result.Status == session.VerificationRetry {
+			session.ApplyNodeVerification(node, result)
+			if node.Status == session.NodeStatusRetrying {
+				node.Status = session.NodeStatusPending
+			}
+		} else {
+			node.Status = session.NodeStatusPending
+			if node.Input == nil {
+				node.Input = map[string]any{}
+			}
+			if result.FeedbackForNextAttempt != "" {
+				node.Input["attempt_feedback"] = result.FeedbackForNextAttempt
+			} else if result.Reason != "" {
+				node.Input["attempt_feedback"] = result.Reason
+			}
+		}
+		node.Acceptance.Verified = false
+		node.Acceptance.Reason = result.Reason
+		node.FailureReason = ""
+		node.VerifiedAt = time.Time{}
+		invalidated[node.ID] = true
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":          "completed_node_revalidated",
+				"graph_id":      g.ID,
+				"task_id":       g.TaskID,
+				"node_id":       node.ID,
+				"verify_status": result.Status,
+				"reason":        result.Reason,
+				"missing":       result.Missing,
+				"new_status":    node.Status,
+			})
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := range g.Nodes {
+			node := &g.Nodes[i]
+			if node.Status != session.NodeStatusCompleted || !node.Acceptance.Verified {
+				continue
+			}
+			dependsOnInvalidated := false
+			for _, dep := range node.Depends {
+				if invalidated[dep] {
+					dependsOnInvalidated = true
+					break
+				}
+			}
+			if !dependsOnInvalidated {
+				continue
+			}
+			node.Status = session.NodeStatusPending
+			node.Acceptance.Verified = false
+			node.Acceptance.Reason = "upstream dependency was revalidated and must be regenerated"
+			node.FailureReason = ""
+			node.VerifiedAt = time.Time{}
+			if node.Input == nil {
+				node.Input = map[string]any{}
+			}
+			node.Input["attempt_feedback"] = "An upstream dependency was regenerated or found invalid. Re-run this node using the latest dependency outputs."
+			invalidated[node.ID] = true
+			changed = true
+			if trace != nil {
+				_ = trace.write(map[string]any{
+					"type":       "completed_node_invalidated_by_dependency",
+					"graph_id":   g.ID,
+					"task_id":    g.TaskID,
+					"node_id":    node.ID,
+					"new_status": node.Status,
+				})
+			}
+		}
+	}
 }
 
 func looksLikeContinuationOffer(text string) bool {

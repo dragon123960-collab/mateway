@@ -42,6 +42,9 @@ func (t FileWriteTool) Run(_ context.Context, call agentcore.ToolCall) agentcore
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
 	}
+	if err := rejectSkillInstallWritePath(path, t.Config); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
+	}
 	content := fmt.Sprint(call.Args["content"])
 	profileStore := agentprofile.NewStore(t.Config)
 	if _, ok := profileStore.CoreTargetAgent(path); ok {
@@ -123,6 +126,9 @@ func (t FileEditTool) Run(_ context.Context, call agentcore.ToolCall) agentcore.
 	path, err := ResolveAllowedPath(fmt.Sprint(call.Args["path"]), t.Config)
 	if err != nil {
 		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": fmt.Sprint(call.Args["path"])}}
+	}
+	if err := rejectSkillInstallWritePath(path, t.Config); err != nil {
+		return agentcore.ToolResult{ToolCallID: call.ID, Content: err.Error(), IsError: true, Evidence: map[string]any{"path": path}}
 	}
 	oldStr := fmt.Sprint(call.Args["old_string"])
 	if oldStr == "" {
@@ -590,4 +596,68 @@ func rejectProtectedReadPath(path string, cfg *config.Root) error {
 		}
 	}
 	return nil
+}
+
+func rejectSkillInstallWritePath(path string, cfg *config.Root) error {
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	for _, root := range skillInstallWriteRoots(cfg) {
+		rootAbs, err := filepath.Abs(filepath.Clean(root))
+		if err != nil || rootAbs == "" {
+			continue
+		}
+		if clean == rootAbs || strings.HasPrefix(clean, rootAbs+string(filepath.Separator)) {
+			return fmt.Errorf("refusing to write inside installed skill directory %s; generated artifacts must use an output directory such as %s", clean, skillArtifactOutputHint(cfg))
+		}
+	}
+	if pathInsideAgentSkillInstall(clean, cfg) {
+		return fmt.Errorf("refusing to write inside installed agent skill directory %s; generated artifacts must use an output directory such as %s", clean, skillArtifactOutputHint(cfg))
+	}
+	return nil
+}
+
+func skillInstallWriteRoots(cfg *config.Root) []string {
+	workspace := ""
+	if cfg != nil {
+		workspace = strings.TrimSpace(cfg.App.Workspace)
+	}
+	if workspace == "" {
+		workspace = filepath.Join(configHome(cfg), "workspace")
+	}
+	return []string{
+		filepath.Join(workspace, "skills"),
+	}
+}
+
+func pathInsideAgentSkillInstall(path string, cfg *config.Root) bool {
+	workspace := ""
+	if cfg != nil {
+		workspace = strings.TrimSpace(cfg.App.Workspace)
+	}
+	if workspace == "" {
+		workspace = filepath.Join(configHome(cfg), "workspace")
+	}
+	agentsRoot, err := filepath.Abs(filepath.Join(workspace, "agents"))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(agentsRoot, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) >= 3 && strings.TrimSpace(parts[0]) != "" && parts[1] == "skills"
+}
+
+func skillArtifactOutputHint(cfg *config.Root) string {
+	workspace := ""
+	if cfg != nil {
+		workspace = strings.TrimSpace(cfg.App.Workspace)
+	}
+	if workspace == "" {
+		workspace = filepath.Join(configHome(cfg), "workspace")
+	}
+	return filepath.Join(workspace, "outputs", "<task-slug>")
 }

@@ -356,8 +356,10 @@ func runFeishuMessage(ctx context.Context, rt runtime.Runtime, sender *feishu.Se
 		_ = sender.Reply(runCtx, msg, channel.OutboundMessage{Channel: msg.Channel, ThreadID: msg.ThreadID, Text: gatewayText(rt.Config, msg, "gateway.processing_failed", map[string]string{"error": err.Error()}), Style: channel.StyleError})
 		return
 	}
+	replyCtx, replyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer replyCancel()
 	replyStart := time.Now()
-	if err := sendFinalReply(runCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
+	if err := sendFinalReply(replyCtx, sender, msg, ackMessageID, resp.Reply); err != nil {
 		log.Printf("mateway gateway reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
 		_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 			"type":                "gateway_done",
@@ -367,7 +369,7 @@ func runFeishuMessage(ctx context.Context, rt runtime.Runtime, sender *feishu.Se
 			"reply_error":         err.Error(),
 		}))
 		if !cardAction {
-			react(runCtx, sender, msg.ID, "CROSS_MARK")
+			react(replyCtx, sender, msg.ID, "CROSS_MARK")
 		}
 		return
 	}
@@ -375,13 +377,13 @@ func runFeishuMessage(ctx context.Context, rt runtime.Runtime, sender *feishu.Se
 		if strings.TrimSpace(followUp.Text) == "" {
 			continue
 		}
-		if err := sender.Reply(runCtx, msg, followUp); err != nil {
+		if err := sender.Reply(replyCtx, msg, followUp); err != nil {
 			log.Printf("mateway gateway follow-up reply error message_id=%s session=%s: %v", msg.ID, msg.SessionKey, err)
 		}
 	}
 	replyDuration := time.Since(replyStart)
 	if !cardAction {
-		react(runCtx, sender, msg.ID, reactionForReply(resp.Reply))
+		react(replyCtx, sender, msg.ID, reactionForReply(resp.Reply))
 	}
 	_ = runtime.AppendTraceEvent(resp.TracePath, gatewayTraceEvent(msg, map[string]any{
 		"type":                "gateway_done",
@@ -412,21 +414,37 @@ func gatewayTraceEvent(msg channel.InboundMessage, payload map[string]any) map[s
 
 func feishuProgressSink(ctx context.Context, sender *feishu.Sender, ackMessageID string) func(channel.OutboundMessage) {
 	var lastUpdate time.Time
+	var lastText string
 	return func(update channel.OutboundMessage) {
 		if sender == nil || strings.TrimSpace(ackMessageID) == "" {
 			return
 		}
+		text := feishuProgressText(update)
+		if text == "" || text == lastText {
+			return
+		}
 		now := time.Now()
-		if !lastUpdate.IsZero() && now.Sub(lastUpdate) < 500*time.Millisecond {
+		if !lastUpdate.IsZero() && now.Sub(lastUpdate) < feishuProgressMinInterval && !feishuProgressHasTerminalStep(update) {
 			return
 		}
 		lastUpdate = now
-		if text := feishuProgressText(update); text != "" {
-			if err := sender.UpdateText(ctx, ackMessageID, text); err != nil {
-				log.Printf("mateway gateway progress text update error message_id=%s: %v", ackMessageID, err)
-			}
+		lastText = text
+		if err := sender.UpdateText(ctx, ackMessageID, text); err != nil {
+			log.Printf("mateway gateway progress text update error message_id=%s: %v", ackMessageID, err)
 		}
 	}
+}
+
+const feishuProgressMinInterval = 3 * time.Second
+
+func feishuProgressHasTerminalStep(update channel.OutboundMessage) bool {
+	for _, step := range update.Progress {
+		switch strings.ToLower(strings.TrimSpace(step.Status)) {
+		case "accepted", "completed", "success", "done", "failed", "blocked", "error", "suspect":
+			return true
+		}
+	}
+	return false
 }
 
 func feishuProgressText(update channel.OutboundMessage) string {
@@ -589,7 +607,28 @@ func sendFinalReply(ctx context.Context, sender *feishu.Sender, msg channel.Inbo
 	if sender == nil {
 		return fmt.Errorf("feishu sender is required")
 	}
-	return sender.Reply(ctx, msg, reply)
+	uuid := strings.TrimSpace(msg.ID)
+	if uuid != "" {
+		uuid += ":final"
+	}
+	return sendFinalReplyWithRetry(ctx, func(sendCtx context.Context) error {
+		_, err := sender.ReplyWithID(sendCtx, msg, reply, uuid)
+		return err
+	})
+}
+
+func sendFinalReplyWithRetry(ctx context.Context, send func(context.Context) error) error {
+	if send == nil {
+		return fmt.Errorf("send final reply callback is required")
+	}
+	if err := send(ctx); err != nil {
+		retryCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if retryErr := send(retryCtx); retryErr != nil {
+			return fmt.Errorf("%w; retry failed: %v", err, retryErr)
+		}
+	}
+	return nil
 }
 
 func SessionKey(msg channel.InboundMessage) string {

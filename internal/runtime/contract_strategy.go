@@ -14,6 +14,11 @@ const (
 	contractStrategyReviewRequired contractStrategy = "review_required"
 )
 
+const (
+	taskLaneDirect = "direct"
+	taskLaneGraph  = "graph"
+)
+
 var highRiskTools = map[string]bool{
 	"file.write":      true,
 	"file.edit":       true,
@@ -156,4 +161,25 @@ func isMultiStepDeliveryTask(contract session.TaskContract, text string) bool {
 func classifyContractStrategyFromGoalAndText(goal, userText string) contractStrategy {
 	contract := fallbackTaskContract(goal, userText)
 	return classifyContractStrategy(goal, userText, contract)
+}
+
+func laneForContractStrategy(strategy contractStrategy) string {
+	if strategy == contractStrategyDirect {
+		return taskLaneDirect
+	}
+	return taskLaneGraph
+}
+
+func laneSelectionReason(strategy contractStrategy, contract session.TaskContract) string {
+	switch strategy {
+	case contractStrategyDirect:
+		return "no tools, skills, evidence, or action markers"
+	case contractStrategyReviewRequired:
+		return "tools, skills, risk, human gate, or multi-step delivery requires graph execution"
+	default:
+		if len(contract.RequiredTools) == 1 && len(contract.PlanItems) <= 1 {
+			return "single tool task represented as one graph node"
+		}
+		return "tool or evidence requirement uses graph execution"
+	}
 }

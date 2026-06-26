@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/dongping/mateway/internal/channel"
@@ -82,6 +83,48 @@ func TestHandleGraphHumanConfirmRejectsAdditionalContext(t *testing.T) {
 	}
 }
 
+func TestHandleGraphHumanConfirmRevisionFeedbackResumesGraph(t *testing.T) {
+	rt := newTestRuntime(t)
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("confirm artifacts")
+	task.Graph = newTestGraph(session.TaskGraphNode{
+		ID:            "metadata",
+		Type:          session.NodeTypeHumanConfirm,
+		Goal:          "confirm generated artifacts",
+		Status:        session.NodeStatusAwaitingInput,
+		ResultSummary: "Reply 1 to confirm.",
+	})
+	state.Pending = &session.PendingAction{
+		Kind:     session.PendingKindHumanConfirm,
+		TaskID:   task.ID,
+		GraphID:  task.Graph.ID,
+		NodeID:   "metadata",
+		Question: "Reply 1 to confirm.",
+	}
+
+	_, handled, err := rt.handleGraphHumanPending(&state, channel.InboundMessage{
+		Channel:  "cli",
+		ThreadID: "test",
+		Text:     "不要确认完成，deck-horizontal.html 不存在，请修复。",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("revision feedback should fall through to graph execution")
+	}
+	if state.Pending != nil {
+		t.Fatal("pending should clear after revision feedback")
+	}
+	node := task.Graph.NodeByID("metadata")
+	if node.Status != session.NodeStatusPending {
+		t.Fatalf("expected node reset to pending, got %q", node.Status)
+	}
+	if node.Input["human_feedback"] == "" || node.Input["attempt_feedback"] == "" {
+		t.Fatalf("expected human feedback recorded, got %#v", node.Input)
+	}
+}
+
 func TestParseNumericHumanPendingActionAllowsDecoratedSingleDigit(t *testing.T) {
 	cases := map[string]string{
 		"1":         "confirm",
@@ -139,6 +182,70 @@ func TestHandleGraphHumanReviewAcceptsDirectInformation(t *testing.T) {
 	}
 	if node.Output["text"] != "personal space, title: AI report" {
 		t.Fatalf("expected direct information output, got %#v", node.Output)
+	}
+}
+
+func TestHandleGraphHumanReviewWorkflowLaneContinuesToFinalize(t *testing.T) {
+	rt := newTestRuntime(t)
+	workspace := t.TempDir()
+	skill := discoveredSkill{
+		Name:        "creator-ppt-production-studio",
+		Path:        filepath.Join(workspace, "skills", "creator-ppt-production-studio", "SKILL.md"),
+		Granularity: "workflow",
+		Outputs:     []string{"xiaohongshu_script_path", "deck_horizontal_path"},
+		AllowedTools: []string{
+			"file.read",
+			"file.write",
+			"file.edit",
+		},
+		HumanGates: []string{"review generated scripts and slide outline before deck generation"},
+	}
+	g, _ := buildWorkflowLaneGraph("task-workflow", "使用 creator-ppt-production-studio 生成小红书口播稿和 HTML PPT", workspace, skill)
+	for i := range g.Nodes {
+		switch g.Nodes[i].ID {
+		case "load-workflow-skill", "draft-workflow-artifacts":
+			g.Nodes[i].Status = session.NodeStatusCompleted
+			g.Nodes[i].Acceptance.Verified = true
+		case "review-workflow-gate":
+			g.Nodes[i].Status = session.NodeStatusAwaitingInput
+		}
+	}
+	state := session.State{Key: "cli:test"}
+	task := state.StartTask("workflow")
+	task.Graph = &g
+	state.ActiveTask = task.ID
+	state.Pending = &session.PendingAction{
+		Kind:     session.PendingKindHumanReview,
+		TaskID:   task.ID,
+		GraphID:  g.ID,
+		NodeID:   "review-workflow-gate",
+		Question: "请审核口播稿并选择风格",
+	}
+
+	_, handled, err := rt.handleGraphHumanPending(&state, channel.InboundMessage{
+		Channel:  "cli",
+		ThreadID: "test",
+		Text:     "口播稿不用修改，选择 H02 风格继续。",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("workflow human review should fall through to graph execution")
+	}
+	if state.Pending != nil {
+		t.Fatal("pending should clear")
+	}
+	review := task.Graph.NodeByID("review-workflow-gate")
+	if review.Status != session.NodeStatusCompleted || !review.Acceptance.Verified {
+		t.Fatalf("expected review completed, got status=%q verified=%v", review.Status, review.Acceptance.Verified)
+	}
+	if review.Output["text"] != "口播稿不用修改，选择 H02 风格继续。" {
+		t.Fatalf("expected user review text output, got %#v", review.Output)
+	}
+	ready := session.ReadyNodes(task.Graph, 10)
+	if len(ready) != 1 || ready[0] != "finalize-workflow-artifacts" {
+		t.Fatalf("expected finalize node ready, got %v", ready)
 	}
 }
 

@@ -288,11 +288,6 @@ func (rt Runtime) executeReactNode(
 				"tool":      btc.ToolCall.Name,
 				"tool_args": redactPayload(cloneStringAnyMap(btc.ToolCall.Args)),
 			})
-			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
-				Tool:    btc.ToolCall.Name,
-				Status:  "running",
-				Summary: summarizeToolCall(btc.ToolCall),
-			})
 			return rt.applyBeforeToolCall(ctx, btc.Message, btc.ToolCall, btc.Tool, state, g.TaskID, trace)
 		},
 		AfterToolCall: func(_ context.Context, atc agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
@@ -305,6 +300,7 @@ func (rt Runtime) executeReactNode(
 				IsError:   atc.ToolResult.IsError,
 				Blocked:   toolResultBlocked(atc.ToolResult),
 			})
+			recordToolArtifactOutputs(node, atc.ToolCall.Name, atc.ToolResult)
 			writeNodeEvent(trace, g, node, map[string]any{
 				"type":     "node_tool_result",
 				"tool":     atc.ToolCall.Name,
@@ -315,12 +311,7 @@ func (rt Runtime) executeReactNode(
 			if atc.ToolResult.IsError {
 				status = "failed"
 			}
-			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
-				Tool:     atc.ToolCall.Name,
-				Status:   status,
-				Summary:  summarizeToolEvidence(atc.ToolResult),
-				TimedOut: toolResultTimedOut(atc.ToolResult),
-			})
+			recordNodeToolProgressSummary(node, atc.ToolCall.Name, status, summarizeToolEvidence(atc.ToolResult), toolResultTimedOut(atc.ToolResult))
 			return rt.applyAfterToolCall(ctx, atc.Message, atc.ToolCall, atc.Tool, atc.ToolResult, state, g.TaskID, trace), nil
 		},
 		ToolTimeout: func(tec agentcore.ToolExecutionContext) time.Duration {
@@ -390,6 +381,95 @@ func filterAllowedTools(reg *agentcore.ToolRegistry, allowed []string) *agentcor
 	return filtered
 }
 
+func recordToolArtifactOutputs(node *session.TaskGraphNode, toolName string, result agentcore.ToolResult) {
+	if node == nil || result.IsError || len(result.Evidence) == 0 {
+		return
+	}
+	paths := extractAbsoluteEvidencePaths(result.Evidence)
+	if len(paths) == 0 {
+		return
+	}
+	if node.Output == nil {
+		node.Output = make(map[string]any)
+	}
+	mergeOutputStringSlice(node.Output, "artifact_paths", paths)
+	key := artifactPathOutputKey(toolName)
+	if key != "" {
+		mergeOutputStringSlice(node.Output, key, paths)
+		if len(paths) == 1 {
+			node.Output[strings.TrimSuffix(key, "s")] = paths[0]
+		}
+	}
+}
+
+func extractAbsoluteEvidencePaths(evidence map[string]any) []string {
+	var paths []string
+	for _, key := range []string{"path", "target_path", "raw_path"} {
+		paths = appendEvidencePath(paths, evidence[key])
+	}
+	return cleanStringSlice(paths)
+}
+
+func appendEvidencePath(paths []string, value any) []string {
+	switch v := value.(type) {
+	case string:
+		if filepath.IsAbs(strings.TrimSpace(v)) {
+			paths = append(paths, strings.TrimSpace(v))
+		}
+	case []string:
+		for _, item := range v {
+			paths = appendEvidencePath(paths, item)
+		}
+	case []any:
+		for _, item := range v {
+			paths = appendEvidencePath(paths, item)
+		}
+	}
+	return paths
+}
+
+func mergeOutputStringSlice(output map[string]any, key string, values []string) {
+	if len(values) == 0 {
+		return
+	}
+	existing := stringSliceFromOutput(output[key])
+	merged := cleanStringSlice(append(existing, values...))
+	if len(merged) > 0 {
+		output[key] = merged
+	}
+}
+
+func stringSliceFromOutput(value any) []string {
+	switch v := value.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		return []string{strings.TrimSpace(v)}
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func artifactPathOutputKey(toolName string) string {
+	switch strings.TrimSpace(toolName) {
+	case "file.write", "file.edit", "file.read", "toolresult.read":
+		return strings.ReplaceAll(strings.TrimSuffix(toolName, ".run"), ".", "_") + "_paths"
+	default:
+		return ""
+	}
+}
+
 func maxNodeIterations(cfg *config.Root) int {
 	if cfg == nil {
 		return 8
@@ -417,7 +497,28 @@ func (rt Runtime) executeToolNode(
 
 	tool, ok := rt.Tools.Get(executor)
 	if !ok {
-		node.SetFailed(fmt.Sprintf("tool %q not found in registry", executor))
+		reason := fmt.Sprintf("tool %q not found in registry", executor)
+		node.SetFailed(reason)
+		node.EvidenceRefs = append(node.EvidenceRefs, session.EvidenceRef{
+			Kind:      "tool",
+			TraceID:   traceID(trace),
+			TracePath: tracePath(trace),
+			ToolName:  executor,
+			Summary:   reason,
+			IsError:   true,
+			Blocked:   true,
+		})
+		if node.Output == nil {
+			node.Output = make(map[string]any)
+		}
+		mergeOutputStringSlice(node.Output, "tool_errors", []string{reason})
+		writeNodeEvent(trace, g, node, map[string]any{
+			"type":     "node_tool_result",
+			"tool":     executor,
+			"is_error": true,
+			"blocked":  true,
+			"summary":  reason,
+		})
 		rt.traceNodeFailed(trace, g, node, node.FailureReason)
 		return nil
 	}
@@ -457,6 +558,7 @@ func (rt Runtime) executeToolNode(
 		IsError:   result.IsError,
 		Blocked:   blocked || toolResultBlocked(result),
 	})
+	recordToolArtifactOutputs(node, executor, result)
 
 	if blocked {
 		node.SetBlocked(result.Content)
@@ -704,7 +806,7 @@ func (rt Runtime) executeSkillNode(
 
 func buildSkillInstruction(skillBody string, meta graphSkillMeta) string {
 	var b strings.Builder
-	if strings.TrimSpace(meta.Graph.Usage) != "" || len(meta.Graph.Entrypoints) > 0 || len(meta.Graph.SuccessCriteria) > 0 || len(meta.Graph.AllowedTools) > 0 {
+	if strings.TrimSpace(meta.Graph.Usage) != "" || len(meta.Graph.Entrypoints) > 0 || len(meta.Graph.SuccessCriteria) > 0 || len(meta.Graph.AllowedTools) > 0 || len(meta.Graph.HumanGates) > 0 {
 		b.WriteString("--- Skill Metadata Contract ---\n")
 		if usage := strings.TrimSpace(meta.Graph.Usage); usage != "" {
 			b.WriteString("Usage: ")
@@ -735,6 +837,17 @@ func buildSkillInstruction(skillBody string, meta graphSkillMeta) string {
 				}
 				b.WriteString("- ")
 				b.WriteString(strings.TrimSpace(criterion))
+				b.WriteString("\n")
+			}
+		}
+		if len(meta.Graph.HumanGates) > 0 {
+			b.WriteString("Human gates:\n")
+			for _, gate := range meta.Graph.HumanGates {
+				if strings.TrimSpace(gate) == "" {
+					continue
+				}
+				b.WriteString("- ")
+				b.WriteString(strings.TrimSpace(gate))
 				b.WriteString("\n")
 			}
 		}
@@ -814,11 +927,6 @@ func (rt Runtime) executeSkillAsReact(
 				"tool":      btc.ToolCall.Name,
 				"tool_args": redactPayload(cloneStringAnyMap(btc.ToolCall.Args)),
 			})
-			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
-				Tool:    btc.ToolCall.Name,
-				Status:  "running",
-				Summary: summarizeToolCall(btc.ToolCall),
-			})
 			return rt.applyBeforeToolCall(ctx, btc.Message, btc.ToolCall, btc.Tool, state, g.TaskID, trace)
 		},
 		AfterToolCall: func(_ context.Context, atc agentcore.AfterToolCallContext) (agentcore.AfterToolCallResult, error) {
@@ -841,12 +949,7 @@ func (rt Runtime) executeSkillAsReact(
 			if atc.ToolResult.IsError {
 				status = "failed"
 			}
-			rt.emitProgressStep(msg, *state, g.TaskID, channel.ProgressStep{
-				Tool:     atc.ToolCall.Name,
-				Status:   status,
-				Summary:  summarizeToolEvidence(atc.ToolResult),
-				TimedOut: toolResultTimedOut(atc.ToolResult),
-			})
+			recordNodeToolProgressSummary(node, atc.ToolCall.Name, status, summarizeToolEvidence(atc.ToolResult), toolResultTimedOut(atc.ToolResult))
 			return rt.applyAfterToolCall(ctx, atc.Message, atc.ToolCall, atc.Tool, atc.ToolResult, state, g.TaskID, trace), nil
 		},
 		ToolTimeout: func(tec agentcore.ToolExecutionContext) time.Duration {
@@ -928,6 +1031,7 @@ type graphSkillMeta struct {
 		Usage           string   `yaml:"usage"`
 		Entrypoints     []string `yaml:"entrypoints"`
 		SuccessCriteria []string `yaml:"success_criteria"`
+		HumanGates      []string `yaml:"human_gates"`
 	} `yaml:"graph"`
 }
 
@@ -981,9 +1085,9 @@ func (rt Runtime) executeHumanNode(
 		kind = session.PendingKindHumanConfirm
 	}
 
-	question := node.Goal
+	question := strings.TrimSpace(node.Acceptance.Criteria)
 	if question == "" {
-		question = node.Acceptance.Criteria
+		question = node.Goal
 	}
 	if question == "" {
 		question = "Please review and confirm."
@@ -1064,6 +1168,14 @@ func buildNodeSystemPrompt(node *session.TaskGraphNode, g *session.TaskGraph) st
 func (rt Runtime) buildNodeSystemPromptForMessage(msg channel.InboundMessage, node *session.TaskGraphNode, g *session.TaskGraph) string {
 	nodePrompt := strings.TrimSpace(buildNodeSystemPrompt(node, g))
 	profilePrompt := strings.TrimSpace(buildRuntimeSystemContext(rt.Config, rt.Pool.ProfileForMessage(msg)))
+	artifactPrompt := strings.TrimSpace(rt.artifactPathPrompt())
+	if artifactPrompt != "" {
+		if nodePrompt != "" {
+			nodePrompt += "\n\n" + artifactPrompt
+		} else {
+			nodePrompt = artifactPrompt
+		}
+	}
 	if profilePrompt == "" {
 		return nodePrompt
 	}
@@ -1071,6 +1183,21 @@ func (rt Runtime) buildNodeSystemPromptForMessage(msg channel.InboundMessage, no
 		return profilePrompt
 	}
 	return profilePrompt + "\n\nNode execution context:\n" + nodePrompt
+}
+
+func (rt Runtime) artifactPathPrompt() string {
+	if rt.Config == nil {
+		return ""
+	}
+	workspace := strings.TrimSpace(rt.Config.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(strings.TrimSpace(rt.Config.App.Home), "workspace")
+	}
+	if strings.TrimSpace(workspace) == "" {
+		return ""
+	}
+	outputRoot := filepath.Join(workspace, "outputs")
+	return fmt.Sprintf("Artifact path policy: create generated task artifacts under %s using concrete absolute paths. Do not write generated artifacts under %s or %s; those directories are installed skill sources only.", outputRoot, filepath.Join(workspace, "skills"), filepath.Join(workspace, "agents", "<agent>", "skills"))
 }
 
 func (rt Runtime) nodeContextMessages(
@@ -1214,6 +1341,7 @@ func renderNodeDependencyContext(g *session.TaskGraph, node *session.TaskGraphNo
 	}
 	var sb strings.Builder
 	sb.WriteString("Completed dependency results:\n")
+	wroteAny := false
 	for _, depID := range node.Depends {
 		dep := g.NodeByID(depID)
 		if dep == nil || dep.Status != session.NodeStatusCompleted {
@@ -1223,16 +1351,70 @@ func renderNodeDependencyContext(g *session.TaskGraph, node *session.TaskGraphNo
 		if text, ok := dep.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
 			result = strings.TrimSpace(text)
 		}
-		if result == "" {
+		structured := renderDependencyStructuredOutput(dep)
+		if result == "" && structured == "" {
 			continue
 		}
 		sb.WriteString("- ")
 		sb.WriteString(dep.ID)
 		sb.WriteString(": ")
-		sb.WriteString(result)
+		if result != "" {
+			sb.WriteString(result)
+		}
+		if structured != "" {
+			if result != "" {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(structured)
+		}
 		sb.WriteString("\n")
+		wroteAny = true
+	}
+	if !wroteAny {
+		return ""
 	}
 	return strings.TrimSpace(sb.String())
+}
+
+func renderDependencyStructuredOutput(dep *session.TaskGraphNode) string {
+	if dep == nil || len(dep.Output) == 0 {
+		return ""
+	}
+	keys := []string{
+		"artifact_paths",
+		"file_write_paths",
+		"file_write_path",
+		"file_edit_paths",
+		"file_edit_path",
+		"file_read_paths",
+		"file_read_path",
+		"toolresult_read_paths",
+		"toolresult_read_path",
+	}
+	var lines []string
+	for _, key := range keys {
+		paths := absoluteStringValues(dep.Output[key])
+		if len(paths) == 0 {
+			continue
+		}
+		lines = append(lines, "  "+key+": "+strings.Join(paths, ", "))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "  Structured dependency outputs (use these absolute paths exactly; do not guess alternate paths):\n" + strings.Join(lines, "\n")
+}
+
+func absoluteStringValues(value any) []string {
+	values := stringSliceFromOutput(value)
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" && filepath.IsAbs(value) {
+			out = append(out, value)
+		}
+	}
+	return cleanStringSlice(out)
 }
 
 func renderModelNodeInput(g *session.TaskGraph, node *session.TaskGraphNode, userText string) string {
@@ -1296,6 +1478,26 @@ func toolResultTimedOut(result agentcore.ToolResult) bool {
 	}
 	timedOut, _ := result.Evidence["timed_out"].(bool)
 	return timedOut
+}
+
+func recordNodeToolProgressSummary(node *session.TaskGraphNode, toolName, status, summary string, timedOut bool) {
+	if node == nil {
+		return
+	}
+	if status != "failed" && !timedOut {
+		return
+	}
+	parts := []string{"failed"}
+	if timedOut {
+		parts = append(parts, "timed out")
+	}
+	if tool := strings.TrimSpace(toolName); tool != "" {
+		parts = append(parts, tool)
+	}
+	if text := strings.TrimSpace(summary); text != "" {
+		parts = append(parts, text)
+	}
+	node.ResultSummary = summarize(strings.Join(parts, ": "))
 }
 
 func cloneStringAnyMap(m map[string]any) map[string]any {

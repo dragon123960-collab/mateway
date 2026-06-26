@@ -27,6 +27,7 @@ type Skill struct {
 	Usage        string
 	Entrypoints  []string
 	Success      []string
+	HumanGates   []string
 	Priority     string
 	Path         string
 	Scope        string
@@ -85,6 +86,7 @@ type GraphMetadata struct {
 	Usage           string   `yaml:"usage,omitempty"`
 	Entrypoints     []string `yaml:"entrypoints,omitempty"`
 	SuccessCriteria []string `yaml:"success_criteria,omitempty"`
+	HumanGates      []string `yaml:"human_gates,omitempty"`
 	SafetyNotes     []string `yaml:"safety_notes,omitempty"`
 }
 
@@ -607,6 +609,7 @@ func listRoot(root, scope string) ([]Skill, error) {
 		item.Usage = metadata.Graph.Usage
 		item.Entrypoints = append([]string(nil), metadata.Graph.Entrypoints...)
 		item.Success = append([]string(nil), metadata.Graph.SuccessCriteria...)
+		item.HumanGates = append([]string(nil), metadata.Graph.HumanGates...)
 		out = append(out, item)
 	}
 	return out, nil

@@ -254,6 +254,7 @@ type TaskGraph struct {
 	ID             string          `json:"id"`
 	TaskID         string          `json:"task_id"`
 	Status         string          `json:"status"`
+	Lane           string          `json:"lane,omitempty"`
 	Nodes          []TaskGraphNode `json:"nodes"`
 	RepairAttempts []RepairAttempt `json:"repair_attempts,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`

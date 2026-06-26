@@ -467,6 +467,162 @@ func TestRuntimeContextIncludesSkillsBeyondOldLimit(t *testing.T) {
 	}
 }
 
+func TestSkillsPromptExplainsWorkspaceLookupOrder(t *testing.T) {
+	text := skillsPrompt([]discoveredSkill{{
+		Name:        "demo",
+		Description: "Demo workflow.",
+		Path:        "/home/me/.mateway/workspace/agents/main/skills/demo/SKILL.md",
+		Scope:       "agent",
+	}})
+	for _, want := range []string{
+		"read the exact Location path below",
+		"agent workspace first, then shared workspace",
+		"workspace/agents/<agent>/skills/<skill>/SKILL.md",
+		"workspace/skills/<skill>/SKILL.md",
+		"Do not create task artifacts inside workspace/skills",
+		"Do not guess skill paths under the current project/repository root",
+		"/home/me/.mateway/workspace/agents/main/skills/demo/SKILL.md",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected skills prompt to contain %q, got:\n%s", want, text)
+		}
+	}
+}
+
+func TestEnsureGraphForTaskUsesWorkflowLaneForWorkflowSkill(t *testing.T) {
+	rt, workspace := newTestRuntimeWithWorkspace(t)
+	skillDir := filepath.Join(workspace, "skills", "creator-ppt-production-studio")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: creator-ppt-production-studio
+description: Produce creator PPT packages and HTML PPT decks.
+---
+# Creator PPT Production Studio
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeWorkflowSkillMetadata(t, skillDir)
+
+	state := &session.State{}
+	task := state.EnsureTask("使用 creator-ppt-production-studio：选题 Cursor，新建小红书口播稿和 HTML PPT")
+	trace := newTestTraceRecorder(t)
+
+	if err := rt.ensureGraphForTask(t.Context(), inbound("cli:test", task.Goal), state, task, task.Goal, trace); err != nil {
+		t.Fatal(err)
+	}
+	if task.Graph == nil || task.Graph.Lane != workflowLane {
+		t.Fatalf("expected workflow lane graph, got %#v", task.Graph)
+	}
+	if len(task.Graph.Nodes) != 5 {
+		t.Fatalf("expected 5 workflow lane nodes, got %d", len(task.Graph.Nodes))
+	}
+	if task.Graph.Nodes[0].ID != "load-workflow-skill" {
+		t.Fatalf("first node should load skill, got %q", task.Graph.Nodes[0].ID)
+	}
+	review := task.Graph.NodeByID("review-workflow-gate")
+	if review == nil || review.Type != session.NodeTypeHumanReview {
+		t.Fatalf("expected human review gate, got %#v", review)
+	}
+	if !strings.Contains(review.Acceptance.Criteria, "口播稿") || !strings.Contains(review.Acceptance.Criteria, "选择") {
+		t.Fatalf("expected business review question, got %q", review.Acceptance.Criteria)
+	}
+	for _, want := range []string{
+		filepath.Join("outputs"),
+		"xiaohongshu-script.md",
+		"slide-outline.md",
+		filepath.Join(skillDir, "assets", "style-catalog", "index.html"),
+	} {
+		if !strings.Contains(review.Acceptance.Criteria, want) {
+			t.Fatalf("expected review question to contain %q, got %q", want, review.Acceptance.Criteria)
+		}
+	}
+	contract := state.TaskByID(task.ID).Execution.Contract
+	if contract == nil || len(contract.RequiredSkills) != 1 || contract.RequiredSkills[0].Path != filepath.Join(skillDir, "SKILL.md") {
+		t.Fatalf("expected workflow skill contract with exact skill path, got %#v", contract)
+	}
+	data, err := os.ReadFile(trace.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if traceText := string(data); !strings.Contains(traceText, `"type":"task_lane_selected"`) || !strings.Contains(traceText, `"lane":"workflow"`) {
+		t.Fatalf("expected workflow task_lane_selected in trace, got:\n%s", traceText)
+	}
+}
+
+func TestWorkflowLanePPTPlanSeparatesDraftReviewAndDeckGeneration(t *testing.T) {
+	workspace := t.TempDir()
+	skill := discoveredSkill{
+		Name:         "creator-ppt-production-studio",
+		Path:         filepath.Join(workspace, "skills", "creator-ppt-production-studio", "SKILL.md"),
+		Granularity:  "workflow",
+		Outputs:      []string{"xiaohongshu_script_path", "slide_outline_path", "deck_horizontal_path", "deck_vertical_path"},
+		AllowedTools: []string{"file.read", "file.write", "file.edit", "web.search", "web.fetch"},
+		HumanGates:   []string{"review generated scripts and slide outline before deck generation", "choose or confirm PPT style before deck generation"},
+	}
+	g, contract := buildWorkflowLaneGraph("task-ppt", "使用 creator-ppt-production-studio：生成小红书口播稿，HTML PPT", workspace, skill)
+	draft := g.NodeByID("draft-workflow-artifacts")
+	review := g.NodeByID("review-workflow-gate")
+	finalize := g.NodeByID("finalize-workflow-artifacts")
+	if draft == nil || review == nil || finalize == nil {
+		t.Fatalf("expected draft/review/finalize nodes, got %#v", g.NodeIDs())
+	}
+	if strings.Contains(strings.ToLower(draft.Goal), "final decks") && !strings.Contains(strings.ToLower(draft.Goal), "do not generate final decks") {
+		t.Fatalf("draft node should defer final decks, got %q", draft.Goal)
+	}
+	if !strings.Contains(strings.ToLower(finalize.Goal), "html ppt") && !strings.Contains(strings.ToLower(finalize.Goal), "deck") {
+		t.Fatalf("finalize node should generate decks, got %q", finalize.Goal)
+	}
+	if !strings.Contains(review.Acceptance.Criteria, "口播稿") || !strings.Contains(review.Acceptance.Criteria, "风格") {
+		t.Fatalf("review gate should be business-specific, got %q", review.Acceptance.Criteria)
+	}
+	for _, want := range []string{
+		filepath.Join(workspace, "outputs"),
+		"xiaohongshu-script.md",
+		"slide-outline.md",
+		filepath.Join(filepath.Dir(skill.Path), "assets", "style-catalog", "index.html"),
+	} {
+		if !strings.Contains(review.Acceptance.Criteria, want) {
+			t.Fatalf("expected review question to contain %q, got %q", want, review.Acceptance.Criteria)
+		}
+	}
+	if len(contract.FinalOutput) != 4 {
+		t.Fatalf("expected metadata outputs carried into contract, got %#v", contract.FinalOutput)
+	}
+}
+
+func TestWorkflowLaneNeedsRepairDoesNotAppendTaskRepairNode(t *testing.T) {
+	rt := newTestRuntime(t)
+	rt.Config.Execution.MaxRepairRounds = intPtrTest(2)
+	rt.Model = &dispatchModel{taskVerifier: taskVerifierSequence("needs_repair")}
+	g := newTestGraph(session.TaskGraphNode{
+		ID:            "final",
+		Type:          session.NodeTypeSubtask,
+		Mode:          session.NodeModeDirect,
+		Goal:          "final",
+		Status:        session.NodeStatusCompleted,
+		ResultSummary: "partial",
+		Output:        map[string]any{"text": "partial"},
+		Acceptance:    session.Acceptance{Criteria: "done", Verified: true},
+	})
+	g.Lane = workflowLane
+	task := &session.TaskNode{ID: g.TaskID, Goal: "workflow", Graph: g}
+	state := &session.State{Tasks: []session.TaskNode{*task}, ActiveTask: task.ID}
+	state.SetTaskContract(g.TaskID, session.TaskContract{FinalOutput: []string{"missing_path"}, TaskAcceptance: "must produce missing path"})
+
+	resp, err := rt.runGraphTask(t.Context(), inbound("cli:test", "workflow"), state, &state.Tasks[0], "workflow", newTestTraceRecorder(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Failed {
+		t.Fatalf("expected blocked response when workflow repair is disabled, got %#v", resp)
+	}
+	if len(state.Tasks[0].Graph.Nodes) != 1 {
+		t.Fatalf("workflow lane must not append task repair nodes, got %d", len(state.Tasks[0].Graph.Nodes))
+	}
+}
+
 func TestSkillValidationUsesRuntimeContextSkillSet(t *testing.T) {
 	rt := newTestRuntime(t)
 	ws := t.TempDir()
@@ -590,7 +746,7 @@ func TestRuntimeProgressSinkDoesNotEmitFinalTextAsModelProgress(t *testing.T) {
 	}
 }
 
-func TestRuntimeProgressSinkEmitsGraphNodeAndToolProgress(t *testing.T) {
+func TestRuntimeProgressSinkEmitsGraphNodeProgressOnly(t *testing.T) {
 	rt := newTestRuntime(t)
 	rt.Model = plannerVerifierModel{planJSON: testUnifiedPlanJSON(
 		"collect facts",
@@ -618,7 +774,7 @@ func TestRuntimeProgressSinkEmitsGraphNodeAndToolProgress(t *testing.T) {
 	if _, err := rt.Handle(context.Background(), inbound("cli:test", "collect facts")); err != nil {
 		t.Fatal(err)
 	}
-	var sawPlanRunning, sawPlanDone, sawNodeRunning, sawNodeDone, sawToolRunning, sawToolDone bool
+	var sawPlanRunning, sawPlanDone, sawNodeRunning, sawNodeDone bool
 	for _, update := range updates {
 		for _, step := range update.Progress {
 			switch {
@@ -631,15 +787,15 @@ func TestRuntimeProgressSinkEmitsGraphNodeAndToolProgress(t *testing.T) {
 			case step.Title == "Collect current facts" && step.Status == "completed":
 				sawNodeDone = true
 			case step.Tool == "web.search" && step.Status == "running":
-				sawToolRunning = true
+				t.Fatalf("tool-level progress should not be user-visible: %#v", updates)
 			case step.Tool == "web.search" && step.Status == "completed":
-				sawToolDone = true
+				t.Fatalf("tool-level progress should not be user-visible: %#v", updates)
 			}
 		}
 	}
-	if !sawPlanRunning || !sawPlanDone || !sawNodeRunning || !sawNodeDone || !sawToolRunning || !sawToolDone {
-		t.Fatalf("missing progress updates planRunning=%v planDone=%v nodeRunning=%v nodeDone=%v toolRunning=%v toolDone=%v updates=%#v",
-			sawPlanRunning, sawPlanDone, sawNodeRunning, sawNodeDone, sawToolRunning, sawToolDone, updates)
+	if !sawPlanRunning || !sawPlanDone || !sawNodeRunning || !sawNodeDone {
+		t.Fatalf("missing progress updates planRunning=%v planDone=%v nodeRunning=%v nodeDone=%v updates=%#v",
+			sawPlanRunning, sawPlanDone, sawNodeRunning, sawNodeDone, updates)
 	}
 }
 
@@ -2494,6 +2650,43 @@ graph:
   stage: "%s"
   granularity: "%s"
 `, graphType, stage, granularity)
+	if err := os.WriteFile(filepath.Join(metadataDir, "metadata.yaml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRuntimeWorkflowSkillMetadata(t *testing.T, dir string) {
+	t.Helper()
+	metadataDir := filepath.Join(dir, ".mateway")
+	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `adapter_version: "2"
+source: "test"
+installed_at: "2026-06-17T00:00:00Z"
+tool_runtime: "mateway"
+graph:
+  mode: "adapted"
+  type: "prompt"
+  stage: "execution"
+  granularity: "workflow"
+  outputs:
+    - xiaohongshu_script_path
+    - slide_outline_path
+    - deck_horizontal_path
+    - deck_vertical_path
+    - production_metadata_path
+  allowed_tools:
+    - file.read
+    - file.write
+    - file.edit
+    - web.search
+    - web.fetch
+  human_gates:
+    - review generated scripts and slide outline before deck generation
+    - choose or confirm PPT style before deck generation
+  usage: "Draft script and outline, pause for review, then generate HTML PPT."
+`
 	if err := os.WriteFile(filepath.Join(metadataDir, "metadata.yaml"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}

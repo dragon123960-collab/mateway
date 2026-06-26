@@ -101,6 +101,34 @@ func TestToolResultReadRetrievesRawRef(t *testing.T) {
 	}
 }
 
+func TestWebFetchRejectsLocalFileURLWithGuidance(t *testing.T) {
+	result := WebFetchTool{}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "web.fetch",
+		Args: map[string]any{"url": "file:///tmp/report.md"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "file.read") {
+		t.Fatalf("expected local file guidance, got %#v", result)
+	}
+	if result.Evidence["recommended_tool"] != "file.read" {
+		t.Fatalf("expected file.read recommendation, got %#v", result.Evidence)
+	}
+}
+
+func TestWebFetchRejectsToolResultRawRefWithGuidance(t *testing.T) {
+	result := WebFetchTool{}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Name: "web.fetch",
+		Args: map[string]any{"url": "raw_ref:tool-result:abc123"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "toolresult.read") {
+		t.Fatalf("expected toolresult.read guidance, got %#v", result)
+	}
+	if result.Evidence["recommended_tool"] != "toolresult.read" {
+		t.Fatalf("expected toolresult.read recommendation, got %#v", result.Evidence)
+	}
+}
+
 func TestTerminalRunReportsTimeoutEvidence(t *testing.T) {
 	result := TerminalRunTool{Config: &config.Root{}}.Run(context.Background(), agentcore.ToolCall{
 		ID:   "call_1",
@@ -451,7 +479,7 @@ func TestTerminalRunTimeoutKillsProcessGroup(t *testing.T) {
 	}
 }
 
-func TestFileWriteAllowsSkillPlaintextSecret(t *testing.T) {
+func TestFileWriteRejectsSharedSkillInstallPath(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	cfg := &config.Root{
@@ -464,15 +492,11 @@ func TestFileWriteAllowsSkillPlaintextSecret(t *testing.T) {
 		Name: "file.write",
 		Args: map[string]any{"path": target, "content": "# Mail\npassword: supersecret123\n"},
 	})
-	if result.IsError {
-		t.Fatalf("expected secret-like skill write, got %#v", result)
+	if !result.IsError || !strings.Contains(result.Content, "installed skill directory") || !strings.Contains(result.Content, filepath.Join(workspace, "outputs", "<task-slug>")) {
+		t.Fatalf("expected skill install write rejection, got %#v", result)
 	}
-	data, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "# Mail\npassword: supersecret123\n" {
-		t.Fatalf("content = %q", data)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("skill install path should not be written, err=%v", err)
 	}
 }
 
@@ -547,7 +571,7 @@ func TestFileWriteAllowsConfigYamlReplacement(t *testing.T) {
 	}
 }
 
-func TestFileWriteAllowsEnvSecretLookupInSkillScript(t *testing.T) {
+func TestFileWriteRejectsSkillScriptPath(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
@@ -558,12 +582,12 @@ func TestFileWriteAllowsEnvSecretLookupInSkillScript(t *testing.T) {
 		Name: "file.write",
 		Args: map[string]any{"path": target, "content": content},
 	})
-	if result.IsError {
-		t.Fatalf("expected env lookup script write, got %#v", result)
+	if !result.IsError || !strings.Contains(result.Content, "installed skill directory") {
+		t.Fatalf("expected skill script write rejection, got %#v", result)
 	}
 }
 
-func TestFileWriteAllowsTinyPartialOverwriteOfExistingSkillScript(t *testing.T) {
+func TestFileWriteRejectsExistingSkillScriptOverwrite(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	cfg := &config.Root{App: config.AppConfig{Home: home, Workspace: workspace}, Security: config.SecurityConfig{EnforceWorkspacePaths: true}}
@@ -580,15 +604,15 @@ func TestFileWriteAllowsTinyPartialOverwriteOfExistingSkillScript(t *testing.T) 
 		Name: "file.write",
 		Args: map[string]any{"path": target, "content": "    return fixed\n"},
 	})
-	if result.IsError {
-		t.Fatalf("expected partial overwrite, got %#v", result)
+	if !result.IsError || !strings.Contains(result.Content, "installed skill directory") {
+		t.Fatalf("expected existing skill script write rejection, got %#v", result)
 	}
 	data, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "    return fixed\n" {
-		t.Fatalf("content = %q", data)
+	if string(data) != original {
+		t.Fatalf("skill script should remain unchanged, got %q", data)
 	}
 }
 
@@ -678,7 +702,7 @@ func TestFileWriteCreatesProposalForAgentCoreProfile(t *testing.T) {
 	}
 }
 
-func TestFileWriteAllowsAgentSkillProfilePath(t *testing.T) {
+func TestFileWriteRejectsAgentSkillInstallPath(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
 	target := filepath.Join(workspace, "agents", "main", "skills", "demo", "SKILL.md")
@@ -691,11 +715,11 @@ func TestFileWriteAllowsAgentSkillProfilePath(t *testing.T) {
 		Name: "file.write",
 		Args: map[string]any{"path": target, "content": "# Demo\n"},
 	})
-	if result.IsError || result.Evidence["requires_review"] == true {
-		t.Fatalf("expected direct skill write, got %#v", result)
+	if !result.IsError || !strings.Contains(result.Content, "installed agent skill directory") {
+		t.Fatalf("expected agent skill write rejection, got %#v", result)
 	}
-	if _, err := os.Stat(target); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("agent skill install path should not be written, err=%v", err)
 	}
 }
 
@@ -840,11 +864,29 @@ func TestScheduleManageToolWritesTask(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("unexpected schedule error: %#v", result)
 	}
-	if result.Evidence["status"] != "active" || result.Evidence["session_key"] != "feishu:chat_1" {
+	if result.Evidence["status"] != "pending" || result.Evidence["session_key"] != "feishu:chat_1" || result.Evidence["require_test"] != true {
 		t.Fatalf("unexpected evidence: %#v", result.Evidence)
 	}
 	if entries, err := os.ReadDir(filepath.Join(home, "schedules")); err != nil || len(entries) != 1 {
 		t.Fatalf("expected one schedule entry, entries=%v err=%v", entries, err)
+	}
+}
+
+func TestScheduleManageToolCanExplicitlySkipTest(t *testing.T) {
+	home := t.TempDir()
+	runAt := "2026-05-29T16:30:00+08:00"
+	tool := ScheduleManageTool{Config: &config.Root{App: config.AppConfig{Home: home}}}
+	result := tool.Run(context.Background(), agentcore.ToolCall{ID: "1", Args: map[string]any{
+		"action":       "create",
+		"text":         "提醒我检查日报",
+		"run_at":       runAt,
+		"require_test": false,
+	}})
+	if result.IsError {
+		t.Fatalf("unexpected schedule error: %#v", result)
+	}
+	if result.Evidence["status"] != "active" || result.Evidence["require_test"] != false {
+		t.Fatalf("unexpected evidence: %#v", result.Evidence)
 	}
 }
 
@@ -1130,6 +1172,68 @@ func TestFileEditCreatesProposalForCoreAgentProfile(t *testing.T) {
 	}
 	if string(data) != "old content" {
 		t.Fatalf("core profile should not be overwritten before review, got %q", data)
+	}
+}
+
+func TestFileEditRejectsSharedSkillInstallPath(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "skills", "demo", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "# Demo\nold\n"
+	if err := os.WriteFile(target, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "old", "new_string": "new"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "installed skill directory") {
+		t.Fatalf("expected skill install edit rejection, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != original {
+		t.Fatalf("skill file should remain unchanged, got %q", data)
+	}
+}
+
+func TestFileEditRejectsAgentSkillInstallPath(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	target := filepath.Join(workspace, "agents", "main", "skills", "demo", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "# Demo\nold\n"
+	if err := os.WriteFile(target, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Root{
+		App:      config.AppConfig{Home: home, Workspace: workspace},
+		Security: config.SecurityConfig{EnforceWorkspacePaths: true},
+	}
+	result := FileEditTool{Config: cfg}.Run(context.Background(), agentcore.ToolCall{
+		ID:   "call_1",
+		Args: map[string]any{"path": target, "old_string": "old", "new_string": "new"},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "installed agent skill directory") {
+		t.Fatalf("expected agent skill install edit rejection, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != original {
+		t.Fatalf("agent skill file should remain unchanged, got %q", data)
 	}
 }
 

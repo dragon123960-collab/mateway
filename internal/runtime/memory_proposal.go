@@ -198,6 +198,32 @@ func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.Inbo
 
 	action, ok := parseNumericHumanPendingAction(userResponse)
 	if !ok {
+		if kind == session.PendingKindHumanConfirm && looksLikeHumanConfirmRevisionFeedback(userResponse) {
+			_ = trace.write(map[string]any{
+				"type":          "graph_human_pending_feedback",
+				"task_id":       taskID,
+				"graph_id":      task.Graph.ID,
+				"node_id":       nodeID,
+				"pending_kind":  kind,
+				"user_response": userResponse,
+			})
+			node.Status = session.NodeStatusPending
+			node.Acceptance.Verified = false
+			node.Acceptance.Reason = ""
+			node.FailureReason = ""
+			if node.Input == nil {
+				node.Input = map[string]any{}
+			}
+			node.Input["human_feedback"] = userResponse
+			node.Input["attempt_feedback"] = "User rejected confirmation and requested revision: " + userResponse
+			node.Input["requires_human_confirmation"] = false
+			node.UpdatedAt = time.Now()
+			state.Pending = nil
+			if err := rt.saveState(state, trace); err != nil {
+				return Response{}, true, err
+			}
+			return Response{}, false, nil
+		}
 		_ = trace.write(map[string]any{
 			"type":          "pending_control_invalid_reply",
 			"task_id":       taskID,
@@ -257,6 +283,24 @@ func (rt Runtime) handleGraphHumanPending(state *session.State, msg channel.Inbo
 	}
 
 	return Response{}, false, nil
+}
+
+func looksLikeHumanConfirmRevisionFeedback(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	markers := []string{
+		"不要", "别", "不确认", "不能确认", "不要确认", "取消确认",
+		"修复", "改", "错误", "失败", "不存在", "没有", "缺少", "问题",
+		"fix", "revise", "revision", "wrong", "missing", "does not exist", "not exist", "failed", "error",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseNumericHumanPendingAction(text string) (string, bool) {

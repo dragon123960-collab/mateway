@@ -173,6 +173,12 @@ func ClassifyFetchFailure(result agentcore.ToolResult) (FetchFailureKind, string
 	if evKind, ok := result.Evidence["failure_kind"].(string); ok && evKind == "bot_protection" {
 		return FetchFailureBlockedOrBot, "bot protection or JS challenge page"
 	}
+	if evKind, ok := result.Evidence["failure_kind"].(string); ok && evKind == "local_file_url" {
+		return FetchFailurePathDenied, "web.fetch was used for a local file URL"
+	}
+	if evKind, ok := result.Evidence["failure_kind"].(string); ok && evKind == "tool_result_ref" {
+		return FetchFailureUnsupportedContent, "web.fetch was used for a raw tool-result reference"
+	}
 	if strings.Contains(content, "ssrf") || strings.Contains(content, "internal") {
 		return FetchFailurePolicyDenied, "URL blocked by SSRF protection"
 	}
@@ -379,7 +385,13 @@ func ClassifyToolFailure(toolName string, result agentcore.ToolResult) FailureIn
 			return FailureInfo{
 				Category: FailureBlocked,
 				Reason:   reason,
-				Guidance: "path is outside allowed roots; use an allowed path or state the concrete blocker to the user",
+				Guidance: "use file.read with the absolute local path; web.fetch is only for http(s) URLs",
+			}
+		case FetchFailureUnsupportedContent:
+			return FailureInfo{
+				Category: FailureBlocked,
+				Reason:   reason,
+				Guidance: "use toolresult.read with raw_ref for tool-result references; web.fetch is only for http(s) URLs",
 			}
 		default:
 			if strings.Contains(content, "status 4") || strings.Contains(content, "status 5") {

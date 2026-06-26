@@ -500,6 +500,9 @@ func convertTaskGraphPlanWithSkills(plan TaskGraphPlan, taskID string, skills []
 				if len(discovered.Success) > 0 {
 					nodeInput["skill_success_criteria"] = append([]string(nil), discovered.Success...)
 				}
+				if len(discovered.HumanGates) > 0 {
+					nodeInput["skill_human_gates"] = append([]string(nil), discovered.HumanGates...)
+				}
 			}
 		}
 		if risk := strings.TrimSpace(pn.Risk); risk != "" {
@@ -588,6 +591,9 @@ func determineNodeModeForType(pn TaskPlanNode, nodeType string) string {
 		}
 		return session.NodeModeTool
 	case session.NodeTypeSubtask, session.NodeTypeModel:
+		if len(cleanStringSlice(pn.AllowedTools)) > 0 {
+			return session.NodeModeReact
+		}
 		if mode == session.NodeModeDirect || mode == session.NodeModeReact {
 			return mode
 		}

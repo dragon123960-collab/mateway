@@ -40,6 +40,19 @@ func TestVerifyTaskGraphWithContract_MissingFinalOutput_NeedsRepair(t *testing.T
 	}
 }
 
+func TestVerifyTaskGraphWithContract_FinalPathSatisfiedByArtifactPaths(t *testing.T) {
+	g := &TaskGraph{ID: "g", TaskID: "t", Nodes: []TaskGraphNode{
+		completedModelNode("n1", true, map[string]any{
+			"artifact_paths": []string{"/Users/dongping/.mateway/workspace/output/cursor/deck-vertical/index.html"},
+		}),
+	}}
+	contract := &TaskContract{TaskAcceptance: "produce deck", FinalOutput: []string{"deck_vertical_path"}}
+	r := VerifyTaskGraphWithContract(g, contract)
+	if r.Status != GraphStatusCompleted {
+		t.Fatalf("expected completed, got %q (%s), missing=%v", r.Status, r.Reason, r.MissingNodes)
+	}
+}
+
 func TestVerifyTaskGraphWithContract_BlockedNode_Blocker(t *testing.T) {
 	g := &TaskGraph{ID: "g", TaskID: "t", Nodes: []TaskGraphNode{
 		{ID: "n1", Type: NodeTypeTool, Status: NodeStatusBlocked, FailureReason: "denied"},

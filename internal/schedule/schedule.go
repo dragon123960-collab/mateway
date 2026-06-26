@@ -18,6 +18,7 @@ type Task struct {
 	RunAt         string `json:"run_at"`
 	Interval      string `json:"interval,omitempty"`
 	RequireTest   bool   `json:"require_test"`
+	RunbookID     string `json:"runbook_id,omitempty"`
 	TestedAt      string `json:"tested_at,omitempty"`
 	LastRunAt     string `json:"last_run_at,omitempty"`
 	LastRunStatus string `json:"last_run_status,omitempty"`
@@ -53,12 +54,25 @@ type RunRecord struct {
 	TaskID     string `json:"task_id"`
 	Kind       string `json:"kind"`
 	Status     string `json:"status"`
+	RunbookID  string `json:"runbook_id,omitempty"`
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
 	SessionKey string `json:"session_key"`
 	Output     string `json:"output,omitempty"`
 	TracePath  string `json:"trace_path,omitempty"`
 	Error      string `json:"error,omitempty"`
+}
+
+type Runbook struct {
+	ID         string   `json:"id"`
+	TaskID     string   `json:"task_id"`
+	Text       string   `json:"text"`
+	Lane       string   `json:"lane,omitempty"`
+	TracePath  string   `json:"trace_path,omitempty"`
+	Steps      []string `json:"steps,omitempty"`
+	SkillPaths []string `json:"skill_paths,omitempty"`
+	OutputRoot string   `json:"output_root,omitempty"`
+	CreatedAt  string   `json:"created_at"`
 }
 
 func (s Store) Create(input CreateInput) (Task, error) {
@@ -227,6 +241,7 @@ func (s Store) MarkTested(task Task, finishedAt time.Time, record RunRecord) err
 	task.LastRunAt = task.TestedAt
 	task.LastRunStatus = record.Status
 	task.LastRunID = record.ID
+	task.RunbookID = record.RunbookID
 	task.UpdatedAt = task.TestedAt
 	if record.Status == "success" {
 		task.Status = "active"
@@ -292,6 +307,37 @@ func (s Store) RecordRun(record RunRecord) (RunRecord, error) {
 	return record, os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
+func (s Store) RecordRunbook(runbook Runbook) (Runbook, error) {
+	now := s.now()
+	if runbook.ID == "" {
+		runbook.ID = "runbook_" + now.Format("20060102150405.000000000")
+	}
+	if runbook.CreatedAt == "" {
+		runbook.CreatedAt = now.Format(time.RFC3339)
+	}
+	if err := os.MkdirAll(s.runbooksDir(), 0o755); err != nil {
+		return Runbook{}, err
+	}
+	data, err := json.MarshalIndent(runbook, "", "  ")
+	if err != nil {
+		return Runbook{}, err
+	}
+	path := filepath.Join(s.runbooksDir(), runbook.ID+".json")
+	return runbook, os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func (s Store) ReadRunbook(id string) (Runbook, error) {
+	data, err := os.ReadFile(filepath.Join(s.runbooksDir(), strings.TrimSpace(id)+".json"))
+	if err != nil {
+		return Runbook{}, err
+	}
+	var runbook Runbook
+	if err := json.Unmarshal(data, &runbook); err != nil {
+		return Runbook{}, err
+	}
+	return runbook, nil
+}
+
 func (s Store) Read(id string) (Task, error) {
 	return s.read(id)
 }
@@ -326,6 +372,10 @@ func (s Store) dir() string {
 
 func (s Store) runsDir() string {
 	return filepath.Join(s.dir(), "runs")
+}
+
+func (s Store) runbooksDir() string {
+	return filepath.Join(s.dir(), "runbooks")
 }
 
 func (s Store) now() time.Time {

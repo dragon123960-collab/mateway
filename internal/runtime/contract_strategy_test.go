@@ -65,6 +65,18 @@ func TestContractStrategyAutoContractForReadFile(t *testing.T) {
 	}
 }
 
+func TestLaneForContractStrategy(t *testing.T) {
+	if got := laneForContractStrategy(contractStrategyDirect); got != taskLaneDirect {
+		t.Fatalf("direct strategy lane = %q", got)
+	}
+	if got := laneForContractStrategy(contractStrategyAutoContract); got != taskLaneGraph {
+		t.Fatalf("auto contract strategy lane = %q", got)
+	}
+	if got := laneForContractStrategy(contractStrategyReviewRequired); got != taskLaneGraph {
+		t.Fatalf("review strategy lane = %q", got)
+	}
+}
+
 func TestContractStrategyReviewRequiredForFileWrite(t *testing.T) {
 	contract := session.TaskContract{
 		RequiresTools: true,
@@ -184,6 +196,9 @@ func TestUniversalPlanShapeDirectHasMinimalContract(t *testing.T) {
 	trace := string(data)
 	if !strings.Contains(trace, `"type":"task_contract_strategy"`) || !strings.Contains(trace, `"strategy":"direct"`) {
 		t.Fatalf("expected task_contract_strategy direct in trace, got:\n%s", trace)
+	}
+	if !strings.Contains(trace, `"type":"task_lane_selected"`) || !strings.Contains(trace, `"lane":"direct"`) {
+		t.Fatalf("expected direct task_lane_selected in trace, got:\n%s", trace)
 	}
 	if !strings.Contains(trace, `"type":"task_contract_created"`) {
 		t.Fatalf("expected task_contract_created for direct path (universal plan shape), got:\n%s", trace)
@@ -323,6 +338,9 @@ func TestUniversalPlanShapeAutoContractExecutesWithPlanItems(t *testing.T) {
 	trace := string(data)
 	if !strings.Contains(trace, `"strategy":"auto_contract"`) {
 		t.Fatalf("expected auto_contract strategy in trace, got:\n%s", trace)
+	}
+	if !strings.Contains(trace, `"type":"task_lane_selected"`) || !strings.Contains(trace, `"lane":"graph"`) {
+		t.Fatalf("expected graph task_lane_selected in trace, got:\n%s", trace)
 	}
 	if !strings.Contains(trace, `"type":"task_contract_created"`) {
 		t.Fatalf("expected task_contract_created in trace, got:\n%s", trace)

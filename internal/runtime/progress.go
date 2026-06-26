@@ -61,6 +61,9 @@ func progressStepsForTask(state session.State, taskID string) []channel.Progress
 
 func progressStepsForTaskSince(state session.State, taskID string, eventOffset int) []channel.ProgressStep {
 	task := taskFromState(state, taskID)
+	if task.Graph != nil && len(task.Graph.Nodes) > 0 {
+		return graphProgressSteps(task.Graph)
+	}
 	events := task.Execution.Events
 	if eventOffset < 0 {
 		eventOffset = 0
@@ -85,6 +88,78 @@ func progressStepsForTaskSince(state session.State, taskID string, eventOffset i
 		out = out[len(out)-limit:]
 	}
 	return out
+}
+
+func graphProgressSteps(g *session.TaskGraph) []channel.ProgressStep {
+	if g == nil {
+		return nil
+	}
+	out := make([]channel.ProgressStep, 0, len(g.Nodes))
+	for _, node := range g.Nodes {
+		title := strings.TrimSpace(node.Goal)
+		if title == "" {
+			title = strings.TrimSpace(node.ID)
+		}
+		if title == "" {
+			continue
+		}
+		summary := graphNodeProgressSummary(node)
+		out = append(out, channel.ProgressStep{
+			Title:   compactProgressSummary(title),
+			Status:  graphNodeProgressStatus(node.Status),
+			Summary: summary,
+		})
+	}
+	const limit = 8
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
+}
+
+func graphNodeProgressStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case session.NodeStatusReady:
+		return session.NodeStatusPending
+	case session.NodeStatusVerifying:
+		return session.NodeStatusRunning
+	case session.NodeStatusRetrying, session.NodeStatusNeedsReplan:
+		return session.NodeStatusRunning
+	case session.NodeStatusAwaitingInput:
+		return "blocked"
+	default:
+		return strings.TrimSpace(status)
+	}
+}
+
+func graphNodeProgressSummary(node session.TaskGraphNode) string {
+	if isNodeProblemStatus(node.Status) {
+		if reason := strings.TrimSpace(node.FailureReason); reason != "" {
+			return compactProgressSummary(reason)
+		}
+		for i := len(node.EvidenceRefs) - 1; i >= 0; i-- {
+			ref := node.EvidenceRefs[i]
+			if ref.IsError || ref.Blocked {
+				return compactProgressSummary(strings.TrimSpace(ref.ToolName + " " + ref.Summary))
+			}
+		}
+	}
+	if strings.TrimSpace(node.ResultSummary) != "" && node.Status == session.NodeStatusCompleted {
+		return compactProgressSummary(node.ResultSummary)
+	}
+	if strings.TrimSpace(node.ID) != "" {
+		return compactProgressSummary("node " + node.ID)
+	}
+	return ""
+}
+
+func isNodeProblemStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case session.NodeStatusFailed, session.NodeStatusBlocked, session.NodeStatusNeedsReplan:
+		return true
+	default:
+		return false
+	}
 }
 
 // isRuntimeInternalEvent returns true for execution event types that exist

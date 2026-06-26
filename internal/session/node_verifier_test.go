@@ -1,6 +1,8 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -316,6 +318,68 @@ func TestVerifyNode_ModelNode_FailedThenSuccessfulToolEvidencePasses(t *testing.
 	result := VerifyNode(node)
 	if result.Status != VerificationPassed {
 		t.Fatalf("expected passed after successful tool evidence, got %q: %s", result.Status, result.Reason)
+	}
+}
+
+func TestVerifyNode_ModelNode_PathOutputPlaceholderFails(t *testing.T) {
+	node := &TaskGraphNode{
+		ID:            "generate-deck",
+		Type:          NodeTypeSubtask,
+		Goal:          "generate horizontal HTML deck",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "HTML deck generated",
+		Output:        map[string]any{"deck_horizontal_path": true},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationFailed {
+		t.Fatalf("expected failed for boolean *_path placeholder, got %q: %s", result.Status, result.Reason)
+	}
+	if !result.Retryable {
+		t.Fatal("missing concrete path should be retryable")
+	}
+	if len(result.Missing) == 0 || result.Missing[0] != "deck_horizontal_path" {
+		t.Fatalf("expected missing deck_horizontal_path, got %#v", result.Missing)
+	}
+}
+
+func TestVerifyNode_ModelNode_PathOutputExistingFilePasses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deck-horizontal.html")
+	if err := os.WriteFile(path, []byte("<!doctype html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	node := &TaskGraphNode{
+		ID:            "generate-deck",
+		Type:          NodeTypeSubtask,
+		Goal:          "generate horizontal HTML deck",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "HTML deck generated",
+		Output:        map[string]any{"deck_horizontal_path": path},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationPassed {
+		t.Fatalf("expected passed for existing absolute path, got %q: %s", result.Status, result.Reason)
+	}
+}
+
+func TestVerifyNode_ModelNode_PathPlaceholderSatisfiedByArtifactPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "master-brief.md")
+	if err := os.WriteFile(path, []byte("brief"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	node := &TaskGraphNode{
+		ID:            "brief",
+		Type:          NodeTypeSubtask,
+		Goal:          "write master brief",
+		Status:        NodeStatusCompleted,
+		ResultSummary: "brief generated",
+		Output: map[string]any{
+			"master_brief_path": true,
+			"artifact_paths":    []string{path},
+		},
+	}
+	result := VerifyNode(node)
+	if result.Status != VerificationPassed {
+		t.Fatalf("expected artifact_paths to satisfy placeholder path output, got %q: %s", result.Status, result.Reason)
 	}
 }
 

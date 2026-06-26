@@ -206,6 +206,31 @@ func TestReactionForReply(t *testing.T) {
 	}
 }
 
+func TestSendFinalReplyWithRetryUsesFreshContext(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	err := sendFinalReplyWithRetry(cancelled, func(ctx context.Context) error {
+		calls++
+		if calls == 1 {
+			if ctx.Err() == nil {
+				t.Fatal("expected first send to receive cancelled context")
+			}
+			return ctx.Err()
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("retry should use fresh live context, got %v", ctx.Err())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("sendFinalReplyWithRetry returned error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("send calls = %d want 2", calls)
+	}
+}
+
 func TestShouldSendProcessingAckSkipsNewSessionCommand(t *testing.T) {
 	rt := runtime.New(&config.Root{App: config.AppConfig{Home: t.TempDir()}})
 	if shouldSendProcessingAck(rt, channel.InboundMessage{Text: "/new"}) {
@@ -261,6 +286,18 @@ func TestFeishuProgressTextShowsRuntimeSteps(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in %q", want, text)
 		}
+	}
+}
+
+func TestFeishuProgressHasTerminalStep(t *testing.T) {
+	if feishuProgressHasTerminalStep(channel.OutboundMessage{Progress: []channel.ProgressStep{{Title: "Plan", Status: "running"}}}) {
+		t.Fatal("running progress should not bypass throttle")
+	}
+	if !feishuProgressHasTerminalStep(channel.OutboundMessage{Progress: []channel.ProgressStep{{Title: "Plan", Status: "completed"}}}) {
+		t.Fatal("completed progress should bypass throttle")
+	}
+	if !feishuProgressHasTerminalStep(channel.OutboundMessage{Progress: []channel.ProgressStep{{Title: "Tool", Status: "failed"}}}) {
+		t.Fatal("failed progress should bypass throttle")
 	}
 }
 

@@ -356,6 +356,7 @@ func renderUnifiedPlannerPrompt(goal, userText, plannerContext string, tools *ag
 	b.WriteString("- Tool calls happen inside react nodes; do NOT emit individual tool nodes.\n")
 	b.WriteString("- For high-risk operations, include human_confirm nodes before mutations.\n")
 	b.WriteString("- If the user asks for confirmation/approval/review/permission, include human_confirm or human_review nodes.\n")
+	b.WriteString("- If a selected skill lists human_gates, include matching human_review or human_confirm nodes at those gates; do not skip skill-required user review.\n")
 	b.WriteString("- Populate task.required_capabilities.tools with all tools the overall task needs.\n")
 
 	if len(skills) > 0 {
@@ -363,6 +364,7 @@ func renderUnifiedPlannerPrompt(goal, userText, plannerContext string, tools *ag
 		b.WriteString("- Skill names are instructional references, NOT executable tools. Do NOT put skill names in allowed_tools.\n")
 		b.WriteString("- Use a skill node only when the skill metadata matches the node: stage must not be planning, granularity must be subtask, and allowed_tools must be a subset of the skill metadata allowed_tools.\n")
 		b.WriteString("- Skills with granularity=workflow must be decomposed into normal subtask/react nodes; do not emit them as a single skill node.\n")
+		b.WriteString("- Skill directories are read-only instruction/template sources for normal tasks. Plan generated artifacts under workspace outputs, never under workspace/skills or workspace/agents/<agent>/skills.\n")
 		b.WriteString("- Preserve skill metadata inputs and outputs as node inputs/outputs when they are relevant to dependency planning.\n")
 		for _, skill := range skills {
 			b.WriteString("- name: ")
@@ -398,6 +400,10 @@ func renderUnifiedPlannerPrompt(goal, userText, plannerContext string, tools *ag
 			if len(skill.Success) > 0 {
 				b.WriteString("\n  success_criteria: ")
 				b.WriteString(strings.Join(skill.Success, " | "))
+			}
+			if len(skill.HumanGates) > 0 {
+				b.WriteString("\n  human_gates: ")
+				b.WriteString(strings.Join(skill.HumanGates, " | "))
 			}
 			b.WriteString("\n  path: ")
 			b.WriteString(skill.Path)

@@ -1003,15 +1003,18 @@ func TestScheduleCreateAndTestCommands(t *testing.T) {
 		t.Fatalf("unexpected tasks: %#v", tasks)
 	}
 	out = captureStdout(t, func() error { return run([]string{"schedule", "test", tasks[0].ID}) })
-	if !strings.Contains(out, "test: success") {
+	if !strings.Contains(out, "test: success") || !strings.Contains(out, "runbook:") {
 		t.Fatalf("unexpected test output:\n%s", out)
 	}
 	tasks, err = schedule.Store{Home: home}.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tasks[0].Status != "active" || tasks[0].TestedAt == "" {
+	if tasks[0].Status != "active" || tasks[0].TestedAt == "" || tasks[0].RunbookID == "" {
 		t.Fatalf("unexpected tested task: %#v", tasks[0])
+	}
+	if _, err := (schedule.Store{Home: home}).ReadRunbook(tasks[0].RunbookID); err != nil {
+		t.Fatalf("expected runbook to be readable: %v", err)
 	}
 }
 

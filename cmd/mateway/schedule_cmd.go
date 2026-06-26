@@ -89,6 +89,9 @@ func runSchedule(args []string) error {
 		}
 		fmt.Println("test:", record.Status)
 		fmt.Println("run:", record.ID)
+		if record.RunbookID != "" {
+			fmt.Println("runbook:", record.RunbookID)
+		}
 		if record.Error != "" {
 			fmt.Println("error:", record.Error)
 		}
@@ -177,12 +180,37 @@ func runDueSchedules(ctx context.Context, cfg *config.Root, store schedule.Store
 func runScheduledTask(ctx context.Context, cfg *config.Root, store schedule.Store, task schedule.Task, kind string) (schedule.RunRecord, error) {
 	startedAt := time.Now()
 	rt := runtime.New(cfg)
+	sessionKey := firstNonEmpty(task.SessionKey, "schedule:"+task.ID)
+	taskText := task.Text
+	runbookID := task.RunbookID
+	if kind == "scheduled" && strings.TrimSpace(runbookID) != "" {
+		runbook, runbookErr := store.ReadRunbook(runbookID)
+		if runbookErr != nil {
+			record, recordErr := store.RecordRun(schedule.RunRecord{
+				TaskID:     task.ID,
+				Kind:       kind,
+				Status:     "error",
+				RunbookID:  runbookID,
+				StartedAt:  startedAt.Format(time.RFC3339),
+				FinishedAt: time.Now().Format(time.RFC3339),
+				SessionKey: sessionKey,
+				Error:      "runbook: " + runbookErr.Error(),
+			})
+			if recordErr != nil {
+				return record, recordErr
+			}
+			return record, nil
+		}
+		if strings.TrimSpace(runbook.Text) != "" {
+			taskText = runbook.Text
+		}
+	}
 	msg := channel.InboundMessage{
 		ID:         task.ID,
 		Channel:    "schedule",
-		SessionKey: firstNonEmpty(task.SessionKey, "schedule:"+task.ID),
-		Text:       task.Text,
-		Metadata:   map[string]string{"scheduled_task_id": task.ID, "scheduled_run_kind": kind},
+		SessionKey: sessionKey,
+		Text:       taskText,
+		Metadata:   map[string]string{"scheduled_task_id": task.ID, "scheduled_run_kind": kind, "scheduled_runbook_id": runbookID},
 	}
 	resp, err := rt.Handle(ctx, msg)
 	status := "success"
@@ -199,10 +227,19 @@ func runScheduledTask(ctx context.Context, cfg *config.Root, store schedule.Stor
 			status = "error"
 		}
 	}
+	if kind == "test" && status == "success" {
+		if runbook, runbookErr := buildScheduleRunbook(store, rt, task, sessionKey, tracePath); runbookErr == nil {
+			runbookID = runbook.ID
+		} else {
+			status = "error"
+			errText = "runbook: " + runbookErr.Error()
+		}
+	}
 	record, recordErr := store.RecordRun(schedule.RunRecord{
 		TaskID:     task.ID,
 		Kind:       kind,
 		Status:     status,
+		RunbookID:  runbookID,
 		StartedAt:  startedAt.Format(time.RFC3339),
 		FinishedAt: time.Now().Format(time.RFC3339),
 		SessionKey: msg.SessionKey,
@@ -216,12 +253,63 @@ func runScheduledTask(ctx context.Context, cfg *config.Root, store schedule.Stor
 	return record, err
 }
 
+func buildScheduleRunbook(store schedule.Store, rt runtime.Runtime, task schedule.Task, sessionKey, tracePath string) (schedule.Runbook, error) {
+	state, err := rt.Store.Load(sessionKey)
+	if err != nil {
+		return schedule.Runbook{}, err
+	}
+	runbook := schedule.Runbook{
+		TaskID:    task.ID,
+		Text:      task.Text,
+		TracePath: tracePath,
+	}
+	for i := len(state.Tasks) - 1; i >= 0; i-- {
+		t := state.Tasks[i]
+		if strings.TrimSpace(t.Goal) != strings.TrimSpace(task.Text) && strings.TrimSpace(t.Execution.OriginalTask) != strings.TrimSpace(task.Text) {
+			continue
+		}
+		if t.Graph != nil {
+			runbook.Lane = strings.TrimSpace(t.Graph.Lane)
+			for _, node := range t.Graph.Nodes {
+				if goal := strings.TrimSpace(node.Goal); goal != "" {
+					runbook.Steps = append(runbook.Steps, goal)
+				}
+				if root := stringInputValue(node.Input, "artifact_root"); root != "" && runbook.OutputRoot == "" {
+					runbook.OutputRoot = root
+				}
+			}
+		}
+		if t.Execution.Contract != nil {
+			for _, skill := range t.Execution.Contract.RequiredSkills {
+				if path := strings.TrimSpace(skill.Path); path != "" {
+					runbook.SkillPaths = append(runbook.SkillPaths, path)
+				}
+			}
+		}
+		break
+	}
+	if runbook.Lane == "" {
+		runbook.Lane = "direct"
+	}
+	return store.RecordRunbook(runbook)
+}
+
+func stringInputValue(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(values[key]))
+}
+
 func printScheduleTask(task schedule.Task) {
 	fmt.Println("schedule:", task.ID)
 	fmt.Println("status:", task.Status)
 	fmt.Println("run_at:", task.RunAt)
 	if task.Interval != "" {
 		fmt.Println("interval:", task.Interval)
+	}
+	if task.RunbookID != "" {
+		fmt.Println("runbook:", task.RunbookID)
 	}
 	fmt.Println("session:", task.SessionKey)
 }

@@ -45,6 +45,39 @@ func (rt Runtime) ensureGraphForTask(
 	if agent := rt.Pool.AgentForMessage(msg); agent != nil && agent.Tools != nil {
 		agentRegistry = agent.Tools
 	}
+	workspace := strings.TrimSpace(rt.Config.App.Workspace)
+	if workspace == "" {
+		workspace = filepath.Join(rt.Config.App.Home, "workspace")
+	}
+	if skill, ok := findWorkflowSkillForTask(userText, discoveredSkills); ok {
+		g, contract := buildWorkflowLaneGraph(task.ID, userText, workspace, skill)
+		if errs := session.ValidateTaskGraph(&g); !errs.IsValid() {
+			return fmt.Errorf("workflow lane graph validation failed: %s", errs.Error())
+		}
+		if invalid := validateContractTools(contract, agentRegistry, discoveredSkills); !invalid.IsValid() {
+			return fmt.Errorf("workflow lane contract references unavailable tools or skills: %s", invalidContractBlockerENWithRegistries(contract, invalid, agentRegistry, rt.Tools))
+		}
+		task.Graph = &g
+		state.SetTaskContract(task.ID, contract)
+		if trace != nil {
+			_ = trace.write(map[string]any{
+				"type":       "workflow_lane_selected",
+				"task_id":    task.ID,
+				"skill":      skill.Name,
+				"skill_path": skill.Path,
+				"nodes":      len(g.Nodes),
+			})
+			_ = trace.write(map[string]any{
+				"type":    "task_lane_selected",
+				"task_id": task.ID,
+				"lane":    workflowLane,
+				"reason":  "explicit workflow skill match",
+				"trigger": skill.Name,
+			})
+		}
+		taskFrame(trace, task)
+		return rt.saveState(state, trace)
+	}
 
 	plannerContext := buildRuntimeSystemContextForTask(rt.Config, rt.Pool.ProfileForMessage(msg), userText, session.TaskContract{})
 	plan, contract, planErr := rt.planTaskGraphUnified(ctx, task, userText, plannerContext, rt.Model, agentRegistry, discoveredSkills, trace)
@@ -68,16 +101,13 @@ func (rt Runtime) ensureGraphForTask(
 		return fmt.Errorf("planner produced invalid graph: %w", convErr)
 	}
 
-	workspace := strings.TrimSpace(rt.Config.App.Workspace)
-	if workspace == "" {
-		workspace = filepath.Join(rt.Config.App.Home, "workspace")
-	}
 	contract = repairContractSkillUsage(contract, discoveredSkills)
 	contract = readSelectedSkillBodies(contract, discoveredSkills, workspace, profileID)
 	contract = augmentContractWithSkillPlanItems(contract, discoveredSkills)
 	traceSelectedSkillBodies(trace, contract)
 
 	strategy := classifyContractStrategy(task.Goal, userText, contract)
+	g.Lane = laneForContractStrategy(strategy)
 	if trace != nil {
 		_ = trace.write(map[string]any{
 			"type":           "task_contract_strategy",
@@ -95,6 +125,13 @@ func (rt Runtime) ensureGraphForTask(
 			"required_skills":   requiredSkillsWithoutBody(contract.RequiredSkills),
 			"required_evidence": contract.RequiredEvidence,
 			"expected_outcome":  contract.ExpectedOutcome,
+		})
+		_ = trace.write(map[string]any{
+			"type":    "task_lane_selected",
+			"task_id": task.ID,
+			"lane":    g.Lane,
+			"reason":  laneSelectionReason(strategy, contract),
+			"trigger": string(strategy),
 		})
 	}
 

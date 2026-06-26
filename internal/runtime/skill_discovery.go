@@ -25,6 +25,7 @@ type discoveredSkill struct {
 	Usage        string
 	Entrypoints  []string
 	Success      []string
+	HumanGates   []string
 	Priority     string
 	Path         string
 	Scope        string
@@ -121,6 +122,7 @@ func discoverSkillsInRoot(root, scope string) []discoveredSkill {
 			Usage:        metadata.Graph.Usage,
 			Entrypoints:  append([]string(nil), metadata.Graph.Entrypoints...),
 			Success:      append([]string(nil), metadata.Graph.SuccessCriteria...),
+			HumanGates:   append([]string(nil), metadata.Graph.HumanGates...),
 		}
 		text := readSkillHeader(path)
 		if text != "" {
@@ -211,8 +213,11 @@ func skillsPrompt(skills []discoveredSkill) string {
 	var b strings.Builder
 	b.WriteString("Discovered skills:\n")
 	b.WriteString("- Skills provide specialized instructions for matching tasks.\n")
-	b.WriteString("- When a task matches a skill description, read the skill file with file.read before relying on its workflow.\n")
-	b.WriteString("- Resolve relative paths in a skill file against the skill directory.\n")
+	b.WriteString("- When a task matches a skill description, read the exact Location path below with file.read before relying on its workflow.\n")
+	b.WriteString("- Skill lookup order is agent workspace first, then shared workspace: workspace/agents/<agent>/skills/<skill>/SKILL.md, then workspace/skills/<skill>/SKILL.md.\n")
+	b.WriteString("- Do not guess skill paths under the current project/repository root; use the discovered absolute Location path.\n")
+	b.WriteString("- Resolve relative reference/script/template paths in a skill file against the skill directory.\n")
+	b.WriteString("- Do not create task artifacts inside workspace/skills or workspace/agents/<agent>/skills. If a skill says outputs/<slug>, write it under the workspace output area, not under the skill directory.\n")
 	for _, skill := range skills {
 		b.WriteString("- ")
 		b.WriteString(skill.Name)

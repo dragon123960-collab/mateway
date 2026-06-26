@@ -913,6 +913,41 @@ func TestConvertTaskGraphPlan_ReactWithAllowedTools(t *testing.T) {
 	}
 }
 
+func TestConvertTaskGraphPlan_DirectWithAllowedToolsBecomesReact(t *testing.T) {
+	plan := TaskGraphPlan{
+		Task: TaskPlanLevel{
+			Goal:        "read a skill",
+			Risk:        "low",
+			Acceptance:  "skill summarized",
+			FinalOutput: TaskPlanFinalOutput{Text: true},
+		},
+		Nodes: []TaskPlanNode{
+			{
+				ID:           "load-skill",
+				Type:         "subtask",
+				Mode:         "direct",
+				Goal:         "Read /workspace/skills/demo/SKILL.md and summarize it.",
+				AllowedTools: []string{"file.read"},
+				Acceptance:   "summary includes workflow",
+			},
+		},
+	}
+	g, err := convertTaskGraphPlan(plan, "task-direct-tools")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	if len(g.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(g.Nodes))
+	}
+	n := g.Nodes[0]
+	if n.Mode != session.NodeModeReact {
+		t.Fatalf("node with allowed_tools must run react, got %q", n.Mode)
+	}
+	if len(n.AllowedTools) != 1 || n.AllowedTools[0] != "file.read" {
+		t.Fatalf("allowed tools = %v", n.AllowedTools)
+	}
+}
+
 func TestConvertTaskGraphPlan_HumanConfirmNode(t *testing.T) {
 	plan := TaskGraphPlan{
 		Task: TaskPlanLevel{
@@ -1487,6 +1522,7 @@ func TestRenderUnifiedPlannerPrompt_IncludesSkillExecutionMetadata(t *testing.T)
 		Usage:        "Use terminal.run with the helper wrapper and return the created URL.",
 		Entrypoints:  []string{"python3 /skill/scripts/feishu.docs.create --title <title>"},
 		Success:      []string{"Return the created document URL."},
+		HumanGates:   []string{"review generated script before publishing"},
 		Path:         "/tmp/skills/feishu-notify/SKILL.md",
 	}}
 	prompt := renderUnifiedPlannerPrompt("publish document", "", "", rt.Tools, skills)
@@ -1497,6 +1533,8 @@ func TestRenderUnifiedPlannerPrompt_IncludesSkillExecutionMetadata(t *testing.T)
 		"usage: Use terminal.run with the helper wrapper",
 		"entrypoints: python3 /skill/scripts/feishu.docs.create",
 		"success_criteria: Return the created document URL.",
+		"human_gates: review generated script before publishing",
+		"include matching human_review or human_confirm nodes",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
