@@ -244,7 +244,7 @@ func sanitizeFeishuText(reply channel.OutboundMessage) string {
 	if text == "" {
 		return ""
 	}
-	if looksLikeJSONToolPlan(text) {
+	if looksLikeJSONToolPlan(text) || looksLikeStructuredJSONReply(text) {
 		return fallbackFeishuText(reply)
 	}
 	lines := strings.Split(text, "\n")
@@ -317,4 +317,19 @@ func looksLikeJSONToolPlan(text string) bool {
 	return strings.Contains(lower, `"tool"`) &&
 		strings.Contains(lower, `"args"`) &&
 		(strings.Contains(lower, `"risk"`) || strings.Contains(lower, `"requires_confirm"`) || strings.Contains(lower, `"expected_evidence"`))
+}
+
+func looksLikeStructuredJSONReply(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "```json") && strings.HasSuffix(trimmed, "```") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+		return true
+	}
+	return strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")
 }

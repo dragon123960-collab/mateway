@@ -175,9 +175,35 @@ func isFinalAnswerNode(n session.TaskGraphNode) bool {
 
 func nodeResultText(n session.TaskGraphNode) string {
 	if text, ok := n.Output["text"].(string); ok && strings.TrimSpace(text) != "" {
-		return strings.TrimSpace(text)
+		return humanReadableFinalText(strings.TrimSpace(text))
 	}
-	return strings.TrimSpace(n.ResultSummary)
+	return humanReadableFinalText(strings.TrimSpace(n.ResultSummary))
+}
+
+func humanReadableFinalText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" || looksLikeStructuredJSONAnswer(text) {
+		return ""
+	}
+	return text
+}
+
+func looksLikeStructuredJSONAnswer(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "```json") && strings.HasSuffix(trimmed, "```") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		return true
+	}
+	return false
 }
 
 func (rt Runtime) FinalizeAndRespond(

@@ -124,6 +124,22 @@ func TestRenderReplyMessageStripsBareJSONToolPlan(t *testing.T) {
 	}
 }
 
+func TestRenderReplyMessageStripsStructuredJSONBlock(t *testing.T) {
+	_, content, err := renderReplyMessage(channel.OutboundMessage{
+		Style: "reply",
+		Text:  "```json\n{\"summary\":\"今晚看点\",\"matches\":[]}\n```",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content, "```json") || strings.Contains(content, `"matches"`) {
+		t.Fatalf("expected structured json stripped, got %s", content)
+	}
+	if !strings.Contains(content, "Done.") {
+		t.Fatalf("expected fallback text, got %s", content)
+	}
+}
+
 func TestRenderReplyMessageUsesEnglishRuntimeText(t *testing.T) {
 	_, content, err := renderReplyMessage(channel.OutboundMessage{
 		Channel:  "feishu",

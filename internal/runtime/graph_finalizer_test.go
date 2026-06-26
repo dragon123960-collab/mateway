@@ -74,6 +74,40 @@ func TestFinalizeGraph_Completed_UsesFinalSinkSubtaskResult(t *testing.T) {
 	}
 }
 
+func TestFinalizeGraph_StructuredJSONFinalSinkUsesModelFinalizer(t *testing.T) {
+	var callCount int
+	rt := newTestRuntime(t)
+	rt.Model = &finalizerCountingModel{calls: &callCount, text: "今晚重点看法国和挪威的小组头名之争，以及姆巴佩和哈兰德的金靴对话。"}
+
+	g := &session.TaskGraph{
+		ID:     "g-json-final",
+		TaskID: "t-json-final",
+		Nodes: []session.TaskGraphNode{
+			{
+				ID:            "repair",
+				Type:          session.NodeTypeSubtask,
+				Mode:          session.NodeModeDirect,
+				Goal:          "produce final structured answer",
+				Status:        session.NodeStatusCompleted,
+				ResultSummary: "```json\n{\"summary\":\"raw structured answer\",\"matches\":[]}\n```",
+				Output:        map[string]any{"text": "```json\n{\"summary\":\"raw structured answer\",\"matches\":[]}\n```"},
+				Acceptance:    session.Acceptance{Verified: true},
+			},
+		},
+	}
+	vr := session.VerifyTaskGraph(g)
+	result := rt.finalizeGraph(t.Context(), channel.InboundMessage{}, g, vr, nil)
+	if result.Status != session.FinalizeCompleted {
+		t.Fatalf("expected completed, got %q", result.Status)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected model finalizer for structured JSON, got %d calls", callCount)
+	}
+	if strings.Contains(result.ReplyText, "```json") || strings.Contains(result.ReplyText, `"matches"`) {
+		t.Fatalf("structured JSON should not be sent directly, got %q", result.ReplyText)
+	}
+}
+
 func TestFinalizeGraph_Completed_MultipleSinkNodesUseModelFinalizer(t *testing.T) {
 	var callCount int
 	rt := newTestRuntime(t)
